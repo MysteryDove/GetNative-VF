@@ -25,8 +25,8 @@
 | CPU0 AArch64 adjacent-column SIMD | `KEPT` | Scalar and NEON workspaces and metrics are bit-identical; the primary candidate and the full named matrix pass |
 | PL0 exact tap reuse | `KEPT` | All 112 matrix cases are byte-identical, loop-derived raw weight calls are halved, and every valid paired case improves; Lanczos3-8 improve 31.92% to 37.18% |
 | PL1 B/C geometry reuse | `KEPT` | Eight B/C sweep cases improve 10.41% to 14.22% with byte-identical plans; the single-B/C control changes +0.224%, and all MAD, thermal, concurrency, isolation, and scratch-accounting gates pass |
-| PL1 packed topology interning | `PENDING_EVALUATION` | Geometry reuse is terminal; sharing immutable offsets/indices remains a separate representation and retained-memory experiment |
-| MK3 arena/ring/cache | `PENDING_PL1_TOPOLOGY` | Stage 1 and PL1 geometry are terminal; runtime reuse remains sequenced after packed-topology evaluation, while content caching also awaits the private identity/packing checkpoint |
+| PL1 packed topology interning | `REMOVED_AFTER_TEST` | Exact interning removed 77.99% of topology upload bytes but reduced total explicit working set only 6.44% and regressed primary Metal wall 1.16%, missing both alternative keep gates |
+| MK3 arena/ring/cache | `PENDING_EVALUATION` | PL1 is terminal; persistent allocation/upload reuse is next, while content caching still requires its own exact identity/packing checkpoint and independent gate |
 | MK4 Float16 coefficient storage | `PENDING_PREREQUISITES` | Strict Float32 remains the only retained path |
 
 ## Final Identity Set
@@ -184,6 +184,43 @@ focused planner TSan 1/1, Metal B3/F2 and B7/F4 improve 6.32% and 7.95%, and
 the CPU primary whole-candidate path improves 62.62% with bit-identical
 NEON/scalar results.
 
+## PL1 Packed Topology Interning - Removed After Test
+
+The separate Metal experiment interned exact-equal transpose offsets/indices and
+forward-left blocks after an O(1) geometry fingerprint and complete byte
+comparison. Transpose weights, forward weights, and every LDLT factor remained
+private. A diagnostic packing ABI split transpose index and weight bases so the
+two paths could be compared in one binary; both paths produced identical result
+SHA-256 values and zero maximum path difference.
+
+The stable 21-pair primary `bicubic-bc@810` run found 746 exact hits among 1,000
+blocks. It eliminated every equality-group duplicate and reduced total topology
+upload from 23,740,948 to 5,226,248 bytes, a 77.99% reduction. That was not
+enough to pass either system-level keep gate:
+
+- Explicit Metal working set fell from 287,349,896 to 268,835,196 bytes, only
+  6.44% rather than the required 10%.
+- The paired wall delta median regressed 1.16% rather than improving at least
+  3%; the independent/interned wall medians were 95.473/96.938 ms and paired
+  MAD was 0.0068.
+- GPU time rose from 88.451 to 89.364 ms and the `wall-GPU` residual rose from
+  7.102 to 7.327 ms. The result was not a hidden transfer-only win.
+- The no-sharing single-B/C control passed at +0.459% with MAD 0.0078. Both
+  formal runs stayed thermally stable and detected no concurrent benchmark.
+
+The interning implementation, diagnostic API, and experimental packing/shader
+ABI were completely removed. Production remains at the `ac71401` PL1 geometry
+baseline; the failure does not pre-approve or reject MK3 persistent allocation
+and upload-ring experiments, which target different costs and retain their own
+gates.
+
+Rejected experiment identities and artifacts:
+
+- Benchmark binary: `900305aae56a3e5965559d3a01399f11ee6dde2c6fcec4bfe717536ca8cbeece`
+- Metallib: `fd774e3a6eef7aa3ca3f4ccf3180289100e47243129868715ca09be2daf39188`
+- Primary failure: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/pl1-topology-formal-810/20260730T212845145Z-pid45698/metal-packed-topology-report.json`
+- Single-B/C control: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/pl1-topology-formal-control/20260730T212821257Z-pid44582/metal-packed-topology-report.json`
+
 ## MK3 Readiness Boundary
 
 The final Metal controls allocate 291 Metal buffers per 1000-candidate run.
@@ -192,8 +229,9 @@ Their median backend wall minus reported GPU execution time is approximately
 submission, synchronization, and measurement overhead; it is not direct proof
 of allocation time.
 
-The terminal Stage 1 commit `6eda3ef` and combined integration commit `00e53b9`
-now satisfy the planner coordination gate. This is sufficient to keep the
-persistent arena and 2/4-slot upload-ring experiment in the plan after PL1.
+The terminal Stage 1 commit `6eda3ef`, combined integration commit `00e53b9`,
+and terminal PL1 decisions now satisfy the planner coordination gate. This is
+sufficient to start the persistent arena and 2/4-slot upload-ring experiment.
 Packed-content caching additionally requires the stable exact plan identity and
-private packing-ABI checkpoint defined in the design plan.
+private packing-ABI checkpoint defined in the design plan; the rejected PL1
+packing ABI is not retained or reused as that checkpoint.
