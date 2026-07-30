@@ -1,5 +1,7 @@
 #include "getnative/cpu_analysis.hpp"
 
+#include "inverse_columns.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -199,11 +201,9 @@ void descale_2d_f32(ConstImageView source, const AxisPlan &horizontal,
                          workspace.intermediate.data()
                              + static_cast<std::ptrdiff_t>(y) * intermediate_stride, 1);
     }
-    for (std::int32_t x = 0; x < native_output.width; ++x) {
-        inverse_axis_f32(vertical,
-                         workspace.intermediate.data() + x, intermediate_stride,
-                         native_output.data + x, native_output.stride);
-    }
+    detail::inverse_columns_f32(
+        vertical, workspace.intermediate.data(), intermediate_stride,
+        native_output.data, native_output.stride, native_output.width);
 }
 
 void reconstruct_2d_f32(ConstImageView native_source, const AxisPlan &horizontal,
@@ -291,10 +291,9 @@ double analyze_candidate_f32(ConstImageView source, const AxisPlan &horizontal,
                              + static_cast<std::ptrdiff_t>(y) * horizontal_stride, 1);
     }
     const std::ptrdiff_t native_stride = horizontal.destination_size;
-    for (std::int32_t x = 0; x < horizontal.destination_size; ++x) {
-        inverse_axis_f32(vertical, workspace.intermediate.data() + x, horizontal_stride,
-                         workspace.native.data() + x, native_stride);
-    }
+    detail::inverse_columns_f32(
+        vertical, workspace.intermediate.data(), horizontal_stride,
+        workspace.native.data(), native_stride, horizontal.destination_size);
 
     MetricAccumulator accumulator(metric);
     if (select_forward_order(horizontal, vertical) == ForwardOrder::vertical_first) {
@@ -348,9 +347,12 @@ double analyze_candidate_f32(ConstImageView source, const AxisPlan &horizontal,
     return accumulator.finish(bounds.count);
 }
 
-double analyze_axis_candidate_f32(ConstImageView source, const AxisPlan &axis,
-                                  AnalysisAxes axis_direction, const MetricSpec &metric,
-                                  CpuWorkspace &workspace) {
+namespace {
+
+double analyze_axis_candidate_impl(ConstImageView source, const AxisPlan &axis,
+                                   AnalysisAxes axis_direction, const MetricSpec &metric,
+                                   CpuWorkspace &workspace,
+                                   detail::ColumnDispatchPolicy column_policy) {
     validate(source);
     const MetricBounds bounds = metric_bounds(source, metric);
     if (axis_direction == AnalysisAxes::both) {
@@ -386,10 +388,9 @@ double analyze_axis_candidate_f32(ConstImageView source, const AxisPlan &axis,
         workspace.reserve(source.width, source.height, source.width, axis.destination_size,
                           AnalysisAxes::vertical);
         const std::ptrdiff_t native_stride = source.width;
-        for (std::int32_t x = 0; x < source.width; ++x) {
-            inverse_axis_f32(axis, source.data + x, source.stride,
-                             workspace.native.data() + x, native_stride);
-        }
+        detail::inverse_columns_f32(
+            axis, source.data, source.stride, workspace.native.data(), native_stride,
+            source.width, column_policy);
         for (std::int32_t y = bounds.y_begin; y < bounds.y_end; ++y) {
             const std::uint32_t begin = axis.forward_offsets[static_cast<std::size_t>(y)];
             const std::int32_t left = axis.forward_indices[begin];
@@ -409,6 +410,27 @@ double analyze_axis_candidate_f32(ConstImageView source, const AxisPlan &axis,
     }
     return accumulator.finish(bounds.count);
 }
+
+} // namespace
+
+double analyze_axis_candidate_f32(ConstImageView source, const AxisPlan &axis,
+                                  AnalysisAxes axis_direction, const MetricSpec &metric,
+                                  CpuWorkspace &workspace) {
+    return analyze_axis_candidate_impl(
+        source, axis, axis_direction, metric, workspace,
+        detail::ColumnDispatchPolicy::automatic);
+}
+
+namespace detail {
+
+double analyze_axis_candidate_with_column_policy_f32(
+    ConstImageView source, const AxisPlan &axis, AnalysisAxes axis_direction,
+    const MetricSpec &metric, CpuWorkspace &workspace, ColumnDispatchPolicy policy) {
+    return analyze_axis_candidate_impl(
+        source, axis, axis_direction, metric, workspace, policy);
+}
+
+} // namespace detail
 
 std::vector<CandidateResult> analyze_batch_f32(
     ConstImageView source, std::span<const CandidateAnalysis> candidates,

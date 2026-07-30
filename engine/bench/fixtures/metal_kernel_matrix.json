@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "source": {
+    "width": 1920,
+    "height": 1080
+  },
+  "candidates": 1000,
+  "tile_size": 32,
+  "reduction_groups": 8,
+  "inverse_threads": 32,
+  "primary_native_height": 810,
+  "cpu_primary_filter_id": "bicubic-catrom",
+  "native_heights": [362, 540, 720, 810, 846, 864, 900],
+  "metric": {
+    "crop_left": 5,
+    "crop_right": 5,
+    "crop_top": 5,
+    "crop_bottom": 5,
+    "threshold": 0.015
+  },
+  "filters": [
+    {"id": "bilinear", "type": "bilinear", "control": true},
+    {"id": "bicubic-catrom", "type": "bicubic", "b": 0.0, "c": 0.5, "control": true},
+    {"id": "bicubic-mitchell", "type": "bicubic", "b": 0.3333333333333333, "c": 0.3333333333333333},
+    {"id": "spline16", "type": "spline16"},
+    {"id": "spline36", "type": "spline36"},
+    {"id": "spline64", "type": "spline64"},
+    {"id": "lanczos1", "type": "lanczos", "taps": 1},
+    {"id": "lanczos2", "type": "lanczos", "taps": 2},
+    {"id": "lanczos3", "type": "lanczos", "taps": 3},
+    {"id": "lanczos4", "type": "lanczos", "taps": 4},
+    {"id": "lanczos5", "type": "lanczos", "taps": 5},
+    {"id": "lanczos6", "type": "lanczos", "taps": 6},
+    {"id": "lanczos7", "type": "lanczos", "taps": 7},
+    {"id": "lanczos8", "type": "lanczos", "taps": 8}
+  ],
+  "fractional_scan": {
+    "id": "800-899.9",
+    "native_start": 800,
+    "native_end": 899,
+    "active_start": 800.0,
+    "active_end": 899.9
+  },
+  "sustained_filter_ids": [
+    "lanczos4",
+    "bicubic-catrom",
+    "lanczos5",
+    "bicubic-catrom",
+    "lanczos6",
+    "bicubic-catrom",
+    "lanczos7",
+    "bicubic-catrom",
+    "lanczos8",
+    "bicubic-catrom"
+  ]
+}
