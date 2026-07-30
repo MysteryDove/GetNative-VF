@@ -48,9 +48,9 @@ Do not modify:
 The expected handoff revisions are:
 
 - `.omx/plans/prd-pre-gpu-foundation-staged.md`:
-  `c90df0aa9a0be50c30f867decff06c48151721708cf606cf63d32b7292be31f2`.
+  `6c508ec2af5c1f6efda99149088af10863c9c3c032ea638705372e942c54a6c9`.
 - `.omx/plans/test-spec-pre-gpu-foundation-stage-1.md`:
-  `5a5c6972068982b65683d986ccdfdcfe220093afeae7004d5dcfbb7299e1bd68`.
+  `030161fd648dd29755c737e17f48ea65cc3c505fdd0914b8d120577eeefc9311`.
 
 Stage 0 is mandatory. Stage 1 starts only when the valid 21-sample result is
 exactly `PROCEED_STAGE1`, defined by
