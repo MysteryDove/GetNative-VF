@@ -6,7 +6,9 @@
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <mutex>
@@ -31,7 +33,25 @@ constexpr std::size_t maximum_reduction_groups =
 enum class KernelShape : std::uint8_t {
     bandwidth3,
     bandwidth7,
+    bandwidth11,
+    bandwidth15,
     generic,
+};
+
+enum class PipelineStage : std::uint8_t {
+    image_inverse,
+    metric,
+    matrix_inverse,
+    matrix_forward,
+    horizontal_first_metric,
+};
+
+constexpr std::array all_pipeline_stages{
+    PipelineStage::image_inverse,
+    PipelineStage::metric,
+    PipelineStage::matrix_inverse,
+    PipelineStage::matrix_forward,
+    PipelineStage::horizontal_first_metric,
 };
 
 struct alignas(16) AxisPlanDescriptor {
@@ -193,8 +213,20 @@ struct TileRange {
     TileSignature signature{};
 };
 
+[[nodiscard]] bool uses_specialized_pipeline(const TileSignature &signature) noexcept {
+    if (signature.axes == AnalysisAxes::horizontal) {
+        return signature.horizontal_shape != KernelShape::generic;
+    }
+    if (signature.axes == AnalysisAxes::vertical) {
+        return signature.vertical_shape != KernelShape::generic;
+    }
+    return signature.horizontal_shape != KernelShape::generic
+        || signature.vertical_shape != KernelShape::generic;
+}
+
 [[nodiscard]] KernelShape axis_shape(const std::shared_ptr<const AxisPlan> &plan_pointer,
-                                     std::int32_t expected_source) {
+                                     std::int32_t expected_source,
+                                     MetalKernelDispatchPolicy policy) {
     if (!plan_pointer || !plan_pointer->valid()) {
         throw std::invalid_argument("Metal candidate contains an invalid axis plan");
     }
@@ -207,24 +239,39 @@ struct TileRange {
         throw std::invalid_argument(
             "Metal supports half-bandwidth 1..15 and forward width 1..16");
     }
+    KernelShape shape = KernelShape::generic;
     if (plan.half_bandwidth == 1 && plan.forward_width == 2) {
-        return KernelShape::bandwidth3;
+        shape = KernelShape::bandwidth3;
+    } else if (plan.half_bandwidth == 3 && plan.forward_width == 4) {
+        shape = KernelShape::bandwidth7;
+    } else if (plan.half_bandwidth == 5 && plan.forward_width == 6) {
+        shape = KernelShape::bandwidth11;
+    } else if (plan.half_bandwidth == 7 && plan.forward_width == 8) {
+        shape = KernelShape::bandwidth15;
     }
-    if (plan.half_bandwidth == 3 && plan.forward_width == 4) {
-        return KernelShape::bandwidth7;
+    if (policy == MetalKernelDispatchPolicy::generic_only) {
+        return KernelShape::generic;
     }
-    return KernelShape::generic;
+    if (policy == MetalKernelDispatchPolicy::required_specialized
+        && shape == KernelShape::generic) {
+        throw std::runtime_error(
+            "required Metal specialization is unavailable for B"
+            + std::to_string(2 * plan.half_bandwidth + 1) + "/F"
+            + std::to_string(plan.forward_width));
+    }
+    return shape;
 }
 
 [[nodiscard]] TileSignature candidate_signature(ConstImageView source,
-                                                const CandidateAnalysis &candidate) {
+                                                const CandidateAnalysis &candidate,
+                                                MetalKernelDispatchPolicy policy) {
     TileSignature signature;
     signature.axes = candidate.axes;
     if (candidate.axes == AnalysisAxes::horizontal || candidate.axes == AnalysisAxes::both) {
-        signature.horizontal_shape = axis_shape(candidate.horizontal, source.width);
+        signature.horizontal_shape = axis_shape(candidate.horizontal, source.width, policy);
     }
     if (candidate.axes == AnalysisAxes::vertical || candidate.axes == AnalysisAxes::both) {
-        signature.vertical_shape = axis_shape(candidate.vertical, source.height);
+        signature.vertical_shape = axis_shape(candidate.vertical, source.height, policy);
     }
     if (candidate.axes == AnalysisAxes::both) {
         signature.forward_order = select_forward_order(*candidate.horizontal, *candidate.vertical);
@@ -233,8 +280,9 @@ struct TileRange {
 }
 
 [[nodiscard]] std::size_t candidate_workspace_elements(ConstImageView source,
-                                                        const CandidateAnalysis &candidate) {
-    (void)candidate_signature(source, candidate);
+                                                        const CandidateAnalysis &candidate,
+                                                        MetalKernelDispatchPolicy policy) {
+    (void)candidate_signature(source, candidate, policy);
     if (candidate.axes != AnalysisAxes::both) {
         const auto &plan = candidate.axes == AnalysisAxes::horizontal
             ? candidate.horizontal : candidate.vertical;
@@ -321,8 +369,9 @@ void append_axis(PackedTile &packed, const AxisPlan &plan, bool horizontal,
 }
 
 void append_single_plan(PackedTile &packed, ConstImageView source,
-                        const CandidateAnalysis &candidate) {
-    (void)candidate_signature(source, candidate);
+                        const CandidateAnalysis &candidate,
+                        MetalKernelDispatchPolicy policy) {
+    (void)candidate_signature(source, candidate, policy);
     const bool horizontal = candidate.axes == AnalysisAxes::horizontal;
     const auto &plan = horizontal ? candidate.horizontal : candidate.vertical;
     const std::uint32_t vector_count = static_cast<std::uint32_t>(
@@ -340,13 +389,15 @@ void append_single_plan(PackedTile &packed, ConstImageView source,
 }
 
 void append_two_axis_plans(PackedTile &packed, ConstImageView source,
-                           std::span<const CandidateAnalysis> candidates) {
+                           std::span<const CandidateAnalysis> candidates,
+                           MetalKernelDispatchPolicy policy) {
     struct Bases { std::uint32_t intermediate; std::uint32_t native; };
     std::vector<Bases> bases;
     bases.reserve(candidates.size());
     for (const CandidateAnalysis &candidate : candidates) {
-        (void)candidate_signature(source, candidate);
-        const std::size_t candidate_elements = candidate_workspace_elements(source, candidate);
+        (void)candidate_signature(source, candidate, policy);
+        const std::size_t candidate_elements =
+            candidate_workspace_elements(source, candidate, policy);
         const std::size_t native_elements = checked_product(
             static_cast<std::size_t>(candidate.horizontal->destination_size),
             static_cast<std::size_t>(candidate.vertical->destination_size),
@@ -398,11 +449,11 @@ void append_two_axis_plans(PackedTile &packed, ConstImageView source,
 }
 
 struct ShapePipelines {
-    id<MTLComputePipelineState> inverse;
-    id<MTLComputePipelineState> metric;
-    id<MTLComputePipelineState> matrix_inverse;
-    id<MTLComputePipelineState> matrix_forward;
-    id<MTLComputePipelineState> horizontal_first_metric;
+    id<MTLComputePipelineState> inverse = nil;
+    id<MTLComputePipelineState> metric = nil;
+    id<MTLComputePipelineState> matrix_inverse = nil;
+    id<MTLComputePipelineState> matrix_forward = nil;
+    id<MTLComputePipelineState> horizontal_first_metric = nil;
 };
 
 } // namespace
@@ -434,35 +485,20 @@ struct MetalAnalysisEngine::Impl {
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
                 DISPATCH_DATA_DESTRUCTOR_DEFAULT);
             NSError *error = nil;
-            id<MTLLibrary> library = [device newLibraryWithData:library_data error:&error];
+            library = [device newLibraryWithData:library_data error:&error];
             if (library == nil) {
                 throw std::runtime_error(ns_error(error, "embedded Metal library could not be loaded"));
             }
-            bandwidth3 = {
-                make_pipeline(device, library, @"inverse_axis_b3"),
-                make_pipeline(device, library, @"metric_axis_p1_b3"),
-                make_pipeline(device, library, @"inverse_axis_matrix_b3"),
-                make_pipeline(device, library, @"forward_axis_matrix_b3"),
-                make_pipeline(device, library, @"metric_axis_p1_horizontal_first_b3"),
-            };
-            bandwidth7 = {
-                make_pipeline(device, library, @"inverse_axis_b7"),
-                make_pipeline(device, library, @"metric_axis_p1_b7"),
-                make_pipeline(device, library, @"inverse_axis_matrix_b7"),
-                make_pipeline(device, library, @"forward_axis_matrix_b7"),
-                make_pipeline(device, library, @"metric_axis_p1_horizontal_first_b7"),
-            };
-            generic = {
-                make_pipeline(device, library, @"inverse_axis_generic"),
-                make_pipeline(device, library, @"metric_axis_p1_generic"),
-                make_pipeline(device, library, @"inverse_axis_matrix_generic"),
-                make_pipeline(device, library, @"forward_axis_matrix_generic"),
-                make_pipeline(device, library, @"metric_axis_p1_horizontal_first_generic"),
-            };
-            if (bandwidth3.metric.maxTotalThreadsPerThreadgroup < reduction_width
-                || bandwidth7.metric.maxTotalThreadsPerThreadgroup < reduction_width
-                || generic.metric.maxTotalThreadsPerThreadgroup < reduction_width) {
-                throw std::runtime_error("Metal device cannot run the 256-thread reduction kernels");
+            for (const PipelineStage stage : all_pipeline_stages) {
+                (void)pipeline(KernelShape::generic, stage);
+            }
+            if (options.kernel_dispatch != MetalKernelDispatchPolicy::generic_only) {
+                for (const KernelShape shape : {
+                         KernelShape::bandwidth3, KernelShape::bandwidth7}) {
+                    for (const PipelineStage stage : all_pipeline_stages) {
+                        (void)pipeline(shape, stage);
+                    }
+                }
             }
             const char *name = device.name.UTF8String;
             info.name = name == nullptr ? "Metal device" : std::string{name};
@@ -476,20 +512,115 @@ struct MetalAnalysisEngine::Impl {
     MetalDeviceInfo info;
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
+    id<MTLLibrary> library;
     ShapePipelines bandwidth3;
     ShapePipelines bandwidth7;
+    ShapePipelines bandwidth11;
+    ShapePipelines bandwidth15;
     ShapePipelines generic;
     std::size_t peak_workspace_elements = 0;
     std::size_t peak_working_set_bytes = 0;
-    std::mutex mutex;
+    std::size_t buffer_allocation_count = 0;
+    std::size_t buffer_allocation_bytes = 0;
+    std::size_t analyzed_tile_count = 0;
+    std::size_t generic_tile_count = 0;
+    std::size_t specialized_tile_count = 0;
+    double pipeline_creation_ms = 0.0;
+    double gpu_execution_ms = 0.0;
+    std::vector<std::string> created_pipeline_names;
+    mutable std::mutex mutex;
 
-    [[nodiscard]] const ShapePipelines &pipelines(KernelShape shape) const noexcept {
+    void record_buffer(id<MTLBuffer> buffer) {
+        const std::size_t bytes = static_cast<std::size_t>(buffer.length);
+        if (bytes > std::numeric_limits<std::size_t>::max() - buffer_allocation_bytes) {
+            throw std::length_error("Metal allocation telemetry overflow");
+        }
+        ++buffer_allocation_count;
+        buffer_allocation_bytes += bytes;
+    }
+
+    [[nodiscard]] ShapePipelines &pipelines(KernelShape shape) noexcept {
         switch (shape) {
         case KernelShape::bandwidth3: return bandwidth3;
         case KernelShape::bandwidth7: return bandwidth7;
+        case KernelShape::bandwidth11: return bandwidth11;
+        case KernelShape::bandwidth15: return bandwidth15;
         case KernelShape::generic: return generic;
         }
         return generic;
+    }
+
+    [[nodiscard]] static std::string_view shape_suffix(KernelShape shape) noexcept {
+        switch (shape) {
+        case KernelShape::bandwidth3: return "b3";
+        case KernelShape::bandwidth7: return "b7";
+        case KernelShape::bandwidth11: return "b11";
+        case KernelShape::bandwidth15: return "b15";
+        case KernelShape::generic: return "generic";
+        }
+        return "generic";
+    }
+
+    [[nodiscard]] static std::string_view stage_prefix(PipelineStage stage) noexcept {
+        switch (stage) {
+        case PipelineStage::image_inverse: return "inverse_axis";
+        case PipelineStage::metric: return "metric_axis_p1";
+        case PipelineStage::matrix_inverse: return "inverse_axis_matrix";
+        case PipelineStage::matrix_forward: return "forward_axis_matrix";
+        case PipelineStage::horizontal_first_metric:
+            return "metric_axis_p1_horizontal_first";
+        }
+        return "Metal pipeline";
+    }
+
+    [[nodiscard]] static id<MTLComputePipelineState> existing_pipeline(
+        const ShapePipelines &pipelines, PipelineStage stage) noexcept {
+        switch (stage) {
+        case PipelineStage::image_inverse: return pipelines.inverse;
+        case PipelineStage::metric: return pipelines.metric;
+        case PipelineStage::matrix_inverse: return pipelines.matrix_inverse;
+        case PipelineStage::matrix_forward: return pipelines.matrix_forward;
+        case PipelineStage::horizontal_first_metric: return pipelines.horizontal_first_metric;
+        }
+        return nil;
+    }
+
+    static void store_pipeline(ShapePipelines &pipelines, PipelineStage stage,
+                               id<MTLComputePipelineState> value) noexcept {
+        switch (stage) {
+        case PipelineStage::image_inverse: pipelines.inverse = value; return;
+        case PipelineStage::metric: pipelines.metric = value; return;
+        case PipelineStage::matrix_inverse: pipelines.matrix_inverse = value; return;
+        case PipelineStage::matrix_forward: pipelines.matrix_forward = value; return;
+        case PipelineStage::horizontal_first_metric:
+            pipelines.horizontal_first_metric = value;
+            return;
+        }
+    }
+
+    [[nodiscard]] id<MTLComputePipelineState> pipeline(KernelShape shape,
+                                                       PipelineStage stage) {
+        ShapePipelines &shape_pipelines = pipelines(shape);
+        id<MTLComputePipelineState> result = existing_pipeline(shape_pipelines, stage);
+        if (result != nil) return result;
+
+        std::string name{stage_prefix(stage)};
+        name += '_';
+        name += shape_suffix(shape);
+        NSString *function_name = [NSString stringWithUTF8String:name.c_str()];
+        if (function_name == nil) throw std::runtime_error("Metal function name is not UTF-8");
+        const auto start = std::chrono::steady_clock::now();
+        result = make_pipeline(device, library, function_name);
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        pipeline_creation_ms += std::chrono::duration<double, std::milli>(elapsed).count();
+        if ((stage == PipelineStage::metric
+             || stage == PipelineStage::horizontal_first_metric)
+            && result.maxTotalThreadsPerThreadgroup < reduction_width) {
+            throw std::runtime_error("Metal device cannot run the 256-thread reduction kernels");
+        }
+        store_pipeline(shape_pipelines, stage, result);
+        created_pipeline_names.push_back(std::move(name));
+        return result;
     }
 };
 
@@ -513,6 +644,28 @@ std::size_t MetalAnalysisEngine::peak_workspace_elements() const noexcept {
 }
 std::size_t MetalAnalysisEngine::peak_working_set_bytes() const noexcept {
     return impl_->peak_working_set_bytes;
+}
+MetalRuntimeTelemetry MetalAnalysisEngine::runtime_telemetry() const {
+    const std::scoped_lock lock(impl_->mutex);
+    return {
+        impl_->buffer_allocation_count,
+        impl_->buffer_allocation_bytes,
+        impl_->analyzed_tile_count,
+        impl_->generic_tile_count,
+        impl_->specialized_tile_count,
+        impl_->pipeline_creation_ms,
+        impl_->gpu_execution_ms,
+        impl_->created_pipeline_names,
+    };
+}
+void MetalAnalysisEngine::reset_analysis_telemetry() {
+    const std::scoped_lock lock(impl_->mutex);
+    impl_->buffer_allocation_count = 0;
+    impl_->buffer_allocation_bytes = 0;
+    impl_->analyzed_tile_count = 0;
+    impl_->generic_tile_count = 0;
+    impl_->specialized_tile_count = 0;
+    impl_->gpu_execution_ms = 0.0;
 }
 
 std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
@@ -563,6 +716,7 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
             throw std::runtime_error("Metal source buffer allocation failed");
         }
         source_buffer.label = @"GetNative source";
+        impl_->record_buffer(source_buffer);
 
         std::vector<CandidateResult> results(candidates.size());
         const std::size_t groups = impl_->options.reduction_groups_per_candidate;
@@ -589,16 +743,19 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
             }
             std::size_t tile_end = tile_begin;
             std::size_t estimated_workspace = 0;
-            const TileSignature signature = candidate_signature(source, candidates[tile_begin]);
+            const TileSignature signature = candidate_signature(
+                source, candidates[tile_begin], impl_->options.kernel_dispatch);
             const std::size_t maximum_tile_end = tile_begin + std::min(
                 impl_->options.tile_size, candidates.size() - tile_begin);
             while (tile_end < maximum_tile_end) {
                 const CandidateAnalysis &candidate = candidates[tile_end];
-                if (candidate_signature(source, candidate) != signature) {
+                if (candidate_signature(source, candidate, impl_->options.kernel_dispatch)
+                    != signature) {
                     break;
                 }
                 const std::size_t candidate_workspace =
-                    candidate_workspace_elements(source, candidate);
+                    candidate_workspace_elements(
+                        source, candidate, impl_->options.kernel_dispatch);
                 if (candidate_workspace > configured_workspace_limit) {
                     throw std::length_error(
                         "one Metal candidate exceeds the workspace limit");
@@ -623,10 +780,12 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
             impl_->peak_workspace_elements, maximum_workspace_elements);
         id<MTLBuffer> workspace_buffer = make_empty_buffer(
             impl_->device, maximum_workspace_elements, "GetNative Metal workspace");
+        impl_->record_buffer(workspace_buffer);
         const std::size_t partial_count = checked_product(
             candidates.size(), groups, "Metal partial results");
         id<MTLBuffer> partial_buffer = make_empty_buffer(
             impl_->device, partial_count, "GetNative metric partials");
+        impl_->record_buffer(partial_buffer);
         const std::size_t commands_per_tile = impl_->options.profile_split_kernels ? 4 : 1;
         NSMutableArray<id<MTLCommandBuffer>> *commands =
             [NSMutableArray arrayWithCapacity:std::min(tiles.size(), maximum_queued_tiles)
@@ -650,16 +809,24 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                 throw std::runtime_error("Metal analysis cancelled");
             }
             @autoreleasepool {
+                ++impl_->analyzed_tile_count;
+                if (uses_specialized_pipeline(tile.signature)) {
+                    ++impl_->specialized_tile_count;
+                } else {
+                    ++impl_->generic_tile_count;
+                }
                 PackedTile packed;
                 const std::size_t tile_candidate_count = tile.end - tile.begin;
                 packed.descriptors.reserve(
                     tile_candidate_count * (tile.signature.axes == AnalysisAxes::both ? 2U : 1U));
                 if (tile.signature.axes == AnalysisAxes::both) {
                     append_two_axis_plans(
-                        packed, source, candidates.subspan(tile.begin, tile_candidate_count));
+                        packed, source, candidates.subspan(tile.begin, tile_candidate_count),
+                        impl_->options.kernel_dispatch);
                 } else {
                     for (std::size_t index = tile.begin; index < tile.end; ++index) {
-                        append_single_plan(packed, source, candidates[index]);
+                        append_single_plan(
+                            packed, source, candidates[index], impl_->options.kernel_dispatch);
                     }
                 }
                 const std::size_t workspace_bytes = checked_product(
@@ -712,6 +879,15 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     impl_->device, packed.forward_left, "GetNative forward left indices");
                 id<MTLBuffer> forward_weight_buffer = make_buffer(
                     impl_->device, packed.forward_weights, "GetNative forward weights");
+                impl_->record_buffer(descriptor_buffer);
+                impl_->record_buffer(transpose_offset_buffer);
+                impl_->record_buffer(transpose_index_buffer);
+                impl_->record_buffer(transpose_weight_buffer);
+                impl_->record_buffer(lower_buffer);
+                impl_->record_buffer(upper_buffer);
+                impl_->record_buffer(diagonal_buffer);
+                impl_->record_buffer(forward_left_buffer);
+                impl_->record_buffer(forward_weight_buffer);
                 const std::size_t tile_plan_bytes =
                     static_cast<std::size_t>(descriptor_buffer.length)
                     + static_cast<std::size_t>(transpose_offset_buffer.length)
@@ -749,7 +925,7 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     return command;
                 };
                 const auto encode_image_inverse = [&](id<MTLCommandBuffer> command,
-                                                      const ShapePipelines &pipelines,
+                                                      id<MTLComputePipelineState> pipeline,
                                                       NSUInteger descriptor_offset,
                                                       AnalysisJob stage_job,
                                                       std::size_t dispatch_count) {
@@ -759,7 +935,7 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                         throw std::runtime_error("Metal inverse encoder creation failed");
                     }
                     inverse.label = @"GetNative inverse axis";
-                    [inverse setComputePipelineState:pipelines.inverse];
+                    [inverse setComputePipelineState:pipeline];
                     [inverse setBuffer:source_buffer offset:0 atIndex:0];
                     [inverse setBytes:&stage_job length:sizeof(stage_job) atIndex:1];
                     [inverse setBuffer:descriptor_buffer offset:descriptor_offset atIndex:2];
@@ -772,7 +948,7 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     [inverse setBuffer:workspace_buffer offset:0 atIndex:9];
                     const NSUInteger threads = std::min<NSUInteger>(
                         static_cast<NSUInteger>(impl_->options.inverse_threads_per_threadgroup),
-                        pipelines.inverse.maxTotalThreadsPerThreadgroup);
+                        pipeline.maxTotalThreadsPerThreadgroup);
                     const NSUInteger dispatch_width = static_cast<NSUInteger>(
                         checked_u32(dispatch_count, "Metal inverse dispatch width"));
                     [inverse dispatchThreads:MTLSizeMake(dispatch_width, 1, 1)
@@ -780,7 +956,7 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     [inverse endEncoding];
                 };
                 const auto encode_matrix_inverse = [&](id<MTLCommandBuffer> command,
-                                                       const ShapePipelines &pipelines,
+                                                       id<MTLComputePipelineState> pipeline,
                                                        NSUInteger descriptor_offset,
                                                        AnalysisJob stage_job,
                                                        std::size_t dispatch_count) {
@@ -788,7 +964,7 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     id<MTLComputeCommandEncoder> inverse = [command computeCommandEncoder];
                     if (inverse == nil) throw std::runtime_error("Metal matrix inverse encoder creation failed");
                     inverse.label = @"GetNative inverse vertical matrix";
-                    [inverse setComputePipelineState:pipelines.matrix_inverse];
+                    [inverse setComputePipelineState:pipeline];
                     [inverse setBytes:&stage_job length:sizeof(stage_job) atIndex:0];
                     [inverse setBuffer:descriptor_buffer offset:descriptor_offset atIndex:1];
                     [inverse setBuffer:transpose_offset_buffer offset:0 atIndex:2];
@@ -800,7 +976,7 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     [inverse setBuffer:workspace_buffer offset:0 atIndex:8];
                     const NSUInteger threads = std::min<NSUInteger>(
                         static_cast<NSUInteger>(impl_->options.inverse_threads_per_threadgroup),
-                        pipelines.matrix_inverse.maxTotalThreadsPerThreadgroup);
+                        pipeline.maxTotalThreadsPerThreadgroup);
                     const NSUInteger dispatch_width = static_cast<NSUInteger>(
                         checked_u32(dispatch_count, "Metal matrix inverse dispatch width"));
                     [inverse dispatchThreads:MTLSizeMake(dispatch_width, 1, 1)
@@ -808,7 +984,7 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     [inverse endEncoding];
                 };
                 const auto encode_matrix_forward = [&](id<MTLCommandBuffer> command,
-                                                       const ShapePipelines &pipelines,
+                                                       id<MTLComputePipelineState> pipeline,
                                                        NSUInteger descriptor_offset,
                                                        AnalysisJob stage_job,
                                                        std::size_t dispatch_count) {
@@ -816,7 +992,7 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     id<MTLComputeCommandEncoder> forward = [command computeCommandEncoder];
                     if (forward == nil) throw std::runtime_error("Metal matrix forward encoder creation failed");
                     forward.label = @"GetNative forward first axis";
-                    [forward setComputePipelineState:pipelines.matrix_forward];
+                    [forward setComputePipelineState:pipeline];
                     [forward setBytes:&stage_job length:sizeof(stage_job) atIndex:0];
                     [forward setBuffer:descriptor_buffer offset:descriptor_offset atIndex:1];
                     [forward setBuffer:forward_left_buffer offset:0 atIndex:2];
@@ -824,7 +1000,7 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     [forward setBuffer:workspace_buffer offset:0 atIndex:4];
                     const NSUInteger threads = std::min<NSUInteger>(
                         static_cast<NSUInteger>(impl_->options.inverse_threads_per_threadgroup),
-                        pipelines.matrix_forward.maxTotalThreadsPerThreadgroup);
+                        pipeline.maxTotalThreadsPerThreadgroup);
                     const NSUInteger dispatch_width = static_cast<NSUInteger>(
                         checked_u32(dispatch_count, "Metal matrix forward dispatch width"));
                     [forward dispatchThreads:MTLSizeMake(dispatch_width, 1, 1)
@@ -862,32 +1038,37 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                 if (tile.signature.axes != AnalysisAxes::both) {
                     const KernelShape shape = tile.signature.axes == AnalysisAxes::horizontal
                         ? tile.signature.horizontal_shape : tile.signature.vertical_shape;
-                    const ShapePipelines &pipelines = impl_->pipelines(shape);
+                    id<MTLComputePipelineState> inverse_pipeline = impl_->pipeline(
+                        shape, PipelineStage::image_inverse);
+                    id<MTLComputePipelineState> metric_pipeline = impl_->pipeline(
+                        shape, PipelineStage::metric);
                     AnalysisJob inverse_job = job;
                     inverse_job.maximum_vector_count = packed.maximum_vector_count;
                     const std::size_t inverse_count = checked_product(
                         tile_candidate_count, packed.maximum_vector_count, "Metal inverse dispatch");
                     if (impl_->options.profile_split_kernels) {
                         id<MTLCommandBuffer> inverse_command = make_command(@"GetNative inverse tile");
-                        encode_image_inverse(inverse_command, pipelines, 0, inverse_job, inverse_count);
+                        encode_image_inverse(
+                            inverse_command, inverse_pipeline, 0, inverse_job, inverse_count);
                         submit(inverse_command);
                         id<MTLCommandBuffer> metric_command = make_command(@"GetNative metric tile");
-                        encode_reduction(metric_command, pipelines.metric, 0);
+                        encode_reduction(metric_command, metric_pipeline, 0);
                         submit(metric_command);
                     } else {
                         id<MTLCommandBuffer> command = make_command(@"GetNative axis analysis tile");
-                        encode_image_inverse(command, pipelines, 0, inverse_job, inverse_count);
-                        encode_reduction(command, pipelines.metric, 0);
+                        encode_image_inverse(
+                            command, inverse_pipeline, 0, inverse_job, inverse_count);
+                        encode_reduction(command, metric_pipeline, 0);
                         submit(command);
                     }
                 } else {
                     const NSUInteger vertical_descriptor_offset = static_cast<NSUInteger>(
                         checked_product(tile_candidate_count, sizeof(AxisPlanDescriptor),
                                         "vertical descriptor offset"));
-                    const ShapePipelines &horizontal_pipelines =
-                        impl_->pipelines(tile.signature.horizontal_shape);
-                    const ShapePipelines &vertical_pipelines =
-                        impl_->pipelines(tile.signature.vertical_shape);
+                    id<MTLComputePipelineState> horizontal_inverse_pipeline = impl_->pipeline(
+                        tile.signature.horizontal_shape, PipelineStage::image_inverse);
+                    id<MTLComputePipelineState> vertical_inverse_pipeline = impl_->pipeline(
+                        tile.signature.vertical_shape, PipelineStage::matrix_inverse);
                     AnalysisJob horizontal_inverse_job = job;
                     horizontal_inverse_job.maximum_vector_count = static_cast<std::uint32_t>(source.height);
                     AnalysisJob vertical_inverse_job = job;
@@ -907,28 +1088,31 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                         "two-axis first forward dispatch");
                     const bool vertical_first =
                         tile.signature.forward_order == ForwardOrder::vertical_first;
-                    const ShapePipelines &first_forward_pipelines =
-                        vertical_first ? vertical_pipelines : horizontal_pipelines;
+                    const KernelShape first_forward_shape = vertical_first
+                        ? tile.signature.vertical_shape : tile.signature.horizontal_shape;
+                    id<MTLComputePipelineState> first_forward_pipeline = impl_->pipeline(
+                        first_forward_shape, PipelineStage::matrix_forward);
                     const NSUInteger first_forward_descriptor_offset =
                         vertical_first ? vertical_descriptor_offset : 0;
                     id<MTLComputePipelineState> final_metric = vertical_first
-                        ? horizontal_pipelines.metric
-                        : vertical_pipelines.horizontal_first_metric;
+                        ? impl_->pipeline(tile.signature.horizontal_shape, PipelineStage::metric)
+                        : impl_->pipeline(tile.signature.vertical_shape,
+                                          PipelineStage::horizontal_first_metric);
                     const NSUInteger final_metric_descriptor_offset =
                         vertical_first ? 0 : vertical_descriptor_offset;
 
                     if (impl_->options.profile_split_kernels) {
                         id<MTLCommandBuffer> h_inverse = make_command(@"GetNative two-axis inverse H");
-                        encode_image_inverse(h_inverse, horizontal_pipelines, 0,
+                        encode_image_inverse(h_inverse, horizontal_inverse_pipeline, 0,
                                              horizontal_inverse_job, horizontal_inverse_count);
                         submit(h_inverse);
                         id<MTLCommandBuffer> v_inverse = make_command(@"GetNative two-axis inverse V");
-                        encode_matrix_inverse(v_inverse, vertical_pipelines,
+                        encode_matrix_inverse(v_inverse, vertical_inverse_pipeline,
                                               vertical_descriptor_offset, vertical_inverse_job,
                                               vertical_inverse_count);
                         submit(v_inverse);
                         id<MTLCommandBuffer> first_forward = make_command(@"GetNative two-axis forward first");
-                        encode_matrix_forward(first_forward, first_forward_pipelines,
+                        encode_matrix_forward(first_forward, first_forward_pipeline,
                                               first_forward_descriptor_offset, forward_job,
                                               forward_count);
                         submit(first_forward);
@@ -938,12 +1122,12 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                         submit(metric_command);
                     } else {
                         id<MTLCommandBuffer> command = make_command(@"GetNative two-axis analysis tile");
-                        encode_image_inverse(command, horizontal_pipelines, 0,
+                        encode_image_inverse(command, horizontal_inverse_pipeline, 0,
                                              horizontal_inverse_job, horizontal_inverse_count);
-                        encode_matrix_inverse(command, vertical_pipelines,
+                        encode_matrix_inverse(command, vertical_inverse_pipeline,
                                               vertical_descriptor_offset, vertical_inverse_job,
                                               vertical_inverse_count);
-                        encode_matrix_forward(command, first_forward_pipelines,
+                        encode_matrix_forward(command, first_forward_pipeline,
                                               first_forward_descriptor_offset, forward_job,
                                               forward_count);
                         encode_reduction(command, final_metric, final_metric_descriptor_offset);
@@ -958,6 +1142,14 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     if (command.status == MTLCommandBufferStatusError) {
                         throw std::runtime_error(ns_error(
                             command.error, "Metal command execution failed"));
+                    }
+                    if (@available(macOS 10.15, *)) {
+                        const double gpu_start = command.GPUStartTime;
+                        const double gpu_end = command.GPUEndTime;
+                        if (std::isfinite(gpu_start) && std::isfinite(gpu_end)
+                            && gpu_end >= gpu_start) {
+                            impl_->gpu_execution_ms += (gpu_end - gpu_start) * 1000.0;
+                        }
                     }
                     if (stop.stop_requested()) {
                         throw std::runtime_error("Metal analysis cancelled");

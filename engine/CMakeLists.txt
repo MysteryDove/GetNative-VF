@@ -35,6 +35,8 @@ endif()
 
 add_library(getnative_core STATIC
     src/backend/cpu/cpu_analysis.cpp
+    src/backend/cpu/inverse_columns.cpp
+    src/backend/cpu/inverse_columns_neon.cpp
     src/geometry/candidate_grid.cpp
     src/geometry/crop_geometry.cpp
     src/geometry/profile.cpp
@@ -49,6 +51,8 @@ if(GETNATIVE_ENABLE_METAL)
     enable_language(OBJCXX)
     find_library(GETNATIVE_METAL_FRAMEWORK Metal REQUIRED)
     find_library(GETNATIVE_FOUNDATION_FRAMEWORK Foundation REQUIRED)
+    find_library(GETNATIVE_COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
+    find_library(GETNATIVE_IMAGEIO_FRAMEWORK ImageIO REQUIRED)
 
     set(GETNATIVE_METAL_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/metal")
     set(GETNATIVE_METAL_AIR "${GETNATIVE_METAL_GENERATED_DIR}/getnative.air")
@@ -140,6 +144,14 @@ if(BUILD_TESTING)
     getnative_enable_strict_fp(getnative_core_tests)
     add_test(NAME getnative_core_tests COMMAND getnative_core_tests)
 
+    add_executable(getnative_cpu_column_simd_tests tests/cpu_column_simd_test.cpp)
+    target_link_libraries(getnative_cpu_column_simd_tests PRIVATE getnative_core)
+    target_include_directories(getnative_cpu_column_simd_tests PRIVATE src/backend/cpu)
+    target_compile_features(getnative_cpu_column_simd_tests PRIVATE cxx_std_23)
+    getnative_enable_warnings(getnative_cpu_column_simd_tests)
+    getnative_enable_strict_fp(getnative_cpu_column_simd_tests)
+    add_test(NAME getnative_cpu_column_simd_tests COMMAND getnative_cpu_column_simd_tests)
+
     add_executable(getnative_geometry_tests tests/geometry_test.cpp)
     target_link_libraries(getnative_geometry_tests PRIVATE getnative_core)
     target_compile_features(getnative_geometry_tests PRIVATE cxx_std_23)
@@ -184,6 +196,16 @@ if(BUILD_TESTING)
         getnative_enable_warnings(getnative_metal_tests)
         getnative_enable_strict_fp(getnative_metal_tests)
         add_test(NAME getnative_metal_tests COMMAND getnative_metal_tests)
+
+        add_executable(getnative_metal_kernel_specialization_tests
+            tests/metal_kernel_specialization_test.cpp
+        )
+        target_link_libraries(getnative_metal_kernel_specialization_tests PRIVATE getnative_metal)
+        target_compile_features(getnative_metal_kernel_specialization_tests PRIVATE cxx_std_23)
+        getnative_enable_warnings(getnative_metal_kernel_specialization_tests)
+        getnative_enable_strict_fp(getnative_metal_kernel_specialization_tests)
+        add_test(NAME getnative_metal_kernel_specialization_tests
+                 COMMAND getnative_metal_kernel_specialization_tests)
     endif()
 
     if(GETNATIVE_BUILD_UPSTREAM_CONFORMANCE)
@@ -243,4 +265,47 @@ if(GETNATIVE_ENABLE_METAL)
     target_compile_features(getnative_metal_benchmark PRIVATE cxx_std_23)
     getnative_enable_warnings(getnative_metal_benchmark)
     getnative_enable_strict_fp(getnative_metal_benchmark)
+
+    add_executable(getnative_metal_kernel_benchmark bench/metal_kernel_benchmark.mm)
+    target_link_libraries(getnative_metal_kernel_benchmark PRIVATE
+        getnative_metal
+        "${GETNATIVE_COREGRAPHICS_FRAMEWORK}"
+        "${GETNATIVE_FOUNDATION_FRAMEWORK}"
+        "${GETNATIVE_IMAGEIO_FRAMEWORK}"
+    )
+    target_compile_features(getnative_metal_kernel_benchmark PRIVATE cxx_std_23)
+    target_compile_options(getnative_metal_kernel_benchmark PRIVATE -fobjc-arc)
+    target_compile_definitions(getnative_metal_kernel_benchmark PRIVATE
+        "GETNATIVE_METALLIB_PATH=\"${GETNATIVE_METALLIB}\""
+    )
+    target_include_directories(getnative_metal_kernel_benchmark PRIVATE src/backend/cpu)
+    getnative_enable_warnings(getnative_metal_kernel_benchmark)
+    getnative_enable_strict_fp(getnative_metal_kernel_benchmark)
+
+    set(GETNATIVE_CPU0_EVALUATOR_ARGS
+        --matrix "${CMAKE_CURRENT_SOURCE_DIR}/bench/fixtures/metal_kernel_matrix.json"
+        --fixture "${CMAKE_CURRENT_SOURCE_DIR}/bench/fixtures/6.2-1.png"
+        --samples 21 --case "bicubic-catrom@810" --cpu-columns --assert
+        --artifact-root "${CMAKE_CURRENT_BINARY_DIR}/artifacts/backend-hotpath"
+    )
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+        list(APPEND GETNATIVE_CPU0_EVALUATOR_ARGS --required-simd)
+    endif()
+
+    add_custom_target(getnative_backend_hotpath_evaluator
+        COMMAND "${CMAKE_CTEST_COMMAND}" --test-dir "${CMAKE_CURRENT_BINARY_DIR}"
+                --output-on-failure
+        COMMAND "${CMAKE_COMMAND}" -E make_directory
+                "${CMAKE_CURRENT_BINARY_DIR}/artifacts/backend-hotpath"
+        COMMAND $<TARGET_FILE:getnative_metal_kernel_benchmark>
+                --matrix "${CMAKE_CURRENT_SOURCE_DIR}/bench/fixtures/metal_kernel_matrix.json"
+                --fixture "${CMAKE_CURRENT_SOURCE_DIR}/bench/fixtures/6.2-1.png"
+                --samples 21 --controls-only --required-specialized --assert
+                --artifact-root "${CMAKE_CURRENT_BINARY_DIR}/artifacts/backend-hotpath"
+        COMMAND $<TARGET_FILE:getnative_metal_kernel_benchmark>
+                ${GETNATIVE_CPU0_EVALUATOR_ARGS}
+        DEPENDS getnative_metal_kernel_benchmark
+        USES_TERMINAL
+        VERBATIM
+    )
 endif()

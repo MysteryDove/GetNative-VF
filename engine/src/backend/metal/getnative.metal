@@ -154,6 +154,26 @@ kernel void inverse_axis_b7(
                       workspace, gid, 3u, true);
 }
 
+#define DEFINE_IMAGE_INVERSE_FIXED(NAME, HALF) \
+kernel void NAME( \
+    device const float *source [[buffer(0)]], \
+    constant AnalysisJob &job [[buffer(1)]], \
+    device const AxisPlanDescriptor *plans [[buffer(2)]], \
+    device const uint *transpose_offsets [[buffer(3)]], \
+    device const uint *transpose_indices [[buffer(4)]], \
+    device const float *transpose_weights [[buffer(5)]], \
+    device const float *lower_ld [[buffer(6)]], \
+    device const float *upper_l [[buffer(7)]], \
+    device const float *inverse_diagonal [[buffer(8)]], \
+    device float *workspace [[buffer(9)]], \
+    uint gid [[thread_position_in_grid]]) { \
+    inverse_axis_impl(source, job, plans, transpose_offsets, transpose_indices, \
+        transpose_weights, lower_ld, upper_l, inverse_diagonal, workspace, gid, HALF, false); \
+}
+
+DEFINE_IMAGE_INVERSE_FIXED(inverse_axis_b11, 5u)
+DEFINE_IMAGE_INVERSE_FIXED(inverse_axis_b15, 7u)
+
 kernel void inverse_axis_generic(
     device const float *source [[buffer(0)]],
     constant AnalysisJob &job [[buffer(1)]],
@@ -251,6 +271,8 @@ kernel void NAME( \
 
 DEFINE_MATRIX_INVERSE(inverse_axis_matrix_b3, 1u, false)
 DEFINE_MATRIX_INVERSE(inverse_axis_matrix_b7, 3u, true)
+DEFINE_MATRIX_INVERSE(inverse_axis_matrix_b11, 5u, false)
+DEFINE_MATRIX_INVERSE(inverse_axis_matrix_b15, 7u, false)
 DEFINE_MATRIX_INVERSE(inverse_axis_matrix_generic, 0u, false)
 
 static inline void forward_axis_matrix_impl(
@@ -300,6 +322,8 @@ kernel void NAME( \
 
 DEFINE_MATRIX_FORWARD(forward_axis_matrix_b3, 2u)
 DEFINE_MATRIX_FORWARD(forward_axis_matrix_b7, 4u)
+DEFINE_MATRIX_FORWARD(forward_axis_matrix_b11, 6u)
+DEFINE_MATRIX_FORWARD(forward_axis_matrix_b15, 8u)
 DEFINE_MATRIX_FORWARD(forward_axis_matrix_generic, 0u)
 
 static inline void metric_axis_p1_impl(
@@ -405,6 +429,25 @@ kernel void metric_axis_p1_b7(
                         workspace, partials, reduction, thread_index, group_index, 4u, false);
 }
 
+#define DEFINE_AXIS_METRIC_FIXED(NAME, WIDTH) \
+kernel void NAME( \
+    device const float *source [[buffer(0)]], \
+    constant AnalysisJob &job [[buffer(1)]], \
+    device const AxisPlanDescriptor *plans [[buffer(2)]], \
+    device const int *forward_left [[buffer(3)]], \
+    device const float *forward_weights [[buffer(4)]], \
+    device const float *workspace [[buffer(5)]], \
+    device float *partials [[buffer(6)]], \
+    uint thread_index [[thread_index_in_threadgroup]], \
+    uint group_index [[threadgroup_position_in_grid]]) { \
+    threadgroup float reduction[reduction_width]; \
+    metric_axis_p1_impl(source, job, plans, forward_left, forward_weights, \
+        workspace, partials, reduction, thread_index, group_index, WIDTH, false); \
+}
+
+DEFINE_AXIS_METRIC_FIXED(metric_axis_p1_b11, 6u)
+DEFINE_AXIS_METRIC_FIXED(metric_axis_p1_b15, 8u)
+
 kernel void metric_axis_p1_generic(
     device const float *source [[buffer(0)]],
     constant AnalysisJob &job [[buffer(1)]],
@@ -438,4 +481,6 @@ kernel void NAME( \
 
 DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_p1_horizontal_first_b3, 2u)
 DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_p1_horizontal_first_b7, 4u)
+DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_p1_horizontal_first_b11, 6u)
+DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_p1_horizontal_first_b15, 8u)
 DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_p1_horizontal_first_generic, 0u)

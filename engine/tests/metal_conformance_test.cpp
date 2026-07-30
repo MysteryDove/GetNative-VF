@@ -287,6 +287,132 @@ void test_vertical_and_horizontal_batches() {
     expect(metal.peak_workspace_elements() > 0, "Metal reports bounded tile workspace");
 }
 
+void test_kernel_dispatch_policy_and_telemetry() {
+    constexpr std::int32_t width = 96;
+    constexpr std::int32_t height = 80;
+    const auto source = make_source(width, height);
+    const auto view = const_view(source, width, height);
+    const getnative::MetricSpec metric{5, 5, 5, 5, 0.015F, 1U};
+    getnative::AxisPlanCache cache;
+    const auto bilinear = cache.get_or_build({
+        height, 52, 52.125, -0.0625, getnative::Filter::bilinear(),
+        getnative::BorderMode::mirror,
+    });
+    const auto bicubic = cache.get_or_build({
+        height, 53, 53.125, -0.0625, getnative::Filter::bicubic(0.25, 0.4),
+        getnative::BorderMode::mirror,
+    });
+    const auto spline36 = cache.get_or_build({
+        height, 54, 54.125, -0.0625, getnative::Filter::spline36(),
+        getnative::BorderMode::mirror,
+    });
+    const auto spline64 = cache.get_or_build({
+        height, 55, 55.125, -0.0625, getnative::Filter::spline64(),
+        getnative::BorderMode::mirror,
+    });
+    const auto lanczos6 = cache.get_or_build({
+        height, 56, 56.125, -0.0625, getnative::Filter::lanczos(6),
+        getnative::BorderMode::mirror,
+    });
+    const std::vector<getnative::CandidateAnalysis> fixed_candidates{
+        {"b3", nullptr, bilinear, getnative::AnalysisAxes::vertical},
+        {"b7", nullptr, bicubic, getnative::AnalysisAxes::vertical},
+    };
+
+    getnative::MetalAnalysisEngine generic({
+        4, 8, 0, false, 32, getnative::MetalKernelDispatchPolicy::generic_only,
+    });
+    compare_cpu_metal(view, fixed_candidates, metric, generic, "forced generic controls");
+    const auto generic_telemetry = generic.runtime_telemetry();
+    expect(generic_telemetry.created_pipeline_names.size() == 5,
+           "generic-only engine creates only the five generic stages");
+    expect(generic_telemetry.generic_tile_count
+                   == generic_telemetry.analyzed_tile_count
+               && generic_telemetry.generic_tile_count > 0
+               && generic_telemetry.specialized_tile_count == 0,
+           "generic-only engine reports generic tile dispatch");
+    expect(generic_telemetry.buffer_allocation_count > 0
+               && generic_telemetry.buffer_allocation_bytes > 0,
+           "Metal runtime reports explicit buffer allocations");
+    generic.reset_analysis_telemetry();
+    const auto reset_telemetry = generic.runtime_telemetry();
+    expect(reset_telemetry.buffer_allocation_count == 0
+               && reset_telemetry.analyzed_tile_count == 0,
+           "analysis telemetry reset clears per-run counters");
+    expect(reset_telemetry.created_pipeline_names.size() == 5
+               && reset_telemetry.pipeline_creation_ms > 0.0,
+           "analysis telemetry reset preserves pipeline creation evidence");
+
+    getnative::MetalAnalysisEngine required({
+        4, 8, 0, false, 32,
+        getnative::MetalKernelDispatchPolicy::required_specialized,
+    });
+    compare_cpu_metal(view, fixed_candidates, metric, required,
+                      "required specialized controls");
+    const auto required_telemetry = required.runtime_telemetry();
+    expect(required_telemetry.created_pipeline_names.size() == 15,
+           "specialized engine reports every eager control pipeline");
+    expect(required_telemetry.specialized_tile_count == 2
+               && required_telemetry.generic_tile_count == 0,
+           "required-specialized engine reports specialized tile dispatch");
+    const std::vector<getnative::CandidateAnalysis> wider_fixed_candidates{
+        {"b11", nullptr, spline36, getnative::AnalysisAxes::vertical},
+        {"b15", nullptr, spline64, getnative::AnalysisAxes::vertical},
+    };
+    compare_cpu_metal(view, wider_fixed_candidates, metric, required,
+                      "required specialized wider fixed shapes");
+    const auto wider_telemetry = required.runtime_telemetry();
+    expect(wider_telemetry.created_pipeline_names.size() == 19,
+           "single-axis B11/B15 use creates only inverse and metric pipelines");
+    for (const std::string_view name : {
+             "inverse_axis_b11", "metric_axis_p1_b11",
+             "inverse_axis_b15", "metric_axis_p1_b15"}) {
+        expect(std::find(wider_telemetry.created_pipeline_names.begin(),
+                         wider_telemetry.created_pipeline_names.end(), name)
+                   != wider_telemetry.created_pipeline_names.end(),
+               "wider fixed single-axis stage is created lazily");
+    }
+    for (const std::string_view name : {
+             "inverse_axis_matrix_b11", "forward_axis_matrix_b11",
+             "metric_axis_p1_horizontal_first_b11", "inverse_axis_matrix_b15",
+             "forward_axis_matrix_b15", "metric_axis_p1_horizontal_first_b15"}) {
+        expect(std::find(wider_telemetry.created_pipeline_names.begin(),
+                         wider_telemetry.created_pipeline_names.end(), name)
+                   == wider_telemetry.created_pipeline_names.end(),
+               "unused wider fixed two-axis stage remains uncreated");
+    }
+    const std::vector<getnative::CandidateAnalysis> removed_function_constant_shape{
+        {"b23", nullptr, lanczos6, getnative::AnalysisAxes::vertical},
+    };
+    expect_throws<std::runtime_error>(
+        [&] {
+            (void)required.analyze_axis_batch_f32(
+                view, removed_function_constant_shape, metric);
+        },
+        "required-specialized policy rejects removed function-constant shapes");
+    getnative::MetalAnalysisEngine automatic;
+    compare_cpu_metal(view, removed_function_constant_shape, metric, automatic,
+                      "automatic generic fallback for removed function constants");
+    const auto automatic_telemetry = automatic.runtime_telemetry();
+    expect(automatic_telemetry.generic_tile_count == 1
+               && automatic_telemetry.specialized_tile_count == 0,
+           "automatic policy reports generic fallback for a removed shape");
+    auto unsupported_shape = std::make_shared<getnative::AxisPlan>(*lanczos6);
+    unsupported_shape->half_bandwidth = 9;
+    const std::size_t unsupported_factor_count = 9U
+        * static_cast<std::size_t>(unsupported_shape->destination_size);
+    unsupported_shape->lower_ld.resize(unsupported_factor_count);
+    unsupported_shape->upper_l.resize(unsupported_factor_count);
+    expect(unsupported_shape->valid(), "test constructs a valid unsupported exact shape");
+    const std::vector<getnative::CandidateAnalysis> unsupported{
+        {"b19-f12", nullptr, std::move(unsupported_shape),
+         getnative::AnalysisAxes::vertical},
+    };
+    expect_throws<std::runtime_error>(
+        [&] { (void)required.analyze_axis_batch_f32(view, unsupported, metric); },
+        "required-specialized policy rejects an unavailable exact shape");
+}
+
 void test_all_supported_plan_shapes_horizontal_and_vertical() {
     constexpr std::int32_t width = 96;
     constexpr std::int32_t height = 80;
@@ -487,6 +613,7 @@ int main() {
             return 0;
         }
         test_vertical_and_horizontal_batches();
+        test_kernel_dispatch_policy_and_telemetry();
         test_all_supported_plan_shapes_horizontal_and_vertical();
         test_dual_axis_filter_families_and_forward_orders();
         test_dual_axis_mixed_shapes_retain_order();
