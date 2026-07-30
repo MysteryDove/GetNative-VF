@@ -62,6 +62,7 @@ struct Configuration {
     bool cpu_columns = false;
     bool required_simd = false;
     bool planner_taps = false;
+    bool planner_bicubic_geometry = false;
     bool assert_gates = false;
 };
 
@@ -237,6 +238,10 @@ struct PlannerMeasurement {
     std::size_t physical_build_count = 0;
     std::size_t peak_active_builds = 0;
     std::size_t effective_worker_count = 0;
+    std::size_t bicubic_geometry_family_count = 0;
+    std::size_t bicubic_geometry_plan_count = 0;
+    std::size_t bicubic_geometry_build_count = 0;
+    std::size_t bicubic_geometry_scratch_bytes = 0;
 };
 
 struct PlannerPairSample {
@@ -265,6 +270,45 @@ struct PlannerCaseReport {
     HostObservation host_before;
     HostObservation host_after;
     bool plans_byte_identical = false;
+    bool thermal_stable = true;
+    bool concurrent_process_detected = false;
+    bool gate_passed = false;
+};
+
+struct BicubicGeometryPairSample {
+    std::string first_mode;
+    double independent_ms = 0.0;
+    double reuse_ms = 0.0;
+    double delta = 0.0;
+    HostObservation host_before;
+    HostObservation host_after;
+};
+
+struct BicubicGeometryCaseReport {
+    std::string id;
+    std::int32_t native_height = 0;
+    bool fractional_scan = false;
+    std::vector<BicubicGeometryPairSample> samples;
+    double independent_median_ms = 0.0;
+    double reuse_median_ms = 0.0;
+    double paired_delta_median = 0.0;
+    double paired_delta_mad = 0.0;
+    std::string independent_plan_sha256;
+    std::string reuse_plan_sha256;
+    std::size_t request_count = 0;
+    std::size_t unique_key_count = 0;
+    std::size_t exact_duplicate_count = 0;
+    std::size_t geometry_family_count = 0;
+    std::size_t geometry_plan_count = 0;
+    std::size_t geometry_build_count = 0;
+    std::size_t geometry_scratch_bytes = 0;
+    std::size_t topology_unique_count = 0;
+    std::size_t topology_reuse_opportunities = 0;
+    HostObservation host_before;
+    HostObservation host_after;
+    bool plans_byte_identical = false;
+    bool exact_duplicates_shared = false;
+    bool zero_topology_isolated = false;
     bool thermal_stable = true;
     bool concurrent_process_detected = false;
     bool gate_passed = false;
@@ -310,6 +354,8 @@ struct PlannerCaseReport {
             result.required_simd = true;
         } else if (argument == "--planner-taps") {
             result.planner_taps = true;
+        } else if (argument == "--planner-bicubic-geometry") {
+            result.planner_bicubic_geometry = true;
         } else if (argument == "--assert") {
             result.assert_gates = true;
         } else {
@@ -318,7 +364,7 @@ struct PlannerCaseReport {
                 "(--json-out PATH|--artifact-root PATH) [--samples N] "
                 "[--controls-only|--full-matrix|--sustained] [--case ID] "
                 "[--required-specialized] [--cpu-columns [--required-simd]] "
-                "[--planner-taps] [--assert]");
+                "[--planner-taps|--planner-bicubic-geometry] [--assert]");
         }
     }
     if (result.matrix_path.empty() || result.fixture_path.empty()) {
@@ -340,11 +386,15 @@ struct PlannerCaseReport {
     if (result.cpu_columns && result.sustained) {
         throw std::invalid_argument("--sustained is not a CPU column benchmark mode");
     }
-    if (result.planner_taps
+    if ((result.planner_taps || result.planner_bicubic_geometry)
         && (result.cpu_columns || result.required_simd
             || result.required_specialized || result.sustained)) {
         throw std::invalid_argument(
-            "--planner-taps is incompatible with CPU, specialization, and sustained modes");
+            "planner diagnostics are incompatible with CPU, specialization, and sustained modes");
+    }
+    if (result.planner_taps && result.planner_bicubic_geometry) {
+        throw std::invalid_argument(
+            "choose exactly one planner diagnostic mode");
     }
     return result;
 }
@@ -907,15 +957,19 @@ void update_sha256_vector(CC_SHA256_CTX &context, const std::vector<T> &values) 
 [[nodiscard]] PlannerMeasurement measure_planner(
     std::span<const getnative::AxisPlanRequest> requests,
     getnative::detail::TapEvaluationMode mode,
-    bool hash_plans) {
+    bool hash_plans,
+    getnative::detail::BicubicGeometryMode bicubic_geometry =
+        getnative::detail::BicubicGeometryMode::reuse,
+    std::optional<std::size_t> expected_unique_count = std::nullopt) {
     getnative::detail::AxisPlanBatchOptions options;
     options.tap_evaluation = mode;
+    options.bicubic_geometry = bicubic_geometry;
     const auto start = Clock::now();
     auto batch = getnative::detail::build_axis_plans(requests, std::move(options));
     const double wall_ms = std::chrono::duration<double, std::milli>(
         Clock::now() - start).count();
     if (batch.plans.size() != requests.size()
-        || batch.unique_key_count != requests.size()
+        || batch.unique_key_count != expected_unique_count.value_or(requests.size())
         || batch.physical_build_count != batch.unique_key_count
         || batch.peak_active_builds > batch.effective_worker_count) {
         throw std::runtime_error("planner tap benchmark batch invariant changed");
@@ -927,6 +981,10 @@ void update_sha256_vector(CC_SHA256_CTX &context, const std::vector<T> &values) 
         batch.physical_build_count,
         batch.peak_active_builds,
         batch.effective_worker_count,
+        batch.bicubic_geometry_family_count,
+        batch.bicubic_geometry_plan_count,
+        batch.bicubic_geometry_build_count,
+        batch.bicubic_geometry_scratch_bytes,
     };
 }
 
@@ -936,7 +994,15 @@ void validate_planner_measurement(
     if (measurement.unique_key_count != warmup.unique_key_count
         || measurement.physical_build_count != warmup.physical_build_count
         || measurement.effective_worker_count != warmup.effective_worker_count
-        || measurement.peak_active_builds > measurement.effective_worker_count) {
+        || measurement.peak_active_builds > measurement.effective_worker_count
+        || measurement.bicubic_geometry_family_count
+            != warmup.bicubic_geometry_family_count
+        || measurement.bicubic_geometry_plan_count
+            != warmup.bicubic_geometry_plan_count
+        || measurement.bicubic_geometry_build_count
+            != warmup.bicubic_geometry_build_count
+        || measurement.bicubic_geometry_scratch_bytes
+            != warmup.bicubic_geometry_scratch_bytes) {
         throw std::runtime_error("planner tap benchmark measurement identity changed");
     }
 }
@@ -1031,6 +1097,385 @@ void validate_planner_measurement(
         && report.expected_recompute_weight_evaluations
             == 2U * report.expected_reuse_weight_evaluations
         && report.paired_delta_median <= maximum_delta
+        && report.paired_delta_mad <= 0.02
+        && report.thermal_stable
+        && !report.concurrent_process_detected;
+    return report;
+}
+
+struct BicubicSweepRequests {
+    static constexpr std::size_t family_count = 125U;
+    static constexpr std::size_t requests_per_family = 8U;
+    static constexpr std::size_t unique_per_family = 6U;
+
+    std::vector<getnative::AxisPlanRequest> requests;
+    std::vector<std::array<std::size_t, requests_per_family>> families;
+};
+
+[[nodiscard]] BicubicSweepRequests make_bicubic_sweep_requests(
+    const Matrix &matrix,
+    std::int32_t native_height,
+    bool fractional_scan) {
+    constexpr std::array filters{
+        getnative::Filter::bicubic(1.0 / 3.0, 1.0 / 3.0),
+        getnative::Filter::bicubic(0.0, 0.5),
+        getnative::Filter::bicubic(1.0, 0.0),
+        getnative::Filter::bicubic(0.0, 0.0),
+        getnative::Filter::bicubic(-0.25, 0.75),
+        getnative::Filter::bicubic(0.5, 0.25),
+        getnative::Filter::bicubic(0.0, 0.5),
+        getnative::Filter::bicubic(1.0 / 3.0, 1.0 / 3.0),
+    };
+    constexpr std::array shifts{-0.375, 0.0, 0.125, 0.3125};
+    BicubicSweepRequests result;
+    result.requests.reserve(
+        BicubicSweepRequests::family_count
+        * BicubicSweepRequests::requests_per_family);
+    result.families.reserve(BicubicSweepRequests::family_count);
+    for (std::size_t family = 0; family < BicubicSweepRequests::family_count;
+         ++family) {
+        const std::int32_t destination = fractional_scan
+            ? matrix.fractional_scan.native_start
+                + static_cast<std::int32_t>(family % static_cast<std::size_t>(
+                    matrix.fractional_scan.native_end
+                    - matrix.fractional_scan.native_start + 1))
+            : native_height;
+        const double fraction = 0.05
+            + 0.9 * static_cast<double>(family)
+                / static_cast<double>(BicubicSweepRequests::family_count - 1U);
+        const double active_length = static_cast<double>(destination) + fraction;
+        const double shift = shifts[family % shifts.size()];
+        std::array<std::size_t, BicubicSweepRequests::requests_per_family> indices{};
+        for (std::size_t variant = 0; variant < filters.size(); ++variant) {
+            indices[variant] = result.requests.size();
+            result.requests.push_back({
+                matrix.source_height,
+                destination,
+                active_length,
+                shift,
+                filters[variant],
+                getnative::BorderMode::mirror,
+            });
+        }
+        result.families.push_back(indices);
+    }
+    return result;
+}
+
+[[nodiscard]] std::string topology_sha256(const getnative::AxisPlan &plan) {
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    update_sha256_value(context, plan.source_size);
+    update_sha256_value(context, plan.destination_size);
+    update_sha256_value(context, plan.support);
+    update_sha256_value(context, plan.half_bandwidth);
+    update_sha256_value(context, plan.forward_width);
+    update_sha256_vector(context, plan.transpose_offsets);
+    update_sha256_vector(context, plan.transpose_indices);
+    update_sha256_vector(context, plan.forward_offsets);
+    for (std::int32_t row = 0; row < plan.source_size; ++row) {
+        const auto begin = plan.forward_offsets[static_cast<std::size_t>(row)];
+        update_sha256_value(context, plan.forward_indices[begin]);
+    }
+    for (const float weight : plan.forward_weights) {
+        const std::uint8_t is_zero = weight == 0.0F ? 1U : 0U;
+        update_sha256_value(context, is_zero);
+    }
+    std::array<unsigned char, CC_SHA256_DIGEST_LENGTH> digest{};
+    CC_SHA256_Final(digest.data(), &context);
+    std::ostringstream output;
+    output << std::hex << std::setfill('0');
+    for (const unsigned char value : digest) {
+        output << std::setw(2) << static_cast<int>(value);
+    }
+    return output.str();
+}
+
+[[nodiscard]] bool topology_equal(
+    const getnative::AxisPlan &lhs,
+    const getnative::AxisPlan &rhs) {
+    if (lhs.source_size != rhs.source_size
+        || lhs.destination_size != rhs.destination_size
+        || lhs.support != rhs.support
+        || lhs.half_bandwidth != rhs.half_bandwidth
+        || lhs.forward_width != rhs.forward_width
+        || lhs.transpose_offsets != rhs.transpose_offsets
+        || lhs.transpose_indices != rhs.transpose_indices
+        || lhs.forward_offsets != rhs.forward_offsets
+        || lhs.forward_weights.size() != rhs.forward_weights.size()) {
+        return false;
+    }
+    for (std::int32_t row = 0; row < lhs.source_size; ++row) {
+        const auto lhs_begin = lhs.forward_offsets[static_cast<std::size_t>(row)];
+        const auto rhs_begin = rhs.forward_offsets[static_cast<std::size_t>(row)];
+        if (lhs.forward_indices[lhs_begin] != rhs.forward_indices[rhs_begin]) return false;
+    }
+    for (std::size_t index = 0; index < lhs.forward_weights.size(); ++index) {
+        if ((lhs.forward_weights[index] == 0.0F)
+            != (rhs.forward_weights[index] == 0.0F)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct BicubicTopologyStats {
+    std::size_t unique_count = 0;
+    bool exact_duplicates_shared = true;
+    bool zero_isolated = true;
+};
+
+[[nodiscard]] BicubicTopologyStats analyze_bicubic_topology(
+    const BicubicSweepRequests &sweep,
+    std::span<const std::shared_ptr<const getnative::AxisPlan>> plans) {
+    BicubicTopologyStats result;
+    for (const auto &family : sweep.families) {
+        result.exact_duplicates_shared = result.exact_duplicates_shared
+            && plans[family[6U]].get() == plans[family[1U]].get()
+            && plans[family[7U]].get() == plans[family[0U]].get();
+        std::vector<std::pair<std::string, std::size_t>> representatives;
+        representatives.reserve(BicubicSweepRequests::unique_per_family);
+        for (std::size_t variant = 0;
+             variant < BicubicSweepRequests::unique_per_family; ++variant) {
+            const std::size_t plan_index = family[variant];
+            const std::string fingerprint = topology_sha256(*plans[plan_index]);
+            const auto found = std::find_if(
+                representatives.begin(), representatives.end(),
+                [&](const auto &entry) {
+                    return entry.first == fingerprint
+                        && topology_equal(*plans[entry.second], *plans[plan_index]);
+                });
+            if (found == representatives.end()) {
+                representatives.emplace_back(fingerprint, plan_index);
+            }
+        }
+        result.unique_count += representatives.size();
+        for (const std::size_t variant : {0U, 1U, 2U, 4U, 5U}) {
+            result.zero_isolated = result.zero_isolated
+                && !topology_equal(*plans[family[3U]], *plans[family[variant]]);
+        }
+    }
+    return result;
+}
+
+[[nodiscard]] BicubicGeometryCaseReport run_bicubic_geometry_case(
+    const Matrix &matrix,
+    std::int32_t native_height,
+    bool fractional_scan,
+    const Configuration &config) {
+    BicubicGeometryCaseReport report;
+    report.id = fractional_scan
+        ? "bicubic-bc@800-899.9"
+        : "bicubic-bc@" + std::to_string(native_height);
+    report.native_height = native_height;
+    report.fractional_scan = fractional_scan;
+    report.host_before = capture_host_observation();
+    const BicubicSweepRequests sweep = make_bicubic_sweep_requests(
+        matrix, native_height, fractional_scan);
+    report.request_count = sweep.requests.size();
+    report.exact_duplicate_count = BicubicSweepRequests::family_count * 2U;
+    const std::size_t expected_unique = BicubicSweepRequests::family_count
+        * BicubicSweepRequests::unique_per_family;
+
+    const PlannerMeasurement independent_warmup = measure_planner(
+        sweep.requests, getnative::detail::TapEvaluationMode::reuse, true,
+        getnative::detail::BicubicGeometryMode::independent, expected_unique);
+    const PlannerMeasurement reuse_warmup = measure_planner(
+        sweep.requests, getnative::detail::TapEvaluationMode::reuse, true,
+        getnative::detail::BicubicGeometryMode::reuse, expected_unique);
+    report.independent_plan_sha256 = independent_warmup.plan_sha256;
+    report.reuse_plan_sha256 = reuse_warmup.plan_sha256;
+    report.plans_byte_identical = report.independent_plan_sha256
+        == report.reuse_plan_sha256;
+    report.unique_key_count = reuse_warmup.unique_key_count;
+    report.geometry_family_count = reuse_warmup.bicubic_geometry_family_count;
+    report.geometry_plan_count = reuse_warmup.bicubic_geometry_plan_count;
+    report.geometry_build_count = reuse_warmup.bicubic_geometry_build_count;
+    report.geometry_scratch_bytes = reuse_warmup.bicubic_geometry_scratch_bytes;
+
+    getnative::detail::AxisPlanBatchOptions topology_options;
+    topology_options.bicubic_geometry = getnative::detail::BicubicGeometryMode::reuse;
+    const auto topology_batch = getnative::detail::build_axis_plans(
+        sweep.requests, std::move(topology_options));
+    const BicubicTopologyStats topology = analyze_bicubic_topology(
+        sweep, topology_batch.plans);
+    report.topology_unique_count = topology.unique_count;
+    report.topology_reuse_opportunities = expected_unique - topology.unique_count;
+    report.exact_duplicates_shared = topology.exact_duplicates_shared;
+    report.zero_topology_isolated = topology.zero_isolated;
+
+    std::vector<double> independent_times;
+    std::vector<double> reuse_times;
+    std::vector<double> deltas;
+    independent_times.reserve(config.samples);
+    reuse_times.reserve(config.samples);
+    deltas.reserve(config.samples);
+    report.samples.reserve(config.samples);
+    for (std::size_t sample = 0; sample < config.samples; ++sample) {
+        BicubicGeometryPairSample pair;
+        pair.first_mode = (sample & 1U) == 0U ? "independent" : "reuse";
+        pair.host_before = capture_host_observation();
+        PlannerMeasurement independent;
+        PlannerMeasurement reuse;
+        if ((sample & 1U) == 0U) {
+            independent = measure_planner(
+                sweep.requests, getnative::detail::TapEvaluationMode::reuse, false,
+                getnative::detail::BicubicGeometryMode::independent, expected_unique);
+            reuse = measure_planner(
+                sweep.requests, getnative::detail::TapEvaluationMode::reuse, false,
+                getnative::detail::BicubicGeometryMode::reuse, expected_unique);
+        } else {
+            reuse = measure_planner(
+                sweep.requests, getnative::detail::TapEvaluationMode::reuse, false,
+                getnative::detail::BicubicGeometryMode::reuse, expected_unique);
+            independent = measure_planner(
+                sweep.requests, getnative::detail::TapEvaluationMode::reuse, false,
+                getnative::detail::BicubicGeometryMode::independent, expected_unique);
+        }
+        pair.host_after = capture_host_observation();
+        validate_planner_measurement(independent, independent_warmup);
+        validate_planner_measurement(reuse, reuse_warmup);
+        pair.independent_ms = independent.wall_ms;
+        pair.reuse_ms = reuse.wall_ms;
+        pair.delta = (pair.reuse_ms - pair.independent_ms) / pair.independent_ms;
+        independent_times.push_back(pair.independent_ms);
+        reuse_times.push_back(pair.reuse_ms);
+        deltas.push_back(pair.delta);
+        report.samples.push_back(std::move(pair));
+    }
+
+    report.independent_median_ms = median(independent_times);
+    report.reuse_median_ms = median(reuse_times);
+    report.paired_delta_median = median(deltas);
+    report.paired_delta_mad = median_absolute_deviation(deltas);
+    report.host_after = capture_host_observation();
+    report.thermal_stable = report.host_before.thermal_state
+        == report.host_after.thermal_state;
+    report.concurrent_process_detected = !report.host_before.concurrent_processes.empty()
+        || !report.host_after.concurrent_processes.empty();
+    for (const auto &sample : report.samples) {
+        report.thermal_stable = report.thermal_stable
+            && sample.host_before.thermal_state == sample.host_after.thermal_state;
+        report.concurrent_process_detected = report.concurrent_process_detected
+            || !sample.host_before.concurrent_processes.empty()
+            || !sample.host_after.concurrent_processes.empty();
+    }
+    report.gate_passed = config.samples >= 21U
+        && report.plans_byte_identical
+        && report.request_count == 1000U
+        && report.unique_key_count == expected_unique
+        && independent_warmup.bicubic_geometry_family_count == 0U
+        && independent_warmup.bicubic_geometry_plan_count == 0U
+        && independent_warmup.bicubic_geometry_build_count == 0U
+        && independent_warmup.bicubic_geometry_scratch_bytes == 0U
+        && report.geometry_family_count == BicubicSweepRequests::family_count
+        && report.geometry_plan_count == BicubicSweepRequests::family_count * 5U
+        && report.geometry_build_count == report.geometry_family_count
+        && report.geometry_scratch_bytes > 0U
+        && report.exact_duplicates_shared
+        && report.zero_topology_isolated
+        && report.paired_delta_median <= -0.05
+        && report.paired_delta_mad <= 0.02
+        && report.thermal_stable
+        && !report.concurrent_process_detected;
+    return report;
+}
+
+[[nodiscard]] BicubicGeometryCaseReport run_bicubic_geometry_control(
+    const Matrix &matrix,
+    const Configuration &config) {
+    BicubicGeometryCaseReport report;
+    report.id = "bicubic-single@810";
+    report.native_height = 810;
+    report.host_before = capture_host_observation();
+    const BenchmarkCase benchmark_case{
+        report.id,
+        {"bicubic-catrom", "bicubic", 0.0, 0.5, 0, true},
+        report.native_height,
+        false,
+    };
+    const auto requests = make_plan_requests(matrix, benchmark_case);
+    report.request_count = requests.size();
+    const std::size_t expected_unique = requests.size();
+    const PlannerMeasurement independent_warmup = measure_planner(
+        requests, getnative::detail::TapEvaluationMode::reuse, true,
+        getnative::detail::BicubicGeometryMode::independent, expected_unique);
+    const PlannerMeasurement reuse_warmup = measure_planner(
+        requests, getnative::detail::TapEvaluationMode::reuse, true,
+        getnative::detail::BicubicGeometryMode::reuse, expected_unique);
+    report.independent_plan_sha256 = independent_warmup.plan_sha256;
+    report.reuse_plan_sha256 = reuse_warmup.plan_sha256;
+    report.plans_byte_identical = report.independent_plan_sha256
+        == report.reuse_plan_sha256;
+    report.unique_key_count = reuse_warmup.unique_key_count;
+    report.exact_duplicates_shared = true;
+    report.zero_topology_isolated = true;
+
+    std::vector<double> independent_times;
+    std::vector<double> reuse_times;
+    std::vector<double> deltas;
+    independent_times.reserve(config.samples);
+    reuse_times.reserve(config.samples);
+    deltas.reserve(config.samples);
+    report.samples.reserve(config.samples);
+    for (std::size_t sample = 0; sample < config.samples; ++sample) {
+        BicubicGeometryPairSample pair;
+        pair.first_mode = (sample & 1U) == 0U ? "independent" : "reuse";
+        pair.host_before = capture_host_observation();
+        PlannerMeasurement independent;
+        PlannerMeasurement reuse;
+        if ((sample & 1U) == 0U) {
+            independent = measure_planner(
+                requests, getnative::detail::TapEvaluationMode::reuse, false,
+                getnative::detail::BicubicGeometryMode::independent, expected_unique);
+            reuse = measure_planner(
+                requests, getnative::detail::TapEvaluationMode::reuse, false,
+                getnative::detail::BicubicGeometryMode::reuse, expected_unique);
+        } else {
+            reuse = measure_planner(
+                requests, getnative::detail::TapEvaluationMode::reuse, false,
+                getnative::detail::BicubicGeometryMode::reuse, expected_unique);
+            independent = measure_planner(
+                requests, getnative::detail::TapEvaluationMode::reuse, false,
+                getnative::detail::BicubicGeometryMode::independent, expected_unique);
+        }
+        pair.host_after = capture_host_observation();
+        validate_planner_measurement(independent, independent_warmup);
+        validate_planner_measurement(reuse, reuse_warmup);
+        pair.independent_ms = independent.wall_ms;
+        pair.reuse_ms = reuse.wall_ms;
+        pair.delta = (pair.reuse_ms - pair.independent_ms) / pair.independent_ms;
+        independent_times.push_back(pair.independent_ms);
+        reuse_times.push_back(pair.reuse_ms);
+        deltas.push_back(pair.delta);
+        report.samples.push_back(std::move(pair));
+    }
+    report.independent_median_ms = median(independent_times);
+    report.reuse_median_ms = median(reuse_times);
+    report.paired_delta_median = median(deltas);
+    report.paired_delta_mad = median_absolute_deviation(deltas);
+    report.host_after = capture_host_observation();
+    report.thermal_stable = report.host_before.thermal_state
+        == report.host_after.thermal_state;
+    report.concurrent_process_detected = !report.host_before.concurrent_processes.empty()
+        || !report.host_after.concurrent_processes.empty();
+    for (const auto &sample : report.samples) {
+        report.thermal_stable = report.thermal_stable
+            && sample.host_before.thermal_state == sample.host_after.thermal_state;
+        report.concurrent_process_detected = report.concurrent_process_detected
+            || !sample.host_before.concurrent_processes.empty()
+            || !sample.host_after.concurrent_processes.empty();
+    }
+    report.gate_passed = config.samples >= 21U
+        && report.plans_byte_identical
+        && report.request_count == 1000U
+        && report.unique_key_count == expected_unique
+        && independent_warmup.bicubic_geometry_family_count == 0U
+        && reuse_warmup.bicubic_geometry_family_count == 0U
+        && reuse_warmup.bicubic_geometry_plan_count == 0U
+        && reuse_warmup.bicubic_geometry_build_count == 0U
+        && reuse_warmup.bicubic_geometry_scratch_bytes == 0U
+        && report.paired_delta_median <= 0.03
         && report.paired_delta_mad <= 0.02
         && report.thermal_stable
         && !report.concurrent_process_detected;
@@ -1646,6 +2091,52 @@ void update_cpu_correctness(CpuCaseReport &report,
     };
 }
 
+[[nodiscard]] NSDictionary *bicubic_geometry_case_json(
+    const BicubicGeometryCaseReport &report) {
+    NSMutableArray *samples = [NSMutableArray arrayWithCapacity:report.samples.size()];
+    for (std::size_t index = 0; index < report.samples.size(); ++index) {
+        const BicubicGeometryPairSample &sample = report.samples[index];
+        [samples addObject:@{
+            @"index": @(index),
+            @"first_mode": @(sample.first_mode.c_str()),
+            @"independent_ms": @(sample.independent_ms),
+            @"reuse_ms": @(sample.reuse_ms),
+            @"paired_delta": @(sample.delta),
+            @"host_before": host_observation_json(sample.host_before),
+            @"host_after": host_observation_json(sample.host_after),
+        }];
+    }
+    return @{
+        @"id": @(report.id.c_str()),
+        @"matrix_native_height": @(report.native_height),
+        @"fractional_scan": @(report.fractional_scan),
+        @"independent_median_ms": @(report.independent_median_ms),
+        @"reuse_median_ms": @(report.reuse_median_ms),
+        @"paired_delta_median": @(report.paired_delta_median),
+        @"paired_delta_mad": @(report.paired_delta_mad),
+        @"independent_plan_sha256": @(report.independent_plan_sha256.c_str()),
+        @"reuse_plan_sha256": @(report.reuse_plan_sha256.c_str()),
+        @"plans_byte_identical": @(report.plans_byte_identical),
+        @"request_count": @(report.request_count),
+        @"unique_key_count": @(report.unique_key_count),
+        @"exact_duplicate_count": @(report.exact_duplicate_count),
+        @"geometry_family_count": @(report.geometry_family_count),
+        @"geometry_plan_count": @(report.geometry_plan_count),
+        @"geometry_build_count": @(report.geometry_build_count),
+        @"geometry_scratch_bytes": @(report.geometry_scratch_bytes),
+        @"topology_unique_count": @(report.topology_unique_count),
+        @"topology_reuse_opportunities": @(report.topology_reuse_opportunities),
+        @"exact_duplicates_shared": @(report.exact_duplicates_shared),
+        @"zero_topology_isolated": @(report.zero_topology_isolated),
+        @"host_before": host_observation_json(report.host_before),
+        @"host_after": host_observation_json(report.host_after),
+        @"thermal_stable": @(report.thermal_stable),
+        @"concurrent_process_detected": @(report.concurrent_process_detected),
+        @"gate_passed": @(report.gate_passed),
+        @"samples": samples,
+    };
+}
+
 [[nodiscard]] std::string compiler_identity() {
 #if defined(__clang__)
     return std::string{"clang "} + __clang_version__;
@@ -1717,7 +2208,9 @@ void update_cpu_correctness(CpuCaseReport &report,
 [[nodiscard]] std::filesystem::path output_path(const Configuration &config) {
     if (config.json_path) return *config.json_path;
     const char *filename = config.planner_taps ? "planner-tap-report.json"
-        : (config.cpu_columns ? "cpu-column-report.json" : "metal-kernel-report.json");
+        : (config.planner_bicubic_geometry ? "planner-bicubic-geometry-report.json"
+            : (config.cpu_columns ? "cpu-column-report.json"
+                                  : "metal-kernel-report.json"));
     return *config.artifact_root
         / (utc_stamp() + "-pid" + std::to_string(static_cast<long long>(getpid())))
         / filename;
@@ -1829,6 +2322,125 @@ int main(int argc, char **argv) {
             }
             if (image.width != matrix.source_width || image.height != matrix.source_height) {
                 throw std::runtime_error("decoded fixture dimensions do not match the matrix");
+            }
+            if (config.planner_bicubic_geometry) {
+                const HostObservation run_host_before = capture_host_observation();
+                if (!run_host_before.concurrent_processes.empty()) {
+                    throw std::runtime_error(
+                        "concurrent benchmark or capture process detected: "
+                        + run_host_before.concurrent_processes.front());
+                }
+                std::vector<BicubicGeometryCaseReport> reports;
+                reports.reserve(matrix.native_heights.size() + 2U);
+                bool all_passed = true;
+                std::cout << "running bicubic single-B/C control ("
+                          << config.samples << " paired samples)\n" << std::flush;
+                BicubicGeometryCaseReport control = run_bicubic_geometry_control(
+                    matrix, config);
+                std::cout << std::fixed << std::setprecision(3)
+                          << "case=" << control.id
+                          << " independent_ms=" << control.independent_median_ms
+                          << " reuse_ms=" << control.reuse_median_ms
+                          << " delta=" << 100.0 * control.paired_delta_median << "%"
+                          << " paired_mad=" << control.paired_delta_mad
+                          << " exact="
+                          << (control.plans_byte_identical ? "yes" : "no")
+                          << " gate=" << (control.gate_passed ? "pass" : "fail")
+                          << '\n';
+                all_passed = all_passed && control.gate_passed;
+                reports.push_back(std::move(control));
+                for (const std::int32_t native_height : matrix.native_heights) {
+                    std::cout << "running bicubic geometry " << native_height << " ("
+                              << config.samples << " paired samples)\n" << std::flush;
+                    BicubicGeometryCaseReport report = run_bicubic_geometry_case(
+                        matrix, native_height, false, config);
+                    std::cout << std::fixed << std::setprecision(3)
+                              << "case=" << report.id
+                              << " independent_ms=" << report.independent_median_ms
+                              << " reuse_ms=" << report.reuse_median_ms
+                              << " improvement="
+                              << -100.0 * report.paired_delta_median << "%"
+                              << " paired_mad=" << report.paired_delta_mad
+                              << " families=" << report.geometry_family_count
+                              << " topology_unique=" << report.topology_unique_count
+                              << " exact="
+                              << (report.plans_byte_identical ? "yes" : "no")
+                              << " gate=" << (report.gate_passed ? "pass" : "fail")
+                              << '\n';
+                    all_passed = all_passed && report.gate_passed;
+                    reports.push_back(std::move(report));
+                }
+                std::cout << "running bicubic geometry 800-899.9 ("
+                          << config.samples << " paired samples)\n" << std::flush;
+                BicubicGeometryCaseReport fractional = run_bicubic_geometry_case(
+                    matrix, matrix.fractional_scan.native_start, true, config);
+                std::cout << std::fixed << std::setprecision(3)
+                          << "case=" << fractional.id
+                          << " independent_ms=" << fractional.independent_median_ms
+                          << " reuse_ms=" << fractional.reuse_median_ms
+                          << " improvement="
+                          << -100.0 * fractional.paired_delta_median << "%"
+                          << " paired_mad=" << fractional.paired_delta_mad
+                          << " families=" << fractional.geometry_family_count
+                          << " topology_unique=" << fractional.topology_unique_count
+                          << " exact="
+                          << (fractional.plans_byte_identical ? "yes" : "no")
+                          << " gate=" << (fractional.gate_passed ? "pass" : "fail")
+                          << '\n';
+                all_passed = all_passed && fractional.gate_passed;
+                reports.push_back(std::move(fractional));
+
+                const HostObservation run_host_after = capture_host_observation();
+                const IdentitySnapshot identity_after = capture_identity_snapshot(
+                    config, fixture_checksum_path);
+                const bool identity_stable = identities_equal(identity_before, identity_after);
+                const bool run_thermal_stable = run_host_before.thermal_state
+                    == run_host_after.thermal_state;
+                const bool run_concurrent_process_detected =
+                    !run_host_before.concurrent_processes.empty()
+                    || !run_host_after.concurrent_processes.empty();
+                all_passed = all_passed && identity_stable && run_thermal_stable
+                    && !run_concurrent_process_detected;
+
+                NSMutableArray *case_objects = [NSMutableArray arrayWithCapacity:reports.size()];
+                for (const BicubicGeometryCaseReport &report : reports) {
+                    [case_objects addObject:bicubic_geometry_case_json(report)];
+                }
+                NSDictionary *root = @{
+                    @"schema_version": @1,
+                    @"status": all_passed ? @"pass" : @"fail",
+                    @"mode": @"planner_bicubic_geometry",
+                    @"case_selection": @"named_heights_and_fractional_scan",
+                    @"comparison_policy": @"independent_vs_exact_geometry_reuse",
+                    @"production_default": @"reuse",
+                    @"sample_count": @(config.samples),
+                    @"host_before": host_observation_json(run_host_before),
+                    @"host_after": host_observation_json(run_host_after),
+                    @"run_thermal_stable": @(run_thermal_stable),
+                    @"run_concurrent_process_detected": @(run_concurrent_process_detected),
+                    @"fixture": @{
+                        @"path": @(config.fixture_path.string().c_str()),
+                        @"checksum_path": @(image.checksum_path.string().c_str()),
+                        @"expected_sha256": @(image.expected_fixture_sha256.c_str()),
+                        @"sha256": @(image.fixture_sha256.c_str()),
+                        @"decoded_luma_sha256": @(image.luma_sha256.c_str()),
+                        @"width": @(image.width),
+                        @"height": @(image.height),
+                    },
+                    @"identities": @{
+                        @"stable": @(identity_stable),
+                        @"before": identity_json(identity_before),
+                        @"after": identity_json(identity_after),
+                        @"binary_sha256": @(identity_before.binary_sha256.c_str()),
+                        @"matrix_path": @(config.matrix_path.string().c_str()),
+                        @"matrix_sha256": @(identity_before.matrix_sha256.c_str()),
+                    },
+                    @"cases": case_objects,
+                };
+                write_json(root, report_path);
+                std::cout << "report=" << report_path << '\n';
+                if (config.assert_gates && !all_passed) return EXIT_FAILURE;
+                return EXIT_SUCCESS;
             }
             if (config.planner_taps) {
                 const auto cases = select_cases(matrix, config);

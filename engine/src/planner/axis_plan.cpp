@@ -5,12 +5,15 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <unordered_map>
 #include <vector>
@@ -19,6 +22,30 @@
 // Frechdachs/descale (MIT, Copyright 2021 Frechdachs). See upstream/descale/LICENSE.
 
 namespace getnative {
+
+namespace detail {
+
+struct AxisPlanGeometry {
+    std::int32_t source_size = 0;
+    std::int32_t destination_size = 0;
+    std::int32_t support = 0;
+    std::int32_t forward_filter_size = 0;
+    std::uint64_t active_length_bits = 0;
+    std::uint64_t shift_bits = 0;
+    BorderMode border = BorderMode::mirror;
+    double forward_step = 1.0;
+    std::vector<double> descale_distances;
+    std::vector<std::uint32_t> descale_row_offsets;
+    std::vector<std::int32_t> descale_unique_indices;
+    std::vector<std::int32_t> descale_tap_slots;
+    std::vector<double> forward_distances;
+    std::vector<std::int32_t> forward_tap_indices;
+    std::vector<std::int32_t> forward_left;
+    std::vector<std::int32_t> forward_right;
+};
+
+} // namespace detail
+
 namespace {
 
 [[nodiscard]] double round_half_up(double x) noexcept {
@@ -136,18 +163,185 @@ private:
     return index >= 0 && index < size ? index : -1;
 }
 
+[[nodiscard]] std::int32_t validated_support(const AxisPlanRequest &request) {
+    if (request.source_size <= 0 || request.destination_size <= 0) {
+        throw std::invalid_argument("axis dimensions must be positive");
+    }
+    if (!(request.active_length > 0.0) || !std::isfinite(request.active_length)
+        || !std::isfinite(request.shift)) {
+        throw std::invalid_argument(
+            "active length and shift must be finite, with positive active length");
+    }
+    const std::int32_t support = request.filter.support();
+    if (support > (std::numeric_limits<std::int32_t>::max() - 1) / 2) {
+        throw std::invalid_argument("filter support is too large");
+    }
+    return support;
+}
+
+[[nodiscard]] std::size_t checked_geometry_elements(
+    std::int32_t rows,
+    std::int32_t width,
+    std::string_view name) {
+    const std::size_t row_count = static_cast<std::size_t>(rows);
+    const std::size_t row_width = static_cast<std::size_t>(width);
+    if (row_width != 0U
+        && row_count > std::numeric_limits<std::size_t>::max() / row_width) {
+        throw std::length_error(std::string{name} + " is too large");
+    }
+    return row_count * row_width;
+}
+
+[[nodiscard]] bool geometry_matches(
+    const detail::AxisPlanGeometry &geometry,
+    const AxisPlanRequest &request,
+    std::int32_t support) noexcept {
+    return geometry.source_size == request.source_size
+        && geometry.destination_size == request.destination_size
+        && geometry.support == support
+        && geometry.active_length_bits
+            == std::bit_cast<std::uint64_t>(request.active_length)
+        && geometry.shift_bits == std::bit_cast<std::uint64_t>(request.shift)
+        && geometry.border == request.border;
+}
+
+[[nodiscard]] std::shared_ptr<const detail::AxisPlanGeometry>
+make_axis_plan_geometry(const AxisPlanRequest &request) {
+    const std::int32_t support = validated_support(request);
+    const std::int32_t tap_count = 2 * support;
+    auto geometry = std::make_shared<detail::AxisPlanGeometry>();
+    geometry->source_size = request.source_size;
+    geometry->destination_size = request.destination_size;
+    geometry->support = support;
+    geometry->active_length_bits = std::bit_cast<std::uint64_t>(request.active_length);
+    geometry->shift_bits = std::bit_cast<std::uint64_t>(request.shift);
+    geometry->border = request.border;
+
+    const std::size_t descale_elements = checked_geometry_elements(
+        request.source_size, tap_count, "descale geometry");
+    geometry->descale_distances.resize(descale_elements);
+    geometry->descale_tap_slots.resize(descale_elements, -1);
+    geometry->descale_row_offsets.reserve(
+        static_cast<std::size_t>(request.source_size) + 1U);
+    geometry->descale_unique_indices.reserve(descale_elements);
+    geometry->descale_row_offsets.push_back(0U);
+
+    const double ratio = static_cast<double>(request.source_size)
+        / request.active_length;
+    std::array<std::int32_t, 30> tap_indices{};
+    std::array<std::int32_t, 30> unique_indices{};
+    for (std::int32_t row = 0; row < request.source_size; ++row) {
+        const double position = (static_cast<double>(row) + 0.5) / ratio
+            + request.shift;
+        const double begin = round_half_up(
+            position - static_cast<double>(support)) + 0.5;
+        std::int32_t unique_count = 0;
+        const std::size_t row_base = static_cast<std::size_t>(row)
+            * static_cast<std::size_t>(tap_count);
+        for (std::int32_t tap = 0; tap < tap_count; ++tap) {
+            const double center = begin + static_cast<double>(tap);
+            const std::size_t offset = row_base + static_cast<std::size_t>(tap);
+            geometry->descale_distances[offset] = center - position;
+            const std::int32_t index = border_index(
+                center, request.destination_size, request.border);
+            tap_indices[static_cast<std::size_t>(tap)] = index;
+            if (index < 0) continue;
+            const auto found = std::find(
+                unique_indices.begin(), unique_indices.begin() + unique_count, index);
+            if (found == unique_indices.begin() + unique_count) {
+                unique_indices[static_cast<std::size_t>(unique_count++)] = index;
+            }
+        }
+        std::sort(unique_indices.begin(), unique_indices.begin() + unique_count);
+        geometry->descale_unique_indices.insert(
+            geometry->descale_unique_indices.end(), unique_indices.begin(),
+            unique_indices.begin() + unique_count);
+        for (std::int32_t tap = 0; tap < tap_count; ++tap) {
+            const std::int32_t index = tap_indices[static_cast<std::size_t>(tap)];
+            if (index < 0) continue;
+            const auto slot = std::lower_bound(
+                unique_indices.begin(), unique_indices.begin() + unique_count, index);
+            geometry->descale_tap_slots[
+                row_base + static_cast<std::size_t>(tap)] = static_cast<std::int32_t>(
+                    std::distance(unique_indices.begin(), slot));
+        }
+        geometry->descale_row_offsets.push_back(static_cast<std::uint32_t>(
+            geometry->descale_unique_indices.size()));
+    }
+
+    const double scale = static_cast<double>(request.source_size)
+        / request.active_length;
+    geometry->forward_step = std::min(scale, 1.0);
+    const double expanded_support = static_cast<double>(support)
+        / geometry->forward_step;
+    if (!std::isfinite(expanded_support)
+        || expanded_support
+            > static_cast<double>(std::numeric_limits<std::int32_t>::max() / 2)) {
+        throw std::length_error("zimg forward filter width is too large");
+    }
+    geometry->forward_filter_size = std::max(
+        static_cast<std::int32_t>(std::ceil(expanded_support)) * 2, 1);
+    const std::size_t forward_elements = checked_geometry_elements(
+        request.source_size, geometry->forward_filter_size, "forward geometry");
+    geometry->forward_distances.resize(forward_elements);
+    geometry->forward_tap_indices.resize(forward_elements);
+    geometry->forward_left.resize(static_cast<std::size_t>(request.source_size));
+    geometry->forward_right.resize(static_cast<std::size_t>(request.source_size));
+    const double maximum_mapped = std::nextafter(
+        static_cast<double>(request.destination_size),
+        -std::numeric_limits<double>::infinity());
+    for (std::int32_t row = 0; row < request.source_size; ++row) {
+        const double position = (static_cast<double>(row) + 0.5) / scale
+            + request.shift;
+        const double begin = round_half_up(
+            position - static_cast<double>(geometry->forward_filter_size) / 2.0)
+            + 0.5;
+        std::int32_t left = request.destination_size;
+        std::int32_t right = 0;
+        const std::size_t row_base = static_cast<std::size_t>(row)
+            * static_cast<std::size_t>(geometry->forward_filter_size);
+        for (std::int32_t tap = 0; tap < geometry->forward_filter_size; ++tap) {
+            const double pixel_center = begin + static_cast<double>(tap);
+            const std::size_t offset = row_base + static_cast<std::size_t>(tap);
+            geometry->forward_distances[offset] =
+                (pixel_center - position) * geometry->forward_step;
+            double mapped = pixel_center;
+            if (pixel_center < 0.0) {
+                mapped = -pixel_center;
+            } else if (pixel_center >= static_cast<double>(request.destination_size)) {
+                mapped = 2.0 * static_cast<double>(request.destination_size)
+                    - pixel_center;
+            }
+            mapped = std::clamp(mapped, 0.0, maximum_mapped);
+            const auto index = static_cast<std::int32_t>(std::floor(mapped));
+            geometry->forward_tap_indices[offset] = index;
+            left = std::min(left, index);
+            right = std::max(right, index + 1);
+        }
+        geometry->forward_left[static_cast<std::size_t>(row)] = left;
+        geometry->forward_right[static_cast<std::size_t>(row)] = right;
+    }
+    return geometry;
+}
+
 struct DoubleCsr {
     std::vector<std::uint32_t> offsets;
     std::vector<std::int32_t> indices;
     std::vector<double> weights;
 };
 
-template <bool ReuseTapWeights>
+template <bool ReuseTapWeights, bool ReuseGeometry = false>
 [[nodiscard]] DoubleCsr make_descale_matrix(const AxisPlanRequest &request,
-                                            std::int32_t support) {
+                                            std::int32_t support,
+                                            const detail::AxisPlanGeometry *geometry = nullptr) {
     const std::int32_t rows = request.source_size;
     const std::int32_t columns = request.destination_size;
     const double ratio = static_cast<double>(rows) / request.active_length;
+    if constexpr (ReuseGeometry) {
+        if (geometry == nullptr || !geometry_matches(*geometry, request, support)) {
+            throw std::invalid_argument("axis plan geometry does not match the request");
+        }
+    }
 
     DoubleCsr result;
     result.offsets.reserve(static_cast<std::size_t>(rows) + 1U);
@@ -159,13 +353,27 @@ template <bool ReuseTapWeights>
     row.reserve(static_cast<std::size_t>(2 * support));
     // Filter::support() caps Lanczos at 15 taps, so the widest row has 30 taps.
     std::array<double, 30> tap_weights{};
+    std::array<double, 30> coalesced_weights{};
+    std::array<bool, 30> coalesced_seen{};
     for (std::int32_t i = 0; i < rows; ++i) {
-        const double position = (static_cast<double>(i) + 0.5) / ratio + request.shift;
-        const double begin = round_half_up(position - static_cast<double>(support)) + 0.5;
+        double position = 0.0;
+        double begin = 0.0;
+        if constexpr (!ReuseGeometry) {
+            position = (static_cast<double>(i) + 0.5) / ratio + request.shift;
+            begin = round_half_up(position - static_cast<double>(support)) + 0.5;
+        }
+        const std::size_t geometry_row_base = static_cast<std::size_t>(i)
+            * static_cast<std::size_t>(2 * support);
         double total = 0.0;
         for (std::int32_t tap = 0; tap < 2 * support; ++tap) {
-            const double weight = request.filter.weight(
-                begin + static_cast<double>(tap) - position);
+            double distance = 0.0;
+            if constexpr (ReuseGeometry) {
+                distance = geometry->descale_distances[
+                    geometry_row_base + static_cast<std::size_t>(tap)];
+            } else {
+                distance = begin + static_cast<double>(tap) - position;
+            }
+            const double weight = request.filter.weight(distance);
             if constexpr (ReuseTapWeights) {
                 tap_weights[static_cast<std::size_t>(tap)] = weight;
             }
@@ -175,56 +383,108 @@ template <bool ReuseTapWeights>
             throw std::runtime_error("filter produced a zero or non-finite weight sum");
         }
 
-        row.clear();
+        if constexpr (ReuseGeometry) {
+            coalesced_weights.fill(0.0);
+            coalesced_seen.fill(false);
+        } else {
+            row.clear();
+        }
         for (std::int32_t tap = 0; tap < 2 * support; ++tap) {
-            const double center = begin + static_cast<double>(tap);
-            const std::int32_t index = border_index(center, columns, request.border);
-            if (index < 0) {
-                continue;
+            std::int32_t index = -1;
+            std::int32_t slot = -1;
+            double center = 0.0;
+            if constexpr (ReuseGeometry) {
+                slot = geometry->descale_tap_slots[
+                    geometry_row_base + static_cast<std::size_t>(tap)];
+                if (slot < 0) continue;
+            } else {
+                center = begin + static_cast<double>(tap);
+                index = border_index(center, columns, request.border);
+                if (index < 0) continue;
             }
             double raw_weight = 0.0;
             if constexpr (ReuseTapWeights) {
                 raw_weight = tap_weights[static_cast<std::size_t>(tap)];
             } else {
-                raw_weight = request.filter.weight(center - position);
+                if constexpr (ReuseGeometry) {
+                    raw_weight = request.filter.weight(geometry->descale_distances[
+                        geometry_row_base + static_cast<std::size_t>(tap)]);
+                } else {
+                    raw_weight = request.filter.weight(center - position);
+                }
             }
             const double weight = raw_weight / total;
-            if (weight == 0.0) {
-                continue;
-            }
-            const auto duplicate = std::find_if(row.begin(), row.end(), [index](const auto &entry) {
-                return entry.first == index;
-            });
-            if (duplicate == row.end()) {
-                row.emplace_back(index, weight);
+            if (weight == 0.0) continue;
+            if constexpr (ReuseGeometry) {
+                const std::size_t output_slot = static_cast<std::size_t>(slot);
+                if (!coalesced_seen[output_slot]) {
+                    coalesced_weights[output_slot] = weight;
+                    coalesced_seen[output_slot] = true;
+                } else {
+                    coalesced_weights[output_slot] += weight;
+                }
             } else {
-                duplicate->second += weight;
+                const auto duplicate = std::find_if(
+                    row.begin(), row.end(), [index](const auto &entry) {
+                        return entry.first == index;
+                    });
+                if (duplicate == row.end()) {
+                    row.emplace_back(index, weight);
+                } else {
+                    duplicate->second += weight;
+                }
             }
         }
-        std::sort(row.begin(), row.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
-        for (const auto &[index, weight] : row) {
-            result.indices.push_back(index);
-            result.weights.push_back(weight);
+        if constexpr (ReuseGeometry) {
+            const std::uint32_t index_begin = geometry->descale_row_offsets[
+                static_cast<std::size_t>(i)];
+            const std::uint32_t index_end = geometry->descale_row_offsets[
+                static_cast<std::size_t>(i) + 1U];
+            for (std::uint32_t slot = 0; slot < index_end - index_begin; ++slot) {
+                if (!coalesced_seen[slot]) continue;
+                result.indices.push_back(
+                    geometry->descale_unique_indices[index_begin + slot]);
+                result.weights.push_back(coalesced_weights[slot]);
+            }
+        } else {
+            std::sort(row.begin(), row.end(), [](const auto &a, const auto &b) {
+                return a.first < b.first;
+            });
+            for (const auto &[index, weight] : row) {
+                result.indices.push_back(index);
+                result.weights.push_back(weight);
+            }
         }
         result.offsets.push_back(static_cast<std::uint32_t>(result.indices.size()));
     }
     return result;
 }
 
-template <bool ReuseTapWeights>
+template <bool ReuseTapWeights, bool ReuseGeometry = false>
 [[nodiscard]] DoubleCsr make_zimg_forward(const AxisPlanRequest &request,
-                                          std::int32_t support) {
+                                          std::int32_t support,
+                                          const detail::AxisPlanGeometry *geometry = nullptr) {
     const std::int32_t rows = request.source_size;
     const std::int32_t columns = request.destination_size;
     const double scale = static_cast<double>(rows) / request.active_length;
-    const double step = std::min(scale, 1.0);
-    const double expanded_support = static_cast<double>(support) / step;
-    if (!std::isfinite(expanded_support)
-        || expanded_support > static_cast<double>(std::numeric_limits<std::int32_t>::max() / 2)) {
-        throw std::length_error("zimg forward filter width is too large");
+    double step = std::min(scale, 1.0);
+    std::int32_t filter_size = 0;
+    if constexpr (ReuseGeometry) {
+        if (geometry == nullptr || !geometry_matches(*geometry, request, support)) {
+            throw std::invalid_argument("axis plan geometry does not match the request");
+        }
+        step = geometry->forward_step;
+        filter_size = geometry->forward_filter_size;
+    } else {
+        const double expanded_support = static_cast<double>(support) / step;
+        if (!std::isfinite(expanded_support)
+            || expanded_support
+                > static_cast<double>(std::numeric_limits<std::int32_t>::max() / 2)) {
+            throw std::length_error("zimg forward filter width is too large");
+        }
+        filter_size = std::max(
+            static_cast<std::int32_t>(std::ceil(expanded_support)) * 2, 1);
     }
-    const std::int32_t filter_size = std::max(
-        static_cast<std::int32_t>(std::ceil(expanded_support)) * 2, 1);
     const ZimgKernel kernel(request.filter);
 
     DoubleCsr result;
@@ -234,16 +494,32 @@ template <bool ReuseTapWeights>
     result.weights.reserve(result.indices.capacity());
     result.offsets.push_back(0U);
 
-    std::vector<std::int32_t> tap_indices(static_cast<std::size_t>(filter_size));
+    std::vector<std::int32_t> tap_indices;
+    if constexpr (!ReuseGeometry) {
+        tap_indices.resize(static_cast<std::size_t>(filter_size));
+    }
     std::vector<double> tap_weights(static_cast<std::size_t>(filter_size));
     std::vector<double> row_weights;
     for (std::int32_t row = 0; row < rows; ++row) {
-        const double position = (static_cast<double>(row) + 0.5) / scale + request.shift;
-        const double begin = round_half_up(position - static_cast<double>(filter_size) / 2.0) + 0.5;
+        double position = 0.0;
+        double begin = 0.0;
+        if constexpr (!ReuseGeometry) {
+            position = (static_cast<double>(row) + 0.5) / scale + request.shift;
+            begin = round_half_up(
+                position - static_cast<double>(filter_size) / 2.0) + 0.5;
+        }
+        const std::size_t geometry_row_base = static_cast<std::size_t>(row)
+            * static_cast<std::size_t>(filter_size);
         double total = 0.0;
         for (std::int32_t tap = 0; tap < filter_size; ++tap) {
-            const double weight = kernel.weight(
-                (begin + static_cast<double>(tap) - position) * step);
+            double distance = 0.0;
+            if constexpr (ReuseGeometry) {
+                distance = geometry->forward_distances[
+                    geometry_row_base + static_cast<std::size_t>(tap)];
+            } else {
+                distance = (begin + static_cast<double>(tap) - position) * step;
+            }
+            const double weight = kernel.weight(distance);
             if constexpr (ReuseTapWeights) {
                 tap_weights[static_cast<std::size_t>(tap)] = weight;
             }
@@ -253,36 +529,56 @@ template <bool ReuseTapWeights>
             throw std::runtime_error("zimg forward filter produced a zero or non-finite weight sum");
         }
 
-        std::int32_t left = columns;
-        std::int32_t right = 0;
+        std::int32_t left = ReuseGeometry
+            ? geometry->forward_left[static_cast<std::size_t>(row)] : columns;
+        std::int32_t right = ReuseGeometry
+            ? geometry->forward_right[static_cast<std::size_t>(row)] : 0;
         for (std::int32_t tap = 0; tap < filter_size; ++tap) {
-            const double pixel_center = begin + static_cast<double>(tap);
-            double mapped = pixel_center;
-            if (pixel_center < 0.0) {
-                mapped = -pixel_center;
-            } else if (pixel_center >= static_cast<double>(columns)) {
-                mapped = 2.0 * static_cast<double>(columns) - pixel_center;
+            double pixel_center = 0.0;
+            std::int32_t index = 0;
+            if constexpr (ReuseGeometry) {
+                index = geometry->forward_tap_indices[
+                    geometry_row_base + static_cast<std::size_t>(tap)];
+            } else {
+                pixel_center = begin + static_cast<double>(tap);
+                double mapped = pixel_center;
+                if (pixel_center < 0.0) {
+                    mapped = -pixel_center;
+                } else if (pixel_center >= static_cast<double>(columns)) {
+                    mapped = 2.0 * static_cast<double>(columns) - pixel_center;
+                }
+                mapped = std::clamp(
+                    mapped, 0.0,
+                    std::nextafter(static_cast<double>(columns),
+                                   -std::numeric_limits<double>::infinity()));
+                index = static_cast<std::int32_t>(std::floor(mapped));
+                tap_indices[static_cast<std::size_t>(tap)] = index;
             }
-            mapped = std::clamp(
-                mapped, 0.0,
-                std::nextafter(static_cast<double>(columns),
-                               -std::numeric_limits<double>::infinity()));
-            const auto index = static_cast<std::int32_t>(std::floor(mapped));
-            tap_indices[static_cast<std::size_t>(tap)] = index;
             double raw_weight = 0.0;
             if constexpr (ReuseTapWeights) {
                 raw_weight = tap_weights[static_cast<std::size_t>(tap)];
             } else {
-                raw_weight = kernel.weight((pixel_center - position) * step);
+                if constexpr (ReuseGeometry) {
+                    raw_weight = kernel.weight(geometry->forward_distances[
+                        geometry_row_base + static_cast<std::size_t>(tap)]);
+                } else {
+                    raw_weight = kernel.weight((pixel_center - position) * step);
+                }
             }
             tap_weights[static_cast<std::size_t>(tap)] = raw_weight / total;
-            left = std::min(left, index);
-            right = std::max(right, index + 1);
+            if constexpr (!ReuseGeometry) {
+                left = std::min(left, index);
+                right = std::max(right, index + 1);
+            }
         }
 
         row_weights.assign(static_cast<std::size_t>(right - left), 0.0);
         for (std::int32_t tap = 0; tap < filter_size; ++tap) {
-            row_weights[static_cast<std::size_t>(tap_indices[static_cast<std::size_t>(tap)] - left)] +=
+            const std::int32_t index = ReuseGeometry
+                ? geometry->forward_tap_indices[
+                    geometry_row_base + static_cast<std::size_t>(tap)]
+                : tap_indices[static_cast<std::size_t>(tap)];
+            row_weights[static_cast<std::size_t>(index - left)] +=
                 tap_weights[static_cast<std::size_t>(tap)];
         }
         for (std::int32_t index = left; index < right; ++index) {
@@ -393,27 +689,29 @@ namespace {
 
 [[nodiscard]] AxisPlan build_axis_plan_impl(
     const AxisPlanRequest &request,
-    detail::TapEvaluationMode tap_evaluation) {
-    if (request.source_size <= 0 || request.destination_size <= 0) {
-        throw std::invalid_argument("axis dimensions must be positive");
-    }
-    if (!(request.active_length > 0.0) || !std::isfinite(request.active_length)
-        || !std::isfinite(request.shift)) {
-        throw std::invalid_argument("active length and shift must be finite, with positive active length");
-    }
-    const std::int32_t support = request.filter.support();
-    if (support > (std::numeric_limits<std::int32_t>::max() - 1) / 2) {
-        throw std::invalid_argument("filter support is too large");
-    }
+    detail::TapEvaluationMode tap_evaluation,
+    const detail::AxisPlanGeometry *geometry) {
+    const std::int32_t support = validated_support(request);
     const std::int32_t half_bandwidth = std::min(2 * support - 1, request.destination_size - 1);
-    DoubleCsr descale_matrix = tap_evaluation == detail::TapEvaluationMode::reuse
-        ? make_descale_matrix<true>(request, support)
-        : make_descale_matrix<false>(request, support);
+    DoubleCsr descale_matrix;
+    DoubleCsr zimg_forward;
+    if (geometry != nullptr) {
+        descale_matrix = tap_evaluation == detail::TapEvaluationMode::reuse
+            ? make_descale_matrix<true, true>(request, support, geometry)
+            : make_descale_matrix<false, true>(request, support, geometry);
+        zimg_forward = tap_evaluation == detail::TapEvaluationMode::reuse
+            ? make_zimg_forward<true, true>(request, support, geometry)
+            : make_zimg_forward<false, true>(request, support, geometry);
+    } else {
+        descale_matrix = tap_evaluation == detail::TapEvaluationMode::reuse
+            ? make_descale_matrix<true>(request, support)
+            : make_descale_matrix<false>(request, support);
+        zimg_forward = tap_evaluation == detail::TapEvaluationMode::reuse
+            ? make_zimg_forward<true>(request, support)
+            : make_zimg_forward<false>(request, support);
+    }
     DoubleCsr transpose = transpose_csr(
         descale_matrix, request.source_size, request.destination_size);
-    DoubleCsr zimg_forward = tap_evaluation == detail::TapEvaluationMode::reuse
-        ? make_zimg_forward<true>(request, support)
-        : make_zimg_forward<false>(request, support);
     std::vector<double> factors = form_normal_bands(
         descale_matrix, request.source_size, request.destination_size, half_bandwidth);
     factor_banded_ldlt(factors, request.destination_size, half_bandwidth);
@@ -499,7 +797,8 @@ namespace {
 } // namespace
 
 AxisPlan build_axis_plan(const AxisPlanRequest &request) {
-    return build_axis_plan_impl(request, detail::TapEvaluationMode::reuse);
+    return build_axis_plan_impl(
+        request, detail::TapEvaluationMode::reuse, nullptr);
 }
 
 namespace detail {
@@ -507,7 +806,31 @@ namespace detail {
 AxisPlan build_axis_plan_with_tap_evaluation(
     const AxisPlanRequest &request,
     TapEvaluationMode mode) {
-    return build_axis_plan_impl(request, mode);
+    return build_axis_plan_impl(request, mode, nullptr);
+}
+
+std::shared_ptr<const AxisPlanGeometry> build_axis_plan_geometry(
+    const AxisPlanRequest &request) {
+    return make_axis_plan_geometry(request);
+}
+
+std::size_t axis_plan_geometry_bytes(const AxisPlanGeometry &geometry) noexcept {
+    return sizeof(geometry)
+        + geometry.descale_distances.capacity() * sizeof(double)
+        + geometry.descale_row_offsets.capacity() * sizeof(std::uint32_t)
+        + geometry.descale_unique_indices.capacity() * sizeof(std::int32_t)
+        + geometry.descale_tap_slots.capacity() * sizeof(std::int32_t)
+        + geometry.forward_distances.capacity() * sizeof(double)
+        + geometry.forward_tap_indices.capacity() * sizeof(std::int32_t)
+        + geometry.forward_left.capacity() * sizeof(std::int32_t)
+        + geometry.forward_right.capacity() * sizeof(std::int32_t);
+}
+
+AxisPlan build_axis_plan_with_geometry(
+    const AxisPlanRequest &request,
+    TapEvaluationMode tap_evaluation,
+    const AxisPlanGeometry *geometry) {
+    return build_axis_plan_impl(request, tap_evaluation, geometry);
 }
 
 } // namespace detail

@@ -192,6 +192,69 @@ void test_tap_reuse_is_byte_identical() {
     }
 }
 
+void test_bicubic_geometry_reuse_is_byte_identical() {
+    const std::array bicubic_parameters{
+        std::pair{1.0 / 3.0, 1.0 / 3.0},
+        std::pair{0.0, 0.5},
+        std::pair{1.0, 0.0},
+        std::pair{0.0, 0.0},
+        std::pair{-0.25, 0.75},
+        std::pair{0.5, 0.25},
+    };
+    std::vector<getnative::AxisPlanRequest> requests;
+    for (const auto border : {getnative::BorderMode::zero,
+                              getnative::BorderMode::repeat,
+                              getnative::BorderMode::mirror}) {
+        const std::size_t family_begin = requests.size();
+        for (const auto [b, c] : bicubic_parameters) {
+            requests.push_back({81, 53, 53.625, -0.375,
+                                getnative::Filter::bicubic(b, c), border});
+        }
+        requests.push_back(requests[family_begin + 1U]);
+    }
+
+    getnative::detail::AxisPlanBatchOptions independent_options;
+    independent_options.worker_count = 4U;
+    independent_options.bicubic_geometry =
+        getnative::detail::BicubicGeometryMode::independent;
+    const auto independent = getnative::detail::build_axis_plans(
+        requests, std::move(independent_options));
+
+    getnative::detail::AxisPlanBatchOptions reuse_options;
+    reuse_options.worker_count = 4U;
+    reuse_options.bicubic_geometry = getnative::detail::BicubicGeometryMode::reuse;
+    const auto reused = getnative::detail::build_axis_plans(
+        requests, std::move(reuse_options));
+
+    expect(independent.plans.size() == reused.plans.size(),
+           "bicubic geometry batches differ in size");
+    for (std::size_t index = 0; index < reused.plans.size(); ++index) {
+        expect_plan_equal(*reused.plans[index], *independent.plans[index]);
+    }
+    expect(independent.bicubic_geometry_family_count == 0U
+               && independent.bicubic_geometry_plan_count == 0U
+               && independent.bicubic_geometry_build_count == 0U
+               && independent.bicubic_geometry_scratch_bytes == 0U,
+           "independent bicubic mode reports no shared geometry");
+    expect(reused.unique_key_count == 18U
+               && reused.bicubic_geometry_family_count == 3U
+               && reused.bicubic_geometry_plan_count == 15U
+               && reused.bicubic_geometry_build_count == 3U
+               && reused.bicubic_geometry_scratch_bytes > 0U,
+           "bicubic geometry telemetry matches exact nonzero B/C families");
+
+    for (std::size_t family = 0; family < 3U; ++family) {
+        const std::size_t base = family * 7U;
+        expect(reused.plans[base + 6U].get() == reused.plans[base + 1U].get(),
+               "exact duplicate B/C requests retain Stage 1 pointer deduplication");
+        const auto &catrom = *reused.plans[base + 1U];
+        const auto &zero = *reused.plans[base + 3U];
+        expect(catrom.transpose_offsets != zero.transpose_offsets
+                   || catrom.transpose_indices != zero.transpose_indices,
+               "B=0,C=0 retains an independent sparse topology");
+    }
+}
+
 void test_exact_bit_key_distinctions_and_call_isolation() {
     const getnative::AxisPlanRequest base{
         64, 43, 43.25, 0.0, getnative::Filter::bicubic(0.2, 0.4),
@@ -327,6 +390,7 @@ int main() {
         test_empty_and_stable_deduplication();
         test_exact_plans_for_all_worker_modes();
         test_tap_reuse_is_byte_identical();
+        test_bicubic_geometry_reuse_is_byte_identical();
         test_exact_bit_key_distinctions_and_call_isolation();
         test_worker_bounds_and_peak_concurrency();
         test_lowest_stable_failure_is_rethrown_after_join();

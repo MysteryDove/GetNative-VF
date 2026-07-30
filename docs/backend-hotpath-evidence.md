@@ -24,17 +24,18 @@
 | MK2 B31/F16 | `REMOVED_AFTER_TEST` | Two valid fractional runs improved 4.83% and 4.997%, below the 5% gate |
 | CPU0 AArch64 adjacent-column SIMD | `KEPT` | Scalar and NEON workspaces and metrics are bit-identical; the primary candidate and the full named matrix pass |
 | PL0 exact tap reuse | `KEPT` | All 112 matrix cases are byte-identical, loop-derived raw weight calls are halved, and every valid paired case improves; Lanczos3-8 improve 31.92% to 37.18% |
-| PL1 B/C topology | `PENDING_EVALUATION` | PL0 is terminal; exact topology sharing still requires its independent byte, wall-time, and retained-memory gates |
-| MK3 arena/ring/cache | `PENDING_PL1` | Stage 1 is terminal and integrated; runtime reuse remains sequenced after PL1, while content caching also awaits the private identity/packing checkpoint |
+| PL1 B/C geometry reuse | `KEPT` | Eight B/C sweep cases improve 10.41% to 14.22% with byte-identical plans; the single-B/C control changes +0.224%, and all MAD, thermal, concurrency, isolation, and scratch-accounting gates pass |
+| PL1 packed topology interning | `PENDING_EVALUATION` | Geometry reuse is terminal; sharing immutable offsets/indices remains a separate representation and retained-memory experiment |
+| MK3 arena/ring/cache | `PENDING_PL1_TOPOLOGY` | Stage 1 and PL1 geometry are terminal; runtime reuse remains sequenced after packed-topology evaluation, while content caching also awaits the private identity/packing checkpoint |
 | MK4 Float16 coefficient storage | `PENDING_PREREQUISITES` | Strict Float32 remains the only retained path |
 
 ## Final Identity Set
 
-The final integrated evaluator and PL0 matrix evidence use these identities:
+The final integrated evaluator and PL1 matrix evidence use these identities:
 
 | Input | SHA-256 |
 | --- | --- |
-| Benchmark binary | `d4cbeffd48046abf8e9997fc75016b3367b329e17ee4b0e5dbbd66615c8ccecf` |
+| Benchmark binary | `4b5651e1a1e4a9e6c68bcd9fa14a114fc9b9eea1b62feb1ed53ad1ec80c5858d` |
 | Metallib | `a2e647dabf08b575c252600713eb5cf29b48e1687496088d6cb47af53ab7567c` |
 | Matrix JSON | `2a34ae9224d06565191977541efcb16d1fe182b94274624cf49daa9343534b06` |
 | Fixture PNG | `61f9ee1ac858bbadd6a959ba35f5eceb077b8452b91e97a5ce3d39ebc69e20c6` |
@@ -141,6 +142,47 @@ Identity and artifacts:
 Post-PL0 regression gates pass: Release Metal/upstream 11/11, CPU-only 9/9,
 focused TSan 1/1, Metal B3/F2 and B7/F4 improve 6.73% and 8.18%, and the CPU
 primary candidate improves 62.38% with bit-identical NEON/scalar results.
+
+## PL1 Bicubic Geometry Reuse
+
+The planner-private PL1 path groups exact geometry keys by source and
+destination size, active-length bits, shift bits, and border mode. For
+non-degenerate Bicubic B/C sweeps it builds the B/C-independent sampling
+distances and boundary mappings once per family. Each plan still evaluates its
+own B/C weights and zero mask, emits its own transpose values, forms its own
+normal bands, and performs its own LDLT factorization in the original order.
+`B=0,C=0` remains outside every shared family because its exact-zero weights
+produce a distinct sparse shape.
+
+The 21-pair formal matrix used 1,000 requests per case. Each sweep contained
+750 exact unique requests, 250 duplicate requests, and 125 geometry families;
+625 nonzero-B/C plans consumed those family geometries. Independent and reuse
+mode produced identical complete-plan SHA-256 values in all nine cases, exact
+duplicates retained Stage 1 pointer deduplication, and `(0,0)` remained
+topologically isolated.
+
+- The seven named heights improve 10.45% to 14.22%; the `800..899.9`
+  fractional scan improves 10.41%.
+- The 810-height sweep improves 10.91%.
+- The single-B/C 810 control changes +0.224%, below the 3% regression gate and
+  correctly builds zero geometry families.
+- Maximum paired MAD is 0.0123. Thermal state stays nominal, no concurrent
+  benchmark is detected, and all nine cases pass.
+- Temporary geometry scratch is 16,770,500 bytes for every 125-family sweep.
+  It is scoped to one batch call; PL1 adds no persistent cache and does not
+  change the public `AxisPlan` representation.
+
+Identity and artifacts:
+
+- Benchmark binary: `4b5651e1a1e4a9e6c68bcd9fa14a114fc9b9eea1b62feb1ed53ad1ec80c5858d`
+- Formal matrix: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/pl1-geometry-final/20260730T210140230Z-pid76595/planner-bicubic-geometry-report.json`
+- Post-PL1 Metal evaluator: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/20260730T210417100Z-pid86634/metal-kernel-report.json`
+- Post-PL1 CPU evaluator: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/20260730T210426441Z-pid86857/cpu-column-report.json`
+
+Post-PL1 regression gates pass: Release Metal/upstream 11/11, CPU-only 9/9,
+focused planner TSan 1/1, Metal B3/F2 and B7/F4 improve 6.32% and 7.95%, and
+the CPU primary whole-candidate path improves 62.62% with bit-identical
+NEON/scalar results.
 
 ## MK3 Readiness Boundary
 
