@@ -91,6 +91,7 @@ add_library(getnative_core STATIC
     src/geometry/crop_geometry.cpp
     src/geometry/profile.cpp
     src/planner/axis_plan.cpp
+    src/planner/axis_planner.cpp
     src/planner/filter.cpp
 )
 target_compile_features(getnative_core PUBLIC cxx_std_23)
@@ -198,6 +199,14 @@ if(BUILD_TESTING)
     add_test(NAME getnative_benchmark_support_tests
              COMMAND getnative_benchmark_support_tests)
 
+    add_executable(getnative_axis_planner_tests tests/axis_planner_test.cpp)
+    target_include_directories(getnative_axis_planner_tests PRIVATE src/planner)
+    target_link_libraries(getnative_axis_planner_tests PRIVATE getnative_core)
+    target_compile_features(getnative_axis_planner_tests PRIVATE cxx_std_23)
+    getnative_enable_warnings(getnative_axis_planner_tests)
+    getnative_enable_strict_fp(getnative_axis_planner_tests)
+    add_test(NAME getnative_axis_planner_tests COMMAND getnative_axis_planner_tests)
+
     add_test(NAME getnative_cli_capabilities COMMAND getnative-engine capabilities)
     if(GETNATIVE_ENABLE_METAL)
         set(GETNATIVE_EXPECTED_METAL_CAPABILITY "\"id\":\"metal\",\"compiled\":true")
@@ -285,6 +294,7 @@ endif()
 
 add_executable(getnative_core_benchmark bench/core_benchmark.cpp)
 target_link_libraries(getnative_core_benchmark PRIVATE getnative_core)
+target_include_directories(getnative_core_benchmark PRIVATE src/planner)
 target_compile_features(getnative_core_benchmark PRIVATE cxx_std_23)
 getnative_enable_warnings(getnative_core_benchmark)
 getnative_enable_strict_fp(getnative_core_benchmark)
@@ -293,6 +303,7 @@ getnative_configure_benchmark_metadata(getnative_core_benchmark)
 if(GETNATIVE_ENABLE_METAL)
     add_executable(getnative_metal_benchmark bench/metal_benchmark.cpp)
     target_link_libraries(getnative_metal_benchmark PRIVATE getnative_metal)
+    target_include_directories(getnative_metal_benchmark PRIVATE src/planner)
     target_compile_features(getnative_metal_benchmark PRIVATE cxx_std_23)
     getnative_enable_warnings(getnative_metal_benchmark)
     getnative_enable_strict_fp(getnative_metal_benchmark)

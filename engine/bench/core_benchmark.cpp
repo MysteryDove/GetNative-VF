@@ -3,7 +3,11 @@
 #include "getnative/axis_plan.hpp"
 #include "getnative/cpu_analysis.hpp"
 
+#include "axis_planner.hpp"
+
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -20,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -29,6 +34,7 @@ using Clock = std::chrono::steady_clock;
 struct Configuration {
     std::size_t samples = 1;
     bool assert_speedup = false;
+    bool compare_planner_modes = false;
     std::optional<std::filesystem::path> json_output;
 };
 
@@ -95,6 +101,30 @@ struct RuntimeMeasurements {
     std::size_t cache_size = 0;
 };
 
+struct PlanTiming {
+    double plan_ms = 0.0;
+    std::uint64_t checksum = 0U;
+    std::size_t unique_key_count = 0U;
+    std::size_t physical_build_count = 0U;
+    std::size_t peak_active_builds = 0U;
+    std::size_t effective_worker_count = 0U;
+};
+
+struct PairedPlanMeasurements {
+    std::string case_name;
+    std::size_t request_count = 0U;
+    std::size_t unique_key_count = 0U;
+    std::size_t requested_worker_count = 0U;
+    std::size_t effective_worker_count = 0U;
+    std::size_t peak_active_builds = 0U;
+    std::vector<bool> serial_first;
+    getnative::benchmark::Summary serial_plan_ms;
+    getnative::benchmark::Summary batch_plan_ms;
+    getnative::benchmark::Summary delta;
+    getnative::benchmark::Summary speedup;
+    getnative::benchmark::Summary overhead_us;
+};
+
 [[nodiscard]] std::size_t parse_size(std::string_view text) {
     std::size_t value = 0;
     const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
@@ -106,6 +136,7 @@ struct RuntimeMeasurements {
 
 [[nodiscard]] Configuration parse_arguments(int argc, char **argv) {
     Configuration result;
+    bool planner_mode_explicit = false;
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument{argv[index]};
         if (argument == "--assert") {
@@ -117,13 +148,20 @@ struct RuntimeMeasurements {
             if (mode != "serial") {
                 throw std::invalid_argument("Stage 0 supports only --planner-mode serial");
             }
+            planner_mode_explicit = true;
+        } else if (argument == "--compare-planner-modes") {
+            result.compare_planner_modes = true;
         } else if (argument == "--json-out" && index + 1 < argc) {
             result.json_output = std::filesystem::path{argv[++index]};
         } else {
             throw std::invalid_argument(
                 "usage: getnative_core_benchmark [--assert] [--samples N] "
-                "[--planner-mode serial] [--json-out PATH]");
+                "[--planner-mode serial | --compare-planner-modes] [--json-out PATH]");
         }
+    }
+    if (planner_mode_explicit && result.compare_planner_modes) {
+        throw std::invalid_argument(
+            "--planner-mode and --compare-planner-modes are mutually exclusive");
     }
     return result;
 }
@@ -267,6 +305,249 @@ template <class Function>
     };
 }
 
+[[nodiscard]] std::vector<getnative::AxisPlanRequest> make_plan_requests(
+    std::size_t request_count,
+    std::size_t unique_count) {
+    std::vector<getnative::AxisPlanRequest> unique_requests;
+    unique_requests.reserve(unique_count);
+    for (std::size_t index = 0; index < unique_count; ++index) {
+        const double active = 720.0
+            + static_cast<double>(index) / static_cast<double>(unique_count + 1U);
+        unique_requests.push_back({
+            1080, 720, active, 0.0, getnative::Filter::bicubic(),
+            getnative::BorderMode::mirror,
+        });
+    }
+    std::vector<getnative::AxisPlanRequest> requests;
+    requests.reserve(request_count);
+    for (std::size_t index = 0; index < request_count; ++index) {
+        requests.push_back(unique_requests[index % unique_count]);
+    }
+    return requests;
+}
+
+[[nodiscard]] PlanTiming run_plan_sample(
+    const std::vector<getnative::AxisPlanRequest> &requests,
+    bool batch,
+    std::size_t worker_count) {
+    std::vector<std::shared_ptr<const getnative::AxisPlan>> plans;
+    std::size_t unique_key_count = 0U;
+    std::size_t physical_build_count = 0U;
+    std::size_t peak_active_builds = 0U;
+    std::size_t effective_worker_count = 1U;
+    double plan_ms = 0.0;
+
+    if (batch) {
+        const auto start = Clock::now();
+        auto result = getnative::detail::build_axis_plans(
+            requests, {worker_count, {}, {}});
+        plans = std::move(result.plans);
+        plan_ms = std::chrono::duration<double, std::milli>(
+            Clock::now() - start).count();
+        unique_key_count = result.unique_key_count;
+        physical_build_count = result.physical_build_count;
+        peak_active_builds = result.peak_active_builds;
+        effective_worker_count = result.effective_worker_count;
+    } else {
+        plans.reserve(requests.size());
+        getnative::AxisPlanCache cache;
+        const auto start = Clock::now();
+        for (const auto &request : requests) plans.push_back(cache.get_or_build(request));
+        plan_ms = std::chrono::duration<double, std::milli>(
+            Clock::now() - start).count();
+        unique_key_count = cache.size();
+        physical_build_count = cache.size();
+        peak_active_builds = requests.empty() ? 0U : 1U;
+        effective_worker_count = requests.empty() ? 0U : 1U;
+    }
+
+    std::unordered_set<const getnative::AxisPlan *> distinct_plans;
+    std::uint64_t checksum = 0U;
+    for (const auto &plan : plans) {
+        if (!plan || !plan->valid()) {
+            throw std::runtime_error("paired planner produced an invalid plan");
+        }
+        distinct_plans.insert(plan.get());
+        checksum += static_cast<std::uint64_t>(plan->forward_weights.size());
+        checksum += static_cast<std::uint64_t>(plan->packed_factor_elements());
+        checksum ^= std::bit_cast<std::uint64_t>(plan->active_length);
+    }
+    if (plans.size() != requests.size() || distinct_plans.size() != unique_key_count
+        || physical_build_count != unique_key_count
+        || peak_active_builds > effective_worker_count) {
+        throw std::runtime_error("paired planner count or worker invariant changed");
+    }
+    return {
+        plan_ms, checksum, unique_key_count, physical_build_count,
+        peak_active_builds, effective_worker_count,
+    };
+}
+
+[[nodiscard]] PairedPlanMeasurements measure_plan_pairs(
+    std::string case_name,
+    const std::vector<getnative::AxisPlanRequest> &requests,
+    std::size_t expected_unique_count,
+    std::size_t worker_count,
+    std::size_t sample_count) {
+    const PlanTiming serial_warmup = run_plan_sample(requests, false, 1U);
+    const PlanTiming batch_warmup = run_plan_sample(requests, true, worker_count);
+    if (serial_warmup.checksum != batch_warmup.checksum
+        || serial_warmup.unique_key_count != expected_unique_count
+        || batch_warmup.unique_key_count != expected_unique_count) {
+        throw std::runtime_error("paired planner warmup changed plan identity or key count");
+    }
+
+    std::vector<bool> serial_first;
+    std::vector<double> serial_samples;
+    std::vector<double> batch_samples;
+    std::vector<double> deltas;
+    std::vector<double> speedups;
+    std::vector<double> overheads;
+    serial_first.reserve(sample_count);
+    serial_samples.reserve(sample_count);
+    batch_samples.reserve(sample_count);
+    deltas.reserve(sample_count);
+    speedups.reserve(sample_count);
+    overheads.reserve(sample_count);
+    std::size_t peak_active_builds = 0U;
+    const std::size_t effective_worker_count = batch_warmup.effective_worker_count;
+
+    for (std::size_t sample = 0; sample < sample_count; ++sample) {
+        const bool run_serial_first = (sample & 1U) == 0U;
+        PlanTiming serial;
+        PlanTiming batch;
+        if (run_serial_first) {
+            serial = run_plan_sample(requests, false, 1U);
+            batch = run_plan_sample(requests, true, worker_count);
+        } else {
+            batch = run_plan_sample(requests, true, worker_count);
+            serial = run_plan_sample(requests, false, 1U);
+        }
+        if (serial.checksum != batch.checksum
+            || serial.unique_key_count != expected_unique_count
+            || batch.unique_key_count != expected_unique_count
+            || batch.physical_build_count != expected_unique_count
+            || batch.effective_worker_count != effective_worker_count) {
+            throw std::runtime_error("paired planner sample changed identity or counts");
+        }
+        serial_first.push_back(run_serial_first);
+        serial_samples.push_back(serial.plan_ms);
+        batch_samples.push_back(batch.plan_ms);
+        deltas.push_back((batch.plan_ms - serial.plan_ms) / serial.plan_ms);
+        speedups.push_back(serial.plan_ms / batch.plan_ms);
+        overheads.push_back((batch.plan_ms - serial.plan_ms) * 1000.0);
+        peak_active_builds = std::max(peak_active_builds, batch.peak_active_builds);
+    }
+
+    return {
+        std::move(case_name), requests.size(), expected_unique_count, worker_count,
+        effective_worker_count, peak_active_builds, std::move(serial_first),
+        getnative::benchmark::summarize(std::move(serial_samples)),
+        getnative::benchmark::summarize(std::move(batch_samples)),
+        getnative::benchmark::summarize(std::move(deltas)),
+        getnative::benchmark::summarize(std::move(speedups)),
+        getnative::benchmark::summarize(std::move(overheads)),
+    };
+}
+
+[[nodiscard]] std::vector<PairedPlanMeasurements> benchmark_plan_pairs(
+    std::size_t sample_count) {
+    struct Case {
+        std::string_view name;
+        std::size_t request_count;
+        std::size_t unique_count;
+    };
+    constexpr std::array cases{
+        Case{"one-unique", 1U, 1U},
+        Case{"two-unique", 2U, 2U},
+        Case{"thirty-two-unique", 32U, 32U},
+        Case{"thousand-unique", 1000U, 1000U},
+        Case{"thousand-identical", 1000U, 1U},
+    };
+    constexpr std::array<std::size_t, 5> worker_counts{1U, 2U, 4U, 8U, 0U};
+    std::vector<PairedPlanMeasurements> results;
+    results.reserve(cases.size() * worker_counts.size());
+    for (const Case &benchmark_case : cases) {
+        const auto requests = make_plan_requests(
+            benchmark_case.request_count, benchmark_case.unique_count);
+        for (const std::size_t worker_count : worker_counts) {
+            results.push_back(measure_plan_pairs(
+                std::string{benchmark_case.name}, requests, benchmark_case.unique_count,
+                worker_count, sample_count));
+        }
+    }
+    return results;
+}
+
+void append_pair_order(std::ostream &output, const std::vector<bool> &serial_first) {
+    output << '[';
+    for (std::size_t index = 0; index < serial_first.size(); ++index) {
+        if (index != 0U) output << ',';
+        output << (serial_first[index]
+            ? "\"serial_then_batch\"" : "\"batch_then_serial\"");
+    }
+    output << ']';
+}
+
+[[nodiscard]] std::string core_measurement_status(
+    const Configuration &config,
+    const std::vector<PairedPlanMeasurements> &measurements) {
+    if (config.samples != 21U) return "TUNING_ONLY";
+    const auto decision_case = std::find_if(
+        measurements.begin(), measurements.end(), [](const auto &current) {
+            return current.case_name == "thousand-unique"
+                && current.requested_worker_count == 0U;
+        });
+    if (decision_case == measurements.end()) return "STAGE1_BLOCKED";
+    return decision_case->delta.mad > 0.025 ? "NO_DECISION_NOISY" : "MEASURED";
+}
+
+[[nodiscard]] std::string make_compare_json(
+    const Configuration &config,
+    const std::vector<PairedPlanMeasurements> &measurements,
+    int argc,
+    char **argv) {
+    std::ostringstream output;
+    output << '{';
+    getnative::benchmark::append_common_metadata(
+        output, "getnative_core_benchmark", "compare",
+        "synthetic-plan-paired-cases-v1", argc, argv);
+    output << ",\"sample_count\":" << config.samples
+           << ",\"warmup_count_per_mode\":1"
+           << ",\"stage1_measurement_status\":"
+           << getnative::benchmark::json_string(
+                  core_measurement_status(config, measurements))
+           << ",\"cases\":[";
+    for (std::size_t index = 0; index < measurements.size(); ++index) {
+        if (index != 0U) output << ',';
+        const PairedPlanMeasurements &current = measurements[index];
+        output << "{\"name\":" << getnative::benchmark::json_string(current.case_name)
+               << ",\"request_count\":" << current.request_count
+               << ",\"unique_key_count\":" << current.unique_key_count
+               << ",\"requested_worker_count\":" << current.requested_worker_count
+               << ",\"worker_mode\":"
+               << getnative::benchmark::json_string(
+                      current.requested_worker_count == 0U ? "auto" : "explicit")
+               << ",\"effective_worker_count\":" << current.effective_worker_count
+               << ",\"peak_active_builds\":" << current.peak_active_builds
+               << ",\"pair_order\":";
+        append_pair_order(output, current.serial_first);
+        output << ",\"serial_plan_ms\":";
+        getnative::benchmark::append_summary(output, current.serial_plan_ms);
+        output << ",\"batch_plan_ms\":";
+        getnative::benchmark::append_summary(output, current.batch_plan_ms);
+        output << ",\"delta\":";
+        getnative::benchmark::append_summary(output, current.delta);
+        output << ",\"speedup\":";
+        getnative::benchmark::append_summary(output, current.speedup);
+        output << ",\"overhead_us\":";
+        getnative::benchmark::append_summary(output, current.overhead_us);
+        output << '}';
+    }
+    output << "],\"correctness\":{\"assertions\":true}}\n";
+    return output.str();
+}
+
 [[nodiscard]] std::string make_json(
     const Configuration &config,
     int argc,
@@ -280,8 +561,8 @@ template <class Function>
     std::ostringstream output;
     output << '{';
     getnative::benchmark::append_common_metadata(
-        output, "getnative_core_benchmark", "synthetic-core-640x360-bicubic-batch32-v1",
-        argc, argv);
+        output, "getnative_core_benchmark", "serial",
+        "synthetic-core-640x360-bicubic-batch32-v1", argc, argv);
     output << ",\"sample_count\":" << config.samples
            << ",\"warmup_count\":1"
            << ",\"stage0_outcome\":\"NOT_APPLICABLE\""
@@ -314,6 +595,28 @@ int main(int argc, char **argv) {
         const Configuration config = parse_arguments(argc, argv);
         if (config.json_output) {
             getnative::benchmark::validate_json_output_path(*config.json_output);
+        }
+
+        if (config.compare_planner_modes) {
+            const auto measurements = benchmark_plan_pairs(config.samples);
+            for (const PairedPlanMeasurements &current : measurements) {
+                std::cout << "case=" << current.case_name
+                          << " workers="
+                          << (current.requested_worker_count == 0U
+                                  ? std::string{"auto"}
+                                  : std::to_string(current.requested_worker_count))
+                          << " effective=" << current.effective_worker_count
+                          << " serial_ms=" << current.serial_plan_ms.median
+                          << " batch_ms=" << current.batch_plan_ms.median
+                          << " speedup=" << current.speedup.median
+                          << " delta_mad=" << current.delta.mad << '\n';
+            }
+            if (config.json_output) {
+                getnative::benchmark::atomic_write_json(
+                    *config.json_output,
+                    make_compare_json(config, measurements, argc, argv));
+            }
+            return EXIT_SUCCESS;
         }
 
         const getnative::AxisPlanRequest request{

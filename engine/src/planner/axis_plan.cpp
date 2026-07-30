@@ -1,7 +1,8 @@
 #include "getnative/axis_plan.hpp"
 
+#include "axis_plan_key.hpp"
+
 #include <algorithm>
-#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -460,68 +461,17 @@ AxisPlan build_axis_plan(const AxisPlanRequest &request) {
     return plan;
 }
 
-namespace {
-
-struct PlanKey {
-    std::int32_t source_size;
-    std::int32_t destination_size;
-    std::uint64_t active_length;
-    std::uint64_t shift;
-    KernelType type;
-    std::uint64_t b;
-    std::uint64_t c;
-    std::int32_t taps;
-    BorderMode border;
-
-    friend bool operator==(const PlanKey &, const PlanKey &) = default;
-};
-
-struct PlanKeyHash {
-    [[nodiscard]] std::size_t operator()(const PlanKey &key) const noexcept {
-        std::size_t hash = 1469598103934665603ULL;
-        const auto mix = [&hash](std::uint64_t value) {
-            hash ^= static_cast<std::size_t>(value);
-            hash *= 1099511628211ULL;
-        };
-        mix(static_cast<std::uint32_t>(key.source_size));
-        mix(static_cast<std::uint32_t>(key.destination_size));
-        mix(key.active_length);
-        mix(key.shift);
-        mix(static_cast<std::uint8_t>(key.type));
-        mix(key.b);
-        mix(key.c);
-        mix(static_cast<std::uint32_t>(key.taps));
-        mix(static_cast<std::uint8_t>(key.border));
-        return hash;
-    }
-};
-
-[[nodiscard]] PlanKey plan_key(const AxisPlanRequest &request) noexcept {
-    return {
-        request.source_size,
-        request.destination_size,
-        std::bit_cast<std::uint64_t>(request.active_length),
-        std::bit_cast<std::uint64_t>(request.shift),
-        request.filter.type,
-        std::bit_cast<std::uint64_t>(request.filter.b),
-        std::bit_cast<std::uint64_t>(request.filter.c),
-        request.filter.taps,
-        request.border,
-    };
-}
-
-} // namespace
-
 struct AxisPlanCache::Impl {
     mutable std::mutex mutex;
-    std::unordered_map<PlanKey, std::shared_ptr<const AxisPlan>, PlanKeyHash> plans;
+    std::unordered_map<detail::PlanKey, std::shared_ptr<const AxisPlan>,
+                       detail::PlanKeyHash> plans;
 };
 
 AxisPlanCache::AxisPlanCache() : impl_(std::make_unique<Impl>()) {}
 AxisPlanCache::~AxisPlanCache() = default;
 
 std::shared_ptr<const AxisPlan> AxisPlanCache::get_or_build(const AxisPlanRequest &request) {
-    const PlanKey key = plan_key(request);
+    const detail::PlanKey key = detail::plan_key(request);
     {
         const std::scoped_lock lock(impl_->mutex);
         if (const auto found = impl_->plans.find(key); found != impl_->plans.end()) {

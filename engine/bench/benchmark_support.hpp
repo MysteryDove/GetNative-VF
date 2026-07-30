@@ -187,6 +187,7 @@ inline void append_summary(std::ostream &output, const Summary &summary) {
 inline void append_common_metadata(
     std::ostream &output,
     std::string_view benchmark_name,
+    std::string_view planner_mode,
     std::string_view fixture_identity,
     int argc,
     char **argv) {
@@ -200,7 +201,7 @@ inline void append_common_metadata(
         output << json_string(argv[index]);
     }
     output << "]"
-           << ",\"planner_mode\":\"serial\""
+           << ",\"planner_mode\":" << json_string(planner_mode)
            << ",\"fixture_identity\":" << json_string(fixture_identity)
            << ",\"source_identity_sha256\":" << json_string(GETNATIVE_BENCHMARK_SOURCE_ID)
            << ",\"executable\":{\"path\":" << json_string(executable.string())

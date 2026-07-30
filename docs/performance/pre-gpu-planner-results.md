@@ -87,3 +87,97 @@ each remains conditional on the next measured result.
 
 The earlier `20260730T173954Z` run is retained only as diagnostic history. Its
 source identity predates the final Stage 0 fixes and it is not gate evidence.
+
+## Stage 1: Bounded Unique-Plan Batch Construction
+
+- Branch: `perf/pre-gpu-stage1`
+- Evaluator: `scripts/run_planner_evaluator.sh stage1`
+- Run directory: `artifacts/stage1/20260730T193106Z`
+- Engine source identity:
+  `4e647ebd58c7f524f331123deb15d556c3f05fe2bf45367f3fc56876a8ee33c4`
+- Core executable FNV-1a 64: `ec515f53ee2cd181`
+- Metal executable FNV-1a 64: `5db1d4b78d3ae740`
+- Core JSON SHA-256:
+  `c0efb6341ec3ec7bbb071a813a7602825c9e67a55300edc135edc60e0d5fedc4`
+- Metal JSON SHA-256:
+  `0a3a95a7802a244b1ce168a2363c9f249b66507b74595869edbb8902ef13f8df`
+- Host-load snapshot SHA-256 (before/after):
+  `dd55b1415f4b490702b10e0696ba491d3fb76f3bba6d9f67812ce7b9b0dbe7e1` /
+  `ebdf63121a1ce20d14ef333b7805ee74702188d89806ff75d23b384acf63bd1a`
+- Process snapshot SHA-256 (before/after):
+  `716f80393d9660ea0ab40e18ce8cd7e656495c49808d40054d97571bac95583b` /
+  `4d7b40bf1ddf2e09b7ebfbf6ecaff3ecdac1db9bfbacbab28809a05a72143f0b`
+
+The immutable JSON and host snapshots are gitignored runtime evidence. Their
+hashes and the decision facts below are retained for integration.
+
+### Verification
+
+- Release build with Metal and upstream conformance: pass, `9/9` tests.
+- CPU-only build with upstream conformance: pass, `8/8` tests.
+- Focused `getnative_axis_planner_tests` under ThreadSanitizer: pass, `1/1`.
+- Core and Metal decision artifacts each contain 21 alternating-order pairs and
+  report `stage1_measurement_status=MEASURED`.
+- Current source identity, compiled definitions, JSON identities, and both
+  executable hashes agree.
+- All raw sample counts, pair orders, deltas, speedups, overheads,
+  medians, MADs, minima, maxima, and phase-total formulas were independently
+  recomputed from the JSON and agree with the stored values.
+- Stable exact-key deduplication, byte-exact plan output, requested output
+  order, worker caps, deterministic failure selection, stop-claiming behavior,
+  and join-before-rethrow are covered by the focused planner test.
+- Existing `AxisPlanCache` tests remain green. The batch helper has no
+  cross-call state and is consumed only by benchmark pre-execution paths.
+- Both process snapshots contain no competing GetNative benchmark, and the run
+  directory contains all six expected files with no `.tmp` residue.
+
+### Results
+
+| Metric | Serial | Batch | Paired delta/speedup | Gate |
+| --- | ---: | ---: | ---: | --- |
+| Core 1000-unique auto plan median | `105.617584 ms` | `15.807875 ms` | `6.653403x` | `>=2x`: pass |
+| Metal 1000-unique plan median | `105.683750 ms` | `15.832875 ms` | `6.661206x` | `>=2x`: pass |
+| Metal plan paired-delta MAD | - | - | `0.003829` | `<=0.025`: pass |
+| 1-request auto plan median | `143.958 us` | `143.875 us` | `0.500 us` paired overhead | `<=14.396 us`: pass |
+| 2-request auto plan median | `204.167 us` | `209.334 us` | `4.458 us` paired overhead | `<=20.417 us`: pass |
+| Metal execution median | `102.596042 ms` | `102.489833 ms` | `+0.0529%` paired regression | `<=5%`: pass |
+| Metal total median | `209.773499 ms` | `118.322708 ms` | `43.5702%` paired improvement | `>=5%`: pass |
+| Metal-total paired-delta MAD | - | - | `0.007216` | `<=0.025`: pass |
+| Correctness/conformance/TSan | pass | pass | exact/tolerance gates green | pass |
+
+Every explicit and auto 1/2-request case passes its overhead bound. Across all
+ten small cases, the largest paired median overhead is `5.667 us`, below its
+`22.058 us` bound. Core auto mode used eight workers for 1000 unique keys and
+reported peak concurrency eight. The Metal batch path likewise built all 1000
+unique keys once with peak/effective concurrency eight.
+
+Correctness and resource results:
+
+- maximum metric error: `5.6093972883308751e-8`;
+- valley step distance: `0`;
+- Metal peak workspace: `176947200` bytes (`168.750 MiB`);
+- Metal explicit working set: `264482784` bytes (`252.230 MiB`).
+
+### Noise Assessment
+
+Host load averages rose from `8.29 6.91 8.59` before the paired run to
+`46.98 19.82 13.34` after it, so this result does not support absolute timing
+comparisons with a different run. The decision uses same-process alternating
+pairs. Metal plan paired-delta MAD is `0.003829` and Metal-total paired-delta
+MAD is `0.007216`, both well below the `0.025` validity limit. The performance
+gates are therefore not sensitive to the observed host-load change.
+
+### Decision
+
+`ADOPT_AND_STOP`
+
+All correctness, conformance, TSan, variance, small-batch overhead, planner
+speedup, Metal execution-regression, and Metal-total improvement gates pass.
+Keep the private bounded batch planner and stop Stage 1 without a revision.
+
+After batching, planner share of the phase-separated Metal total has median
+`0.132946`, still above the PRD's `0.10` direction threshold. This selects one
+small follow-up measurement stage for persistent worker reuse. It does not
+authorize cross-call single-flight, persistent plan caching, a broader
+scheduler, or GPU-backend changes; those remain skipped unless later benchmark
+evidence independently justifies them.
