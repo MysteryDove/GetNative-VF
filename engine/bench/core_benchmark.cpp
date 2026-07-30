@@ -1,16 +1,22 @@
+#include "benchmark_support.hpp"
+
 #include "getnative/axis_plan.hpp"
 #include "getnative/cpu_analysis.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -20,19 +26,110 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+struct Configuration {
+    std::size_t samples = 1;
+    bool assert_speedup = false;
+    std::optional<std::filesystem::path> json_output;
+};
+
 struct DenseReference {
     std::vector<double> factor;
     double checksum = 0.0;
 };
 
-struct RuntimeReference {
+struct RuntimeFixture {
+    static constexpr std::int32_t width = 640;
+    static constexpr std::int32_t height = 360;
+    static constexpr std::int32_t native_width = 426;
+    static constexpr std::int32_t native_height = 240;
+    static constexpr std::size_t candidate_count = 32;
+
+    std::vector<float> source;
+    std::vector<std::string> candidate_ids;
+    getnative::AxisPlanRequest horizontal_request{
+        width, native_width, static_cast<double>(native_width), 0.0,
+        getnative::Filter::bicubic(), getnative::BorderMode::mirror,
+    };
+    getnative::AxisPlanRequest vertical_request{
+        height, native_height, static_cast<double>(native_height), 0.0,
+        getnative::Filter::bicubic(), getnative::BorderMode::mirror,
+    };
+    getnative::MetricSpec metric{5, 5, 5, 5, 0.015F, 1U};
+
+    RuntimeFixture()
+        : source(static_cast<std::size_t>(width) * static_cast<std::size_t>(height)) {
+        for (std::size_t index = 0; index < source.size(); ++index) {
+            source[index] = static_cast<float>(
+                (index * 131U + (index >> 3U) * 17U) % 1024U) / 1023.0F;
+        }
+        candidate_ids.reserve(candidate_count);
+        for (std::size_t index = 0; index < candidate_count; ++index) {
+            candidate_ids.push_back(std::to_string(index));
+        }
+    }
+
+    [[nodiscard]] getnative::ConstImageView view() const noexcept {
+        return {source.data(), width, height, width};
+    }
+};
+
+struct CandidateReference {
     double candidate_ns = 0.0;
-    double batch_ns = 0.0;
     std::size_t workspace_elements = 0;
     double checksum = 0.0;
 };
 
-[[nodiscard]] DenseReference build_dense_reference(const getnative::AxisPlanRequest &request) {
+struct RuntimeSample {
+    double plan_ms = 0.0;
+    double cpu_ms = 0.0;
+    double cpu_total_ms = 0.0;
+    double checksum = 0.0;
+    std::size_t cache_size = 0;
+};
+
+struct RuntimeMeasurements {
+    getnative::benchmark::Summary plan_ms;
+    getnative::benchmark::Summary cpu_ms;
+    getnative::benchmark::Summary cpu_total_ms;
+    double checksum = 0.0;
+    std::size_t cache_size = 0;
+};
+
+[[nodiscard]] std::size_t parse_size(std::string_view text) {
+    std::size_t value = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || value == 0U) {
+        throw std::invalid_argument("numeric option must be a positive integer");
+    }
+    return value;
+}
+
+[[nodiscard]] Configuration parse_arguments(int argc, char **argv) {
+    Configuration result;
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument{argv[index]};
+        if (argument == "--assert") {
+            result.assert_speedup = true;
+        } else if (argument == "--samples" && index + 1 < argc) {
+            result.samples = parse_size(argv[++index]);
+        } else if (argument == "--planner-mode" && index + 1 < argc) {
+            const std::string_view mode{argv[++index]};
+            if (mode != "serial") {
+                throw std::invalid_argument("Stage 0 supports only --planner-mode serial");
+            }
+        } else if (argument == "--json-out" && index + 1 < argc) {
+            result.json_output = std::filesystem::path{argv[++index]};
+        } else {
+            throw std::invalid_argument(
+                "usage: getnative_core_benchmark [--assert] [--samples N] "
+                "[--planner-mode serial] [--json-out PATH]");
+        }
+    }
+    return result;
+}
+
+[[nodiscard]] DenseReference build_dense_reference(
+    const getnative::AxisPlanRequest &request) {
     const auto plan = getnative::build_axis_plan(request);
     const std::size_t n = static_cast<std::size_t>(request.destination_size);
     std::vector<double> normal(n * n);
@@ -75,98 +172,154 @@ template <class Function>
     for (;;) {
         const auto start = Clock::now();
         double checksum = 0.0;
-        for (std::size_t i = 0; i < repetitions; ++i) checksum += function();
+        for (std::size_t index = 0; index < repetitions; ++index) checksum += function();
         const auto elapsed = Clock::now() - start;
         if (!std::isfinite(checksum)) throw std::runtime_error("benchmark checksum is nonfinite");
         if (elapsed >= target || repetitions >= 4096U) {
-            return static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count())
+            return static_cast<double>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count())
                 / static_cast<double>(repetitions);
         }
         repetitions *= 2U;
     }
 }
 
-[[nodiscard]] double median(std::vector<double> values) {
-    std::sort(values.begin(), values.end());
-    return values[values.size() / 2U];
-}
-
-[[nodiscard]] RuntimeReference benchmark_runtime() {
-    constexpr std::int32_t width = 640;
-    constexpr std::int32_t height = 360;
-    constexpr std::int32_t native_width = 426;
-    constexpr std::int32_t native_height = 240;
-    std::vector<float> source(static_cast<std::size_t>(width)
-                              * static_cast<std::size_t>(height));
-    for (std::size_t i = 0; i < source.size(); ++i) {
-        source[i] = static_cast<float>((i * 131U + (i >> 3U) * 17U) % 1024U) / 1023.0F;
-    }
+[[nodiscard]] CandidateReference benchmark_candidate(const RuntimeFixture &fixture) {
     const auto horizontal = std::make_shared<const getnative::AxisPlan>(
-        getnative::build_axis_plan({width, native_width, static_cast<double>(native_width),
-                                    0.0, getnative::Filter::bicubic(),
-                                    getnative::BorderMode::mirror}));
+        getnative::build_axis_plan(fixture.horizontal_request));
     const auto vertical = std::make_shared<const getnative::AxisPlan>(
-        getnative::build_axis_plan({height, native_height, static_cast<double>(native_height),
-                                    0.0, getnative::Filter::bicubic(),
-                                    getnative::BorderMode::mirror}));
-    const getnative::ConstImageView view{source.data(), width, height, width};
-    const getnative::MetricSpec metric{5, 5, 5, 5, 0.015F, 1U};
+        getnative::build_axis_plan(fixture.vertical_request));
     getnative::CpuWorkspace workspace;
     const double warmup = getnative::analyze_candidate_f32(
-        view, *horizontal, *vertical, metric, workspace);
+        fixture.view(), *horizontal, *vertical, fixture.metric, workspace);
 
-    std::vector<double> candidate_samples;
+    std::vector<double> samples;
     for (int sample = 0; sample < 7; ++sample) {
         const auto start = Clock::now();
         const double value = getnative::analyze_candidate_f32(
-            view, *horizontal, *vertical, metric, workspace);
+            fixture.view(), *horizontal, *vertical, fixture.metric, workspace);
         const auto elapsed = Clock::now() - start;
         if (value != warmup) throw std::runtime_error("candidate benchmark is not deterministic");
-        candidate_samples.push_back(static_cast<double>(
+        samples.push_back(static_cast<double>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()));
     }
-
-    std::vector<getnative::CandidateAnalysis> candidates;
-    candidates.reserve(32U);
-    for (std::size_t i = 0; i < 32U; ++i) {
-        candidates.push_back({std::to_string(i), horizontal, vertical,
-                              getnative::AnalysisAxes::both});
-    }
-    const auto batch_start = Clock::now();
-    const auto results = getnative::analyze_batch_f32(view, candidates, metric);
-    const auto batch_elapsed = Clock::now() - batch_start;
-    for (const auto &result : results) {
-        if (result.error != warmup) throw std::runtime_error("batch benchmark changed the metric");
-    }
     return {
-        median(std::move(candidate_samples)),
-        static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            batch_elapsed).count()),
+        getnative::benchmark::median(std::move(samples)),
         workspace.peak_elements(),
         warmup,
     };
 }
 
+[[nodiscard]] RuntimeSample run_runtime_sample(const RuntimeFixture &fixture) {
+    getnative::AxisPlanCache cache;
+    std::vector<getnative::CandidateAnalysis> candidates;
+    candidates.reserve(fixture.candidate_ids.size());
+
+    const auto plan_start = Clock::now();
+    for (const auto &id : fixture.candidate_ids) {
+        candidates.push_back({
+            id,
+            cache.get_or_build(fixture.horizontal_request),
+            cache.get_or_build(fixture.vertical_request),
+            getnative::AnalysisAxes::both,
+        });
+    }
+    const auto plan_elapsed = Clock::now() - plan_start;
+
+    const auto cpu_start = Clock::now();
+    const auto results = getnative::analyze_batch_f32(
+        fixture.view(), candidates, fixture.metric);
+    const auto cpu_elapsed = Clock::now() - cpu_start;
+
+    double checksum = 0.0;
+    for (const auto &result : results) checksum += result.error;
+    const double plan_ms = std::chrono::duration<double, std::milli>(plan_elapsed).count();
+    const double cpu_ms = std::chrono::duration<double, std::milli>(cpu_elapsed).count();
+    return {plan_ms, cpu_ms, plan_ms + cpu_ms, checksum, cache.size()};
+}
+
+[[nodiscard]] RuntimeMeasurements benchmark_runtime(
+    const RuntimeFixture &fixture,
+    std::size_t sample_count) {
+    const RuntimeSample warmup = run_runtime_sample(fixture);
+    std::vector<double> plan_samples;
+    std::vector<double> cpu_samples;
+    std::vector<double> total_samples;
+    plan_samples.reserve(sample_count);
+    cpu_samples.reserve(sample_count);
+    total_samples.reserve(sample_count);
+
+    for (std::size_t sample = 0; sample < sample_count; ++sample) {
+        const RuntimeSample current = run_runtime_sample(fixture);
+        if (current.checksum != warmup.checksum || current.cache_size != 2U) {
+            throw std::runtime_error("core staged benchmark changed result or cache cardinality");
+        }
+        plan_samples.push_back(current.plan_ms);
+        cpu_samples.push_back(current.cpu_ms);
+        total_samples.push_back(current.cpu_total_ms);
+    }
+    return {
+        getnative::benchmark::summarize(std::move(plan_samples)),
+        getnative::benchmark::summarize(std::move(cpu_samples)),
+        getnative::benchmark::summarize(std::move(total_samples)),
+        warmup.checksum,
+        warmup.cache_size,
+    };
+}
+
+[[nodiscard]] std::string make_json(
+    const Configuration &config,
+    int argc,
+    char **argv,
+    double banded_ns,
+    double dense_ns,
+    double planner_speedup,
+    const CandidateReference &candidate,
+    const RuntimeMeasurements &runtime,
+    bool assertions_pass) {
+    std::ostringstream output;
+    output << '{';
+    getnative::benchmark::append_common_metadata(
+        output, "getnative_core_benchmark", "synthetic-core-640x360-bicubic-batch32-v1",
+        argc, argv);
+    output << ",\"sample_count\":" << config.samples
+           << ",\"warmup_count\":1"
+           << ",\"stage0_outcome\":\"NOT_APPLICABLE\""
+           << ",\"anchors\":{\"banded_us\":" << std::setprecision(17)
+           << banded_ns / 1000.0
+           << ",\"dense_us\":" << dense_ns / 1000.0
+           << ",\"planner_speedup\":" << planner_speedup
+           << ",\"candidate_640x360_us\":" << candidate.candidate_ns / 1000.0
+           << '}'
+           << ",\"metrics\":{\"plan_ms\":";
+    getnative::benchmark::append_summary(output, runtime.plan_ms);
+    output << ",\"cpu_ms\":";
+    getnative::benchmark::append_summary(output, runtime.cpu_ms);
+    output << ",\"cpu_total_ms\":";
+    getnative::benchmark::append_summary(output, runtime.cpu_total_ms);
+    output << "}"
+           << ",\"correctness\":{\"cache_size\":" << runtime.cache_size
+           << ",\"workspace_elements\":" << candidate.workspace_elements
+           << ",\"metric_checksum\":" << std::setprecision(17) << candidate.checksum
+           << ",\"batch_checksum\":" << runtime.checksum
+           << ",\"assertions\":" << (assertions_pass ? "true" : "false") << "}"
+           << "}\n";
+    return output.str();
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
-    bool assert_speedup = false;
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view argument{argv[i]};
-        if (argument == "--assert") {
-            assert_speedup = true;
-        } else {
-            std::cerr << "usage: getnative_core_benchmark [--assert]\n";
-            return EXIT_FAILURE;
-        }
-    }
-
-    // Representative 480p-width bicubic axis. Dense storage is 2.8 MiB; the
-    // banded planner stores seven factor bands and performs bounded-band work.
-    const getnative::AxisPlanRequest request{854, 600, 600.0, 0.0,
-                                             getnative::Filter::bicubic(),
-                                             getnative::BorderMode::mirror};
     try {
+        const Configuration config = parse_arguments(argc, argv);
+        if (config.json_output) {
+            getnative::benchmark::validate_json_output_path(*config.json_output);
+        }
+
+        const getnative::AxisPlanRequest request{
+            854, 600, 600.0, 0.0, getnative::Filter::bicubic(),
+            getnative::BorderMode::mirror,
+        };
         (void)getnative::build_axis_plan(request);
         (void)build_dense_reference(request);
         std::vector<double> banded_samples;
@@ -181,27 +334,45 @@ int main(int argc, char **argv) {
                 return build_dense_reference(request).checksum;
             }));
         }
-        const double banded_ns = median(std::move(banded_samples));
-        const double dense_ns = median(std::move(dense_samples));
+        const double banded_ns = getnative::benchmark::median(std::move(banded_samples));
+        const double dense_ns = getnative::benchmark::median(std::move(dense_samples));
         const double speedup = dense_ns / banded_ns;
-        const RuntimeReference runtime = benchmark_runtime();
+
+        const RuntimeFixture fixture;
+        const CandidateReference candidate = benchmark_candidate(fixture);
+        const RuntimeMeasurements runtime = benchmark_runtime(fixture, config.samples);
         constexpr std::size_t expected_workspace = 640U * 240U + 426U * 240U + 640U;
+        const bool assertions_pass = speedup >= 2.0 && std::isfinite(speedup)
+            && candidate.workspace_elements == expected_workspace;
+
         std::cout << std::fixed << std::setprecision(3)
                   << "case=bicubic source=854 destination=600 active=600 shift=0 border=mirror\n"
                   << "banded_us=" << banded_ns / 1000.0 << '\n'
                   << "dense_us=" << dense_ns / 1000.0 << '\n'
                   << "planner_speedup=" << speedup << "x\n"
-                  << "candidate_640x360_us=" << runtime.candidate_ns / 1000.0 << '\n'
-                  << "batch32_ms=" << runtime.batch_ns / 1'000'000.0 << '\n'
-                  << "batch_candidates_per_s=" << 32'000'000'000.0 / runtime.batch_ns << '\n'
-                  << "workspace_elements=" << runtime.workspace_elements << '\n'
-                  << "metric_checksum=" << runtime.checksum << '\n';
-        if (assert_speedup && (!(speedup >= 2.0) || !std::isfinite(speedup))) {
-            std::cerr << "benchmark assertion failed: planner speedup must be at least 2.0x\n";
-            return EXIT_FAILURE;
+                  << "candidate_640x360_us=" << candidate.candidate_ns / 1000.0 << '\n'
+                  << "batch32_ms=" << runtime.cpu_ms.median << '\n'
+                  << "batch_candidates_per_s="
+                  << static_cast<double>(RuntimeFixture::candidate_count) * 1000.0
+                      / runtime.cpu_ms.median
+                  << '\n'
+                  << "workspace_elements=" << candidate.workspace_elements << '\n'
+                  << "metric_checksum=" << candidate.checksum << '\n'
+                  << "planner_mode=serial\n"
+                  << "samples=" << config.samples << '\n'
+                  << "plan_ms=" << runtime.plan_ms.median << '\n'
+                  << "plan_mad_ms=" << runtime.plan_ms.mad << '\n'
+                  << "cpu_total_ms=" << runtime.cpu_total_ms.median << '\n'
+                  << "cpu_total_mad_ms=" << runtime.cpu_total_ms.mad << '\n';
+
+        if (config.json_output) {
+            getnative::benchmark::atomic_write_json(
+                *config.json_output,
+                make_json(config, argc, argv, banded_ns, dense_ns, speedup,
+                          candidate, runtime, assertions_pass));
         }
-        if (assert_speedup && runtime.workspace_elements != expected_workspace) {
-            std::cerr << "benchmark assertion failed: workspace must reuse one intermediate buffer\n";
+        if (config.assert_speedup && !assertions_pass) {
+            std::cerr << "benchmark assertion failed: planner speedup or workspace invariant\n";
             return EXIT_FAILURE;
         }
         return EXIT_SUCCESS;
