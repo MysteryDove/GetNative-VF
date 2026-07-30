@@ -63,6 +63,7 @@ struct Configuration {
     bool required_simd = false;
     bool planner_taps = false;
     bool planner_bicubic_geometry = false;
+    bool metal_working_buffers = false;
     bool assert_gates = false;
 };
 
@@ -356,6 +357,8 @@ struct BicubicGeometryCaseReport {
             result.planner_taps = true;
         } else if (argument == "--planner-bicubic-geometry") {
             result.planner_bicubic_geometry = true;
+        } else if (argument == "--metal-working-buffers") {
+            result.metal_working_buffers = true;
         } else if (argument == "--assert") {
             result.assert_gates = true;
         } else {
@@ -364,7 +367,8 @@ struct BicubicGeometryCaseReport {
                 "(--json-out PATH|--artifact-root PATH) [--samples N] "
                 "[--controls-only|--full-matrix|--sustained] [--case ID] "
                 "[--required-specialized] [--cpu-columns [--required-simd]] "
-                "[--planner-taps|--planner-bicubic-geometry] [--assert]");
+                "[--planner-taps|--planner-bicubic-geometry|--metal-working-buffers] "
+                "[--assert]");
         }
     }
     if (result.matrix_path.empty() || result.fixture_path.empty()) {
@@ -392,9 +396,17 @@ struct BicubicGeometryCaseReport {
         throw std::invalid_argument(
             "planner diagnostics are incompatible with CPU, specialization, and sustained modes");
     }
-    if (result.planner_taps && result.planner_bicubic_geometry) {
+    if (result.metal_working_buffers
+        && (result.cpu_columns || result.required_simd)) {
         throw std::invalid_argument(
-            "choose exactly one planner diagnostic mode");
+            "Metal working-buffer diagnostics are incompatible with CPU modes");
+    }
+    const std::size_t diagnostic_mode_count = static_cast<std::size_t>(result.planner_taps)
+        + static_cast<std::size_t>(result.planner_bicubic_geometry)
+        + static_cast<std::size_t>(result.metal_working_buffers);
+    if (diagnostic_mode_count > 1U) {
+        throw std::invalid_argument(
+            "choose exactly one diagnostic mode");
     }
     return result;
 }
@@ -1555,12 +1567,21 @@ struct BicubicTopologyStats {
 
     getnative::MetalAnalysisOptions generic_options{
         matrix.tile_size, matrix.reduction_groups, 0, false, matrix.inverse_threads,
-        getnative::MetalKernelDispatchPolicy::generic_only,
+        config.metal_working_buffers
+            ? (config.required_specialized
+                ? getnative::MetalKernelDispatchPolicy::required_specialized
+                : getnative::MetalKernelDispatchPolicy::automatic)
+            : getnative::MetalKernelDispatchPolicy::generic_only,
     };
     getnative::MetalAnalysisOptions comparison_options = generic_options;
-    comparison_options.kernel_dispatch = config.required_specialized
-        ? getnative::MetalKernelDispatchPolicy::required_specialized
-        : getnative::MetalKernelDispatchPolicy::automatic;
+    if (config.metal_working_buffers) {
+        generic_options.reuse_working_buffers = false;
+        comparison_options.reuse_working_buffers = true;
+    } else {
+        comparison_options.kernel_dispatch = config.required_specialized
+            ? getnative::MetalKernelDispatchPolicy::required_specialized
+            : getnative::MetalKernelDispatchPolicy::automatic;
+    }
     getnative::MetalAnalysisEngine generic(generic_options);
     getnative::MetalAnalysisEngine comparison(comparison_options);
     const auto generic_creation = generic.runtime_telemetry();
@@ -1589,11 +1610,11 @@ struct BicubicTopologyStats {
         PairSample pair;
         pair.host_before = capture_host_observation();
         if (sample % 2U == 0U) {
-            pair.first_mode = "generic";
+            pair.first_mode = config.metal_working_buffers ? "transient" : "generic";
             pair.generic = measure(generic, source, candidates, matrix.metric);
             pair.comparison = measure(comparison, source, candidates, matrix.metric);
         } else {
-            pair.first_mode = "comparison";
+            pair.first_mode = config.metal_working_buffers ? "persistent" : "comparison";
             pair.comparison = measure(comparison, source, candidates, matrix.metric);
             pair.generic = measure(generic, source, candidates, matrix.metric);
         }
@@ -1624,8 +1645,11 @@ struct BicubicTopologyStats {
         deltas.end() - static_cast<std::ptrdiff_t>(decile_count), deltas.end()));
     report.generic_accuracy = accuracy_against(cpu, report.samples.front().generic.results);
     report.comparison_accuracy = accuracy_against(cpu, report.samples.front().comparison.results);
-    report.maximum_path_difference = maximum_difference(
-        report.samples.front().generic.results, report.samples.front().comparison.results);
+    for (const PairSample &sample : report.samples) {
+        report.maximum_path_difference = std::max(
+            report.maximum_path_difference,
+            maximum_difference(sample.generic.results, sample.comparison.results));
+    }
     report.generic_peak_working_set = generic.peak_working_set_bytes();
     report.comparison_peak_working_set = comparison.peak_working_set_bytes();
     report.cpu_results = std::move(cpu);
@@ -1634,6 +1658,43 @@ struct BicubicTopologyStats {
         && report.host_after.thermal_state == report.host_before.thermal_state;
     report.concurrent_process_detected = report.concurrent_process_detected
         || !report.host_after.concurrent_processes.empty();
+    std::vector<double> baseline_working_allocation_times;
+    std::vector<double> comparison_working_allocation_times;
+    baseline_working_allocation_times.reserve(report.samples.size());
+    comparison_working_allocation_times.reserve(report.samples.size());
+    bool working_buffer_telemetry_exact = true;
+    for (const PairSample &sample : report.samples) {
+        const auto &baseline = sample.generic.telemetry;
+        const auto &comparison = sample.comparison.telemetry;
+        baseline_working_allocation_times.push_back(
+            baseline.working_buffer_allocation_ms);
+        comparison_working_allocation_times.push_back(
+            comparison.working_buffer_allocation_ms);
+        working_buffer_telemetry_exact = working_buffer_telemetry_exact
+            && baseline.working_buffer_allocation_count == 3U
+            && baseline.working_buffer_retained_bytes == 0U
+            && comparison.working_buffer_allocation_count == 0U
+            && comparison.working_buffer_reuse_count == 3U
+            && comparison.working_buffer_retained_bytes > 0U;
+    }
+    const double baseline_working_allocation_median = median(
+        baseline_working_allocation_times);
+    const double comparison_working_allocation_median = median(
+        comparison_working_allocation_times);
+    const bool primary_working_buffer_case = !benchmark_case.fractional_scan
+        && benchmark_case.native_height == matrix.primary_native_height
+        && benchmark_case.filter.id == matrix.cpu_primary_filter_id;
+    const double maximum_working_buffer_delta = primary_working_buffer_case ? -0.03 : 0.03;
+    const bool working_buffer_gate = !config.metal_working_buffers
+        || (report.maximum_path_difference == 0.0
+            && working_buffer_telemetry_exact
+            && baseline_working_allocation_median > 0.0
+            && comparison_working_allocation_median
+                <= 0.5 * baseline_working_allocation_median
+            && report.comparison_peak_working_set
+                <= static_cast<std::size_t>(
+                    1.05 * static_cast<double>(report.generic_peak_working_set))
+            && report.paired_delta_median <= maximum_working_buffer_delta);
     report.gate_passed = report.generic_accuracy.within_tolerance
         && report.comparison_accuracy.within_tolerance
         && report.generic_accuracy.valley_distance <= 1
@@ -1643,9 +1704,14 @@ struct BicubicTopologyStats {
         && !report.concurrent_process_detected
         && report.generic_peak_working_set < absolute_working_set_limit
         && report.comparison_peak_working_set < absolute_working_set_limit
-        && (!config.required_specialized || report.paired_delta_median <= -0.05)
+        && working_buffer_gate
+        && (config.metal_working_buffers
+            || !config.required_specialized || report.paired_delta_median <= -0.05)
         && (!config.required_specialized
-            || report.samples.front().comparison.telemetry.specialized_tile_count > 0);
+            || (config.metal_working_buffers
+                ? (report.samples.front().generic.telemetry.specialized_tile_count > 0
+                   && report.samples.front().comparison.telemetry.specialized_tile_count > 0)
+                : report.samples.front().comparison.telemetry.specialized_tile_count > 0));
     return report;
 }
 
@@ -1887,9 +1953,24 @@ void update_cpu_correctness(CpuCaseReport &report,
     return @{
         @"buffer_allocation_count": @(value.buffer_allocation_count),
         @"buffer_allocation_bytes": @(value.buffer_allocation_bytes),
+        @"working_buffer_allocation_count": @(value.working_buffer_allocation_count),
+        @"working_buffer_allocation_bytes": @(value.working_buffer_allocation_bytes),
+        @"working_buffer_reuse_count": @(value.working_buffer_reuse_count),
+        @"working_buffer_active_bytes": @(value.working_buffer_active_bytes),
+        @"working_buffer_retained_bytes": @(value.working_buffer_retained_bytes),
+        @"working_buffer_peak_active_bytes": @(value.working_buffer_peak_active_bytes),
+        @"working_buffer_peak_retained_bytes": @(value.working_buffer_peak_retained_bytes),
+        @"command_buffer_submission_count": @(value.command_buffer_submission_count),
+        @"command_buffer_completion_count": @(value.command_buffer_completion_count),
+        @"plan_upload_bytes": @(value.plan_upload_bytes),
         @"analyzed_tile_count": @(value.analyzed_tile_count),
         @"generic_tile_count": @(value.generic_tile_count),
         @"specialized_tile_count": @(value.specialized_tile_count),
+        @"buffer_allocation_ms": @(value.buffer_allocation_ms),
+        @"working_buffer_allocation_ms": @(value.working_buffer_allocation_ms),
+        @"source_upload_ms": @(value.source_upload_ms),
+        @"plan_upload_ms": @(value.plan_upload_ms),
+        @"buffer_wiring_ms": @(value.buffer_wiring_ms),
         @"pipeline_creation_ms": @(value.pipeline_creation_ms),
         @"gpu_execution_ms": @(value.gpu_execution_ms),
         @"created_pipeline_names": strings_json(value.created_pipeline_names),
@@ -1987,6 +2068,151 @@ void update_cpu_correctness(CpuCaseReport &report,
         @"comparison_peak_working_set_bytes": @(report.comparison_peak_working_set),
         @"generic_pipeline_creation": telemetry_json(report.generic_creation),
         @"comparison_pipeline_creation": telemetry_json(report.comparison_creation),
+        @"host_before": host_observation_json(report.host_before),
+        @"host_after": host_observation_json(report.host_after),
+        @"thermal_stable": @(report.thermal_stable),
+        @"concurrent_process_detected": @(report.concurrent_process_detected),
+        @"gate_passed": @(report.gate_passed),
+        @"samples": samples,
+    };
+}
+
+[[nodiscard]] double fractional_reduction(double baseline, double comparison) {
+    if (baseline <= 0.0) return comparison <= 0.0 ? 0.0 : -1.0;
+    return (baseline - comparison) / baseline;
+}
+
+[[nodiscard]] NSDictionary *working_buffer_case_json(const CaseReport &report) {
+    NSMutableArray *samples = [NSMutableArray arrayWithCapacity:report.samples.size()];
+    std::vector<double> transient_gpu_times;
+    std::vector<double> persistent_gpu_times;
+    std::vector<double> transient_host_times;
+    std::vector<double> persistent_host_times;
+    std::vector<double> transient_allocation_times;
+    std::vector<double> persistent_allocation_times;
+    std::vector<double> transient_working_allocation_times;
+    std::vector<double> persistent_working_allocation_times;
+    std::vector<double> transient_upload_times;
+    std::vector<double> persistent_upload_times;
+    std::vector<double> transient_plan_upload_times;
+    std::vector<double> persistent_plan_upload_times;
+    std::vector<double> transient_wiring_times;
+    std::vector<double> persistent_wiring_times;
+    std::vector<double> transient_allocation_and_wiring_times;
+    std::vector<double> persistent_allocation_and_wiring_times;
+    for (std::size_t index = 0; index < report.samples.size(); ++index) {
+        const PairSample &sample = report.samples[index];
+        const double transient_host_ms = sample.generic.wall_ms
+            - sample.generic.telemetry.gpu_execution_ms;
+        const double persistent_host_ms = sample.comparison.wall_ms
+            - sample.comparison.telemetry.gpu_execution_ms;
+        transient_gpu_times.push_back(sample.generic.telemetry.gpu_execution_ms);
+        persistent_gpu_times.push_back(sample.comparison.telemetry.gpu_execution_ms);
+        transient_host_times.push_back(transient_host_ms);
+        persistent_host_times.push_back(persistent_host_ms);
+        transient_allocation_times.push_back(sample.generic.telemetry.buffer_allocation_ms);
+        persistent_allocation_times.push_back(sample.comparison.telemetry.buffer_allocation_ms);
+        transient_working_allocation_times.push_back(
+            sample.generic.telemetry.working_buffer_allocation_ms);
+        persistent_working_allocation_times.push_back(
+            sample.comparison.telemetry.working_buffer_allocation_ms);
+        transient_upload_times.push_back(sample.generic.telemetry.source_upload_ms);
+        persistent_upload_times.push_back(sample.comparison.telemetry.source_upload_ms);
+        transient_plan_upload_times.push_back(sample.generic.telemetry.plan_upload_ms);
+        persistent_plan_upload_times.push_back(sample.comparison.telemetry.plan_upload_ms);
+        transient_wiring_times.push_back(sample.generic.telemetry.buffer_wiring_ms);
+        persistent_wiring_times.push_back(sample.comparison.telemetry.buffer_wiring_ms);
+        transient_allocation_and_wiring_times.push_back(
+            sample.generic.telemetry.buffer_allocation_ms
+            + sample.generic.telemetry.buffer_wiring_ms);
+        persistent_allocation_and_wiring_times.push_back(
+            sample.comparison.telemetry.buffer_allocation_ms
+            + sample.comparison.telemetry.buffer_wiring_ms);
+        [samples addObject:@{
+            @"index": @(index),
+            @"first_mode": @(sample.first_mode.c_str()),
+            @"transient_ms": @(sample.generic.wall_ms),
+            @"persistent_ms": @(sample.comparison.wall_ms),
+            @"paired_delta": @(sample.delta),
+            @"transient_gpu_ms": @(sample.generic.telemetry.gpu_execution_ms),
+            @"persistent_gpu_ms": @(sample.comparison.telemetry.gpu_execution_ms),
+            @"transient_host_ms": @(transient_host_ms),
+            @"persistent_host_ms": @(persistent_host_ms),
+            @"transient_telemetry": telemetry_json(sample.generic.telemetry),
+            @"persistent_telemetry": telemetry_json(sample.comparison.telemetry),
+            @"host_before": host_observation_json(sample.host_before),
+            @"host_after": host_observation_json(sample.host_after),
+        }];
+    }
+    const auto &transient = report.samples.front().generic.telemetry;
+    const auto &persistent = report.samples.front().comparison.telemetry;
+    const double transient_allocation_median_ms = median(transient_allocation_times);
+    const double persistent_allocation_median_ms = median(persistent_allocation_times);
+    const double transient_working_allocation_median_ms = median(
+        transient_working_allocation_times);
+    const double persistent_working_allocation_median_ms = median(
+        persistent_working_allocation_times);
+    const double transient_allocation_and_wiring_median_ms = median(
+        transient_allocation_and_wiring_times);
+    const double persistent_allocation_and_wiring_median_ms = median(
+        persistent_allocation_and_wiring_times);
+    const double working_set_growth = report.generic_peak_working_set == 0U ? 0.0
+        : (static_cast<double>(report.comparison_peak_working_set)
+           - static_cast<double>(report.generic_peak_working_set))
+            / static_cast<double>(report.generic_peak_working_set);
+    return @{
+        @"id": @(report.benchmark_case.id.c_str()),
+        @"filter_id": @(report.benchmark_case.filter.id.c_str()),
+        @"shape": @(report.shape.c_str()),
+        @"native_height": @(report.benchmark_case.native_height),
+        @"fractional_scan": @(report.benchmark_case.fractional_scan),
+        @"cpu_oracle_ms": @(report.cpu_oracle_ms),
+        @"transient_median_ms": @(report.generic_median_ms),
+        @"persistent_median_ms": @(report.comparison_median_ms),
+        @"transient_p95_ms": @(report.generic_p95_ms),
+        @"persistent_p95_ms": @(report.comparison_p95_ms),
+        @"transient_gpu_median_ms": @(median(transient_gpu_times)),
+        @"persistent_gpu_median_ms": @(median(persistent_gpu_times)),
+        @"transient_host_median_ms": @(median(transient_host_times)),
+        @"persistent_host_median_ms": @(median(persistent_host_times)),
+        @"transient_buffer_allocation_median_ms": @(transient_allocation_median_ms),
+        @"persistent_buffer_allocation_median_ms": @(persistent_allocation_median_ms),
+        @"transient_working_buffer_allocation_median_ms": @(
+            transient_working_allocation_median_ms),
+        @"persistent_working_buffer_allocation_median_ms": @(
+            persistent_working_allocation_median_ms),
+        @"transient_source_upload_median_ms": @(median(transient_upload_times)),
+        @"persistent_source_upload_median_ms": @(median(persistent_upload_times)),
+        @"transient_plan_upload_median_ms": @(median(transient_plan_upload_times)),
+        @"persistent_plan_upload_median_ms": @(median(persistent_plan_upload_times)),
+        @"transient_buffer_wiring_median_ms": @(median(transient_wiring_times)),
+        @"persistent_buffer_wiring_median_ms": @(median(persistent_wiring_times)),
+        @"paired_delta_median": @(report.paired_delta_median),
+        @"paired_delta_mad": @(report.paired_delta_mad),
+        @"first_decile_delta_median": @(report.first_decile_delta_median),
+        @"last_decile_delta_median": @(report.last_decile_delta_median),
+        @"transient_accuracy": accuracy_json(report.generic_accuracy),
+        @"persistent_accuracy": accuracy_json(report.comparison_accuracy),
+        @"maximum_path_difference": @(report.maximum_path_difference),
+        @"transient_peak_working_set_bytes": @(report.generic_peak_working_set),
+        @"persistent_peak_working_set_bytes": @(report.comparison_peak_working_set),
+        @"working_set_growth": @(working_set_growth),
+        @"working_buffer_allocation_count_reduction": @(
+            fractional_reduction(
+                static_cast<double>(transient.working_buffer_allocation_count),
+                static_cast<double>(persistent.working_buffer_allocation_count))),
+        @"total_buffer_allocation_count_reduction": @(
+            fractional_reduction(
+                static_cast<double>(transient.buffer_allocation_count),
+                static_cast<double>(persistent.buffer_allocation_count))),
+        @"working_buffer_allocation_time_reduction": @(
+            fractional_reduction(transient_working_allocation_median_ms,
+                                 persistent_working_allocation_median_ms)),
+        @"allocation_and_wiring_time_reduction": @(
+            fractional_reduction(transient_allocation_and_wiring_median_ms,
+                                 persistent_allocation_and_wiring_median_ms)),
+        @"transient_pipeline_creation": telemetry_json(report.generic_creation),
+        @"persistent_pipeline_creation": telemetry_json(report.comparison_creation),
         @"host_before": host_observation_json(report.host_before),
         @"host_after": host_observation_json(report.host_after),
         @"thermal_stable": @(report.thermal_stable),
@@ -2210,7 +2436,8 @@ void update_cpu_correctness(CpuCaseReport &report,
     const char *filename = config.planner_taps ? "planner-tap-report.json"
         : (config.planner_bicubic_geometry ? "planner-bicubic-geometry-report.json"
             : (config.cpu_columns ? "cpu-column-report.json"
-                                  : "metal-kernel-report.json"));
+                : (config.metal_working_buffers ? "metal-working-buffer-report.json"
+                                                : "metal-kernel-report.json")));
     return *config.artifact_root
         / (utc_stamp() + "-pid" + std::to_string(static_cast<long long>(getpid())))
         / filename;
@@ -2642,10 +2869,15 @@ int main(int argc, char **argv) {
                 CaseReport report = run_case(matrix, benchmark_case, image, config);
                 std::cout << std::fixed << std::setprecision(3)
                           << "case=" << report.benchmark_case.id
-                          << " shape=" << report.shape
-                          << " generic_ms=" << report.generic_median_ms
-                          << " comparison_ms=" << report.comparison_median_ms
-                          << " improvement=" << -100.0 * report.paired_delta_median << "%"
+                          << " shape=" << report.shape;
+                if (config.metal_working_buffers) {
+                    std::cout << " transient_ms=" << report.generic_median_ms
+                              << " persistent_ms=" << report.comparison_median_ms;
+                } else {
+                    std::cout << " generic_ms=" << report.generic_median_ms
+                              << " comparison_ms=" << report.comparison_median_ms;
+                }
+                std::cout << " improvement=" << -100.0 * report.paired_delta_median << "%"
                           << " paired_mad=" << report.paired_delta_mad
                           << " gate=" << (report.gate_passed ? "pass" : "fail") << '\n';
                 all_passed = all_passed && report.gate_passed;
@@ -2666,16 +2898,24 @@ int main(int argc, char **argv) {
 
             getnative::MetalAnalysisEngine device_probe;
             NSMutableArray *case_objects = [NSMutableArray arrayWithCapacity:reports.size()];
-            for (const CaseReport &report : reports) [case_objects addObject:case_json(report)];
+            for (const CaseReport &report : reports) {
+                [case_objects addObject:config.metal_working_buffers
+                    ? working_buffer_case_json(report) : case_json(report)];
+            }
             const std::filesystem::path binary = executable_path();
             const std::filesystem::path metallib = GETNATIVE_METALLIB_PATH;
             NSDictionary *root = @{
                 @"schema_version": @1,
                 @"status": all_passed ? @"pass" : @"fail",
-                @"mode": config.sustained ? @"sustained"
-                    : (config.controls_only ? @"controls" : @"full_matrix"),
-                @"comparison_policy": config.required_specialized
-                    ? @"required_specialized" : @"automatic",
+                @"mode": config.metal_working_buffers ? @"metal_working_buffers"
+                    : (config.sustained ? @"sustained"
+                        : (config.controls_only ? @"controls" : @"full_matrix")),
+                @"comparison_policy": config.metal_working_buffers
+                    ? @"transient_vs_persistent_working_buffers"
+                    : (config.required_specialized
+                        ? @"required_specialized" : @"automatic"),
+                @"production_default": config.metal_working_buffers
+                    ? @"persistent" : @"automatic_dispatch",
                 @"sample_count": @(config.samples),
                 @"host_before": host_observation_json(run_host_before),
                 @"host_after": host_observation_json(run_host_after),

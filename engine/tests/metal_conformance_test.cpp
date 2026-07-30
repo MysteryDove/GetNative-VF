@@ -3,6 +3,8 @@
 #include "getnative/filter.hpp"
 
 #include <algorithm>
+#include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <iostream>
@@ -13,6 +15,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -604,6 +607,157 @@ void test_queued_tile_window() {
            "queued tiles reuse one bounded workspace across submission windows");
 }
 
+void test_persistent_working_buffer_reuse_and_ceiling() {
+    constexpr std::int32_t width = 32;
+    constexpr std::int32_t height = 24;
+    const auto source = make_source(width, height);
+    const auto view = const_view(source, width, height);
+    const getnative::MetricSpec metric{2, 2, 2, 2, 0.015F, 1U};
+    auto plan = std::make_shared<const getnative::AxisPlan>(getnative::build_axis_plan({
+        height, 16, 16.0, 0.0, getnative::Filter::bicubic(),
+        getnative::BorderMode::mirror,
+    }));
+    std::vector<getnative::CandidateAnalysis> small;
+    std::vector<getnative::CandidateAnalysis> large;
+    for (std::size_t index = 0; index < 4; ++index) {
+        getnative::CandidateAnalysis candidate{
+            std::to_string(index), nullptr, plan, getnative::AnalysisAxes::vertical,
+        };
+        large.push_back(candidate);
+        if (index < 2U) small.push_back(std::move(candidate));
+    }
+
+    getnative::MetalAnalysisOptions persistent_options{
+        8, 2, 0, false, 32, getnative::MetalKernelDispatchPolicy::automatic,
+    };
+    persistent_options.reuse_working_buffers = true;
+    persistent_options.retained_working_buffer_limit_bytes = 1024U * 1024U;
+    getnative::MetalAnalysisEngine persistent(persistent_options);
+
+    const auto first = persistent.analyze_axis_batch_f32(view, small, metric);
+    const auto first_telemetry = persistent.runtime_telemetry();
+    expect(first_telemetry.working_buffer_allocation_count == 3
+               && first_telemetry.working_buffer_reuse_count == 0,
+           "persistent Metal working buffers allocate source, workspace, and partials once");
+    expect(first_telemetry.working_buffer_retained_bytes
+               == first_telemetry.working_buffer_active_bytes
+               && first_telemetry.working_buffer_peak_retained_bytes
+                   == first_telemetry.working_buffer_retained_bytes,
+           "first persistent call reports exact active and retained working-buffer bytes");
+
+    persistent.reset_analysis_telemetry();
+    const auto grown = persistent.analyze_axis_batch_f32(view, large, metric);
+    const auto grown_telemetry = persistent.runtime_telemetry();
+    expect(grown_telemetry.working_buffer_allocation_count == 2
+               && grown_telemetry.working_buffer_reuse_count == 1,
+           "grow-to-fit replaces only workspace and partial buffers");
+    expect(grown_telemetry.working_buffer_retained_bytes
+               > first_telemetry.working_buffer_retained_bytes,
+           "grow-to-fit increases retained capacity for the larger batch");
+
+    persistent.reset_analysis_telemetry();
+    const auto reused = persistent.analyze_axis_batch_f32(view, large, metric);
+    const auto reused_telemetry = persistent.runtime_telemetry();
+    expect(reused_telemetry.working_buffer_allocation_count == 0
+               && reused_telemetry.working_buffer_allocation_bytes == 0
+               && reused_telemetry.working_buffer_reuse_count == 3,
+           "stable repeated call reuses all three Metal working buffers");
+    expect(reused_telemetry.buffer_allocation_count
+               == reused_telemetry.analyzed_tile_count * 9U,
+           "stable repeated call allocates only the existing nine plan buffers per tile");
+    expect(std::isfinite(reused_telemetry.buffer_allocation_ms)
+               && std::isfinite(reused_telemetry.source_upload_ms)
+               && std::isfinite(reused_telemetry.buffer_wiring_ms),
+           "Metal runtime reports finite allocation, upload, and wiring timings");
+
+    getnative::MetalAnalysisOptions transient_options = persistent_options;
+    transient_options.reuse_working_buffers = false;
+    getnative::MetalAnalysisEngine transient(transient_options);
+    const auto transient_results = transient.analyze_axis_batch_f32(view, large, metric);
+    const auto transient_telemetry = transient.runtime_telemetry();
+    expect(transient_telemetry.working_buffer_allocation_count == 3
+               && transient_telemetry.working_buffer_reuse_count == 0
+               && transient_telemetry.working_buffer_retained_bytes == 0,
+           "diagnostic transient path allocates and retains no working buffers");
+
+    getnative::MetalAnalysisOptions constrained_options = persistent_options;
+    constrained_options.retained_working_buffer_limit_bytes = 1;
+    getnative::MetalAnalysisEngine constrained(constrained_options);
+    const auto constrained_results = constrained.analyze_axis_batch_f32(
+        view, large, metric);
+    const auto constrained_telemetry = constrained.runtime_telemetry();
+    expect(constrained_telemetry.working_buffer_allocation_count == 3
+               && constrained_telemetry.working_buffer_reuse_count == 0
+               && constrained_telemetry.working_buffer_retained_bytes == 0,
+           "working-buffer request above the retained ceiling falls back to transient buffers");
+
+    expect(first.size() == small.size() && grown.size() == large.size()
+               && reused.size() == large.size()
+               && transient_results.size() == large.size()
+               && constrained_results.size() == large.size(),
+           "working-buffer paths return every candidate");
+    for (std::size_t index = 0; index < large.size(); ++index) {
+        const std::uint64_t expected = std::bit_cast<std::uint64_t>(grown[index].error);
+        expect(std::bit_cast<std::uint64_t>(reused[index].error) == expected
+                   && std::bit_cast<std::uint64_t>(transient_results[index].error) == expected
+                   && std::bit_cast<std::uint64_t>(constrained_results[index].error) == expected,
+               "persistent, reused, transient, and ceiling-fallback metrics are bit-identical");
+    }
+}
+
+void test_submitted_cancellation_drains_before_reuse() {
+    constexpr std::int32_t width = 320;
+    constexpr std::int32_t height = 240;
+    const auto source = make_source(width, height);
+    const auto view = const_view(source, width, height);
+    const getnative::MetricSpec metric{5, 5, 5, 5, 0.015F, 1U};
+    auto plan = std::make_shared<const getnative::AxisPlan>(getnative::build_axis_plan({
+        height, 160, 160.0, 0.0, getnative::Filter::lanczos(8),
+        getnative::BorderMode::mirror,
+    }));
+    std::vector<getnative::CandidateAnalysis> candidates;
+    candidates.reserve(1000);
+    for (std::size_t index = 0; index < 1000; ++index) {
+        candidates.push_back({
+            std::to_string(index), nullptr, plan, getnative::AnalysisAxes::vertical,
+        });
+    }
+
+    getnative::MetalAnalysisEngine metal({1, 2, 0, true, 32});
+    std::stop_source stop;
+    std::jthread canceller([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        stop.request_stop();
+    });
+    expect_throws<std::runtime_error>(
+        [&] {
+            (void)metal.analyze_axis_batch_f32(
+                view, candidates, metric, stop.get_token());
+        },
+        "Metal observes cancellation after command submission");
+    canceller.join();
+
+    const auto cancelled = metal.runtime_telemetry();
+    expect(cancelled.command_buffer_submission_count > 0,
+           "cancellation test submits Metal work before requesting stop");
+    expect(cancelled.command_buffer_completion_count
+               == cancelled.command_buffer_submission_count,
+           "cancellation drains every submitted command before returning");
+
+    metal.reset_analysis_telemetry();
+    const std::span<const getnative::CandidateAnalysis> one_candidate{
+        candidates.data(), 1U,
+    };
+    const auto reused = metal.analyze_axis_batch_f32(view, one_candidate, metric);
+    const auto reused_telemetry = metal.runtime_telemetry();
+    expect(reused.size() == 1U && std::isfinite(reused.front().error),
+           "engine remains usable immediately after submitted cancellation");
+    expect(reused_telemetry.working_buffer_reuse_count == 3U
+               && reused_telemetry.command_buffer_submission_count
+                   == reused_telemetry.command_buffer_completion_count,
+           "immediate reuse uses retained buffers only after submitted work is complete");
+}
+
 } // namespace
 
 int main() {
@@ -620,6 +774,8 @@ int main() {
         test_dual_axis_cancellation_and_complete_working_set();
         test_validation_and_cancellation();
         test_queued_tile_window();
+        test_persistent_working_buffer_reuse_and_ceiling();
+        test_submitted_cancellation_drains_before_reuse();
         std::cout << "metal conformance tests passed\n";
         return 0;
     } catch (const std::exception &error) {

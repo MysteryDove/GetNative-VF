@@ -10,6 +10,8 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstring>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -145,40 +147,6 @@ static_assert(sizeof(AnalysisJob) == 40);
         static_cast<std::uint32_t>(metric.crop_bottom),
         static_cast<double>(cropped_width) * static_cast<double>(cropped_height),
     };
-}
-
-template <class T>
-[[nodiscard]] id<MTLBuffer> make_buffer(id<MTLDevice> device,
-                                        const std::vector<T> &values,
-                                        std::string_view name) {
-    if (values.empty()) {
-        throw std::invalid_argument(std::string{name} + " must not be empty");
-    }
-    const std::size_t bytes = checked_product(values.size(), sizeof(T), name);
-    id<MTLBuffer> buffer = [device newBufferWithBytes:values.data()
-                                               length:bytes
-                                              options:MTLResourceStorageModeShared];
-    if (buffer == nil) {
-        throw std::runtime_error("Metal could not allocate " + std::string{name});
-    }
-    buffer.label = [NSString stringWithUTF8String:std::string{name}.c_str()];
-    return buffer;
-}
-
-[[nodiscard]] id<MTLBuffer> make_empty_buffer(id<MTLDevice> device,
-                                              std::size_t elements,
-                                              std::string_view name) {
-    const std::size_t bytes = checked_product(elements, sizeof(float), name);
-    if (bytes == 0) {
-        throw std::invalid_argument(std::string{name} + " must not be empty");
-    }
-    id<MTLBuffer> buffer = [device newBufferWithLength:bytes
-                                               options:MTLResourceStorageModeShared];
-    if (buffer == nil) {
-        throw std::runtime_error("Metal could not allocate " + std::string{name});
-    }
-    buffer.label = [NSString stringWithUTF8String:std::string{name}.c_str()];
-    return buffer;
 }
 
 struct PackedTile {
@@ -456,6 +424,13 @@ struct ShapePipelines {
     id<MTLComputePipelineState> horizontal_first_metric = nil;
 };
 
+struct WorkingBufferSet {
+    id<MTLBuffer> source = nil;
+    id<MTLBuffer> workspace = nil;
+    id<MTLBuffer> partials = nil;
+    std::size_t resident_bytes = 0;
+};
+
 } // namespace
 
 struct MetalAnalysisEngine::Impl {
@@ -469,6 +444,11 @@ struct MetalAnalysisEngine::Impl {
         }
         if (options.reduction_groups_per_candidate > maximum_reduction_groups) {
             throw std::invalid_argument("Metal reduction group count exceeds the 32-bit schedule range");
+        }
+        if (options.reuse_working_buffers
+            && options.retained_working_buffer_limit_bytes == 0) {
+            throw std::invalid_argument(
+                "Metal retained-buffer limit must be positive when reuse is enabled");
         }
         @autoreleasepool {
             device = MTLCreateSystemDefaultDevice();
@@ -518,25 +498,200 @@ struct MetalAnalysisEngine::Impl {
     ShapePipelines bandwidth11;
     ShapePipelines bandwidth15;
     ShapePipelines generic;
+    id<MTLBuffer> retained_source_buffer = nil;
+    id<MTLBuffer> retained_workspace_buffer = nil;
+    id<MTLBuffer> retained_partial_buffer = nil;
     std::size_t peak_workspace_elements = 0;
     std::size_t peak_working_set_bytes = 0;
     std::size_t buffer_allocation_count = 0;
     std::size_t buffer_allocation_bytes = 0;
+    std::size_t working_buffer_allocation_count = 0;
+    std::size_t working_buffer_allocation_bytes = 0;
+    std::size_t working_buffer_reuse_count = 0;
+    std::size_t working_buffer_active_bytes = 0;
+    std::size_t working_buffer_peak_active_bytes = 0;
+    std::size_t working_buffer_peak_retained_bytes = 0;
+    std::size_t command_buffer_submission_count = 0;
+    std::size_t command_buffer_completion_count = 0;
+    std::size_t plan_upload_bytes = 0;
     std::size_t analyzed_tile_count = 0;
     std::size_t generic_tile_count = 0;
     std::size_t specialized_tile_count = 0;
+    double buffer_allocation_ms = 0.0;
+    double working_buffer_allocation_ms = 0.0;
+    double source_upload_ms = 0.0;
+    double plan_upload_ms = 0.0;
+    double buffer_wiring_ms = 0.0;
     double pipeline_creation_ms = 0.0;
     double gpu_execution_ms = 0.0;
     std::vector<std::string> created_pipeline_names;
     mutable std::mutex mutex;
 
-    void record_buffer(id<MTLBuffer> buffer) {
+    [[nodiscard]] static std::size_t buffer_bytes(id<MTLBuffer> buffer) noexcept {
+        return buffer == nil ? 0 : static_cast<std::size_t>(buffer.length);
+    }
+
+    [[nodiscard]] std::size_t retained_working_buffer_bytes() const {
+        const std::size_t source_bytes = buffer_bytes(retained_source_buffer);
+        const std::size_t workspace_bytes = buffer_bytes(retained_workspace_buffer);
+        const std::size_t partial_bytes = buffer_bytes(retained_partial_buffer);
+        if (source_bytes > std::numeric_limits<std::size_t>::max() - workspace_bytes
+            || source_bytes + workspace_bytes
+                > std::numeric_limits<std::size_t>::max() - partial_bytes) {
+            throw std::length_error("Metal retained-buffer telemetry overflow");
+        }
+        return source_bytes + workspace_bytes + partial_bytes;
+    }
+
+    void record_buffer(id<MTLBuffer> buffer, double elapsed_ms, bool working_buffer) {
         const std::size_t bytes = static_cast<std::size_t>(buffer.length);
         if (bytes > std::numeric_limits<std::size_t>::max() - buffer_allocation_bytes) {
             throw std::length_error("Metal allocation telemetry overflow");
         }
         ++buffer_allocation_count;
         buffer_allocation_bytes += bytes;
+        buffer_allocation_ms += elapsed_ms;
+        if (working_buffer) {
+            if (bytes > std::numeric_limits<std::size_t>::max()
+                            - working_buffer_allocation_bytes) {
+                throw std::length_error("Metal working-buffer telemetry overflow");
+            }
+            ++working_buffer_allocation_count;
+            working_buffer_allocation_bytes += bytes;
+            working_buffer_allocation_ms += elapsed_ms;
+        }
+    }
+
+    [[nodiscard]] id<MTLBuffer> allocate_empty_buffer(std::size_t bytes,
+                                                       NSString *label,
+                                                       bool working_buffer) {
+        if (bytes == 0) {
+            throw std::invalid_argument("Metal buffer must not be empty");
+        }
+        if (bytes > info.maximum_buffer_bytes) {
+            throw std::length_error("Metal buffer exceeds the device buffer limit");
+        }
+        const auto start = std::chrono::steady_clock::now();
+        id<MTLBuffer> buffer = [device newBufferWithLength:bytes
+                                                   options:MTLResourceStorageModeShared];
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+        if (buffer == nil) {
+            throw std::runtime_error("Metal buffer allocation failed");
+        }
+        buffer.label = label;
+        record_buffer(buffer, elapsed_ms, working_buffer);
+        return buffer;
+    }
+
+    template <class T>
+    [[nodiscard]] id<MTLBuffer> allocate_plan_buffer(const std::vector<T> &values,
+                                                      std::string_view name) {
+        if (values.empty()) {
+            throw std::invalid_argument(std::string{name} + " must not be empty");
+        }
+        const std::size_t bytes = checked_product(values.size(), sizeof(T), name);
+        const std::string label_text{name};
+        NSString *label = [NSString stringWithUTF8String:label_text.c_str()];
+        if (label == nil) throw std::invalid_argument("Metal buffer label is not UTF-8");
+        id<MTLBuffer> buffer = allocate_empty_buffer(bytes, label, false);
+        const auto upload_start = std::chrono::steady_clock::now();
+        std::memcpy(buffer.contents, values.data(), bytes);
+        plan_upload_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - upload_start).count();
+        if (bytes > std::numeric_limits<std::size_t>::max() - plan_upload_bytes) {
+            throw std::length_error("Metal plan-upload telemetry overflow");
+        }
+        plan_upload_bytes += bytes;
+        return buffer;
+    }
+
+    [[nodiscard]] id<MTLBuffer> acquire_retained_buffer(id<MTLBuffer> __strong &buffer,
+                                                         std::size_t required_bytes,
+                                                         NSString *label) {
+        if (buffer != nil && buffer_bytes(buffer) >= required_bytes) {
+            ++working_buffer_reuse_count;
+            return buffer;
+        }
+        buffer = nil;
+        id<MTLBuffer> replacement = allocate_empty_buffer(required_bytes, label, true);
+        buffer = replacement;
+        return buffer;
+    }
+
+    void clear_retained_working_buffers() noexcept {
+        retained_source_buffer = nil;
+        retained_workspace_buffer = nil;
+        retained_partial_buffer = nil;
+    }
+
+    [[nodiscard]] WorkingBufferSet prepare_working_buffers(
+        std::size_t source_bytes, std::size_t workspace_bytes,
+        std::size_t partial_bytes, const float *source_data) {
+        if (source_bytes > std::numeric_limits<std::size_t>::max() - workspace_bytes
+            || source_bytes + workspace_bytes
+                > std::numeric_limits<std::size_t>::max() - partial_bytes) {
+            throw std::length_error("Metal working-buffer size overflow");
+        }
+        const std::size_t active_bytes = source_bytes + workspace_bytes + partial_bytes;
+        working_buffer_active_bytes = active_bytes;
+        working_buffer_peak_active_bytes = std::max(
+            working_buffer_peak_active_bytes, active_bytes);
+
+        WorkingBufferSet result;
+        bool retain = options.reuse_working_buffers;
+        if (retain) {
+            const std::size_t desired_source = std::max(
+                source_bytes, buffer_bytes(retained_source_buffer));
+            const std::size_t desired_workspace = std::max(
+                workspace_bytes, buffer_bytes(retained_workspace_buffer));
+            const std::size_t desired_partials = std::max(
+                partial_bytes, buffer_bytes(retained_partial_buffer));
+            if (desired_source > std::numeric_limits<std::size_t>::max() - desired_workspace
+                || desired_source + desired_workspace
+                    > std::numeric_limits<std::size_t>::max() - desired_partials) {
+                throw std::length_error("Metal retained-buffer capacity overflow");
+            }
+            retain = desired_source + desired_workspace + desired_partials
+                <= options.retained_working_buffer_limit_bytes;
+        }
+
+        if (retain) {
+            result.source = acquire_retained_buffer(
+                retained_source_buffer, source_bytes, @"GetNative source");
+            result.workspace = acquire_retained_buffer(
+                retained_workspace_buffer, workspace_bytes,
+                @"GetNative Metal workspace");
+            result.partials = acquire_retained_buffer(
+                retained_partial_buffer, partial_bytes,
+                @"GetNative metric partials");
+            result.resident_bytes = retained_working_buffer_bytes();
+            working_buffer_peak_retained_bytes = std::max(
+                working_buffer_peak_retained_bytes, result.resident_bytes);
+        } else {
+            clear_retained_working_buffers();
+            result.source = allocate_empty_buffer(
+                source_bytes, @"GetNative source", true);
+            result.workspace = allocate_empty_buffer(
+                workspace_bytes, @"GetNative Metal workspace", true);
+            result.partials = allocate_empty_buffer(
+                partial_bytes, @"GetNative metric partials", true);
+            result.resident_bytes = active_bytes;
+        }
+
+        const auto upload_start = std::chrono::steady_clock::now();
+        std::memcpy(result.source.contents, source_data, source_bytes);
+        source_upload_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - upload_start).count();
+        return result;
+    }
+
+    template <class Function>
+    void record_buffer_wiring(Function &&function) {
+        const auto start = std::chrono::steady_clock::now();
+        std::forward<Function>(function)();
+        buffer_wiring_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
     }
 
     [[nodiscard]] ShapePipelines &pipelines(KernelShape shape) noexcept {
@@ -647,24 +802,53 @@ std::size_t MetalAnalysisEngine::peak_working_set_bytes() const noexcept {
 }
 MetalRuntimeTelemetry MetalAnalysisEngine::runtime_telemetry() const {
     const std::scoped_lock lock(impl_->mutex);
-    return {
-        impl_->buffer_allocation_count,
-        impl_->buffer_allocation_bytes,
-        impl_->analyzed_tile_count,
-        impl_->generic_tile_count,
-        impl_->specialized_tile_count,
-        impl_->pipeline_creation_ms,
-        impl_->gpu_execution_ms,
-        impl_->created_pipeline_names,
-    };
+    MetalRuntimeTelemetry result;
+    result.buffer_allocation_count = impl_->buffer_allocation_count;
+    result.buffer_allocation_bytes = impl_->buffer_allocation_bytes;
+    result.working_buffer_allocation_count = impl_->working_buffer_allocation_count;
+    result.working_buffer_allocation_bytes = impl_->working_buffer_allocation_bytes;
+    result.working_buffer_reuse_count = impl_->working_buffer_reuse_count;
+    result.working_buffer_active_bytes = impl_->working_buffer_active_bytes;
+    result.working_buffer_retained_bytes = impl_->retained_working_buffer_bytes();
+    result.working_buffer_peak_active_bytes = impl_->working_buffer_peak_active_bytes;
+    result.working_buffer_peak_retained_bytes = impl_->working_buffer_peak_retained_bytes;
+    result.command_buffer_submission_count = impl_->command_buffer_submission_count;
+    result.command_buffer_completion_count = impl_->command_buffer_completion_count;
+    result.plan_upload_bytes = impl_->plan_upload_bytes;
+    result.analyzed_tile_count = impl_->analyzed_tile_count;
+    result.generic_tile_count = impl_->generic_tile_count;
+    result.specialized_tile_count = impl_->specialized_tile_count;
+    result.buffer_allocation_ms = impl_->buffer_allocation_ms;
+    result.working_buffer_allocation_ms = impl_->working_buffer_allocation_ms;
+    result.source_upload_ms = impl_->source_upload_ms;
+    result.plan_upload_ms = impl_->plan_upload_ms;
+    result.buffer_wiring_ms = impl_->buffer_wiring_ms;
+    result.pipeline_creation_ms = impl_->pipeline_creation_ms;
+    result.gpu_execution_ms = impl_->gpu_execution_ms;
+    result.created_pipeline_names = impl_->created_pipeline_names;
+    return result;
 }
 void MetalAnalysisEngine::reset_analysis_telemetry() {
     const std::scoped_lock lock(impl_->mutex);
     impl_->buffer_allocation_count = 0;
     impl_->buffer_allocation_bytes = 0;
+    impl_->working_buffer_allocation_count = 0;
+    impl_->working_buffer_allocation_bytes = 0;
+    impl_->working_buffer_reuse_count = 0;
+    impl_->working_buffer_active_bytes = 0;
+    impl_->working_buffer_peak_active_bytes = 0;
+    impl_->working_buffer_peak_retained_bytes = impl_->retained_working_buffer_bytes();
+    impl_->command_buffer_submission_count = 0;
+    impl_->command_buffer_completion_count = 0;
+    impl_->plan_upload_bytes = 0;
     impl_->analyzed_tile_count = 0;
     impl_->generic_tile_count = 0;
     impl_->specialized_tile_count = 0;
+    impl_->buffer_allocation_ms = 0.0;
+    impl_->working_buffer_allocation_ms = 0.0;
+    impl_->source_upload_ms = 0.0;
+    impl_->plan_upload_ms = 0.0;
+    impl_->buffer_wiring_ms = 0.0;
     impl_->gpu_execution_ms = 0.0;
 }
 
@@ -709,14 +893,6 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
         if (source_bytes > impl_->info.maximum_buffer_bytes) {
             throw std::length_error("Metal source image exceeds the device buffer limit");
         }
-        id<MTLBuffer> source_buffer = [impl_->device newBufferWithBytes:source_data
-                                                                length:source_bytes
-                                                               options:MTLResourceStorageModeShared];
-        if (source_buffer == nil) {
-            throw std::runtime_error("Metal source buffer allocation failed");
-        }
-        source_buffer.label = @"GetNative source";
-        impl_->record_buffer(source_buffer);
 
         std::vector<CandidateResult> results(candidates.size());
         const std::size_t groups = impl_->options.reduction_groups_per_candidate;
@@ -778,33 +954,54 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
 
         impl_->peak_workspace_elements = std::max(
             impl_->peak_workspace_elements, maximum_workspace_elements);
-        id<MTLBuffer> workspace_buffer = make_empty_buffer(
-            impl_->device, maximum_workspace_elements, "GetNative Metal workspace");
-        impl_->record_buffer(workspace_buffer);
+        const std::size_t workspace_buffer_bytes = checked_product(
+            maximum_workspace_elements, sizeof(float), "GetNative Metal workspace");
         const std::size_t partial_count = checked_product(
             candidates.size(), groups, "Metal partial results");
-        id<MTLBuffer> partial_buffer = make_empty_buffer(
-            impl_->device, partial_count, "GetNative metric partials");
-        impl_->record_buffer(partial_buffer);
+        const std::size_t partial_buffer_bytes = checked_product(
+            partial_count, sizeof(float), "GetNative metric partials");
+        const WorkingBufferSet working_buffers = impl_->prepare_working_buffers(
+            source_bytes, workspace_buffer_bytes, partial_buffer_bytes, source_data);
+        id<MTLBuffer> source_buffer = working_buffers.source;
+        id<MTLBuffer> workspace_buffer = working_buffers.workspace;
+        id<MTLBuffer> partial_buffer = working_buffers.partials;
         const std::size_t commands_per_tile = impl_->options.profile_split_kernels ? 4 : 1;
         NSMutableArray<id<MTLCommandBuffer>> *commands =
             [NSMutableArray arrayWithCapacity:std::min(tiles.size(), maximum_queued_tiles)
                                                * commands_per_tile];
+        const auto drain_commands = [&] {
+            std::string command_error;
+            for (id<MTLCommandBuffer> command in commands) {
+                [command waitUntilCompleted];
+                ++impl_->command_buffer_completion_count;
+                if (command.status == MTLCommandBufferStatusError &&
+                    command_error.empty()) {
+                    command_error = ns_error(command.error,
+                                             "Metal command execution failed");
+                }
+                if (@available(macOS 10.15, *)) {
+                    const double gpu_start = command.GPUStartTime;
+                    const double gpu_end = command.GPUEndTime;
+                    if (std::isfinite(gpu_start) && std::isfinite(gpu_end) &&
+                        gpu_end >= gpu_start) {
+                        impl_->gpu_execution_ms +=
+                            (gpu_end - gpu_start) * 1000.0;
+                    }
+                }
+            }
+            [commands removeAllObjects];
+            if (!command_error.empty()) {
+                throw std::runtime_error(command_error);
+            }
+        };
         std::size_t queued_tiles = 0;
         std::size_t queued_plan_bytes = 0;
-        const std::size_t workspace_buffer_bytes = static_cast<std::size_t>(workspace_buffer.length);
-        const std::size_t partial_buffer_bytes = static_cast<std::size_t>(partial_buffer.length);
-        if (source_bytes > std::numeric_limits<std::size_t>::max() - workspace_buffer_bytes
-            || source_bytes + workspace_buffer_bytes
-                > std::numeric_limits<std::size_t>::max() - partial_buffer_bytes) {
-            throw std::length_error("Metal persistent working set overflow");
-        }
         const std::size_t persistent_metal_bytes =
-            source_bytes + workspace_buffer_bytes + partial_buffer_bytes;
+            working_buffers.resident_bytes;
         impl_->peak_working_set_bytes = std::max(
             impl_->peak_working_set_bytes, persistent_metal_bytes);
 
-        for (const TileRange &tile : tiles) {
+        const auto process_tile = [&](const TileRange &tile) {
             if (stop.stop_requested()) {
                 throw std::runtime_error("Metal analysis cancelled");
             }
@@ -861,33 +1058,24 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     packed.maximum_vector_count,
                 };
 
-                id<MTLBuffer> descriptor_buffer = make_buffer(
-                    impl_->device, packed.descriptors, "GetNative plan descriptors");
-                id<MTLBuffer> transpose_offset_buffer = make_buffer(
-                    impl_->device, packed.transpose_offsets, "GetNative transpose offsets");
-                id<MTLBuffer> transpose_index_buffer = make_buffer(
-                    impl_->device, packed.transpose_indices, "GetNative transpose indices");
-                id<MTLBuffer> transpose_weight_buffer = make_buffer(
-                    impl_->device, packed.transpose_weights, "GetNative transpose weights");
-                id<MTLBuffer> lower_buffer = make_buffer(
-                    impl_->device, packed.lower_ld, "GetNative lower factors");
-                id<MTLBuffer> upper_buffer = make_buffer(
-                    impl_->device, packed.upper_l, "GetNative upper factors");
-                id<MTLBuffer> diagonal_buffer = make_buffer(
-                    impl_->device, packed.inverse_diagonal, "GetNative inverse diagonal");
-                id<MTLBuffer> forward_left_buffer = make_buffer(
-                    impl_->device, packed.forward_left, "GetNative forward left indices");
-                id<MTLBuffer> forward_weight_buffer = make_buffer(
-                    impl_->device, packed.forward_weights, "GetNative forward weights");
-                impl_->record_buffer(descriptor_buffer);
-                impl_->record_buffer(transpose_offset_buffer);
-                impl_->record_buffer(transpose_index_buffer);
-                impl_->record_buffer(transpose_weight_buffer);
-                impl_->record_buffer(lower_buffer);
-                impl_->record_buffer(upper_buffer);
-                impl_->record_buffer(diagonal_buffer);
-                impl_->record_buffer(forward_left_buffer);
-                impl_->record_buffer(forward_weight_buffer);
+                id<MTLBuffer> descriptor_buffer = impl_->allocate_plan_buffer(
+                    packed.descriptors, "GetNative plan descriptors");
+                id<MTLBuffer> transpose_offset_buffer = impl_->allocate_plan_buffer(
+                    packed.transpose_offsets, "GetNative transpose offsets");
+                id<MTLBuffer> transpose_index_buffer = impl_->allocate_plan_buffer(
+                    packed.transpose_indices, "GetNative transpose indices");
+                id<MTLBuffer> transpose_weight_buffer = impl_->allocate_plan_buffer(
+                    packed.transpose_weights, "GetNative transpose weights");
+                id<MTLBuffer> lower_buffer = impl_->allocate_plan_buffer(
+                    packed.lower_ld, "GetNative lower factors");
+                id<MTLBuffer> upper_buffer = impl_->allocate_plan_buffer(
+                    packed.upper_l, "GetNative upper factors");
+                id<MTLBuffer> diagonal_buffer = impl_->allocate_plan_buffer(
+                    packed.inverse_diagonal, "GetNative inverse diagonal");
+                id<MTLBuffer> forward_left_buffer = impl_->allocate_plan_buffer(
+                    packed.forward_left, "GetNative forward left indices");
+                id<MTLBuffer> forward_weight_buffer = impl_->allocate_plan_buffer(
+                    packed.forward_weights, "GetNative forward weights");
                 const std::size_t tile_plan_bytes =
                     static_cast<std::size_t>(descriptor_buffer.length)
                     + static_cast<std::size_t>(transpose_offset_buffer.length)
@@ -936,16 +1124,18 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     }
                     inverse.label = @"GetNative inverse axis";
                     [inverse setComputePipelineState:pipeline];
-                    [inverse setBuffer:source_buffer offset:0 atIndex:0];
-                    [inverse setBytes:&stage_job length:sizeof(stage_job) atIndex:1];
-                    [inverse setBuffer:descriptor_buffer offset:descriptor_offset atIndex:2];
-                    [inverse setBuffer:transpose_offset_buffer offset:0 atIndex:3];
-                    [inverse setBuffer:transpose_index_buffer offset:0 atIndex:4];
-                    [inverse setBuffer:transpose_weight_buffer offset:0 atIndex:5];
-                    [inverse setBuffer:lower_buffer offset:0 atIndex:6];
-                    [inverse setBuffer:upper_buffer offset:0 atIndex:7];
-                    [inverse setBuffer:diagonal_buffer offset:0 atIndex:8];
-                    [inverse setBuffer:workspace_buffer offset:0 atIndex:9];
+                    impl_->record_buffer_wiring([&] {
+                        [inverse setBuffer:source_buffer offset:0 atIndex:0];
+                        [inverse setBytes:&stage_job length:sizeof(stage_job) atIndex:1];
+                        [inverse setBuffer:descriptor_buffer offset:descriptor_offset atIndex:2];
+                        [inverse setBuffer:transpose_offset_buffer offset:0 atIndex:3];
+                        [inverse setBuffer:transpose_index_buffer offset:0 atIndex:4];
+                        [inverse setBuffer:transpose_weight_buffer offset:0 atIndex:5];
+                        [inverse setBuffer:lower_buffer offset:0 atIndex:6];
+                        [inverse setBuffer:upper_buffer offset:0 atIndex:7];
+                        [inverse setBuffer:diagonal_buffer offset:0 atIndex:8];
+                        [inverse setBuffer:workspace_buffer offset:0 atIndex:9];
+                    });
                     const NSUInteger threads = std::min<NSUInteger>(
                         static_cast<NSUInteger>(impl_->options.inverse_threads_per_threadgroup),
                         pipeline.maxTotalThreadsPerThreadgroup);
@@ -962,18 +1152,22 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                                                        std::size_t dispatch_count) {
                     if (stop.stop_requested()) throw std::runtime_error("Metal analysis cancelled");
                     id<MTLComputeCommandEncoder> inverse = [command computeCommandEncoder];
-                    if (inverse == nil) throw std::runtime_error("Metal matrix inverse encoder creation failed");
+                    if (inverse == nil) throw std::runtime_error(
+                        "Metal matrix inverse encoder creation "
+                        "failed");
                     inverse.label = @"GetNative inverse vertical matrix";
                     [inverse setComputePipelineState:pipeline];
-                    [inverse setBytes:&stage_job length:sizeof(stage_job) atIndex:0];
-                    [inverse setBuffer:descriptor_buffer offset:descriptor_offset atIndex:1];
-                    [inverse setBuffer:transpose_offset_buffer offset:0 atIndex:2];
-                    [inverse setBuffer:transpose_index_buffer offset:0 atIndex:3];
-                    [inverse setBuffer:transpose_weight_buffer offset:0 atIndex:4];
-                    [inverse setBuffer:lower_buffer offset:0 atIndex:5];
-                    [inverse setBuffer:upper_buffer offset:0 atIndex:6];
-                    [inverse setBuffer:diagonal_buffer offset:0 atIndex:7];
-                    [inverse setBuffer:workspace_buffer offset:0 atIndex:8];
+                    impl_->record_buffer_wiring([&] {
+                        [inverse setBytes:&stage_job length:sizeof(stage_job) atIndex:0];
+                        [inverse setBuffer:descriptor_buffer offset:descriptor_offset atIndex:1];
+                        [inverse setBuffer:transpose_offset_buffer offset:0 atIndex:2];
+                        [inverse setBuffer:transpose_index_buffer offset:0 atIndex:3];
+                        [inverse setBuffer:transpose_weight_buffer offset:0 atIndex:4];
+                        [inverse setBuffer:lower_buffer offset:0 atIndex:5];
+                        [inverse setBuffer:upper_buffer offset:0 atIndex:6];
+                        [inverse setBuffer:diagonal_buffer offset:0 atIndex:7];
+                        [inverse setBuffer:workspace_buffer offset:0 atIndex:8];
+                    });
                     const NSUInteger threads = std::min<NSUInteger>(
                         static_cast<NSUInteger>(impl_->options.inverse_threads_per_threadgroup),
                         pipeline.maxTotalThreadsPerThreadgroup);
@@ -990,14 +1184,18 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                                                        std::size_t dispatch_count) {
                     if (stop.stop_requested()) throw std::runtime_error("Metal analysis cancelled");
                     id<MTLComputeCommandEncoder> forward = [command computeCommandEncoder];
-                    if (forward == nil) throw std::runtime_error("Metal matrix forward encoder creation failed");
+                    if (forward == nil) throw std::runtime_error(
+                        "Metal matrix forward encoder creation "
+                        "failed");
                     forward.label = @"GetNative forward first axis";
                     [forward setComputePipelineState:pipeline];
-                    [forward setBytes:&stage_job length:sizeof(stage_job) atIndex:0];
-                    [forward setBuffer:descriptor_buffer offset:descriptor_offset atIndex:1];
-                    [forward setBuffer:forward_left_buffer offset:0 atIndex:2];
-                    [forward setBuffer:forward_weight_buffer offset:0 atIndex:3];
-                    [forward setBuffer:workspace_buffer offset:0 atIndex:4];
+                    impl_->record_buffer_wiring([&] {
+                        [forward setBytes:&stage_job length:sizeof(stage_job) atIndex:0];
+                        [forward setBuffer:descriptor_buffer offset:descriptor_offset atIndex:1];
+                        [forward setBuffer:forward_left_buffer offset:0 atIndex:2];
+                        [forward setBuffer:forward_weight_buffer offset:0 atIndex:3];
+                        [forward setBuffer:workspace_buffer offset:0 atIndex:4];
+                    });
                     const NSUInteger threads = std::min<NSUInteger>(
                         static_cast<NSUInteger>(impl_->options.inverse_threads_per_threadgroup),
                         pipeline.maxTotalThreadsPerThreadgroup);
@@ -1017,13 +1215,15 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     }
                     reduction.label = @"GetNative p1 metric";
                     [reduction setComputePipelineState:pipeline];
-                    [reduction setBuffer:source_buffer offset:0 atIndex:0];
-                    [reduction setBytes:&job length:sizeof(job) atIndex:1];
-                    [reduction setBuffer:descriptor_buffer offset:descriptor_offset atIndex:2];
-                    [reduction setBuffer:forward_left_buffer offset:0 atIndex:3];
-                    [reduction setBuffer:forward_weight_buffer offset:0 atIndex:4];
-                    [reduction setBuffer:workspace_buffer offset:0 atIndex:5];
-                    [reduction setBuffer:partial_buffer offset:partial_offset_bytes atIndex:6];
+                    impl_->record_buffer_wiring([&] {
+                        [reduction setBuffer:source_buffer offset:0 atIndex:0];
+                        [reduction setBytes:&job length:sizeof(job) atIndex:1];
+                        [reduction setBuffer:descriptor_buffer offset:descriptor_offset atIndex:2];
+                        [reduction setBuffer:forward_left_buffer offset:0 atIndex:3];
+                        [reduction setBuffer:forward_weight_buffer offset:0 atIndex:4];
+                        [reduction setBuffer:workspace_buffer offset:0 atIndex:5];
+                        [reduction setBuffer:partial_buffer offset:partial_offset_bytes atIndex:6];
+                    });
                     const NSUInteger dispatch_width = static_cast<NSUInteger>(
                         checked_u32(tile_partial_count, "Metal reduction dispatch width"));
                     [reduction dispatchThreadgroups:MTLSizeMake(dispatch_width, 1, 1)
@@ -1033,6 +1233,7 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                 const auto submit = [&](id<MTLCommandBuffer> command) {
                     [command commit];
                     [commands addObject:command];
+                    ++impl_->command_buffer_submission_count;
                 };
 
                 if (tile.signature.axes != AnalysisAxes::both) {
@@ -1137,28 +1338,23 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
             }
             ++queued_tiles;
             if (queued_tiles == maximum_queued_tiles || tile.end == candidates.size()) {
-                for (id<MTLCommandBuffer> command in commands) {
-                    [command waitUntilCompleted];
-                    if (command.status == MTLCommandBufferStatusError) {
-                        throw std::runtime_error(ns_error(
-                            command.error, "Metal command execution failed"));
-                    }
-                    if (@available(macOS 10.15, *)) {
-                        const double gpu_start = command.GPUStartTime;
-                        const double gpu_end = command.GPUEndTime;
-                        if (std::isfinite(gpu_start) && std::isfinite(gpu_end)
-                            && gpu_end >= gpu_start) {
-                            impl_->gpu_execution_ms += (gpu_end - gpu_start) * 1000.0;
-                        }
-                    }
-                    if (stop.stop_requested()) {
-                        throw std::runtime_error("Metal analysis cancelled");
-                    }
-                }
-                [commands removeAllObjects];
+                drain_commands();
                 queued_tiles = 0;
                 queued_plan_bytes = 0;
+                if (stop.stop_requested()) {
+                    throw std::runtime_error("Metal analysis cancelled");
+                }
             }
+        };
+
+        try {
+            for (const TileRange &tile : tiles) {
+                process_tile(tile);
+            }
+        } catch (...) {
+            const std::exception_ptr original = std::current_exception();
+            drain_commands();
+            std::rethrow_exception(original);
         }
 
         const float *partials = static_cast<const float *>(partial_buffer.contents);

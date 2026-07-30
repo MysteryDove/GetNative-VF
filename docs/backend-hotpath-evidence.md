@@ -26,16 +26,18 @@
 | PL0 exact tap reuse | `KEPT` | All 112 matrix cases are byte-identical, loop-derived raw weight calls are halved, and every valid paired case improves; Lanczos3-8 improve 31.92% to 37.18% |
 | PL1 B/C geometry reuse | `KEPT` | Eight B/C sweep cases improve 10.41% to 14.22% with byte-identical plans; the single-B/C control changes +0.224%, and all MAD, thermal, concurrency, isolation, and scratch-accounting gates pass |
 | PL1 packed topology interning | `REMOVED_AFTER_TEST` | Exact interning removed 77.99% of topology upload bytes but reduced total explicit working set only 6.44% and regressed primary Metal wall 1.16%, missing both alternative keep gates |
-| MK3 arena/ring/cache | `PENDING_EVALUATION` | PL1 is terminal; persistent allocation/upload reuse is next, while content caching still requires its own exact identity/packing checkpoint and independent gate |
+| MK3a persistent working buffers | `KEPT` | Repeated source/workspace/partial allocation falls 3 to 0; the 112-case final matrix has zero path and working-set differences, improves the primary Bicubic case 4.90%, and has no paired-median regression |
+| MK3b plan-upload arena/ring | `PENDING_EVALUATION` | MK3a removes only 3 of 291 total allocations; the remaining 288 per-tile plan allocations require independent 2-slot and 4-slot experiments |
+| MK3c packed-content cache | `PENDING_ABI_CHECKPOINT` | Content caching still requires its own exact identity/private packing-ABI checkpoint and independent cold/warm/eviction gate |
 | MK4 Float16 coefficient storage | `PENDING_PREREQUISITES` | Strict Float32 remains the only retained path |
 
 ## Final Identity Set
 
-The final integrated evaluator and PL1 matrix evidence use these identities:
+The final integrated evaluator and MK3a matrix evidence use these identities:
 
 | Input | SHA-256 |
 | --- | --- |
-| Benchmark binary | `4b5651e1a1e4a9e6c68bcd9fa14a114fc9b9eea1b62feb1ed53ad1ec80c5858d` |
+| Benchmark binary | `144a6c2986c4df12c01a37b1ee834c4fddd5aac394bbb8cc34985fe8a7310489` |
 | Metallib | `a2e647dabf08b575c252600713eb5cf29b48e1687496088d6cb47af53ab7567c` |
 | Matrix JSON | `2a34ae9224d06565191977541efcb16d1fe182b94274624cf49daa9343534b06` |
 | Fixture PNG | `61f9ee1ac858bbadd6a959ba35f5eceb077b8452b91e97a5ce3d39ebc69e20c6` |
@@ -57,17 +59,17 @@ cmake --build build/backend-hotpath-evaluator \
 Result:
 
 - 11/11 CTest cases passed.
-- Metal B3/F2 control: 6.73% median improvement, paired MAD 0.0115.
-- Metal B7/F4 control: 8.18% median improvement, paired MAD 0.0036.
+- Metal B3/F2 control: 6.93% median improvement, paired MAD 0.006.
+- Metal B7/F4 control: 8.08% median improvement, paired MAD 0.003.
 - CPU Bicubic Catmull-Rom 1080 to representative 810 candidate:
-  73.39% inverse-stage improvement and 62.38% whole-candidate improvement.
+  73.80% inverse-stage improvement and 61.24% whole-candidate improvement.
 - Thermal state stayed nominal, no concurrent benchmark was detected, and all
   identities remained stable.
 
 Artifacts:
 
-- `build/backend-hotpath-evaluator/artifacts/backend-hotpath/20260730T203330908Z-pid12708/metal-kernel-report.json`
-- `build/backend-hotpath-evaluator/artifacts/backend-hotpath/20260730T203340222Z-pid12938/cpu-column-report.json`
+- `build/backend-hotpath-evaluator/artifacts/backend-hotpath/20260730T225151167Z-pid47073/metal-kernel-report.json`
+- `build/backend-hotpath-evaluator/artifacts/backend-hotpath/20260730T225200066Z-pid47268/cpu-column-report.json`
 
 ## CPU0 Full Matrix
 
@@ -221,17 +223,65 @@ Rejected experiment identities and artifacts:
 - Primary failure: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/pl1-topology-formal-810/20260730T212845145Z-pid45698/metal-packed-topology-report.json`
 - Single-B/C control: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/pl1-topology-formal-control/20260730T212821257Z-pid44582/metal-packed-topology-report.json`
 
+## MK3a Persistent Working Buffers
+
+The engine now keeps grow-to-fit shared source, workspace, and metric-partial
+buffers across serialized analysis calls. The retained capacities are bounded
+by a configurable 2 GiB default ceiling; a request that cannot fit the ceiling
+clears the retained set and uses the original transient behavior for that call.
+The transient path remains selectable for same-binary diagnostics. Source bytes
+are copied into either path in the same order, and shader arithmetic, plan
+packing, command order, and strict Float32 compilation are unchanged.
+
+Telemetry separates total and working-buffer allocation counts/bytes/times,
+source and plan upload time, buffer wiring time, active bytes, retained capacity
+and high-water marks, and submitted/completed command counts. A submitted-command
+cancellation test verifies that every command is drained before the call throws,
+then immediately reuses the same engine and retained buffers successfully.
+
+The formal 21-pair matrix covers all 14 filters at seven named native heights
+plus the `800..899.9` fractional scan. The aggregate produced 100 valid cases;
+one thermal-transition case and eleven MAD-over-0.02 cases were replaced with
+same-binary isolated runs. The merged 112-case evidence passes:
+
+- Bicubic Catmull-Rom at 810 has a 4.90% paired wall improvement; the
+  transient/persistent wall medians are 104.966/100.926 ms and paired MAD is
+  0.0059. Its GPU medians are 97.672/99.169 ms, while the `wall-GPU` residual
+  falls from 7.125 to 1.738 ms.
+- Bilinear at 810 has a 6.22% paired improvement and wall medians of
+  74.634/69.650 ms. Across the final matrix, every paired median improves;
+  improvements range from 0.010% to 8.389%, and maximum valid MAD is 0.019872.
+- Every transient/persistent result path is identical, all accuracy and valley
+  checks pass, and explicit working-set growth is exactly zero.
+- Every measured transient call allocates three working buffers; every warm
+  persistent call allocates zero and reuses all three. Submitted and completed
+  command counts match in every sample.
+
+This is an independent MK3a keep, not completion of MK3. Total repeated-call
+allocation count falls only from 291 to 288 (1.03%) because each of the 32 tiles
+still creates nine plan buffers. The overall 80% allocation-count and 50%
+allocation/wiring-time gates remain open for the separate plan arena and 2/4
+slot ring experiments.
+
+Identity and artifacts:
+
+- Benchmark binary: `144a6c2986c4df12c01a37b1ee834c4fddd5aac394bbb8cc34985fe8a7310489`
+- Metallib: `a2e647dabf08b575c252600713eb5cf29b48e1687496088d6cb47af53ab7567c`
+- Aggregate: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/mk3-working-buffer-clean-full/20260730T225239038Z-pid48988/metal-working-buffer-report.json`
+- Twelve same-binary replacements: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/mk3-working-buffer-clean-replacements/`
+
 ## MK3 Readiness Boundary
 
-The final Metal controls allocate 291 Metal buffers per 1000-candidate run.
-Their median backend wall minus reported GPU execution time is approximately
-6.9 to 8.1 ms. This residual includes packing, allocation, command encoding,
-submission, synchronization, and measurement overhead; it is not direct proof
-of allocation time.
+The transient controls allocate 291 Metal buffers per 1000-candidate run; MK3a
+reduces that to 288. The remaining allocations are exactly the nine plan buffers
+for each of 32 tiles. Direct telemetry for the retained Bilinear/Bicubic 810
+paths reports approximately 3.0/5.5 ms of plan upload and 1.4/1.5 ms of Metal
+allocation API time per call. Those counters overlap GPU execution and must not
+be summed into `wall-GPU` residual, but they identify the next host-side target.
 
 The terminal Stage 1 commit `6eda3ef`, combined integration commit `00e53b9`,
-and terminal PL1 decisions now satisfy the planner coordination gate. This is
-sufficient to start the persistent arena and 2/4-slot upload-ring experiment.
+and terminal PL1/MK3a decisions now satisfy the planner coordination gate. This
+is sufficient to start the aligned plan arena and 2/4-slot upload-ring experiment.
 Packed-content caching additionally requires the stable exact plan identity and
 private packing-ABI checkpoint defined in the design plan; the rejected PL1
 packing ABI is not retained or reused as that checkpoint.
