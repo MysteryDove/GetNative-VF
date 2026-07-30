@@ -27,7 +27,7 @@
 | PL1 B/C geometry reuse | `KEPT` | Eight B/C sweep cases improve 10.41% to 14.22% with byte-identical plans; the single-B/C control changes +0.224%, and all MAD, thermal, concurrency, isolation, and scratch-accounting gates pass |
 | PL1 packed topology interning | `REMOVED_AFTER_TEST` | Exact interning removed 77.99% of topology upload bytes but reduced total explicit working set only 6.44% and regressed primary Metal wall 1.16%, missing both alternative keep gates |
 | MK3a persistent working buffers | `KEPT` | Repeated source/workspace/partial allocation falls 3 to 0; the 112-case final matrix has zero path and working-set differences, improves the primary Bicubic case 4.90%, and has no paired-median regression |
-| MK3b plan-upload arena/ring | `PENDING_EVALUATION` | MK3a removes only 3 of 291 total allocations; the remaining 288 per-tile plan allocations require independent 2-slot and 4-slot experiments |
+| MK3b plan-upload arena/ring | `REMOVED_AFTER_TEST` | Two/four-slot rings removed all 288 warm plan-buffer allocations and cut allocation/wiring time over 99%, but improved the primary wall only 0.689%/1.043%, below the 3% gate |
 | MK3c packed-content cache | `PENDING_ABI_CHECKPOINT` | Content caching still requires its own exact identity/private packing-ABI checkpoint and independent cold/warm/eviction gate |
 | MK4 Float16 coefficient storage | `PENDING_PREREQUISITES` | Strict Float32 remains the only retained path |
 
@@ -270,7 +270,55 @@ Identity and artifacts:
 - Aggregate: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/mk3-working-buffer-clean-full/20260730T225239038Z-pid48988/metal-working-buffer-report.json`
 - Twelve same-binary replacements: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/mk3-working-buffer-clean-replacements/`
 
-## MK3 Readiness Boundary
+## MK3b Plan-Upload Arena and Ring - Removed After Test
+
+The experiment packed descriptors and all eight plan tables into one 256-byte
+aligned shared Metal buffer per slot while preserving the existing buffer
+indices, shader ABI, table contents, and strict Float32 arithmetic. `ring=0`
+kept the nine-buffer diagnostic path. The two/four-slot paths used grow-to-fit
+retained arenas under a 512 MiB configured ceiling and a 2 GiB combined retained
+ceiling.
+
+An initial whole-window drain exposed an 11.4% two-slot smoke regression because
+it introduced a barrier after every two tiles. That implementation was not used
+for formal evidence. The corrected experiment packed the next tile while the GPU
+ran, then waited only for the exact slot about to be overwritten. Other slots
+remained in flight, and cancellation drained every submitted command before
+returning.
+
+Both stable 21-pair primary `bicubic-catrom@810` runs failed the required 3%
+backend-wall gate:
+
+| Ring | Nine-buffer/ring median | Improvement | Paired MAD | Allocation count | Allocation+wiring | Plan upload median | Working-set change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 slots | 90.432/89.811 ms | 0.689% | 0.00392 | -100% | -99.590% | 5.231/2.014 ms | -26.54% |
+| 4 slots | 90.537/89.815 ms | 1.043% | 0.00400 | -100% | -99.575% | 5.387/1.977 ms | -24.73% |
+
+The result is compute-dominated rather than an unmeasured host win: two-slot
+median GPU time changed 88.994 to 88.633 ms and four-slot changed 89.127 to
+88.651 ms. Removing allocation and packing overhead therefore did not translate
+into the required end-to-end gain. The full matrix was not run after both ring
+depths failed this necessary primary gate.
+
+Correctness and resource gates passed before removal: Release CTest passed
+11/11; Metal API plus Shader Validation passed; all legacy/ring/fallback result
+bits matched; maximum path difference was zero; all submitted commands completed;
+active arena bytes returned to zero; and cancellation followed by immediate slot
+reuse passed. The implementation, public diagnostic options, tests, and
+benchmark mode were then removed. Production remains at the independently kept
+MK3a working-buffer baseline. A clean rebuild after removal again passed Release
+CTest 11/11 and Metal API plus Shader Validation.
+
+Rejected experiment identities and artifacts:
+
+- Benchmark binary: `44e60c653c0536bb7e2e6ee1a52b0f369852cc4b6565ff14d2ea9fc12a8acbaa`
+- Metallib: `a2e647dabf08b575c252600713eb5cf29b48e1687496088d6cb47af53ab7567c`
+- Two-slot failure: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/mk3-plan-ring2-primary/20260730T235034320Z-pid72550/metal-plan-ring-2-report.json`
+- Four-slot failure: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/mk3-plan-ring4-primary/20260730T235115005Z-pid74349/metal-plan-ring-4-report.json`
+- Experimental validation: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/mk3-plan-ring-validation/metal-validation-ctest.log`
+- Post-removal validation: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/mk3-plan-ring-removed-baseline/metal-validation-ctest.log`
+
+## MK3c Readiness Boundary
 
 The transient controls allocate 291 Metal buffers per 1000-candidate run; MK3a
 reduces that to 288. The remaining allocations are exactly the nine plan buffers
@@ -280,8 +328,7 @@ allocation API time per call. Those counters overlap GPU execution and must not
 be summed into `wall-GPU` residual, but they identify the next host-side target.
 
 The terminal Stage 1 commit `6eda3ef`, combined integration commit `00e53b9`,
-and terminal PL1/MK3a decisions now satisfy the planner coordination gate. This
-is sufficient to start the aligned plan arena and 2/4-slot upload-ring experiment.
-Packed-content caching additionally requires the stable exact plan identity and
-private packing-ABI checkpoint defined in the design plan; the rejected PL1
-packing ABI is not retained or reused as that checkpoint.
+and terminal PL1/MK3a/MK3b decisions leave packed-content caching as a separate
+experiment. It still requires the stable exact plan identity and private
+packing-ABI checkpoint defined in the design plan; neither the rejected PL1 ABI
+nor the removed MK3b arena establishes that checkpoint.
