@@ -176,8 +176,88 @@ speedup, Metal execution-regression, and Metal-total improvement gates pass.
 Keep the private bounded batch planner and stop Stage 1 without a revision.
 
 After batching, planner share of the phase-separated Metal total has median
-`0.132946`, still above the PRD's `0.10` direction threshold. This selects one
-small follow-up measurement stage for persistent worker reuse. It does not
-authorize cross-call single-flight, persistent plan caching, a broader
-scheduler, or GPU-backend changes; those remain skipped unless later benchmark
-evidence independently justifies them.
+`0.132946`, still above the PRD's `0.10` direction threshold. This triggers an
+evaluation of persistent worker reuse, not its implementation. The final
+21-pair artifact already contains the serial and eight-worker measurements
+needed for the bounded evaluation below.
+
+## Remaining Planner Dispositions
+
+### Persistent Worker Reuse
+
+For each Metal pair, use the deliberately optimistic assumptions that eight
+workers scale the serial plan work perfectly and that a persistent pool has
+zero dispatch cost:
+
+```text
+ideal_8_worker_ms_i = serial_plan_ms_i / 8
+maximum_removable_ms_i = max(0, batch_plan_ms_i - ideal_8_worker_ms_i)
+maximum_total_improvement_i =
+    maximum_removable_ms_i / batch_metal_total_ms_i
+```
+
+This treats every gap from perfect eight-way scaling as removable worker
+lifecycle overhead, even though it also includes unavoidable serial work,
+load imbalance, allocation, and atomic task-claim cost. It is therefore an
+optimistic non-superlinear upper bound, not an estimate of expected gain.
+
+| Bound from 21 Metal pairs | Median | MAD | Range |
+| --- | ---: | ---: | ---: |
+| Maximum removable planner time | `2.602552 ms` | `0.362011 ms` | `1.992573..3.175844 ms` |
+| Fraction of batch planner time | `16.7349%` | `2.0710%` | `12.6230%..19.6910%` |
+| Fraction of batch Metal total | `2.1960%` | `0.2947%` | `1.6392%..2.5687%` |
+
+Even the largest pair stays below the existing 5% full-wall complexity-retention
+gate. A real fixed pool would retain dispatch, synchronization, lifetime,
+failure, and shutdown cost, so it cannot claim this entire bound.
+
+Decision: `SKIPPED_UPPER_BOUND_BELOW_GATE`.
+
+### Cross-Call Single-Flight And Plan Cache
+
+Stage 1 proves stable in-call exact-key deduplication: 1000 identical requests
+physically build once and share one result pointer. The decision workload has
+1000 unique keys, and no retained artifact reports concurrent equal cross-call
+misses, repeated-scan cache hit rate, cache pressure, or duplicate physical
+builds across calls. The old M1 design would add a public claim/error protocol,
+generation-safe clear, bounded LRU residency, waiters, and failure publication
+without a measured workload that benefits from them.
+
+Decision: `SKIPPED_NO_MEASURED_CROSS_CALL_DUPLICATION`.
+
+### Full Planner Service And Remediation Variants
+
+The retained private helper already supplies the measured M2 subset: stable
+first-occurrence deduplication, exact request-order output, bounded 1/2/4/8/auto
+workers, one build per unique key, serial fallback for at most two keys, stable
+failure selection, stop-claiming after failure observation, and join before
+rethrow.
+
+The wider service design's bounded queue, public cancellation lifecycle,
+cross-call admission, shared resource budget, and persistent cache are not
+triggered by a measured queueing, cancellation, or memory problem in this lane.
+Its two remediation variants are explicitly trigger-false:
+
+- per-worker scratch reuse: `SKIPPED_TRIGGER_FALSE`;
+- exact capacity reservation: `SKIPPED_TRIGGER_FALSE`.
+
+The trigger is false because the final core auto result is `6.653403x`, the
+Metal planner result is `6.661206x`, every 1/2-request overhead gate passes,
+and the measured Metal working set is `252.230 MiB`, below the old M2
+`512 MiB` ceiling.
+
+Decision: `RETAIN_SIMPLE_BATCH_HELPER`; do not introduce the wider service.
+
+### Planner Lane Terminal State
+
+- Stage 0 measurement: `PROCEED_STAGE1`.
+- Stage 1 bounded unique-plan construction: `ADOPT_AND_STOP`.
+- Persistent worker reuse: `SKIPPED_UPPER_BOUND_BELOW_GATE`.
+- Cross-call single-flight/LRU: `SKIPPED_NO_MEASURED_CROSS_CALL_DUPLICATION`.
+- Scratch reuse and exact reservation: `SKIPPED_TRIGGER_FALSE`.
+- Queue/cancellation/resource-budget service: `SKIPPED_NO_PRODUCT_TRIGGER`.
+
+Prepared scan slicing, portable GPU packing, Metal queue hardening, shared GPU
+plan representation, pipeline overlap, and CUDA/Vulkan work are not planner
+lane stages and remain owned by their separate plans/worktrees. No additional
+planner implementation is justified by the retained evidence.
