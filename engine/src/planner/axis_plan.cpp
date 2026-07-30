@@ -1,8 +1,10 @@
 #include "getnative/axis_plan.hpp"
 
+#include "axis_plan_diagnostics.hpp"
 #include "axis_plan_key.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -140,6 +142,7 @@ struct DoubleCsr {
     std::vector<double> weights;
 };
 
+template <bool ReuseTapWeights>
 [[nodiscard]] DoubleCsr make_descale_matrix(const AxisPlanRequest &request,
                                             std::int32_t support) {
     const std::int32_t rows = request.source_size;
@@ -154,12 +157,19 @@ struct DoubleCsr {
 
     std::vector<std::pair<std::int32_t, double>> row;
     row.reserve(static_cast<std::size_t>(2 * support));
+    // Filter::support() caps Lanczos at 15 taps, so the widest row has 30 taps.
+    std::array<double, 30> tap_weights{};
     for (std::int32_t i = 0; i < rows; ++i) {
         const double position = (static_cast<double>(i) + 0.5) / ratio + request.shift;
         const double begin = round_half_up(position - static_cast<double>(support)) + 0.5;
         double total = 0.0;
         for (std::int32_t tap = 0; tap < 2 * support; ++tap) {
-            total += request.filter.weight(begin + static_cast<double>(tap) - position);
+            const double weight = request.filter.weight(
+                begin + static_cast<double>(tap) - position);
+            if constexpr (ReuseTapWeights) {
+                tap_weights[static_cast<std::size_t>(tap)] = weight;
+            }
+            total += weight;
         }
         if (!std::isfinite(total) || total == 0.0) {
             throw std::runtime_error("filter produced a zero or non-finite weight sum");
@@ -172,7 +182,13 @@ struct DoubleCsr {
             if (index < 0) {
                 continue;
             }
-            const double weight = request.filter.weight(center - position) / total;
+            double raw_weight = 0.0;
+            if constexpr (ReuseTapWeights) {
+                raw_weight = tap_weights[static_cast<std::size_t>(tap)];
+            } else {
+                raw_weight = request.filter.weight(center - position);
+            }
+            const double weight = raw_weight / total;
             if (weight == 0.0) {
                 continue;
             }
@@ -195,6 +211,7 @@ struct DoubleCsr {
     return result;
 }
 
+template <bool ReuseTapWeights>
 [[nodiscard]] DoubleCsr make_zimg_forward(const AxisPlanRequest &request,
                                           std::int32_t support) {
     const std::int32_t rows = request.source_size;
@@ -225,7 +242,12 @@ struct DoubleCsr {
         const double begin = round_half_up(position - static_cast<double>(filter_size) / 2.0) + 0.5;
         double total = 0.0;
         for (std::int32_t tap = 0; tap < filter_size; ++tap) {
-            total += kernel.weight((begin + static_cast<double>(tap) - position) * step);
+            const double weight = kernel.weight(
+                (begin + static_cast<double>(tap) - position) * step);
+            if constexpr (ReuseTapWeights) {
+                tap_weights[static_cast<std::size_t>(tap)] = weight;
+            }
+            total += weight;
         }
         if (!std::isfinite(total) || total == 0.0) {
             throw std::runtime_error("zimg forward filter produced a zero or non-finite weight sum");
@@ -247,8 +269,13 @@ struct DoubleCsr {
                                -std::numeric_limits<double>::infinity()));
             const auto index = static_cast<std::int32_t>(std::floor(mapped));
             tap_indices[static_cast<std::size_t>(tap)] = index;
-            tap_weights[static_cast<std::size_t>(tap)] =
-                kernel.weight((pixel_center - position) * step) / total;
+            double raw_weight = 0.0;
+            if constexpr (ReuseTapWeights) {
+                raw_weight = tap_weights[static_cast<std::size_t>(tap)];
+            } else {
+                raw_weight = kernel.weight((pixel_center - position) * step);
+            }
+            tap_weights[static_cast<std::size_t>(tap)] = raw_weight / total;
             left = std::min(left, index);
             right = std::max(right, index + 1);
         }
@@ -362,7 +389,11 @@ std::size_t AxisPlan::packed_factor_elements() const noexcept {
     return lower_ld.size() + upper_l.size() + inverse_diagonal.size();
 }
 
-AxisPlan build_axis_plan(const AxisPlanRequest &request) {
+namespace {
+
+[[nodiscard]] AxisPlan build_axis_plan_impl(
+    const AxisPlanRequest &request,
+    detail::TapEvaluationMode tap_evaluation) {
     if (request.source_size <= 0 || request.destination_size <= 0) {
         throw std::invalid_argument("axis dimensions must be positive");
     }
@@ -375,10 +406,14 @@ AxisPlan build_axis_plan(const AxisPlanRequest &request) {
         throw std::invalid_argument("filter support is too large");
     }
     const std::int32_t half_bandwidth = std::min(2 * support - 1, request.destination_size - 1);
-    DoubleCsr descale_matrix = make_descale_matrix(request, support);
+    DoubleCsr descale_matrix = tap_evaluation == detail::TapEvaluationMode::reuse
+        ? make_descale_matrix<true>(request, support)
+        : make_descale_matrix<false>(request, support);
     DoubleCsr transpose = transpose_csr(
         descale_matrix, request.source_size, request.destination_size);
-    DoubleCsr zimg_forward = make_zimg_forward(request, support);
+    DoubleCsr zimg_forward = tap_evaluation == detail::TapEvaluationMode::reuse
+        ? make_zimg_forward<true>(request, support)
+        : make_zimg_forward<false>(request, support);
     std::vector<double> factors = form_normal_bands(
         descale_matrix, request.source_size, request.destination_size, half_bandwidth);
     factor_banded_ldlt(factors, request.destination_size, half_bandwidth);
@@ -460,6 +495,22 @@ AxisPlan build_axis_plan(const AxisPlanRequest &request) {
     }
     return plan;
 }
+
+} // namespace
+
+AxisPlan build_axis_plan(const AxisPlanRequest &request) {
+    return build_axis_plan_impl(request, detail::TapEvaluationMode::reuse);
+}
+
+namespace detail {
+
+AxisPlan build_axis_plan_with_tap_evaluation(
+    const AxisPlanRequest &request,
+    TapEvaluationMode mode) {
+    return build_axis_plan_impl(request, mode);
+}
+
+} // namespace detail
 
 struct AxisPlanCache::Impl {
     mutable std::mutex mutex;

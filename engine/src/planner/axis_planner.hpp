@@ -1,5 +1,6 @@
 #pragma once
 
+#include "axis_plan_diagnostics.hpp"
 #include "getnative/axis_plan.hpp"
 
 #include <cstddef>
@@ -14,6 +15,7 @@ struct AxisPlanBatchOptions {
     std::size_t worker_count = 0;
     std::function<void(std::size_t)> before_build;
     std::function<void(std::size_t)> failure_observed;
+    TapEvaluationMode tap_evaluation = TapEvaluationMode::reuse;
 };
 
 struct AxisPlanBatchResult {

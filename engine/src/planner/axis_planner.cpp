@@ -81,7 +81,8 @@ AxisPlanBatchResult build_axis_plans(
         if (options.before_build) options.before_build(index);
         physical_builds.fetch_add(1U, std::memory_order_relaxed);
         unique_plans[index] = std::make_shared<const AxisPlan>(
-            build_axis_plan(unique_requests[index]));
+            build_axis_plan_with_tap_evaluation(
+                unique_requests[index], options.tap_evaluation));
     };
 
     if (result.effective_worker_count == 1U) {

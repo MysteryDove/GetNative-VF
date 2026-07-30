@@ -1,6 +1,7 @@
 #include "getnative/metal_analysis.hpp"
 
 #include "getnative/filter.hpp"
+#include "axis_planner.hpp"
 #include "inverse_columns.hpp"
 
 #import <CoreGraphics/CoreGraphics.h>
@@ -60,6 +61,7 @@ struct Configuration {
     bool required_specialized = false;
     bool cpu_columns = false;
     bool required_simd = false;
+    bool planner_taps = false;
     bool assert_gates = false;
 };
 
@@ -228,6 +230,46 @@ struct CpuCaseReport {
     bool gate_passed = false;
 };
 
+struct PlannerMeasurement {
+    double wall_ms = 0.0;
+    std::string plan_sha256;
+    std::size_t unique_key_count = 0;
+    std::size_t physical_build_count = 0;
+    std::size_t peak_active_builds = 0;
+    std::size_t effective_worker_count = 0;
+};
+
+struct PlannerPairSample {
+    std::string first_mode;
+    double recompute_ms = 0.0;
+    double reuse_ms = 0.0;
+    double delta = 0.0;
+    HostObservation host_before;
+    HostObservation host_after;
+};
+
+struct PlannerCaseReport {
+    BenchmarkCase benchmark_case;
+    std::vector<PlannerPairSample> samples;
+    double recompute_median_ms = 0.0;
+    double reuse_median_ms = 0.0;
+    double paired_delta_median = 0.0;
+    double paired_delta_mad = 0.0;
+    std::string recompute_plan_sha256;
+    std::string reuse_plan_sha256;
+    std::uint64_t expected_recompute_weight_evaluations = 0;
+    std::uint64_t expected_reuse_weight_evaluations = 0;
+    std::size_t unique_key_count = 0;
+    std::size_t peak_active_builds = 0;
+    std::size_t effective_worker_count = 0;
+    HostObservation host_before;
+    HostObservation host_after;
+    bool plans_byte_identical = false;
+    bool thermal_stable = true;
+    bool concurrent_process_detected = false;
+    bool gate_passed = false;
+};
+
 [[nodiscard]] std::size_t parse_size(std::string_view text) {
     std::size_t value = 0;
     const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
@@ -266,6 +308,8 @@ struct CpuCaseReport {
             result.cpu_columns = true;
         } else if (argument == "--required-simd") {
             result.required_simd = true;
+        } else if (argument == "--planner-taps") {
+            result.planner_taps = true;
         } else if (argument == "--assert") {
             result.assert_gates = true;
         } else {
@@ -273,7 +317,8 @@ struct CpuCaseReport {
                 "usage: getnative_metal_kernel_benchmark --matrix PATH --fixture PATH "
                 "(--json-out PATH|--artifact-root PATH) [--samples N] "
                 "[--controls-only|--full-matrix|--sustained] [--case ID] "
-                "[--required-specialized] [--cpu-columns [--required-simd]] [--assert]");
+                "[--required-specialized] [--cpu-columns [--required-simd]] "
+                "[--planner-taps] [--assert]");
         }
     }
     if (result.matrix_path.empty() || result.fixture_path.empty()) {
@@ -294,6 +339,12 @@ struct CpuCaseReport {
     }
     if (result.cpu_columns && result.sustained) {
         throw std::invalid_argument("--sustained is not a CPU column benchmark mode");
+    }
+    if (result.planner_taps
+        && (result.cpu_columns || result.required_simd
+            || result.required_specialized || result.sustained)) {
+        throw std::invalid_argument(
+            "--planner-taps is incompatible with CPU, specialization, and sustained modes");
     }
     return result;
 }
@@ -756,6 +807,234 @@ struct CandidatePoint {
         });
     }
     return result;
+}
+
+[[nodiscard]] std::vector<getnative::AxisPlanRequest> make_plan_requests(
+    const Matrix &matrix,
+    const BenchmarkCase &benchmark_case) {
+    std::vector<getnative::AxisPlanRequest> result;
+    result.reserve(matrix.candidates);
+    const getnative::Filter filter = make_filter(benchmark_case.filter);
+    for (std::size_t index = 0; index < matrix.candidates; ++index) {
+        const CandidatePoint point = candidate_point(matrix, benchmark_case, index);
+        result.push_back({matrix.source_height, point.native_height, point.active_height,
+                          0.0, filter, getnative::BorderMode::mirror});
+    }
+    return result;
+}
+
+void update_sha256(CC_SHA256_CTX &context, const void *data, std::size_t size) {
+    const auto *bytes = static_cast<const unsigned char *>(data);
+    while (size > 0U) {
+        const std::size_t chunk = std::min<std::size_t>(
+            size, static_cast<std::size_t>(std::numeric_limits<CC_LONG>::max()));
+        CC_SHA256_Update(&context, bytes, static_cast<CC_LONG>(chunk));
+        bytes += chunk;
+        size -= chunk;
+    }
+}
+
+template <typename T>
+void update_sha256_value(CC_SHA256_CTX &context, const T &value) {
+    update_sha256(context, &value, sizeof(value));
+}
+
+template <typename T>
+void update_sha256_vector(CC_SHA256_CTX &context, const std::vector<T> &values) {
+    const std::uint64_t size = static_cast<std::uint64_t>(values.size());
+    update_sha256_value(context, size);
+    if (!values.empty()) {
+        update_sha256(context, values.data(), values.size() * sizeof(T));
+    }
+}
+
+[[nodiscard]] std::string plan_batch_sha256(
+    std::span<const std::shared_ptr<const getnative::AxisPlan>> plans) {
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    const std::uint64_t plan_count = static_cast<std::uint64_t>(plans.size());
+    update_sha256_value(context, plan_count);
+    for (const auto &plan : plans) {
+        if (!plan || !plan->valid()) {
+            throw std::runtime_error("planner tap benchmark produced an invalid plan");
+        }
+        update_sha256_value(context, plan->source_size);
+        update_sha256_value(context, plan->destination_size);
+        update_sha256_value(context, plan->support);
+        update_sha256_value(context, plan->half_bandwidth);
+        update_sha256_value(context, plan->forward_width);
+        update_sha256_value(context, plan->active_length);
+        update_sha256_value(context, plan->shift);
+        update_sha256_vector(context, plan->forward_offsets);
+        update_sha256_vector(context, plan->forward_indices);
+        update_sha256_vector(context, plan->forward_weights);
+        update_sha256_vector(context, plan->transpose_offsets);
+        update_sha256_vector(context, plan->transpose_indices);
+        update_sha256_vector(context, plan->transpose_weights);
+        update_sha256_vector(context, plan->lower_ld);
+        update_sha256_vector(context, plan->upper_l);
+        update_sha256_vector(context, plan->inverse_diagonal);
+    }
+    std::array<unsigned char, CC_SHA256_DIGEST_LENGTH> digest{};
+    CC_SHA256_Final(digest.data(), &context);
+    std::ostringstream output;
+    output << std::hex << std::setfill('0');
+    for (const unsigned char value : digest) {
+        output << std::setw(2) << static_cast<int>(value);
+    }
+    return output.str();
+}
+
+[[nodiscard]] std::uint64_t expected_reuse_weight_evaluations(
+    std::span<const getnative::AxisPlanRequest> requests) {
+    std::uint64_t result = 0U;
+    for (const auto &request : requests) {
+        const std::int32_t support = request.filter.support();
+        const double scale = static_cast<double>(request.source_size)
+            / request.active_length;
+        const double step = std::min(scale, 1.0);
+        const std::int32_t forward_filter_size = std::max(
+            static_cast<std::int32_t>(
+                std::ceil(static_cast<double>(support) / step)) * 2,
+            1);
+        const std::uint64_t calls_per_row = static_cast<std::uint64_t>(
+            2 * support + forward_filter_size);
+        result += static_cast<std::uint64_t>(request.source_size) * calls_per_row;
+    }
+    return result;
+}
+
+[[nodiscard]] PlannerMeasurement measure_planner(
+    std::span<const getnative::AxisPlanRequest> requests,
+    getnative::detail::TapEvaluationMode mode,
+    bool hash_plans) {
+    getnative::detail::AxisPlanBatchOptions options;
+    options.tap_evaluation = mode;
+    const auto start = Clock::now();
+    auto batch = getnative::detail::build_axis_plans(requests, std::move(options));
+    const double wall_ms = std::chrono::duration<double, std::milli>(
+        Clock::now() - start).count();
+    if (batch.plans.size() != requests.size()
+        || batch.unique_key_count != requests.size()
+        || batch.physical_build_count != batch.unique_key_count
+        || batch.peak_active_builds > batch.effective_worker_count) {
+        throw std::runtime_error("planner tap benchmark batch invariant changed");
+    }
+    return {
+        wall_ms,
+        hash_plans ? plan_batch_sha256(batch.plans) : std::string{},
+        batch.unique_key_count,
+        batch.physical_build_count,
+        batch.peak_active_builds,
+        batch.effective_worker_count,
+    };
+}
+
+void validate_planner_measurement(
+    const PlannerMeasurement &measurement,
+    const PlannerMeasurement &warmup) {
+    if (measurement.unique_key_count != warmup.unique_key_count
+        || measurement.physical_build_count != warmup.physical_build_count
+        || measurement.effective_worker_count != warmup.effective_worker_count
+        || measurement.peak_active_builds > measurement.effective_worker_count) {
+        throw std::runtime_error("planner tap benchmark measurement identity changed");
+    }
+}
+
+[[nodiscard]] PlannerCaseReport run_planner_case(
+    const Matrix &matrix,
+    const BenchmarkCase &benchmark_case,
+    const Configuration &config) {
+    PlannerCaseReport report;
+    report.benchmark_case = benchmark_case;
+    report.host_before = capture_host_observation();
+    const auto requests = make_plan_requests(matrix, benchmark_case);
+    const PlannerMeasurement recompute_warmup = measure_planner(
+        requests, getnative::detail::TapEvaluationMode::recompute, true);
+    const PlannerMeasurement reuse_warmup = measure_planner(
+        requests, getnative::detail::TapEvaluationMode::reuse, true);
+    validate_planner_measurement(reuse_warmup, recompute_warmup);
+    report.recompute_plan_sha256 = recompute_warmup.plan_sha256;
+    report.reuse_plan_sha256 = reuse_warmup.plan_sha256;
+    report.plans_byte_identical = report.recompute_plan_sha256
+        == report.reuse_plan_sha256;
+    report.unique_key_count = recompute_warmup.unique_key_count;
+    report.effective_worker_count = recompute_warmup.effective_worker_count;
+    report.peak_active_builds = std::max(
+        recompute_warmup.peak_active_builds, reuse_warmup.peak_active_builds);
+    report.expected_reuse_weight_evaluations =
+        expected_reuse_weight_evaluations(requests);
+    report.expected_recompute_weight_evaluations =
+        2U * report.expected_reuse_weight_evaluations;
+
+    std::vector<double> recompute_times;
+    std::vector<double> reuse_times;
+    std::vector<double> deltas;
+    recompute_times.reserve(config.samples);
+    reuse_times.reserve(config.samples);
+    deltas.reserve(config.samples);
+    report.samples.reserve(config.samples);
+    for (std::size_t sample = 0; sample < config.samples; ++sample) {
+        PlannerPairSample pair;
+        pair.first_mode = (sample & 1U) == 0U ? "recompute" : "reuse";
+        pair.host_before = capture_host_observation();
+        PlannerMeasurement recompute;
+        PlannerMeasurement reuse;
+        if ((sample & 1U) == 0U) {
+            recompute = measure_planner(
+                requests, getnative::detail::TapEvaluationMode::recompute, false);
+            reuse = measure_planner(
+                requests, getnative::detail::TapEvaluationMode::reuse, false);
+        } else {
+            reuse = measure_planner(
+                requests, getnative::detail::TapEvaluationMode::reuse, false);
+            recompute = measure_planner(
+                requests, getnative::detail::TapEvaluationMode::recompute, false);
+        }
+        pair.host_after = capture_host_observation();
+        validate_planner_measurement(recompute, recompute_warmup);
+        validate_planner_measurement(reuse, reuse_warmup);
+        pair.recompute_ms = recompute.wall_ms;
+        pair.reuse_ms = reuse.wall_ms;
+        pair.delta = (pair.reuse_ms - pair.recompute_ms) / pair.recompute_ms;
+        recompute_times.push_back(pair.recompute_ms);
+        reuse_times.push_back(pair.reuse_ms);
+        deltas.push_back(pair.delta);
+        report.peak_active_builds = std::max(
+            report.peak_active_builds,
+            std::max(recompute.peak_active_builds, reuse.peak_active_builds));
+        report.samples.push_back(std::move(pair));
+    }
+
+    report.recompute_median_ms = median(recompute_times);
+    report.reuse_median_ms = median(reuse_times);
+    report.paired_delta_median = median(deltas);
+    report.paired_delta_mad = median_absolute_deviation(deltas);
+    report.host_after = capture_host_observation();
+    report.thermal_stable = report.host_before.thermal_state
+        == report.host_after.thermal_state;
+    report.concurrent_process_detected = !report.host_before.concurrent_processes.empty()
+        || !report.host_after.concurrent_processes.empty();
+    for (const auto &sample : report.samples) {
+        report.thermal_stable = report.thermal_stable
+            && sample.host_before.thermal_state == sample.host_after.thermal_state;
+        report.concurrent_process_detected = report.concurrent_process_detected
+            || !sample.host_before.concurrent_processes.empty()
+            || !sample.host_after.concurrent_processes.empty();
+    }
+
+    const bool requires_five_percent = benchmark_case.filter.type == "lanczos"
+        && benchmark_case.filter.taps >= 3;
+    const double maximum_delta = requires_five_percent ? -0.05 : 0.03;
+    report.gate_passed = config.samples >= 21U
+        && report.plans_byte_identical
+        && report.expected_recompute_weight_evaluations
+            == 2U * report.expected_reuse_weight_evaluations
+        && report.paired_delta_median <= maximum_delta
+        && report.paired_delta_mad <= 0.02
+        && report.thermal_stable
+        && !report.concurrent_process_detected;
+    return report;
 }
 
 [[nodiscard]] Measurement measure(getnative::MetalAnalysisEngine &engine,
@@ -1325,6 +1604,48 @@ void update_cpu_correctness(CpuCaseReport &report,
     };
 }
 
+[[nodiscard]] NSDictionary *planner_case_json(const PlannerCaseReport &report) {
+    NSMutableArray *samples = [NSMutableArray arrayWithCapacity:report.samples.size()];
+    for (std::size_t index = 0; index < report.samples.size(); ++index) {
+        const PlannerPairSample &sample = report.samples[index];
+        [samples addObject:@{
+            @"index": @(index),
+            @"first_mode": @(sample.first_mode.c_str()),
+            @"recompute_ms": @(sample.recompute_ms),
+            @"reuse_ms": @(sample.reuse_ms),
+            @"paired_delta": @(sample.delta),
+            @"host_before": host_observation_json(sample.host_before),
+            @"host_after": host_observation_json(sample.host_after),
+        }];
+    }
+    return @{
+        @"id": @(report.benchmark_case.id.c_str()),
+        @"filter_id": @(report.benchmark_case.filter.id.c_str()),
+        @"matrix_native_height": @(report.benchmark_case.native_height),
+        @"fractional_scan": @(report.benchmark_case.fractional_scan),
+        @"recompute_median_ms": @(report.recompute_median_ms),
+        @"reuse_median_ms": @(report.reuse_median_ms),
+        @"paired_delta_median": @(report.paired_delta_median),
+        @"paired_delta_mad": @(report.paired_delta_mad),
+        @"recompute_plan_sha256": @(report.recompute_plan_sha256.c_str()),
+        @"reuse_plan_sha256": @(report.reuse_plan_sha256.c_str()),
+        @"plans_byte_identical": @(report.plans_byte_identical),
+        @"expected_recompute_weight_evaluations":
+            @(report.expected_recompute_weight_evaluations),
+        @"expected_reuse_weight_evaluations":
+            @(report.expected_reuse_weight_evaluations),
+        @"unique_key_count": @(report.unique_key_count),
+        @"peak_active_builds": @(report.peak_active_builds),
+        @"effective_worker_count": @(report.effective_worker_count),
+        @"host_before": host_observation_json(report.host_before),
+        @"host_after": host_observation_json(report.host_after),
+        @"thermal_stable": @(report.thermal_stable),
+        @"concurrent_process_detected": @(report.concurrent_process_detected),
+        @"gate_passed": @(report.gate_passed),
+        @"samples": samples,
+    };
+}
+
 [[nodiscard]] std::string compiler_identity() {
 #if defined(__clang__)
     return std::string{"clang "} + __clang_version__;
@@ -1395,9 +1716,11 @@ void update_cpu_correctness(CpuCaseReport &report,
 
 [[nodiscard]] std::filesystem::path output_path(const Configuration &config) {
     if (config.json_path) return *config.json_path;
+    const char *filename = config.planner_taps ? "planner-tap-report.json"
+        : (config.cpu_columns ? "cpu-column-report.json" : "metal-kernel-report.json");
     return *config.artifact_root
         / (utc_stamp() + "-pid" + std::to_string(static_cast<long long>(getpid())))
-        / (config.cpu_columns ? "cpu-column-report.json" : "metal-kernel-report.json");
+        / filename;
 }
 
 void write_json(NSDictionary *root, const std::filesystem::path &path) {
@@ -1506,6 +1829,89 @@ int main(int argc, char **argv) {
             }
             if (image.width != matrix.source_width || image.height != matrix.source_height) {
                 throw std::runtime_error("decoded fixture dimensions do not match the matrix");
+            }
+            if (config.planner_taps) {
+                const auto cases = select_cases(matrix, config);
+                const HostObservation run_host_before = capture_host_observation();
+                if (!run_host_before.concurrent_processes.empty()) {
+                    throw std::runtime_error(
+                        "concurrent benchmark or capture process detected: "
+                        + run_host_before.concurrent_processes.front());
+                }
+                std::vector<PlannerCaseReport> reports;
+                reports.reserve(cases.size());
+                bool all_passed = true;
+                for (const BenchmarkCase &benchmark_case : cases) {
+                    std::cout << "running planner taps " << benchmark_case.id << " ("
+                              << config.samples << " paired samples)\n" << std::flush;
+                    PlannerCaseReport report = run_planner_case(
+                        matrix, benchmark_case, config);
+                    std::cout << std::fixed << std::setprecision(3)
+                              << "case=" << report.benchmark_case.id
+                              << " recompute_ms=" << report.recompute_median_ms
+                              << " reuse_ms=" << report.reuse_median_ms
+                              << " improvement="
+                              << -100.0 * report.paired_delta_median << "%"
+                              << " paired_mad=" << report.paired_delta_mad
+                              << " exact="
+                              << (report.plans_byte_identical ? "yes" : "no")
+                              << " gate=" << (report.gate_passed ? "pass" : "fail")
+                              << '\n';
+                    all_passed = all_passed && report.gate_passed;
+                    reports.push_back(std::move(report));
+                }
+
+                const HostObservation run_host_after = capture_host_observation();
+                const IdentitySnapshot identity_after = capture_identity_snapshot(
+                    config, fixture_checksum_path);
+                const bool identity_stable = identities_equal(identity_before, identity_after);
+                const bool run_thermal_stable = run_host_before.thermal_state
+                    == run_host_after.thermal_state;
+                const bool run_concurrent_process_detected =
+                    !run_host_before.concurrent_processes.empty()
+                    || !run_host_after.concurrent_processes.empty();
+                all_passed = all_passed && identity_stable && run_thermal_stable
+                    && !run_concurrent_process_detected;
+
+                NSMutableArray *case_objects = [NSMutableArray arrayWithCapacity:reports.size()];
+                for (const PlannerCaseReport &report : reports) {
+                    [case_objects addObject:planner_case_json(report)];
+                }
+                NSDictionary *root = @{
+                    @"schema_version": @1,
+                    @"status": all_passed ? @"pass" : @"fail",
+                    @"mode": @"planner_tap_reuse",
+                    @"case_selection": config.controls_only ? @"controls" : @"full_matrix",
+                    @"comparison_policy": @"recompute_vs_reuse",
+                    @"production_default": @"reuse",
+                    @"sample_count": @(config.samples),
+                    @"host_before": host_observation_json(run_host_before),
+                    @"host_after": host_observation_json(run_host_after),
+                    @"run_thermal_stable": @(run_thermal_stable),
+                    @"run_concurrent_process_detected": @(run_concurrent_process_detected),
+                    @"fixture": @{
+                        @"path": @(config.fixture_path.string().c_str()),
+                        @"checksum_path": @(image.checksum_path.string().c_str()),
+                        @"expected_sha256": @(image.expected_fixture_sha256.c_str()),
+                        @"sha256": @(image.fixture_sha256.c_str()),
+                        @"decoded_luma_sha256": @(image.luma_sha256.c_str()),
+                        @"width": @(image.width),
+                        @"height": @(image.height),
+                    },
+                    @"identities": @{
+                        @"stable": @(identity_stable),
+                        @"before": identity_json(identity_before),
+                        @"after": identity_json(identity_after),
+                        @"binary_sha256": @(identity_before.binary_sha256.c_str()),
+                        @"matrix_path": @(config.matrix_path.string().c_str()),
+                        @"matrix_sha256": @(identity_before.matrix_sha256.c_str()),
+                    },
+                    @"cases": case_objects,
+                };
+                write_json(root, report_path);
+                std::cout << "report=" << report_path << '\n';
+                if (config.assert_gates && !all_passed) return EXIT_FAILURE;
+                return EXIT_SUCCESS;
             }
             if (config.cpu_columns) {
                 if (config.required_simd && !getnative::detail::column_simd_available()) {

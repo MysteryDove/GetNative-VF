@@ -343,7 +343,10 @@ if(GETNATIVE_ENABLE_METAL)
     target_compile_definitions(getnative_metal_kernel_benchmark PRIVATE
         "GETNATIVE_METALLIB_PATH=\"${GETNATIVE_METALLIB}\""
     )
-    target_include_directories(getnative_metal_kernel_benchmark PRIVATE src/backend/cpu)
+    target_include_directories(getnative_metal_kernel_benchmark PRIVATE
+        src/backend/cpu
+        src/planner
+    )
     getnative_enable_warnings(getnative_metal_kernel_benchmark)
     getnative_enable_strict_fp(getnative_metal_kernel_benchmark)
 

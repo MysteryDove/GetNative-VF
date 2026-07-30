@@ -1,6 +1,7 @@
 #include "axis_planner.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstddef>
@@ -141,6 +142,56 @@ void test_exact_plans_for_all_worker_modes() {
     }
 }
 
+void test_tap_reuse_is_byte_identical() {
+    std::vector<getnative::AxisPlanRequest> requests = fixture_requests();
+    const std::array bicubic_parameters{
+        std::pair{0.0, 0.0},
+        std::pair{0.0, 0.5},
+        std::pair{1.0 / 3.0, 1.0 / 3.0},
+        std::pair{1.0, 0.0},
+        std::pair{-0.25, 0.75},
+    };
+    for (const auto [b, c] : bicubic_parameters) {
+        requests.push_back({81, 53, 53.625, -0.375,
+                            getnative::Filter::bicubic(b, c),
+                            getnative::BorderMode::mirror});
+    }
+    for (std::int32_t taps = 1; taps <= 8; ++taps) {
+        for (const auto border : {getnative::BorderMode::zero,
+                                  getnative::BorderMode::repeat,
+                                  getnative::BorderMode::mirror}) {
+            requests.push_back({73, 49, 49.375, 0.3125,
+                                getnative::Filter::lanczos(taps), border});
+        }
+    }
+
+    for (const auto &request : requests) {
+        const auto recomputed = getnative::detail::build_axis_plan_with_tap_evaluation(
+            request, getnative::detail::TapEvaluationMode::recompute);
+        const auto reused = getnative::detail::build_axis_plan_with_tap_evaluation(
+            request, getnative::detail::TapEvaluationMode::reuse);
+        expect_plan_equal(reused, recomputed);
+        expect_plan_equal(getnative::build_axis_plan(request), reused);
+    }
+
+    getnative::detail::AxisPlanBatchOptions recompute_options;
+    recompute_options.worker_count = 4U;
+    recompute_options.tap_evaluation = getnative::detail::TapEvaluationMode::recompute;
+    const auto recomputed_batch = getnative::detail::build_axis_plans(
+        requests, std::move(recompute_options));
+
+    getnative::detail::AxisPlanBatchOptions reuse_options;
+    reuse_options.worker_count = 4U;
+    reuse_options.tap_evaluation = getnative::detail::TapEvaluationMode::reuse;
+    const auto reused_batch = getnative::detail::build_axis_plans(
+        requests, std::move(reuse_options));
+    expect(recomputed_batch.plans.size() == reused_batch.plans.size(),
+           "tap evaluation batches differ in size");
+    for (std::size_t index = 0; index < reused_batch.plans.size(); ++index) {
+        expect_plan_equal(*reused_batch.plans[index], *recomputed_batch.plans[index]);
+    }
+}
+
 void test_exact_bit_key_distinctions_and_call_isolation() {
     const getnative::AxisPlanRequest base{
         64, 43, 43.25, 0.0, getnative::Filter::bicubic(0.2, 0.4),
@@ -275,6 +326,7 @@ int main() {
     try {
         test_empty_and_stable_deduplication();
         test_exact_plans_for_all_worker_modes();
+        test_tap_reuse_is_byte_identical();
         test_exact_bit_key_distinctions_and_call_isolation();
         test_worker_bounds_and_peak_concurrency();
         test_lowest_stable_failure_is_rethrown_after_join();
