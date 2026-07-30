@@ -8,6 +8,58 @@ option(GETNATIVE_BUILD_UPSTREAM_CONFORMANCE
        "Build test-only exact comparisons against pinned descale and zimg" OFF)
 option(GETNATIVE_ENABLE_METAL "Build the Metal analysis backend on macOS" ${APPLE})
 
+file(GLOB_RECURSE GETNATIVE_BENCHMARK_ID_FILES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
+    "${CMAKE_CURRENT_SOURCE_DIR}/bench/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/bench/*.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/*.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.mm"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.metal"
+)
+list(SORT GETNATIVE_BENCHMARK_ID_FILES)
+set(GETNATIVE_BENCHMARK_SOURCE_MATERIAL "")
+foreach(GETNATIVE_BENCHMARK_ID_FILE IN LISTS GETNATIVE_BENCHMARK_ID_FILES)
+    file(SHA256 "${GETNATIVE_BENCHMARK_ID_FILE}" GETNATIVE_BENCHMARK_FILE_SHA256)
+    file(RELATIVE_PATH GETNATIVE_BENCHMARK_RELATIVE_PATH
+         "${CMAKE_CURRENT_SOURCE_DIR}" "${GETNATIVE_BENCHMARK_ID_FILE}")
+    string(APPEND GETNATIVE_BENCHMARK_SOURCE_MATERIAL
+           "${GETNATIVE_BENCHMARK_RELATIVE_PATH}:${GETNATIVE_BENCHMARK_FILE_SHA256}\n")
+endforeach()
+string(SHA256 GETNATIVE_BENCHMARK_SOURCE_ID "${GETNATIVE_BENCHMARK_SOURCE_MATERIAL}")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             ${GETNATIVE_BENCHMARK_ID_FILES})
+
+if(MSVC)
+    set(GETNATIVE_WARNING_OPTIONS /W4 /permissive-)
+    set(GETNATIVE_STRICT_FP_OPTIONS /fp:strict)
+else()
+    set(GETNATIVE_WARNING_OPTIONS
+        -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+    set(GETNATIVE_STRICT_FP_OPTIONS -ffp-contract=off)
+endif()
+string(JOIN " " GETNATIVE_WARNING_OPTIONS_TEXT ${GETNATIVE_WARNING_OPTIONS})
+string(JOIN " " GETNATIVE_STRICT_FP_OPTIONS_TEXT ${GETNATIVE_STRICT_FP_OPTIONS})
+set(GETNATIVE_BENCHMARK_CONFIG_FLAGS
+    "standard=c++23 | common=[${CMAKE_CXX_FLAGS}] | Debug=[${CMAKE_CXX_FLAGS_DEBUG}] | Release=[${CMAKE_CXX_FLAGS_RELEASE}] | RelWithDebInfo=[${CMAKE_CXX_FLAGS_RELWITHDEBINFO}] | MinSizeRel=[${CMAKE_CXX_FLAGS_MINSIZEREL}] | target=[${GETNATIVE_WARNING_OPTIONS_TEXT} ${GETNATIVE_STRICT_FP_OPTIONS_TEXT}]")
+string(REPLACE ";" "," GETNATIVE_BENCHMARK_CONFIG_FLAGS
+       "${GETNATIVE_BENCHMARK_CONFIG_FLAGS}")
+string(REPLACE "\\" "\\\\" GETNATIVE_BENCHMARK_CONFIG_FLAGS
+       "${GETNATIVE_BENCHMARK_CONFIG_FLAGS}")
+string(REPLACE "\"" "\\\"" GETNATIVE_BENCHMARK_CONFIG_FLAGS
+       "${GETNATIVE_BENCHMARK_CONFIG_FLAGS}")
+
+function(getnative_configure_benchmark_metadata target)
+    target_compile_definitions(${target} PRIVATE
+        "GETNATIVE_BENCHMARK_SOURCE_ID=\"${GETNATIVE_BENCHMARK_SOURCE_ID}\""
+        "GETNATIVE_BENCHMARK_BUILD_TYPE=\"$<CONFIG>\""
+        "GETNATIVE_BENCHMARK_CXX_FLAGS=\"${GETNATIVE_BENCHMARK_CONFIG_FLAGS}\""
+        "GETNATIVE_BENCHMARK_SYSTEM_NAME=\"${CMAKE_SYSTEM_NAME}\""
+        "GETNATIVE_BENCHMARK_SYSTEM_PROCESSOR=\"${CMAKE_SYSTEM_PROCESSOR}\""
+    )
+endfunction()
+
 if(GETNATIVE_ENABLE_METAL)
     if(NOT APPLE)
         message(FATAL_ERROR "GETNATIVE_ENABLE_METAL requires an Apple platform")
@@ -39,6 +91,7 @@ add_library(getnative_core STATIC
     src/geometry/crop_geometry.cpp
     src/geometry/profile.cpp
     src/planner/axis_plan.cpp
+    src/planner/axis_planner.cpp
     src/planner/filter.cpp
 )
 target_compile_features(getnative_core PUBLIC cxx_std_23)
@@ -96,19 +149,11 @@ if(GETNATIVE_ENABLE_METAL)
 endif()
 
 function(getnative_enable_warnings target)
-if(MSVC)
-        target_compile_options(${target} PRIVATE /W4 /permissive-)
-else()
-        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
-endif()
+    target_compile_options(${target} PRIVATE ${GETNATIVE_WARNING_OPTIONS})
 endfunction()
 
 function(getnative_enable_strict_fp target)
-if(MSVC)
-        target_compile_options(${target} PRIVATE /fp:strict)
-else()
-        target_compile_options(${target} PRIVATE -ffp-contract=off)
-endif()
+    target_compile_options(${target} PRIVATE ${GETNATIVE_STRICT_FP_OPTIONS})
 endfunction()
 
 getnative_enable_warnings(getnative_core)
@@ -145,6 +190,22 @@ if(BUILD_TESTING)
     target_compile_features(getnative_geometry_tests PRIVATE cxx_std_23)
     getnative_enable_warnings(getnative_geometry_tests)
     add_test(NAME getnative_geometry_tests COMMAND getnative_geometry_tests)
+
+    add_executable(getnative_benchmark_support_tests
+        tests/benchmark_support_test.cpp)
+    target_include_directories(getnative_benchmark_support_tests PRIVATE bench)
+    target_compile_features(getnative_benchmark_support_tests PRIVATE cxx_std_23)
+    getnative_enable_warnings(getnative_benchmark_support_tests)
+    add_test(NAME getnative_benchmark_support_tests
+             COMMAND getnative_benchmark_support_tests)
+
+    add_executable(getnative_axis_planner_tests tests/axis_planner_test.cpp)
+    target_include_directories(getnative_axis_planner_tests PRIVATE src/planner)
+    target_link_libraries(getnative_axis_planner_tests PRIVATE getnative_core)
+    target_compile_features(getnative_axis_planner_tests PRIVATE cxx_std_23)
+    getnative_enable_warnings(getnative_axis_planner_tests)
+    getnative_enable_strict_fp(getnative_axis_planner_tests)
+    add_test(NAME getnative_axis_planner_tests COMMAND getnative_axis_planner_tests)
 
     add_test(NAME getnative_cli_capabilities COMMAND getnative-engine capabilities)
     if(GETNATIVE_ENABLE_METAL)
@@ -233,14 +294,18 @@ endif()
 
 add_executable(getnative_core_benchmark bench/core_benchmark.cpp)
 target_link_libraries(getnative_core_benchmark PRIVATE getnative_core)
+target_include_directories(getnative_core_benchmark PRIVATE src/planner)
 target_compile_features(getnative_core_benchmark PRIVATE cxx_std_23)
 getnative_enable_warnings(getnative_core_benchmark)
 getnative_enable_strict_fp(getnative_core_benchmark)
+getnative_configure_benchmark_metadata(getnative_core_benchmark)
 
 if(GETNATIVE_ENABLE_METAL)
     add_executable(getnative_metal_benchmark bench/metal_benchmark.cpp)
     target_link_libraries(getnative_metal_benchmark PRIVATE getnative_metal)
+    target_include_directories(getnative_metal_benchmark PRIVATE src/planner)
     target_compile_features(getnative_metal_benchmark PRIVATE cxx_std_23)
     getnative_enable_warnings(getnative_metal_benchmark)
     getnative_enable_strict_fp(getnative_metal_benchmark)
+    getnative_configure_benchmark_metadata(getnative_metal_benchmark)
 endif()

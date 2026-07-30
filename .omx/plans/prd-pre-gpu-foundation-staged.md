@@ -3,7 +3,7 @@
 ## Status
 
 - Workflow: non-interactive `$ralplan`, deliberate but intentionally bounded
-- Current revision: staged revision 2, submitted for Architect review 7
+- Current revision: staged revision 3, submitted for Architect review 8
 - Current execution scope: Stage 0 measurement plus Stage 1 batch planning only
 - Companion test spec: `.omx/plans/test-spec-pre-gpu-foundation-stage-1.md`
 - Supersedes the all-phases exploration draft in
@@ -144,11 +144,12 @@ Required behavior:
    the private shared key header without changing any field or bit semantics;
    both `AxisPlanCache` and the batch helper reuse it.
 2. Deduplicate in stable first-occurrence order.
-3. Auto workers are
-   `min(unique_count, max(1, min(hardware_concurrency, 8)))`; explicit workers
-   clamp to `[1, unique_count]`. Report the effective count.
-4. Use a serial fast path when there are at most two unique requests or one
-   effective worker.
+3. Empty input reports zero effective workers. For non-empty input, auto workers
+   are `min(unique_count, max(1, min(hardware_concurrency, 8)))`; explicit
+   workers clamp to `[1, unique_count]`.
+4. Use and report one effective worker when there are at most two unique
+   requests or the bounded worker result is one; otherwise report the actual
+   per-call worker count.
 5. Otherwise use one per-call `jthread` group plus an atomic work cursor, matching
    the existing CPU batch join-before-rethrow pattern. Each task calls unchanged
    serial `build_axis_plan()` into a private unique-key slot.
@@ -195,11 +196,13 @@ pair order and identical precomputed requests. Define
 - Adopt Stage 1 only when the paired `metal_total_ms` median improves at least 5%
   and paired-delta MAD is at most 0.025.
 
-If correctness is green and exactly one named bounded bottleneck explains a near
-miss, revise once and rerun the unchanged gate. Otherwise, including total
-improvement below 5%, unstable variance after an unchanged rerun, correctness
-failure, or material execution regression, remove the batch path and retain only
-the immutable evidence. No result starts a broader scheduler automatically.
+If correctness, TSan, variance, and execution regression are green, revise once
+only when exactly one performance gate misses within the companion test spec's
+bounded near-miss band and profiling names one local cause. Rerun the unchanged
+gate once. Otherwise, including a miss outside that band, unstable variance
+after an unchanged rerun, correctness failure, or material execution regression,
+remove the batch path and retain only the immutable evidence. No result starts a
+broader scheduler automatically.
 
 ## 6. Evidence-Driven Next Directions
 
@@ -286,3 +289,5 @@ table and recommendation; it does not auto-continue into Stage 2.
   boundaries and noise handling; kept the helper private and cache-independent;
   defined bounded workers, transactional failure, immutable UTC outputs, and one
   unambiguous adopt/revise/revert stop rule.
+- Applied staged Architect review 2: defined the paired small-batch overhead
+  formula and made revert the exhaustive fallback after the one bounded revision.
