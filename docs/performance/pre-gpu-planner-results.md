@@ -498,3 +498,107 @@ Retain the bounded caller-owned session cache and stop this planner lane. The
 next optimization stage, if any, must start with a new benchmark showing a
 remaining product bottleneck; this result does not authorize the skipped
 service, global-cache, or GPU directions.
+
+## 1080p To 810p All-Filter Planner A/B
+
+- Host: Apple M4 Max.
+- Fixture: `1920x1080 -> 810`, 1000 unique vertical candidate plans.
+- Filters: Bilinear, Bicubic Catrom/Mitchell, Spline16/36/64, and Lanczos1-8.
+- Run directory: `build/planner-810-all/20260731T055228Z`.
+- Selected cold summary: `cold-selected-summary.json`.
+- Production-cache summary: `session-final-summary.json`.
+- Engine source identity:
+  `948f2a8b4546a3158ab0990d4c0bf22d6bf98177128860007bf4ba1fdd041399`.
+- Metal executable FNV-1a 64: `72ef4feebf47c6e6`.
+
+The reported legacy arm uses the current `AxisPlanCache` with unbounded limits.
+It preserves the old exact-key lookup, serial build, and map publication, but
+also computes logical plan bytes on each miss; `074dd8a` did not. It still uses
+the current binary's plan builder, backend, and widened CPU RHS path, so backend
+changes are not mixed into the comparison. Each result contains 21 alternating
+same-binary pairs.
+
+A stopped follow-up run replaced this approximation with a benchmark-local copy
+of the exact pre-bounded cache behavior. Its two completed filters moved serial
+planner medians by `-2.04%` (Bilinear) and `+2.94%` (Bicubic Catrom), opposite
+directions. Treat the published planner speedups as having about `+/-3%`
+relative fairness uncertainty. A worst-case 3% serial-plan inflation would
+overstate controlled CPU totals by `0.45..0.76` percentage points and controlled
+Metal totals by `0.84..0.91` percentage points. The follow-up was stopped before
+the remaining filters at the user's request.
+
+CPU total is planner plus CPU execution. Metal total is planner plus Metal
+execution. Observed totals retain independently measured execution noise. The
+controlled totals give both sides of a pair the mean of their two measured
+execution times, so only measured planner time changes; controlled values are
+the primary planner-attribution statistic.
+
+### Cold Serial Versus Bounded Batch
+
+| Filter | Planner speedup | CPU observed | CPU controlled | Metal observed | Metal controlled |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Bilinear | 5.839x | 13.65% | 14.84% | 36.45% | 35.62% |
+| Bicubic Catrom | 6.985x | 15.79% | 16.30% | 40.67% | 41.11% |
+| Bicubic Mitchell | 6.654x | 14.77% | 15.42% | 41.81% | 41.64% |
+| Spline16 | 6.685x | 12.14% | 18.07% | 41.16% | 41.80% |
+| Spline36 | 6.460x | 8.55% | 20.96% | 48.65% | 48.94% |
+| Spline64 | 6.774x | 2.25% | 20.20% | 54.86% | 54.66% |
+| Lanczos1 | 6.265x | 17.15% | 18.23% | 40.81% | 40.57% |
+| Lanczos2 | 6.310x | 13.99% | 23.52% | 53.89% | 53.92% |
+| Lanczos3 | 6.590x | 15.51% | 26.75% | 55.96% | 56.35% |
+| Lanczos4 | 6.579x | 17.26% | 28.64% | 58.72% | 58.10% |
+| Lanczos5 | 7.442x | 23.08% | 31.71% | 47.95% | 48.14% |
+| Lanczos6 | 6.671x | 11.84% | 27.29% | 49.99% | 50.65% |
+| Lanczos7 | 6.654x | 14.64% | 26.67% | 49.16% | 48.94% |
+| Lanczos8 | 7.183x | 16.19% | 26.61% | 49.72% | 49.35% |
+
+Across filters, median planner speedup is `6.654x` (`5.839x..7.442x`). Median
+controlled CPU-total improvement is `22.24%` (`14.84%..31.71%`), and median
+controlled Metal-total improvement is `48.94%` (`35.62%..58.10%`). Four first
+passes exceeded the raw Metal-total MAD limit and were each replaced once after
+cooldown. The selected 14 results are all `MEASURED`; controlled CPU/Metal MAD
+is below `2.5%`, Metal execution median stays within `5%`, strict tolerance and
+assertions pass, and valley distance is zero. Both original and replacement
+artifacts remain in `cold-final/` and `cold-replacement/`.
+
+### Additional Production Session-Cache Gain
+
+This comparison starts from the new bounded cold batch, then invokes the same
+1000 keys through the default production cache. The cache remains fixed at
+1024 entries and 256 MiB. A warm call reuses resident plan pointers and rebuilds
+non-resident plans; it does not assume that every filter fits.
+
+| Filter | Ready-hit rate | Hits | Cache plan speedup | CPU controlled | Metal controlled |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Bilinear | 100% | 1000/1000 | 166.015x | 3.16% | 10.59% |
+| Bicubic Catrom | 100% | 1000/1000 | 232.207x | 3.50% | 12.97% |
+| Bicubic Mitchell | 100% | 1000/1000 | 229.335x | 3.76% | 13.28% |
+| Spline16 | 100% | 1000/1000 | 237.284x | 3.84% | 13.43% |
+| Spline36 | 100% | 1000/1000 | 302.868x | 4.20% | 14.91% |
+| Spline64 | 100% | 1000/1000 | 405.953x | 4.17% | 16.27% |
+| Lanczos1 | 100% | 1000/1000 | 200.972x | 4.05% | 19.43% |
+| Lanczos2 | 100% | 1000/1000 | 327.689x | 5.28% | 22.61% |
+| Lanczos3 | 100% | 1000/1000 | 412.315x | 5.32% | 24.82% |
+| Lanczos4 | 100% | 1000/1000 | 576.481x | 6.08% | 26.36% |
+| Lanczos5 | 100% | 1000/1000 | 729.824x | 5.67% | 19.45% |
+| Lanczos6 | 92.7% | 927/1000 | 12.605x | 5.73% | 18.00% |
+| Lanczos7 | 79.7% | 797/1000 | 4.995x | 4.80% | 14.62% |
+| Lanczos8 | 69.8% | 698/1000 | 3.183x | 3.90% | 10.95% |
+
+Lanczos6/7/8 stop at `255.75/255.89/255.63 MiB` and rebuild `73/203/302`
+plans per warm call. Every other single-filter set fits completely. The median
+additional controlled improvement over the bounded cold batch is `4.19%` for
+CPU total and `15.59%` for Metal total. All 14 cache results are `MEASURED`,
+their controlled MADs are below `2.5%`, execution medians remain inside the
+`5%` bound, `ready hits + rebuilt misses = 1000`, resident bytes stay within
+the production limit, and `pmset` records no thermal or performance warning.
+
+The reported partial-residency fixture retained its overflow plans solely for
+pointer checking while timing the next call. A later Lanczos8 smoke released
+those transient references and changed warm planner time from `23.94 ms` to
+`22.27 ms`; treat the Lanczos6-8 session-cache totals as conservative diagnostic
+results rather than final production estimates. This does not affect the cold
+serial-versus-batch table above.
+
+The cold and session-cache gains are sequential measurements with separate
+paired execution controls. They must not be added directly into one percentage.

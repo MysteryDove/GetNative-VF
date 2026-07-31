@@ -323,6 +323,14 @@ getnative_enable_strict_fp(getnative_core_benchmark)
 getnative_configure_benchmark_metadata(getnative_core_benchmark)
 
 if(GETNATIVE_ENABLE_METAL)
+    add_executable(getnative_fixed_recipe_benchmark
+        bench/fixed_recipe_benchmark.cpp)
+    target_link_libraries(getnative_fixed_recipe_benchmark PRIVATE getnative_metal)
+    target_compile_features(getnative_fixed_recipe_benchmark PRIVATE cxx_std_23)
+    getnative_enable_warnings(getnative_fixed_recipe_benchmark)
+    getnative_enable_strict_fp(getnative_fixed_recipe_benchmark)
+    getnative_configure_benchmark_metadata(getnative_fixed_recipe_benchmark)
+
     add_executable(getnative_metal_benchmark bench/metal_benchmark.cpp)
     target_link_libraries(getnative_metal_benchmark PRIVATE getnative_metal)
     target_include_directories(getnative_metal_benchmark PRIVATE src/planner)

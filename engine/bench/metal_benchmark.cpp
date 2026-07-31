@@ -5,6 +5,7 @@
 #include "getnative/filter.hpp"
 
 #include "axis_planner.hpp"
+#include "axis_plan_key.hpp"
 
 #include <algorithm>
 #include <array>
@@ -17,12 +18,15 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -122,9 +126,44 @@ struct CachePairedMeasurements {
     std::size_t retained_plan_bytes = 0;
     getnative::benchmark::Summary plan_delta;
     getnative::benchmark::Summary plan_speedup;
+    getnative::benchmark::Summary cpu_delta;
+    getnative::benchmark::Summary cpu_total_delta;
+    getnative::benchmark::Summary controlled_cpu_total_delta;
     getnative::benchmark::Summary metal_delta;
     getnative::benchmark::Summary metal_total_delta;
     getnative::benchmark::Summary controlled_metal_total_delta;
+};
+
+// Same-binary copy of the cache behavior used before bounded admission.
+class LegacyAxisPlanCache {
+public:
+    [[nodiscard]] std::shared_ptr<const getnative::AxisPlan> get_or_build(
+        const getnative::AxisPlanRequest &request) {
+        const getnative::detail::PlanKey key = getnative::detail::plan_key(request);
+        {
+            const std::scoped_lock lock(mutex_);
+            if (const auto found = plans_.find(key); found != plans_.end()) {
+                return found->second;
+            }
+        }
+        auto candidate = std::make_shared<const getnative::AxisPlan>(
+            getnative::build_axis_plan(request));
+        const std::scoped_lock lock(mutex_);
+        const auto [position, inserted] = plans_.emplace(key, candidate);
+        return inserted ? std::move(candidate) : position->second;
+    }
+
+    [[nodiscard]] std::size_t size() const {
+        const std::scoped_lock lock(mutex_);
+        return plans_.size();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::unordered_map<
+        getnative::detail::PlanKey,
+        std::shared_ptr<const getnative::AxisPlan>,
+        getnative::detail::PlanKeyHash> plans_;
 };
 
 enum class PlannerPath : std::uint8_t {
@@ -157,6 +196,13 @@ enum class PlannerPath : std::uint8_t {
             result.width = 1920;
             result.height = 1080;
             result.native_height = 720;
+        } else if (argument == "--native-height" && index + 1 < argc) {
+            const std::size_t native_height = parse_size(argv[++index]);
+            if (native_height > static_cast<std::size_t>(
+                                    std::numeric_limits<std::int32_t>::max())) {
+                throw std::invalid_argument("native height exceeds int32 range");
+            }
+            result.native_height = static_cast<std::int32_t>(native_height);
         } else if (argument == "--candidates" && index + 1 < argc) {
             result.candidates = parse_size(argv[++index]);
         } else if (argument == "--tile-size" && index + 1 < argc) {
@@ -185,12 +231,14 @@ enum class PlannerPath : std::uint8_t {
         } else {
             throw std::invalid_argument(
                 "usage: getnative_metal_benchmark [--full] [--candidates N] "
+                "[--native-height N] "
                 "[--tile-size N] [--reduction-groups N] [--inverse-threads N] "
                 "[--samples N] [--planner-mode serial | --compare-planner-modes | "
                 "--compare-session-cache] "
                 "[--json-out PATH] [--assert] "
                 "[--profile-split-kernels] "
-                "[--kernel bilinear|bicubic|spline36|spline64|lanczos3|lanczos8]");
+                "[--kernel bilinear|bicubic-catrom|bicubic-mitchell|"
+                "spline16|spline36|spline64|lanczos1..lanczos8]");
         }
     }
     const unsigned selected_modes = static_cast<unsigned>(planner_mode_explicit)
@@ -205,13 +253,25 @@ enum class PlannerPath : std::uint8_t {
 
 [[nodiscard]] getnative::Filter benchmark_filter(std::string_view name) {
     if (name == "bilinear") return getnative::Filter::bilinear();
-    if (name == "bicubic") return getnative::Filter::bicubic();
+    if (name == "bicubic" || name == "bicubic-catrom") {
+        return getnative::Filter::bicubic(0.0, 0.5);
+    }
+    if (name == "bicubic-mitchell") {
+        return getnative::Filter::bicubic(1.0 / 3.0, 1.0 / 3.0);
+    }
+    if (name == "spline16") return getnative::Filter::spline16();
     if (name == "spline36") return getnative::Filter::spline36();
     if (name == "spline64") return getnative::Filter::spline64();
+    if (name == "lanczos1") return getnative::Filter::lanczos(1);
+    if (name == "lanczos2") return getnative::Filter::lanczos(2);
     if (name == "lanczos3") return getnative::Filter::lanczos(3);
+    if (name == "lanczos4") return getnative::Filter::lanczos(4);
+    if (name == "lanczos5") return getnative::Filter::lanczos(5);
+    if (name == "lanczos6") return getnative::Filter::lanczos(6);
+    if (name == "lanczos7") return getnative::Filter::lanczos(7);
     if (name == "lanczos8") return getnative::Filter::lanczos(8);
     throw std::invalid_argument(
-        "kernel must be bilinear, bicubic, spline36, spline64, lanczos3, or lanczos8");
+        "unsupported benchmark kernel");
 }
 
 [[nodiscard]] BenchmarkFixture make_fixture(
@@ -249,10 +309,31 @@ void prewarm_retained_cache(
     retained.setup_published_plan_count = result.published_plan_count;
     retained.retained_plan_bytes = result.resident_bytes;
     retained.expected_plans = std::move(result.plans);
-    if (retained.cache.size() != fixture.requests.size()
-        || retained.setup_physical_build_count != fixture.requests.size()
-        || retained.setup_published_plan_count != fixture.requests.size()) {
-        throw std::runtime_error("production session-cache prewarm did not publish every key");
+    const getnative::AxisPlanCacheLimits limits = retained.cache.limits();
+    std::size_t predicted_resident_count = 0U;
+    std::size_t predicted_resident_bytes = 0U;
+    for (auto &plan : retained.expected_plans) {
+        const std::size_t plan_bytes = getnative::axis_plan_storage_bytes(*plan);
+        const bool admitted = predicted_resident_count < limits.maximum_entries
+            && plan_bytes <= limits.maximum_resident_bytes - predicted_resident_bytes;
+        if (admitted) {
+            ++predicted_resident_count;
+            predicted_resident_bytes += plan_bytes;
+        } else {
+            plan.reset();
+        }
+    }
+    if (result.unique_key_count != fixture.requests.size()
+        || retained.expected_plans.size() != fixture.requests.size()
+        || result.ready_hit_count != 0U
+        || retained.setup_physical_build_count != result.unique_key_count
+        || retained.setup_published_plan_count != result.resident_entry_count
+        || predicted_resident_count != result.resident_entry_count
+        || predicted_resident_bytes != result.resident_bytes
+        || retained.cache.size() != result.resident_entry_count
+        || retained.cache.resident_bytes() != result.resident_bytes
+        || result.published_plan_count > result.unique_key_count) {
+        throw std::runtime_error("production session-cache prewarm invariant changed");
     }
 }
 
@@ -269,8 +350,10 @@ void prewarm_retained_cache(
     std::vector<getnative::CandidateAnalysis> candidates;
     candidates.reserve(fixture.requests.size());
     std::unique_ptr<getnative::AxisPlanCache> cache;
-    if (planner_path == PlannerPath::serial
-        || planner_path == PlannerPath::session_cache_cold) {
+    std::unique_ptr<LegacyAxisPlanCache> legacy_cache;
+    if (planner_path == PlannerPath::serial) {
+        legacy_cache = std::make_unique<LegacyAxisPlanCache>();
+    } else if (planner_path == PlannerPath::session_cache_cold) {
         cache = std::make_unique<getnative::AxisPlanCache>();
     }
     getnative::detail::AxisPlanBatchResult batch_result;
@@ -289,7 +372,7 @@ void prewarm_retained_cache(
         for (std::size_t index = 0; index < fixture.requests.size(); ++index) {
             candidates.push_back({
                 fixture.candidate_ids[index], nullptr,
-                cache->get_or_build(fixture.requests[index]),
+                legacy_cache->get_or_build(fixture.requests[index]),
                 getnative::AnalysisAxes::vertical,
             });
         }
@@ -307,15 +390,20 @@ void prewarm_retained_cache(
             throw std::invalid_argument("retained cache fixture is not initialized");
         }
         cache_batch_result = retained->cache.get_or_build_batch(fixture.requests);
+        std::size_t reused_plan_count = 0U;
         for (std::size_t index = 0; index < fixture.requests.size(); ++index) {
             auto plan = cache_batch_result.plans[index];
-            if (plan.get() != retained->expected_plans[index].get()) {
-                throw std::runtime_error("cross-call cache lookup did not return the ready plan");
+            if (plan.get() == retained->expected_plans[index].get()) {
+                ++reused_plan_count;
             }
             candidates.push_back({
                 fixture.candidate_ids[index], nullptr, std::move(plan),
                 getnative::AnalysisAxes::vertical,
             });
+        }
+        if (reused_plan_count != cache_batch_result.ready_hit_count) {
+            throw std::runtime_error(
+                "cross-call cache ready-hit pointers did not match telemetry");
         }
     }
     const auto plan_elapsed = Clock::now() - plan_start;
@@ -356,10 +444,10 @@ void prewarm_retained_cache(
         || planner_path == PlannerPath::session_cache_warm;
     const std::size_t unique_key_count = batch_planner
         ? batch_result.unique_key_count
-        : serial_planner ? cache->size() : cache_batch_result.unique_key_count;
+        : serial_planner ? legacy_cache->size() : cache_batch_result.unique_key_count;
     const std::size_t physical_build_count = batch_planner
         ? batch_result.physical_build_count
-        : serial_planner ? cache->size() : cache_batch_result.physical_build_count;
+        : serial_planner ? legacy_cache->size() : cache_batch_result.physical_build_count;
     return {
         plan_ms,
         cpu_ms,
@@ -454,33 +542,58 @@ void validate_planner_sample(const Sample &sample, std::size_t expected_unique_c
         || sample.physical_build_count != expected_unique_count
         || sample.ready_hit_count != 0U
         || sample.peak_active_builds > sample.effective_worker_count) {
-        throw std::runtime_error("Metal staged benchmark planner invariant changed");
+        throw std::runtime_error(
+            "Metal staged benchmark planner invariant changed: expected_unique="
+            + std::to_string(expected_unique_count)
+            + " unique=" + std::to_string(sample.unique_key_count)
+            + " physical=" + std::to_string(sample.physical_build_count)
+            + " ready=" + std::to_string(sample.ready_hit_count)
+            + " peak=" + std::to_string(sample.peak_active_builds)
+            + " workers=" + std::to_string(sample.effective_worker_count));
     }
 }
 
-void validate_warm_cache_sample(const Sample &sample, std::size_t expected_unique_count) {
+[[nodiscard]] bool build_activity_is_valid(const Sample &sample) {
+    if (sample.physical_build_count == 0U) {
+        return sample.peak_active_builds == 0U
+            && sample.effective_worker_count == 0U;
+    }
+    return sample.peak_active_builds > 0U
+        && sample.effective_worker_count > 0U
+        && sample.peak_active_builds <= sample.effective_worker_count;
+}
+
+void validate_warm_cache_sample(
+    const Sample &sample,
+    std::size_t expected_unique_count,
+    std::size_t expected_resident_count,
+    std::size_t expected_resident_bytes) {
+    if (expected_resident_count > expected_unique_count) {
+        throw std::invalid_argument("resident plan count exceeds unique plan count");
+    }
     if (sample.unique_key_count != expected_unique_count
-        || sample.physical_build_count != 0U
-        || sample.ready_hit_count != expected_unique_count
+        || sample.physical_build_count != expected_unique_count - expected_resident_count
+        || sample.ready_hit_count != expected_resident_count
         || sample.published_plan_count != 0U
-        || sample.resident_entry_count != expected_unique_count
-        || sample.resident_bytes == 0U
-        || sample.peak_active_builds != 0U
-        || sample.effective_worker_count != 0U) {
+        || sample.resident_entry_count != expected_resident_count
+        || sample.resident_bytes != expected_resident_bytes
+        || !build_activity_is_valid(sample)) {
         throw std::runtime_error("Metal cross-call cache benchmark invariant changed");
     }
 }
 
 void validate_cold_session_cache_sample(
     const Sample &sample,
-    std::size_t expected_unique_count) {
+    std::size_t expected_unique_count,
+    std::size_t expected_resident_count,
+    std::size_t expected_resident_bytes) {
     if (sample.unique_key_count != expected_unique_count
         || sample.physical_build_count != expected_unique_count
         || sample.ready_hit_count != 0U
-        || sample.published_plan_count != expected_unique_count
-        || sample.resident_entry_count != expected_unique_count
-        || sample.resident_bytes == 0U
-        || sample.peak_active_builds > sample.effective_worker_count) {
+        || sample.published_plan_count != expected_resident_count
+        || sample.resident_entry_count != expected_resident_count
+        || sample.resident_bytes != expected_resident_bytes
+        || !build_activity_is_valid(sample)) {
         throw std::runtime_error("Metal cold session-cache invariant changed");
     }
 }
@@ -494,12 +607,13 @@ void validate_cold_session_cache_sample(
     const PlannerPath planner_path = batch_planner
         ? PlannerPath::batch : PlannerPath::serial;
     const Sample warmup = run_sample(config, fixture, metal, metric, planner_path);
-    validate_planner_sample(warmup, fixture.requests.size());
+    const std::size_t expected_unique_count = warmup.unique_key_count;
+    validate_planner_sample(warmup, expected_unique_count);
     std::vector<Sample> samples;
     samples.reserve(config.samples);
     for (std::size_t index = 0; index < config.samples; ++index) {
         Sample sample = run_sample(config, fixture, metal, metric, planner_path);
-        validate_planner_sample(sample, fixture.requests.size());
+        validate_planner_sample(sample, expected_unique_count);
         samples.push_back(std::move(sample));
     }
     return summarize_samples(samples, warmup.within_tolerance);
@@ -514,9 +628,11 @@ void validate_cold_session_cache_sample(
         config, fixture, metal, metric, PlannerPath::serial);
     const Sample batch_warmup = run_sample(
         config, fixture, metal, metric, PlannerPath::batch);
-    validate_planner_sample(serial_warmup, fixture.requests.size());
-    validate_planner_sample(batch_warmup, fixture.requests.size());
-    if (serial_warmup.maximum_error != batch_warmup.maximum_error
+    const std::size_t expected_unique_count = serial_warmup.unique_key_count;
+    validate_planner_sample(serial_warmup, expected_unique_count);
+    validate_planner_sample(batch_warmup, expected_unique_count);
+    if (serial_warmup.unique_key_count != batch_warmup.unique_key_count
+        || serial_warmup.maximum_error != batch_warmup.maximum_error
         || serial_warmup.valley_distance != batch_warmup.valley_distance) {
         throw std::runtime_error("Metal paired warmup changed correctness output");
     }
@@ -547,8 +663,8 @@ void validate_cold_session_cache_sample(
             batch = run_sample(config, fixture, metal, metric, PlannerPath::batch);
             serial = run_sample(config, fixture, metal, metric, PlannerPath::serial);
         }
-        validate_planner_sample(serial, fixture.requests.size());
-        validate_planner_sample(batch, fixture.requests.size());
+        validate_planner_sample(serial, expected_unique_count);
+        validate_planner_sample(batch, expected_unique_count);
         if (serial.maximum_error != batch.maximum_error
             || serial.valley_distance != batch.valley_distance) {
             throw std::runtime_error("Metal paired sample changed correctness output");
@@ -585,8 +701,16 @@ void validate_cold_session_cache_sample(
     prewarm_retained_cache(fixture, warmup_retained);
     const Sample warm_warmup = run_sample(
         config, fixture, metal, metric, PlannerPath::session_cache_warm, &warmup_retained);
-    validate_cold_session_cache_sample(cold_warmup, fixture.requests.size());
-    validate_warm_cache_sample(warm_warmup, fixture.requests.size());
+    const std::size_t expected_unique_count = cold_warmup.unique_key_count;
+    const std::size_t expected_resident_count =
+        warmup_retained.setup_published_plan_count;
+    const std::size_t expected_resident_bytes = warmup_retained.retained_plan_bytes;
+    validate_cold_session_cache_sample(
+        cold_warmup, expected_unique_count,
+        expected_resident_count, expected_resident_bytes);
+    validate_warm_cache_sample(
+        warm_warmup, expected_unique_count,
+        expected_resident_count, expected_resident_bytes);
     if (cold_warmup.maximum_error != warm_warmup.maximum_error
         || cold_warmup.valley_distance != warm_warmup.valley_distance) {
         throw std::runtime_error("Metal cache paired warmup changed correctness output");
@@ -597,11 +721,16 @@ void validate_cold_session_cache_sample(
     std::vector<bool> cold_first;
     std::vector<double> plan_deltas;
     std::vector<double> plan_speedups;
+    std::vector<double> cpu_deltas;
+    std::vector<double> cpu_total_deltas;
+    std::vector<double> controlled_cpu_total_deltas;
     std::vector<double> metal_deltas;
     std::vector<double> metal_total_deltas;
     std::vector<double> controlled_metal_total_deltas;
     std::vector<double> prewarm_samples;
-    for (auto *values : {&plan_deltas, &plan_speedups, &metal_deltas,
+    for (auto *values : {&plan_deltas, &plan_speedups,
+                         &cpu_deltas, &cpu_total_deltas,
+                         &controlled_cpu_total_deltas, &metal_deltas,
                          &metal_total_deltas, &controlled_metal_total_deltas,
                          &prewarm_samples}) {
         values->reserve(config.samples);
@@ -609,16 +738,17 @@ void validate_cold_session_cache_sample(
     cold_samples.reserve(config.samples);
     warm_samples.reserve(config.samples);
     cold_first.reserve(config.samples);
-    std::size_t retained_plan_bytes = 0U;
+    const std::size_t retained_plan_bytes = expected_resident_bytes;
 
     const auto run_warm = [&] {
         RetainedCacheFixture retained;
         prewarm_retained_cache(fixture, retained);
         prewarm_samples.push_back(retained.setup_only_cold_publish_ms);
-        if (retained_plan_bytes == 0U) {
-            retained_plan_bytes = retained.retained_plan_bytes;
-        } else if (retained_plan_bytes != retained.retained_plan_bytes) {
-            throw std::runtime_error("retained cache byte count changed between samples");
+        if (retained.setup_physical_build_count != expected_unique_count
+            || retained.setup_published_plan_count != expected_resident_count
+            || retained.retained_plan_bytes != retained_plan_bytes) {
+            throw std::runtime_error(
+                "retained cache setup counts changed between samples");
         }
         return run_sample(
             config, fixture, metal, metric, PlannerPath::session_cache_warm, &retained);
@@ -637,8 +767,12 @@ void validate_cold_session_cache_sample(
             cold = run_sample(
                 config, fixture, metal, metric, PlannerPath::session_cache_cold);
         }
-        validate_cold_session_cache_sample(cold, fixture.requests.size());
-        validate_warm_cache_sample(warm, fixture.requests.size());
+        validate_cold_session_cache_sample(
+            cold, expected_unique_count,
+            expected_resident_count, retained_plan_bytes);
+        validate_warm_cache_sample(
+            warm, expected_unique_count,
+            expected_resident_count, retained_plan_bytes);
         if (cold.maximum_error != warm.maximum_error
             || cold.valley_distance != warm.valley_distance) {
             throw std::runtime_error("Metal cache paired sample changed correctness output");
@@ -646,6 +780,15 @@ void validate_cold_session_cache_sample(
         cold_first.push_back(run_cold_first);
         plan_deltas.push_back((warm.plan_ms - cold.plan_ms) / cold.plan_ms);
         plan_speedups.push_back(cold.plan_ms / warm.plan_ms);
+        cpu_deltas.push_back((warm.cpu_ms - cold.cpu_ms) / cold.cpu_ms);
+        cpu_total_deltas.push_back(
+            (warm.cpu_total_ms - cold.cpu_total_ms) / cold.cpu_total_ms);
+        const double cpu_execution_control = (cold.cpu_ms + warm.cpu_ms) / 2.0;
+        const double controlled_cold_cpu_total = cold.plan_ms + cpu_execution_control;
+        const double controlled_warm_cpu_total = warm.plan_ms + cpu_execution_control;
+        controlled_cpu_total_deltas.push_back(
+            (controlled_warm_cpu_total - controlled_cold_cpu_total)
+            / controlled_cold_cpu_total);
         metal_deltas.push_back((warm.metal_ms - cold.metal_ms) / cold.metal_ms);
         metal_total_deltas.push_back(
             (warm.metal_total_ms - cold.metal_total_ms) / cold.metal_total_ms);
@@ -669,6 +812,9 @@ void validate_cold_session_cache_sample(
         retained_plan_bytes,
         getnative::benchmark::summarize(std::move(plan_deltas)),
         getnative::benchmark::summarize(std::move(plan_speedups)),
+        getnative::benchmark::summarize(std::move(cpu_deltas)),
+        getnative::benchmark::summarize(std::move(cpu_total_deltas)),
+        getnative::benchmark::summarize(std::move(controlled_cpu_total_deltas)),
         getnative::benchmark::summarize(std::move(metal_deltas)),
         getnative::benchmark::summarize(std::move(metal_total_deltas)),
         getnative::benchmark::summarize(std::move(controlled_metal_total_deltas)),
@@ -955,7 +1101,7 @@ void append_amortized_video_results(
     output << '{';
     getnative::benchmark::append_common_metadata(
         output, "getnative_metal_benchmark", "session_cache_compare",
-        "synthetic-lcg-production-session-cache-v1", argc, argv);
+        "synthetic-lcg-production-session-cache-v2", argc, argv);
     output << ",\"sample_count\":" << config.samples
            << ",\"warmup_count_per_mode\":1"
            << ",\"cache_baseline_status\":"
@@ -989,6 +1135,10 @@ void append_amortized_video_results(
            << measurements.cache_limits.maximum_resident_bytes
            << ",\"entry_count\":" << measurements.warm_cache.resident_entry_count
            << ",\"logical_plan_bytes\":" << measurements.retained_plan_bytes
+           << ",\"ready_hit_count\":" << measurements.warm_cache.ready_hit_count
+           << ",\"ready_hit_rate\":" << std::setprecision(17)
+           << static_cast<double>(measurements.warm_cache.ready_hit_count)
+                  / static_cast<double>(measurements.warm_cache.unique_key_count)
            << ",\"setup_physical_build_count\":"
            << measurements.setup_physical_build_count
            << ",\"setup_published_plan_count\":"
@@ -1009,6 +1159,13 @@ void append_amortized_video_results(
     getnative::benchmark::append_summary(output, measurements.plan_delta);
     output << ",\"plan_speedup\":";
     getnative::benchmark::append_summary(output, measurements.plan_speedup);
+    output << ",\"cpu_delta\":";
+    getnative::benchmark::append_summary(output, measurements.cpu_delta);
+    output << ",\"cpu_total_delta\":";
+    getnative::benchmark::append_summary(output, measurements.cpu_total_delta);
+    output << ",\"controlled_cpu_total_delta\":";
+    getnative::benchmark::append_summary(
+        output, measurements.controlled_cpu_total_delta);
     output << ",\"metal_delta\":";
     getnative::benchmark::append_summary(output, measurements.metal_delta);
     output << ",\"metal_total_delta\":";
@@ -1019,7 +1176,8 @@ void append_amortized_video_results(
     output << "},\"amortized_video\":{\"model\":"
            << getnative::benchmark::json_string(
                   "one measured production cold miss/build/publish call followed by "
-                  "measured production 100% ready-hit calls; "
+                  "measured production bounded-cache calls; resident plans are ready hits "
+                  "and non-resident plans are rebuilt; "
                   "each pair shares the mean of its two measured Metal executions and "
                   "fixture setup is excluded")
            << ",\"frames\":";
@@ -1034,8 +1192,9 @@ void append_amortized_video_results(
            << ",\"strict_tolerance\":"
            << (measurements.cold_batch.within_tolerance
                    && measurements.warm_cache.within_tolerance ? "true" : "false")
-           << ",\"warm_requests_are_ready_hits\":"
-           << (measurements.warm_cache.ready_hit_count == config.candidates
+           << ",\"warm_ready_hits_match_resident_entries\":"
+           << (measurements.warm_cache.ready_hit_count
+                       == measurements.warm_cache.resident_entry_count
                    ? "true" : "false")
            << ",\"metal_peak_workspace_bytes\":" << workspace_bytes
            << ",\"metal_peak_working_set_bytes\":" << working_set_bytes
@@ -1068,26 +1227,29 @@ int main(int argc, char **argv) {
                 config, fixture, metal, metric);
             const std::size_t workspace_bytes = metal.peak_workspace_elements() * sizeof(float);
             const std::size_t working_set_bytes = metal.peak_working_set_bytes();
+            const std::size_t unique_key_count = paired.cold_batch.unique_key_count;
+            const std::size_t resident_entry_count = paired.setup_published_plan_count;
             const bool assertions_pass = paired.cold_batch.within_tolerance
                 && paired.warm_cache.within_tolerance
                 && paired.cold_batch.valley_distance.maximum <= 1.0
                 && paired.warm_cache.valley_distance.maximum <= 1.0
-                && paired.cold_batch.physical_build_count == config.candidates
+                && unique_key_count == config.candidates
+                && paired.warm_cache.unique_key_count == unique_key_count
+                && paired.cold_batch.physical_build_count == unique_key_count
                 && paired.cold_batch.ready_hit_count == 0U
-                && paired.cold_batch.published_plan_count == config.candidates
-                && paired.cold_batch.resident_entry_count == config.candidates
-                && paired.warm_cache.physical_build_count == 0U
-                && paired.warm_cache.ready_hit_count == config.candidates
+                && paired.cold_batch.published_plan_count == resident_entry_count
+                && paired.cold_batch.resident_entry_count == resident_entry_count
+                && paired.warm_cache.physical_build_count
+                       == unique_key_count - resident_entry_count
+                && paired.warm_cache.ready_hit_count == resident_entry_count
                 && paired.warm_cache.published_plan_count == 0U
-                && paired.warm_cache.resident_entry_count == config.candidates
-                && paired.setup_physical_build_count == config.candidates
-                && paired.setup_published_plan_count == config.candidates
-                && paired.retained_plan_bytes > 0U
+                && paired.warm_cache.resident_entry_count == resident_entry_count
+                && paired.setup_physical_build_count == unique_key_count
                 && paired.cold_batch.resident_bytes == paired.retained_plan_bytes
                 && paired.warm_cache.resident_bytes == paired.retained_plan_bytes
                 && paired.retained_plan_bytes
                        <= paired.cache_limits.maximum_resident_bytes
-                && config.candidates <= paired.cache_limits.maximum_entries
+                && resident_entry_count <= paired.cache_limits.maximum_entries
                 && workspace_bytes < 2ULL * 1024ULL * 1024ULL * 1024ULL
                 && working_set_bytes < 2ULL * 1024ULL * 1024ULL * 1024ULL;
             const std::string status = cache_baseline_status(
@@ -1102,6 +1264,13 @@ int main(int argc, char **argv) {
                       << "warm_session_plan_ms=" << paired.warm_cache.plan_ms.median << '\n'
                       << "plan_speedup=" << paired.plan_speedup.median << "x\n"
                       << "plan_delta_mad=" << paired.plan_delta.mad << '\n'
+                      << "cold_session_cpu_ms=" << paired.cold_batch.cpu_ms.median << '\n'
+                      << "warm_session_cpu_ms=" << paired.warm_cache.cpu_ms.median << '\n'
+                      << "cpu_execution_delta=" << paired.cpu_delta.median << '\n'
+                      << "observed_steady_state_cpu_total_improvement="
+                      << -paired.cpu_total_delta.median << '\n'
+                      << "controlled_steady_state_cpu_total_improvement="
+                      << -paired.controlled_cpu_total_delta.median << '\n'
                       << "cold_session_metal_ms=" << paired.cold_batch.metal_ms.median << '\n'
                       << "warm_session_metal_ms=" << paired.warm_cache.metal_ms.median << '\n'
                       << "metal_execution_delta=" << paired.metal_delta.median << '\n'
@@ -1118,7 +1287,13 @@ int main(int argc, char **argv) {
                       << paired.metal_total_delta.mad << '\n'
                       << "controlled_metal_total_delta_mad="
                       << paired.controlled_metal_total_delta.mad << '\n'
-                      << "retained_cache_entries=" << config.candidates << '\n'
+                      << "retained_cache_entries=" << resident_entry_count << '\n'
+                      << "warm_ready_hit_count=" << paired.warm_cache.ready_hit_count << '\n'
+                      << "warm_rebuilt_miss_count="
+                      << paired.warm_cache.physical_build_count << '\n'
+                      << "warm_ready_hit_rate=" << std::setprecision(6)
+                      << static_cast<double>(paired.warm_cache.ready_hit_count)
+                             / static_cast<double>(unique_key_count) << '\n'
                       << "retained_plan_mib="
                       << static_cast<double>(paired.retained_plan_bytes)
                               / (1024.0 * 1024.0) << '\n'
