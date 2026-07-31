@@ -25,17 +25,18 @@ x86 CPU strict 路径先完成，因为它既是 Windows fallback，也是 CUDA/
 
 - 仓库：`<repo>`，即 Windows agent 收到的 GetNative-VF 根目录。
 - 分支：`main`。
-- `HEAD`：`7ae91c91b086faea96b59eba6508019177603a6c`。
-- 相对 `origin/main`：ahead 1。
-- 当前 worktree 已有以下未提交内容，全部属于接收基线，不得清除或覆盖：
-  - `DESIGN.md`：modified，SHA-256 `fb759d557a57a229f06221cf44d37e1d94320506d52a8a0938ad403137026234`。
-  - `docs/performance/pre-gpu-planner-results.md`：modified，SHA-256 `f9fd5f6e617b7191ba4c26e5402ba179ec08467d18c5995a3f6f11ae3f8ed183`。
-  - `engine/CMakeLists.txt`：modified，SHA-256 `a410a4a1fafdff4439a06d43c9edb5ba51195ac075b1d9eff613de304da12842`。
-  - `engine/bench/metal_benchmark.cpp`：modified，SHA-256 `257ec8f941b1f71b20d9f5ae38e463e6fb4fbf1b6419d3706b2c1fc3a295a9f0`。
-  - `engine/bench/fixed_recipe_benchmark.cpp`：untracked，SHA-256 `b6943f634577ce740b984be24bfa8a09c4bbc427acd2521b812a2955f46ba545`。
-  - `docs/gui-development-spec.md`：untracked，SHA-256 `07030242c7abae5338d75303530689a26c3d37fba4efe83d042a3b70d5684d04`。
-  - 本 handover 自身为 modified；因为它是正在生成的交付物，不在正文内写自引用 hash，接收方必须对收到的最终文件另行取 hash。
-- `DESIGN.md` 和 GUI spec 扩展了产品 planner/RunGroup/Recipe 目标；planner results 与 Metal benchmark 修改扩大了 planner、kernel/native-height 和 session-cache 测量面；CMake 和新 fixed-recipe benchmark 增加了 prepared-once Recipe 的多帧 CPU/Metal 对比。它们都不是 Windows agent 可以删除的临时文件。
+- `HEAD`：`0b035fa4ed0e2b96fbd5b988a653653f03d2cb61`，commit `perf: add 810p planning and verification evidence`。
+- 相对 `origin/main`：一致。
+- 本轮 CUDA/PTX handover 修改开始前 worktree 干净；本文件是当前任务产生的唯一未提交 path。因为它是正在生成的交付物，不在正文内写自引用 hash，接收方必须对收到的最终文件另行取 hash。
+- 最新 `HEAD` 已提交而非 dirty 的关键文件：
+  - `DESIGN.md`，SHA-256 `fb759d557a57a229f06221cf44d37e1d94320506d52a8a0938ad403137026234`；
+  - `docs/gui-development-spec.md`，SHA-256 `07030242c7abae5338d75303530689a26c3d37fba4efe83d042a3b70d5684d04`；
+  - `docs/performance/pre-gpu-planner-results.md`，SHA-256 `07b5ada963d9c45cc844ab3e307ac184f136bdda5d6c60335843177bcb399b6d`；
+  - `docs/performance/fixed-recipe-multiframe-results.md`，SHA-256 `71553a039955cd83f1ce119e6a4bafd2ccd601fe5fb0d0f2ba13366aae97abd3`；
+  - `engine/CMakeLists.txt`，SHA-256 `a410a4a1fafdff4439a06d43c9edb5ba51195ac075b1d9eff613de304da12842`；
+  - `engine/bench/metal_benchmark.cpp`，SHA-256 `257ec8f941b1f71b20d9f5ae38e463e6fb4fbf1b6419d3706b2c1fc3a295a9f0`；
+  - `engine/bench/fixed_recipe_benchmark.cpp`，SHA-256 `a61b616f089441567ece91ee1ba2eb6c85f0e726295f382e8df4027241ffe7cb`。
+- `DESIGN.md` 和 GUI spec 扩展了产品 planner/RunGroup/Recipe 目标；planner/fixed-recipe results 与 Metal benchmark 扩大了 planner、kernel/native-height、session-cache 和 prepared-once 多帧测量面。它们是当前 committed baseline，不是 Windows agent 可以删除的临时文件。
 
 Windows agent 开工时必须重新记录：
 
@@ -46,6 +47,7 @@ git diff --stat
 Get-FileHash -Path @(
   "DESIGN.md"
   "docs/performance/pre-gpu-planner-results.md"
+  "docs/performance/fixed-recipe-multiframe-results.md"
   "docs/windows-cuda-vulkan-handover.md"
   "docs/gui-development-spec.md"
   "engine/CMakeLists.txt"
@@ -605,7 +607,10 @@ engine/tests/gpu_batch_test.cpp
 engine/include/getnative/cuda_analysis.hpp
 engine/src/backend/cuda/cuda_backend.cpp
 engine/src/backend/cuda/getnative_cuda.cu
+engine/src/backend/cuda/getnative_cuda_kernels.cuh
+engine/src/backend/cuda/cuda_ptx_intrinsics.cuh   # 仅在第 12.7 节 gate 通过后增加
 engine/tests/cuda_conformance_test.cpp
+engine/tests/cuda_artifact_test.cpp
 engine/bench/cuda_benchmark.cpp
 
 engine/include/getnative/vulkan_analysis.hpp
@@ -780,17 +785,23 @@ Generic 必须先覆盖全部 `half_bandwidth<=15`、`forward_width<=16` 的合�
 1. B7/F4 fixed path。
 2. B3/F2 fixed path。
 3. B11/F6、B15/F8 fixed path。
-4. grow-to-fit source/workspace/partial capacity reuse。
-5. source 每 call 一次 upload、partial-only readback。
-6. plan packing/upload 分段遥测。
-7. CUDA pinned staging 和 async copy。
-8. CUDA 多 stream，只在 timeline 证明 overlap 后保留。
-9. Vulkan device-local arena + staging reuse。
-10. Vulkan pipeline cache，key 包含 shader hash、device、driver。
-11. Generic register pressure、occupancy 和 memory coalescing。
-12. tile size、groups、inverse threads 的 device profile。
-13. p>1，仅在产品需求和新数值契约明确后。
-14. 独立 fast artifact，仅在 strict 完成后。
+4. CUDA 按 axis/stage/shape 编译期专用化，以及 candidate x vector 二维 grid；不要按滤镜名称重复生成相同 shape。
+5. grow-to-fit source/workspace/partial capacity reuse。
+6. source 每 call 一次 upload、partial-only readback，plan packing/upload 分段遥测。
+7. CUDA source/plan/workspace 的合并访问、对齐和只读缓存；horizontal source transpose/repack 只在摊销后获益时保留。
+8. CUDA 可证明不需要跨 block barrier 的 kernel fusion，优先评估同一 vector owner 的 matrix inverse + first forward。
+9. CUDA pinned staging、真正异步的 HtoD/DtoH 和 copy/compute overlap。
+10. 重复 fixed-recipe 的 CUDA Graph；只有 timeline 显示 launch/host overhead 时保留。
+11. CUDA 多 stream，只在 timeline 证明 overlap 后保留。
+12. `sm_80+` async copy、`sm_90a`/后续 architecture-specific TMA，只为有 shared-memory reuse 的 tile 增加独立变体。
+13. metric reduction 的显式 warp-shuffle binary tree；必须保持第 6.5 节相同 pair/order。
+14. Generic register pressure、occupancy、spill、memory coalescing、cache 和 barrier profile；再调 tile size、groups、inverse threads、`__launch_bounds__`。
+15. inline PTX，仅处理第 12.7 节已证明的编译器 codegen 缺口，并通过第 16.6 节逐 SM A/B gate。
+16. Vulkan device-local arena + staging reuse。
+17. Vulkan pipeline cache，key 包含 shader hash、device、driver。
+18. p>1，仅在产品需求和新数值契约明确后。
+
+FMA、`half2`、hardware sampler interpolation 和其他 relaxed/fast-math 路径不因“极限优化”重新进入本 handover。性能工作必须优化相同的 `math_mode=strict` artifact。
 
 ## 12. CUDA 后端要求
 
@@ -802,12 +813,12 @@ Generic 必须先覆盖全部 `half_bandwidth<=15`、`forward_width<=16` 的合�
 
 ```text
 nvcc --fatbin getnative_cuda.cu
-  strict flags
+  --fmad=false --ftz=false --prec-div=true --prec-sqrt=true
   -gencode arch=compute_X,code=sm_X
   -gencode arch=compute_Y,code=[sm_Y,compute_Y]
 ```
 
-架构列表由 Windows CI/目标 GPU 决定，不在 handover 中猜测。fatbin 至少包含验证过的 SASS 和一个 PTX fallback。使用现有 `engine/cmake/embed_binary.cmake` 嵌入 binary。
+架构列表由 Windows CI/目标 GPU 决定，不在 handover 中猜测。fatbin 至少包含每个已验证目标的 native cubin 和一个不依赖 architecture-specific feature 的 PTX fallback。`sm_XXa`/`compute_XXa` 之类 architecture-specific feature 不得成为通用 fallback；对应优化只放入匹配的 native cubin，其他 GPU 回到 generic strict kernel。使用现有 `engine/cmake/embed_binary.cmake` 嵌入 binary。
 
 要求：
 
@@ -815,7 +826,10 @@ nvcc --fatbin getnative_cuda.cu
 - 不链接 CUDA Driver import library。
 - 主 executable 的 import table 无 `nvcuda.dll`、`cudart64_*.dll`。
 - `--use_fast_math` 禁止进入 strict artifact。
-- `RelWithDebInfo` profile build 保留 `-lineinfo`，但与 release strict 数值 flags 一致。
+- strict build 显式固定 `--fmad=false --ftz=false --prec-div=true --prec-sqrt=true`；即使当前 kernel 没有除法/平方根也记录完整 flags。
+- profile build 增加 `-lineinfo -Xptxas=-v`，保存每个 kernel 的 registers、shared/local memory 和 spill 输出；release strict build 与 profile build 的数学 flags 相同。
+- 保存 nvcc 生成的 PTX、每个 native cubin 和最终 fatbin hash。PTX 是虚拟 ISA，不能作为最终指令证明；完成判断看每个目标 cubin 的 SASS。
+- Driver API 的 PTX fallback 使用 module JIT；需要 JIT 诊断时通过 `cuModuleLoadDataEx` 保存 info/error log。产品不链接 `nvptxcompiler_static.lib`，也不在运行时引入 CUDA Toolkit/PTX Compiler API。
 
 ### 12.2 Driver API 动态加载
 
@@ -823,12 +837,14 @@ Host 仅用 `LoadLibraryW(L"nvcuda.dll")` 和 `GetProcAddress`。最小 function
 
 - init/device enumeration/name/UUID/attributes/driver version；
 - context create/destroy/current guard；
-- module load/unload/function lookup；
-- stream create/destroy/synchronize；
-- device alloc/free；
+- module load/load-data-with-JIT-log/unload/function lookup；
+- stream create/destroy/synchronize，event create/record/elapsed/destroy；
+- device alloc/free、pinned host alloc/free；
 - HtoD/DtoH async copy；
 - kernel launch；
 - error name/string。
+
+M5A 启用 CUDA Graph 时再增加可选 Driver API function table：stream capture begin/end、graph instantiate/update/launch、graph-exec/node parameter update 和 graph/exec destroy。缺少这些可选 symbols 只让 Graph variant unavailable；不能让 generic CUDA backend 初始化失败，也不能改为链接 cudart。
 
 注意 `_v2` symbol 和 Driver API version。每个 resolve 失败要报告确切 symbol，不得解引用 null function pointer。
 
@@ -848,9 +864,113 @@ Host 仅用 `LoadLibraryW(L"nvcuda.dll")` 和 `GetProcAddress`。最小 function
 ### 12.4 CUDA 验证工具
 
 - Nsight Systems：CPU planning、upload、launch、sync、tile timeline。
-- Nsight Compute：occupancy、register、memory、branch、kernel duration。
+- Nsight Compute：先用 SpeedOfLight/LaunchStats/Occupancy/MemoryWorkloadAnalysis/SourceCounters 判断瓶颈，再看 kernel duration、register、spill、memory transaction、cache、branch、barrier 和 warp stall。高 occupancy 不是单独目标。
 - Compute Sanitizer：`memcheck`、`racecheck`、`initcheck`、`synccheck` 中适用项。
-- `cuobjdump`：确认 SASS/PTX 架构和 kernel symbols。
+- `cuobjdump`：确认 fatbin 中的 PTX/cubin 架构、kernel symbols、resource usage 和 SASS。
+- `nvdisasm`：对逐目标 cubin 检查 control flow、source/PTX line mapping、register live range 和最终指令。SASS 只作检查输出，不是本项目的源码层。
+
+### 12.5 对底层优化路线的项目化结论
+
+给定分析的主方向正确，但必须按 GetNative 当前实现收紧：
+
+| 路线 | 本 handover 决策 | GetNative 约束 |
+| --- | --- | --- |
+| CUDA C++ template/specialization | 必做 | 按 `AxisShape`、axis 和 stage 专用化；Bilinear/Lanczos1 同属 B3/F2，不为滤镜名重复 kernel |
+| CUDA intrinsics / libcu++ async primitives | 优先于 PTX | warp shuffle、vector load/store、`cuda::memcpy_async`/pipeline、cooperative groups 必须有实际数据流收益且保持 strict order |
+| SASS inspection | 必做 | 每个 native SM 都看最终 cubin；PTX 数量不等于 SASS 数量，不能从 PTX 推断寄存器、spill 或调度 |
+| 局部 inline PTX | 条件必做 | 只有编译器持续不能生成目标指令且第 16.6 节 A/B 通过时保留；必须有 CUDA C++ fallback |
+| 独立手写 `.ptx` kernel | 例外路径 | 仅当局部 wrapper 仍不足且热点已稳定；需要独立 ABI、ptxas、SASS 和每个 SM conformance |
+| 直接写/patch SASS | 不属于支持路径 | 不使用 maxas、TuringAs、CuAssembler 或其他非官方 assembler/patcher 生成 shipping artifact |
+| `half2`、Float16 coefficient、texture interpolation | strict 禁止 | Float16 已有 valley 漂移；硬件插值不消费 CPU `AxisPlan` 的准确权重/顺序 |
+| FMA / fast math | strict 禁止 | 保持 `--fmad=false`，不重新增加 fast-math product/job mode |
+| PTX Compiler API | shipping 不采用 | 当前 runtime 只动态依赖 Driver API；offline nvcc/ptxas + embedded fatbin 已覆盖目标，避免新增 Toolkit static-library 依赖和自管 JIT cache |
+
+“模板实例化 Lanczos1-8”需要改写为 shape specialization。滤镜名称只影响 CPU planner 生成的 coefficients；GPU 看到的是 `half_bandwidth`、`forward_width` 和已打包的 Float32 arrays。首批只保留当前 Metal 已有证据的 B3/F2、B7/F4、B11/F6、B15/F8 加 generic。B19/F10 到 B31/F16 若 profiler 证明 generic loop/control 是实际瓶颈，再逐 shape 增加；每个实例都要计入 cubin size 和 instruction-cache 影响。
+
+`prmt`/byte permutation 示例也不直接适用于这些 Float32 solver。不要为了展示 inline PTX 引入与 profile 无关的指令。
+
+### 12.6 CUDA kernel/dataflow 优化方向
+
+#### 12.6.1 Dispatch 和专用化
+
+- 将 flat `gid / maximum_vector_count` 改为可比较的二维 launch 变体：一个 grid dimension 表示 candidate，另一个表示独立 vector。这样同一 block 的 descriptor/weights 可保持 uniform，减少整数除法、candidate boundary divergence 和重复地址计算。
+- 用共同的 device template 定义数学顺序，再实例化 `Axis::horizontal/vertical`、image/matrix/metric stage 和 B3/B7/B11/B15/generic；不得复制并逐渐分叉数学实现。
+- `if constexpr`、固定 loop bound 和审计过的 unroll 优先于 inline PTX。Generic 必须始终保留为 correctness oracle 和未知合法 shape fallback。
+- 使用 `const`/`__restrict__`、预计算 base pointer/stride、32-bit validated offsets，减少 inner-loop 64-bit address arithmetic。任何 host-side layout 改动都先通过 `gpu_batch_test` 的 byte/offset contract。
+
+#### 12.6.2 Memory layout 和 reuse
+
+- Vertical image/matrix path 先验证 warp 相邻 lane 的 source/workspace load 已合并；若已 coalesced，不要为使用 shared memory 而额外 copy。
+- Horizontal image inverse 的相邻 vector 访问通常跨 row stride。评估 source 一次性 tiled transpose/repack 或同时保留 row-major/column-major source；成本必须在同一 call 的 candidate 数和 fixed-recipe 多帧中摊销，且计入 working set/upload/total wall。
+- plan coefficients 对同一 candidate 的 vectors 是只读共享数据。先观察 L1/L2 hit、uniform load 和 long-scoreboard；只有 cache 不能满足时，才把当前 block 实际复用的小窗口 staged 到 shared memory。
+- `float2/float4` load/store 只在 host packer 保证 8/16-byte alignment、row/arena offset 和 tail 后使用。不得对未验证的 crop/stride/arena offset 直接 reinterpret cast；vector load 不能改变 Float32 运算顺序。
+- Hardware texture interpolation 禁止。只读/texture cache 若仅用于 point load，也必须证明比普通 global load 更快，并保持完全相同的 values 和地址边界。
+
+#### 12.6.3 Fusion、reduction 和 launch overhead
+
+- 当前 final forward reconstruction 已与 abs/threshold/metric reduction 融合，不要重复声称这是待完成优化。
+- 两轴路径优先评估“同一 thread 已拥有完整 vector”的 matrix inverse + 同轴 first forward 融合；它可减少 native intermediate 的一次 global write/read。若需要跨 block/grid barrier、cooperative launch 或改变 B7/generic 次序，则保持分离 kernel。
+- 256-thread metric reduction 可在 shared-memory 的 128/64/32 层后，用显式 `__shfl_down_sync` 完成 16/8/4/2/1；pairing 和 add order 必须与第 6.5 节 binary tree 相同。不要替换成顺序未被契约固定的 aggregate reduce intrinsic。
+- fixed-recipe/多帧在 buffer address、tile signature 和 launch topology 稳定后评估 CUDA Graph capture/update。只有 Nsight Systems 证明 launch/host overhead 可见且 graph 的 update/recapture 成本可摊销时保留。
+- persistent kernel、cooperative grid synchronization 和跨 candidate work queue 是最后一层实验；它们不得削弱 stop/drain、workspace ceiling 或稳定结果顺序。
+
+#### 12.6.4 Architecture-specific data movement
+
+- `sm_80+` 可评估 CUDA pipeline/`cuda::memcpy_async` 对 global -> shared 的硬件 async copy；前提是该 shared tile 被重复消费并能与计算重叠。单次读取数据不应为了 `cp.async` 多走 shared memory。
+- Hopper `sm_90a`/后续支持 TMA 的目标可评估 1D/2D tile transfer 和 double buffering。TMA variant 单独编译、单独 dispatch、单独 benchmark；generic cubin/PTX fallback 不含 `a` feature。
+- `__launch_bounds__` 和 `--maxrregcount` 都是 trade-off，不是越低越好。只有 ptxas/occupancy/Nsight 同时证明 register limiter 或 spill 问题时按 kernel、按 SM 调整；禁止全 artifact 统一硬压 register count。
+- CUDA Tile 不是 M4/M5 依赖。当前 workload 是有序 Float32 banded solve 和 reduction，不是 dense tensor-core tile；只有目标 Toolkit 上的独立原型证明它改善相同 strict kernel 的数据移动或代码生成时再立项。
+
+### 12.7 inline PTX 准入和实现契约
+
+inline PTX 是最后的 codegen 修正层，不是完整 kernel 的首选语言。每个候选必须遵守：
+
+1. 先有同一 binary 内可 forced 的纯 CUDA C++ strict baseline；baseline 已通过第 15.3/15.4 节并有 Nsight/SASS 证据。
+2. 写一份候选记录：目标 kernel/SM、当前 CUDA C++/PTX/SASS、具体坏 codegen、预期替换指令、受影响数据和第 16.6 节成功门槛。
+3. inline asm 限制在一个 `__device__ __forceinline__` wrapper 的一个语义操作；放入 `cuda_ptx_intrinsics.cuh`。调用点仍保留 C++ fallback，使用 `__CUDA_ARCH__` 和 PTX ISA/SM capability guard。
+4. operand constraint 与 C++ scalar size/type 严格匹配；pointer 先确认 generic/global/shared address space。局部 PTX register 放在 `{}` scope，避免 wrapper 多次 inline 的 namespace collision。
+5. 有副作用或不可移动的操作使用 `asm volatile`；影响未列出内存的 load/store/barrier 使用正确的 `"memory"` clobber。不要机械地给纯寄存器表达式加 clobber而阻断编译器调度。
+6. nvcc host front-end 不解析 PTX template string；语法/type错误可能到 ptxas 才暴露。每个 native `sm_XX` 都必须实际经过 ptxas；每个保留的 `compute_XX` PTX 必须至少在兼容真实 device 上 forced Driver JIT，不能只让一个架构通过。
+7. PTX 指令仍由 ptxas 做 instruction selection、register allocation、scheduling 和可能的多指令 lowering。最终验收以逐 SM SASS、resource usage、Nsight 和 wall time 为准，不以“PTX 看起来更短”为准。
+
+优先候选仅包括：
+
+- 编译器无法稳定表达的 cache-policy/eviction-hint load，且 Nsight 已证明对应 cache miss/scoreboard 是瓶颈；
+- 没有等价 CUDA intrinsic 的目标 SM 新指令；
+- 可减少已在 SASS 中确认的多余 address conversion、packed integer/bit 操作；
+- 需要精确定义且 CUDA primitive 无法表达的 memory ordering。
+
+以下不准作为首批 inline PTX：
+
+- `A^T b`、forward/backward solve 或 reconstruction 的完整手写 PTX；
+- 任何 `fma`/`mad` 浮点融合、approximate math、Float16/`half2`；
+- 已能由 `__shfl_*_sync`、cooperative groups、`cuda::memcpy_async` 等官方接口产生同等 SASS 的操作；
+- 为追求特定 SASS 排列而塞入无语义依赖的 barrier、volatile load 或 dummy instruction；
+- undocumented opcode、raw SASS encoding 或 binary patch。
+
+独立手写 `.ptx` kernel 需要比 inline wrapper 更高的 gate：固定 `.version/.target/.address_size`、导出参数 ABI test、逐目标 ptxas、Driver module-load failure test、完整 CUDA C++ fallback 和逐 SM benchmark。没有这些证据时不创建 `.ptx` source。
+
+### 12.8 cubin/PTX 分发、选择和可维护性
+
+- 每个 Windows release 记录 Toolkit、nvcc、ptxas 和 driver version；不同 compiler/driver 可能从相同 PTX 生成不同 SASS，因此优化批准表必须带 toolchain 与 SM。
+- fatbin 放入已验证 GPU 的 native cubin，另放一个在最低 driver/device policy 上可用的最高通用 virtual architecture 的 generic strict PTX，以保留尽可能新的 PTX codegen 和未来 GPU JIT。用 `CUDA_FORCE_PTX_JIT=1` 在真实设备验证 fallback；测试后清除环境变量。
+- architecture-specific `sm_XXa` kernel 只能在匹配 device 上选中。runtime provenance 至少记录 device UUID、compute capability、kernel variant、native cubin/PTX-JIT 路径、artifact hash 和批准 benchmark id。
+- 如果同一 fatbin 含 baseline、specialized、async/TMA 和 PTX-optimized kernels，host 必须按稳定 function table/variant id 选择；缺 symbol 或 variant 未获该 SM benchmark 批准时回到 generic strict，不得静默切换 math mode。
+- 不以删除 PTX、去符号或混淆 kernel 名作为本任务的“性能/保密优化”。cubin 仍可反汇编；删除 PTX 会失去 forward-compatible fallback。若产品以后优先保护实现，应单独做分发 ADR，而不是由 Windows backend agent 擅自决定。
+- 直接 SASS patch 没有进入仓库、CI 或 package 的批准路径。若所有受支持层完成后仍需要最后几个百分点，先提交独立 R&D 结果、固定 GPU/driver/toolkit 商业收益和维护预算，再由项目 owner 决定是否另立非 portable artifact。
+
+### 12.9 NVIDIA 官方参考边界
+
+以下链接在 2026-07-31 核对为 CUDA 13.3 文档；Windows agent 必须按实际安装 Toolkit 版本使用对应 archive，并在 handback 记录差异：
+
+- [NVCC compiler driver](https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/index.html)：CUDA C++ -> PTX/cubin/fatbin、`-gencode`、`--fmad`、`--maxrregcount`。
+- [Using Inline PTX Assembly](https://docs.nvidia.com/cuda/inline-ptx-assembly/index.html)：operand constraints、namespace/memory-space、`volatile`/`memory` clobber 和 ptxas error boundary。
+- [CUDA Binary Utilities](https://docs.nvidia.com/cuda/cuda-binary-utilities/index.html)：`cuobjdump`、`nvdisasm`、resource usage、control flow 和 register live range。
+- [Nsight Compute Profiling Guide](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html)：SpeedOfLight、MemoryWorkloadAnalysis、Occupancy、SourceCounters 和 stall 解释。
+- [Ampere Tuning Guide](https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html)：global -> shared async copy、pipeline 和 occupancy/resource limits。
+- [Hopper Tuning Guide](https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html)：TMA、thread-block cluster 和 architecture-specific resource trade-off。
+- [Blackwell Compatibility Guide](https://docs.nvidia.com/cuda/blackwell-compatibility-guide/index.html)：native cubin compatibility、forward-compatible PTX 和 `CUDA_FORCE_PTX_JIT` 验证。
+- [PTX Compiler APIs](https://docs.nvidia.com/cuda/ptx-compiler-api/index.html)：只作为为何本项目不引入 runtime compiler/static library 的决策参考。
 
 ## 13. Vulkan Compute 后端要求
 
@@ -993,6 +1113,8 @@ Capability schema v3 的 CPU entry 除现有 backend 三态外，必须能表达
 
 Recipe 锁定的是 `math_mode`，不是某台机器的 ISA。`auto` 在 job 创建时解析到具体 `selected_isa`，结果 provenance 至少保存 `backend=cpu`、ISA、`math_mode=strict`、是否 forced、CPU signature、compiler/strict flags 和 benchmark source id。相同 Recipe 在另一台 CPU 上可以选择不同 ISA，但本 handover 不得改变 math mode。
 
+CUDA capability/debug 输出还要列出 device compute capability、fatbin 中的 native/PTX targets，以及该 device 已获批准的 kernel variants。每个 CUDA result provenance 至少保存 `math_mode=strict`、device UUID、compute capability、driver/toolkit、kernel variant、native cubin 或 PTX-JIT 路径、strict flags、fatbin hash 和 benchmark approval id。普通用户不需要选择 PTX/SASS；forced variant 只开放给 test/benchmark。
+
 ### 14.4 需要修改的现有文件
 
 - `engine/CMakeLists.txt`：x86 ISA object-library/逐文件 flags、独立 CUDA/Vulkan options、artifact build/embed、可组合 link targets、backend tests/benchmarks。
@@ -1094,7 +1216,17 @@ Recipe 锁定的是 `math_mode`，不是某台机器的 ISA。`auto` 在 job 创
 15. peak host/device/total explicit working set。
 16. 多 device enumeration 和稳定 selector。
 
-CUDA 额外：no `nvcuda.dll`、no device、unsupported fatbin/PTX、missing symbol、context/module failure。
+CUDA 额外：
+
+- no `nvcuda.dll`、no device、unsupported fatbin/PTX、missing symbol、context/module failure；
+- test/benchmark-only forced `cpp-generic`、`cpp-specialized`、architecture-specific async/TMA 和 `inline-ptx` variant；未编译、SM 不匹配或未批准 variant 在 launch 前稳定拒绝；
+- 每个优化 variant 与同一 artifact 的 `cpp-generic` 逐 candidate bit-identical，并通过相同 valley/order matrix；
+- warp-shuffle reduction 与 shared-memory 256-thread binary tree 的 partial/result bits 一致；
+- alignment/vector-load tail、horizontal transpose/repack、kernel fusion、CUDA Graph update/replay 各有启用/禁用 A/B correctness；
+- 每个包含的 native cubin 在对应真实 SM 上执行 conformance；mock compute capability 不能替代实际指令执行；
+- `CUDA_FORCE_PTX_JIT=1` 下完整 conformance，证明 generic strict PTX fallback 存在且可 JIT；architecture-specific `a` variant 不得污染该 fallback；
+- inline PTX wrapper 的 capability guard、C++ fallback、每个目标 ptxas assembly 和 Compute Sanitizer；
+- strict SASS 不含 `FFMA`/`DFMA`/`HFMA` contraction，ptxas 无未解释 spill；若 local memory 是显式设计，必须逐项说明而不能归因于 compiler spill。
 
 Vulkan 额外：no `vulkan-1.dll`、no compute queue、insufficient limits、validation clean、device lost。
 
@@ -1196,6 +1328,14 @@ GPU 报告必须同次运行 `auto + strict` CPU，且把该 end-to-end median �
 - strict compile flags 和 artifact hashes；
 - 每次 raw sample、median、MAD。
 
+CUDA 每个 kernel variant 另报：
+
+- launch count、grid/block、dynamic shared memory、registers/thread、spill stores/loads、local-memory bytes、theoretical/achieved occupancy；
+- kernel duration、SM/DRAM/L1/L2 throughput、global load/store transactions、branch efficiency、barrier、long/short scoreboard 和主要 warp-stall reason；
+- `cuobjdump --dump-resource-usage`、目标 cubin SASS、`nvdisasm` register live range 和 Nsight Compute report 路径；
+- CUDA Graph instantiate/update/replay、async copy/TMA、transpose/repack 和 fusion 各自的额外内存、setup time、amortization break-even；
+- native cubin 与 forced PTX-JIT 的 first-load/cold-JIT/warm-cache 时间，不能把 JIT cache 预热隐藏在 steady-state 数字中。
+
 ### 16.5 门槛
 
 - x86 strict 自动选择只包含通过第 15.2 和 16.2 节 gate 的 tier；可用但未获 benchmark 批准的 AVX-512 保持 forced experimental。
@@ -1205,6 +1345,21 @@ GPU 报告必须同次运行 `auto + strict` CPU，且把该 end-to-end median �
 - 同机、同输入、同 candidate、同 strict compiler/math mode，相对 `auto + strict` 最快正确 CPU end-to-end `>=3x` 才可考虑默认启用。
 
 CUDA 和 Vulkan 分别 go/no-go。一个通过不能替另一个背书。
+
+### 16.6 CUDA 低层优化保留门槛
+
+每个 CUDA C++ layout/fusion/graph/architecture/inline-PTX 变体必须与同一 binary 中的前一层 baseline 做单变量 A/B。至少 21 个预热后的交错 raw samples，保持输入、tile、clock/power 状态、driver、toolkit、strict flags 和其他 kernel variants 不变。
+
+inline PTX 或独立手写 PTX 只有同时满足以下条件才可进入自动选择：
+
+- 第 15.3/15.4 节全部 green，输出与 `cpp-generic`/对应 C++ specialized path bit-identical；
+- 目标 hotspot kernel median 改善至少 3%，end-to-end median 改善至少 1%；
+- observed gain 大于 baseline/candidate 两者 relative MAD 较大值的 2 倍；
+- primary matrix 没有 case 回退超过 2%，cold/JIT/multiframe/memory/cancel 没有实质回归；
+- 无新增 compiler spill；register/shared-memory 增长有 occupancy 和 wall-time 证据；
+- SASS 确认目标 codegen 缺口确实消失，且没有 FMA、relaxed precision、越界 wide load 或额外 barrier。
+
+CUDA C++ specialization、layout、fusion、Graph、async/TMA 等较高层优化至少满足同样的噪声显著性和无 correctness 回归；是否保留可依据其 end-to-end gain、复杂度和通用性单独记录。批准必须按 GPU 型号/device class、compute capability、driver/toolkit 和 artifact hash 建表，并保存验证机 UUID；不得把一个 `sm_XX` 的结论外推到另一代或同 SM 的明显不同资源档位。profile 未发现合理的 PTX codegen 缺口时记录 `NO_PTX_CANDIDATE`；有候选但没有达到门槛时记录 `NO_PTX_WINNER`。两者都比提交无收益的 asm 更完整。
 
 ## 17. CMake 和 packaging 约束
 
@@ -1307,6 +1462,30 @@ GETNATIVE_BUILD_UPSTREAM_CONFORMANCE
 
 完成标准：完整 CUDA matrix、memory、cancel、artifact/dependency gates green。
 
+### M5A: CUDA C++ / intrinsic 极限优化
+
+交付：
+
+- Nsight Systems/Compute baseline 和逐 kernel roofline/bottleneck 分类。
+- axis/stage/shape compile-time variants、二维 candidate/vector grid 和 address simplification。
+- coalescing/alignment/vector-load 证据；horizontal transpose/repack 的含 setup/amortization A/B。
+- 可行的 matrix inverse + same-axis first-forward fusion，以及 strict-order warp-shuffle reduction。
+- fixed-recipe CUDA Graph；只有可复用 shared tile 才增加 `sm_80+` async-copy 或匹配硬件的 TMA variant。
+- 每个优化的 forced fallback、correctness、resource、SASS、raw samples 和第 16.6 节保留决定。
+
+完成标准：所有 selected variants 逐 SM 有 correctness/performance approval；未获益或回归的变体删除，generic strict 始终可 forced。M5A 先于 inline PTX，但 Vulkan correctness 的 M6 不必等待没有依赖关系的 CUDA profile 实验。
+
+### M5B: inline PTX 终局优化
+
+交付：
+
+- 对 M5A 后仍存在的 hotspot/codegen 缺口建立候选记录；不得为了使用 PTX 而虚构候选。
+- 每个 wrapper 的 CUDA C++ fallback、SM/PTX guard、逐 target ptxas、SASS/resource diff 和 Compute Sanitizer。
+- 同一 artifact forced A/B、21-sample raw data、逐 SM 第 16.6 节决定。
+- native cubin + generic PTX-JIT fallback 验证，以及 direct-SASS/nonofficial-tooling exclusion 证明。
+
+完成标准：达到门槛的 wrapper 才进入对应 device approval table；没有合理 codegen 缺口时提交 `NO_PTX_CANDIDATE`，有候选但未达门槛时提交 `NO_PTX_WINNER`，并以 M5A C++ strict variant 完成，不保留零收益 asm。
+
 ### M6: Vulkan vertical generic strict MVP
 
 交付：
@@ -1358,7 +1537,7 @@ GETNATIVE_BUILD_UPSTREAM_CONFORMANCE
 
 ### M10: 性能和默认策略
 
-交付 x86 ISA 自动选择表，以及每个 GPU backend 的 raw samples、profiler、memory、cancel、correctness 和 go/no-go。AVX-512 未过相对 AVX2 gate 时不自动选择；GPU 未达相对 `auto + strict` CPU 的 3x 时保持显式 experimental backend；不得降低 strict 门槛。
+交付 x86 ISA 自动选择表，以及每个 GPU backend 的 raw samples、profiler、memory、cancel、correctness 和 go/no-go。CUDA 还要交付逐 SM kernel-variant approval table、PTX-JIT/native 路径和所有 inline PTX 接受/拒绝记录。AVX-512 未过相对 AVX2 gate 时不自动选择；GPU 未达相对 `auto + strict` CPU 的 3x 时保持显式 experimental backend；不得降低 strict 门槛。
 
 ## 19. Windows 验证命令
 
@@ -1471,6 +1650,69 @@ spirv-val path/to/generated.spv
 spirv-dis path/to/generated.spv -o path/to/generated.spvasm
 ```
 
+CUDA artifact/SASS 检查使用 build tree 中解析出的真实 fatbin/cubin 路径；以下 placeholder 不得原样出现在 handback：
+
+```powershell
+nvcc --version
+ptxas --version
+ncu --version
+nsys --version
+
+cuobjdump --list-elf <getnative_cuda.fatbin>
+cuobjdump --list-ptx <getnative_cuda.fatbin>
+cuobjdump --dump-resource-usage <getnative_cuda.fatbin> |
+  Set-Content build/engine-win-cuda/artifacts/cuda/resource-usage.txt
+cuobjdump --dump-sass <getnative_cuda.fatbin> |
+  Set-Content build/engine-win-cuda/artifacts/cuda/all-targets.sass
+
+New-Item -ItemType Directory -Force build/engine-win-cuda/artifacts/cuda/cubins | Out-Null
+Push-Location build/engine-win-cuda/artifacts/cuda/cubins
+cuobjdump --extract-elf all <absolute-getnative_cuda.fatbin>
+Pop-Location
+
+nvdisasm --print-line-info-inline --print-life-ranges `
+  build/engine-win-cuda/artifacts/cuda/cubins/<target-sm.cubin> |
+  Set-Content build/engine-win-cuda/artifacts/cuda/<target-sm>.nvdisasm
+
+Select-String build/engine-win-cuda/artifacts/cuda/all-targets.sass `
+  -Pattern 'FFMA|DFMA|HFMA'
+```
+
+strict SASS 的 contraction 搜索必须无结果。另保存 `-Xptxas=-v` 原始输出；spill load/store 非零时先定位原因，不能仅用 `--maxrregcount` 压数字。
+
+benchmark/test 增加等价的内部 forced variant surface；名字可调整，但 handback 必须能复现每层 A/B：
+
+```powershell
+build/engine-win-cuda/getnative_cuda_conformance_tests.exe --cuda-variant cpp-generic
+build/engine-win-cuda/getnative_cuda_conformance_tests.exe --cuda-variant cpp-specialized
+build/engine-win-cuda/getnative_cuda_conformance_tests.exe --cuda-variant inline-ptx
+
+build/engine-win-cuda/getnative_cuda_benchmark.exe --full --samples 21 `
+  --cuda-variant all --artifact-root build/engine-win-cuda/artifacts/cuda
+
+nsys profile --trace=cuda,osrt --sample=none `
+  --output=build/engine-win-cuda/artifacts/cuda/timeline `
+  build/engine-win-cuda/getnative_cuda_benchmark.exe --full --cuda-variant cpp-specialized
+
+ncu --set full --target-processes all `
+  --export build/engine-win-cuda/artifacts/cuda/ncu-specialized `
+  build/engine-win-cuda/getnative_cuda_benchmark.exe --profile-cases `
+  --cuda-variant cpp-specialized
+```
+
+验证 forward-compatible PTX fallback：
+
+```powershell
+$env:CUDA_FORCE_PTX_JIT = '1'
+try {
+  build/engine-win-cuda/getnative_cuda_conformance_tests.exe --cuda-variant cpp-generic
+} finally {
+  Remove-Item Env:CUDA_FORCE_PTX_JIT
+}
+```
+
+若 forced `inline-ptx` 未编译、目标 SM 不匹配或未通过 approval，预期是明确拒绝；不能静默运行另一个 variant 后仍把结果标成 PTX。
+
 ### 19.5 GUI/package
 
 ```powershell
@@ -1515,6 +1757,13 @@ dumpbin /DEPENDENTS path/to/GetNative-VF.exe
 - GPU 为通过测试而修改 CPU oracle、threshold、crop 或 candidate order。
 - GPU 生成 filter taps、normal matrix 或 LDLT。
 - strict artifact 使用 fast math、未记录 contraction 或 relaxed precision。
+- strict CUDA SASS 出现 `FFMA`/`DFMA`/`HFMA`，或重新引入 Float16/`half2`/hardware interpolation。
+- 在 CUDA C++ baseline、profile、SASS 和逐 SM A/B 之前加入 inline PTX；inline wrapper 无 C++ fallback、无 `__CUDA_ARCH__` guard 或跨 address space 错用 pointer。
+- 仅因 PTX 指令数更少就宣称优化；没有检查目标 cubin SASS、register/spill、Nsight 和 end-to-end wall time。
+- 为指定 SASS 排列加入 dummy dependency/barrier，或使用非官方 SASS assembler/patcher 生成 shipping artifact。
+- 对所有 kernel/SM 统一使用 `--maxrregcount`、`__launch_bounds__`、cache hint、`cp.async` 或 TMA，而没有逐 kernel resource/profile 证据。
+- architecture-specific `sm_XXa` 指令进入 generic PTX fallback，或一个 SM 的 approval 被外推到其他 compute capability/driver/toolkit。
+- CUDA Graph、fusion、persistent kernel 或多 stream 破坏 cancel/drain、stable order、workspace ceiling 或错误 provenance。
 - options OFF 时仍要求 GPU SDK/runtime。
 - PE import table 硬依赖 CUDA/Vulkan runtime。
 - 只有 compile proof 却报告 device available。
@@ -1555,6 +1804,11 @@ Handback 必须包含：
 19. `dumpbin /DEPENDENTS` 关键输出。
 20. Grok/其他 agent 的输出只能作为建议；最终以 Windows checkout diff 和 host tests 为证据。
 21. 未验证 CPU/ISA、平台、GPU、driver、shape 和剩余风险。
+22. fatbin 内 native cubin/PTX target list、逐 artifact hash、forced PTX-JIT conformance 和 cold/warm JIT 时间。
+23. 每个 CUDA kernel variant 的 ptxas resource、register/spill、SASS/`nvdisasm` 和 Nsight Systems/Compute report 路径。
+24. CUDA C++ specialization、layout/transpose、fusion/reduction、Graph、async/TMA 的逐项 A/B 和保留/删除理由。
+25. 每个 inline PTX candidate 的 codegen 缺口、wrapper/guard/fallback、逐 SM raw samples、approval，或 `NO_PTX_CANDIDATE`/`NO_PTX_WINNER` 结论。
+26. CUDA runtime provenance sample：device UUID、compute capability、driver/toolkit、variant、native/PTX-JIT、strict flags、artifact/benchmark id。
 
 ## 22. 完成定义
 
@@ -1577,6 +1831,8 @@ Handback 必须包含：
 - 两者功能支持 H、V、both、p=1 和全部合法 15/16 shape。
 - Generic 全覆盖；B3/B7/B11/B15 optimization 已实现或以 profiler 明确记录未保留原因。
 - CPU tolerance、valley、order、generic/specialized、memory、cancel 和 failure-path tests 通过。
+- CUDA 的 `cpp-generic`、selected C++/intrinsic/architecture/inline-PTX variants 可被 forced；每个 selected variant 与 generic bit-identical，并有对应真实 SM 的 sanitizer、SASS、resource、Nsight 和第 16.6 节 approval。
+- CUDA strict SASS 无浮点 contraction；native cubin 和 forced generic PTX-JIT 都通过。inline PTX 有逐 candidate 通过记录，或明确的 `NO_PTX_CANDIDATE`/`NO_PTX_WINNER`，direct SASS patch 未进入 artifact。
 - caller-owned planner/cache 契约未被绕过。
 - CPU-only build 与无 GPU runtime package startup 不回归。
 - capability 只报告事实；command availability 可继续 false。
