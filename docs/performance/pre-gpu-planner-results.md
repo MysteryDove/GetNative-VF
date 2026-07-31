@@ -213,7 +213,7 @@ failure, and shutdown cost, so it cannot claim this entire bound.
 
 Decision: `SKIPPED_UPPER_BOUND_BELOW_GATE`.
 
-### Cross-Call Single-Flight And Plan Cache
+### Cross-Call Single-Flight And Plan Cache (Stage 1 Disposition, Superseded)
 
 Stage 1 proves stable in-call exact-key deduplication: 1000 identical requests
 physically build once and share one result pointer. The decision workload has
@@ -223,7 +223,13 @@ builds across calls. The old M1 design would add a public claim/error protocol,
 generation-safe clear, bounded LRU residency, waiters, and failure publication
 without a measured workload that benefits from them.
 
-Decision: `SKIPPED_NO_MEASURED_CROSS_CALL_DUPLICATION`.
+Historical Stage 1 decision: `SKIPPED_NO_MEASURED_CROSS_CALL_DUPLICATION`.
+
+That decision correctly reflected the evidence available at the end of Stage 1,
+but it is superseded for ready-hit reuse by the explicit same-kernel full-video
+scan baseline below. The new baseline does not measure concurrent equal misses,
+so it still does not authorize a single-flight protocol or the old public LRU
+service design.
 
 ### Full Planner Service And Remediation Variants
 
@@ -253,11 +259,110 @@ Decision: `RETAIN_SIMPLE_BATCH_HELPER`; do not introduce the wider service.
 - Stage 0 measurement: `PROCEED_STAGE1`.
 - Stage 1 bounded unique-plan construction: `ADOPT_AND_STOP`.
 - Persistent worker reuse: `SKIPPED_UPPER_BOUND_BELOW_GATE`.
-- Cross-call single-flight/LRU: `SKIPPED_NO_MEASURED_CROSS_CALL_DUPLICATION`.
+- Cross-call single-flight/LRU service: `SKIPPED_NO_MEASURED_CONCURRENT_MISSES`.
+- Video-session ready-hit cache baseline: `PROCEED_SESSION_CACHE_STAGE`;
+  production implementation has not started.
 - Scratch reuse and exact reservation: `SKIPPED_TRIGGER_FALSE`.
 - Queue/cancellation/resource-budget service: `SKIPPED_NO_PRODUCT_TRIGGER`.
 
 Prepared scan slicing, portable GPU packing, Metal queue hardening, shared GPU
 plan representation, pipeline overlap, and CUDA/Vulkan work are not planner
 lane stages and remain owned by their separate plans/worktrees. No additional
-planner implementation is justified by the retained evidence.
+planner implementation beyond the narrow session-cache stage is justified by
+the retained evidence.
+
+## Cross-Call Cache Baseline: Same-Kernel Full-Video Scan
+
+- Branch: `perf/pre-gpu-stage1`
+- Evaluator: `scripts/run_planner_evaluator.sh cache-baseline`
+- Run directory: `artifacts/cache-baseline/20260731T031822Z`
+- Engine source identity:
+  `fba222c4ede062b4455acb58fb39b3bd8ceaa9a8c54bc514395b6bae985d4de5`
+- Metal executable FNV-1a 64: `56c417933ba638a9`
+- Metal JSON SHA-256:
+  `d1551428394d0722065d77de6c3f0f36969505d5a6dbcdf12b8d0078c9fd698c`
+- Host-load snapshot SHA-256 (before/after):
+  `f45a49c97d98b2cca2edcab9e45edbce997c8fabe49c775e71fb9cd811549cc8` /
+  `5dccfa71fedb392fbf5eaf13d2ac799c4cec8417f9c53f0d3ae6599b041f8e2d`
+- Process snapshot SHA-256 (before/after):
+  `a3cba2811c8fa7212d25718e78c9a05a6d8154068d85007ad5a40d557c63c27b` /
+  `a13065cd6ca8be3dc162c902b1b3ac9a8ce455a55292732844e6f1a16c7a7c6e`
+
+This benchmark adds no production cache API or behavior. Its cold path is the
+adopted Stage 1 bounded construction of 1000 unique bicubic plans. Its warm
+path uses a temporary `AxisPlanCache` preloaded with the same 1000 exact keys
+and verifies that every timed request returns the already-retained plan
+pointer. Cold-first and warm-first order alternates. Each warm sample owns its
+cache only for that sample, so a following cold sample does not run while both
+plan populations are resident.
+
+### Verification
+
+- Release build with Metal and upstream conformance: pass, `9/9` tests.
+- The decision artifact contains 21 alternating-order pairs and reports
+  `cache_baseline_status=MEASURED`.
+- Warm requests are `1000/1000` existing-pointer hits in every sample, with
+  zero warm physical builds. The cold path builds all 1000 unique plans.
+- Maximum metric error is `5.6093972883308751e-8`, valley step distance is
+  `0`, and all strict assertions pass.
+- The JSON contains all 21 raw observed and controlled paired totals, all five
+  video amortization populations, build/source identity, and host snapshots.
+- The evaluator's JSON gate passed and the run directory contains no temporary
+  artifact residue.
+
+### Results
+
+| Metric | Cold Stage 1 batch | Warm retained cache | Paired result | Gate |
+| --- | ---: | ---: | ---: | --- |
+| Planner median | `16.310000 ms` | `0.036917 ms` | `445.207987x` | diagnostic |
+| Planner paired delta | - | - | `-99.775386%`, MAD `0.036443%` | MAD `<=2.5%`: pass |
+| Metal execution median | `112.366958 ms` | `111.188958 ms` | `+0.892270%` median delta | `<=5%`: pass |
+| Observed Metal total median | `129.821458 ms` | `111.230458 ms` | `12.458884%` improvement | MAD `3.520688%`: diagnostic only |
+| Controlled Metal total | per-pair shared execution control | per-pair shared execution control | `12.833957%` improvement | MAD `0.357144%`, gain `>=5%`: pass |
+| Retained logical plan storage | `0` after cold sample | `96,685,184 bytes` | `92.206 MiB` for 1000 plans | report |
+
+The observed total executes Metal independently for cold and warm modes. Its
+paired median still shows a `12.46%` improvement, but its MAD exceeds the
+`2.5%` attribution limit because the cache changes only CPU planning, not Metal
+execution. It remains retained diagnostic evidence.
+
+The formal cache-attributable total gives both sides of each pair the mean of
+their two measured Metal execution times, then changes only measured planner
+time. This preserves the measured full-wall composition while removing a
+non-cache execution difference. The `12.83%` controlled result is therefore
+the decision statistic, not a replacement for the observed total.
+
+### Video Amortization
+
+The model uses one measured Stage 1 cold batch followed by measured ready-hit
+frames. Cache publication and the benchmark fixture's serial prewarm are
+excluded; the production stage must populate from the existing batch result
+rather than reproduce that setup path.
+
+| Frames with one cold first frame | Median total improvement | MAD |
+| ---: | ---: | ---: |
+| 2 | `6.416978%` | `0.178572%` |
+| 5 | `10.267165%` | `0.285716%` |
+| 10 | `11.550561%` | `0.321430%` |
+| 100 | `12.705617%` | `0.353573%` |
+| 1000 | `12.821123%` | `0.356787%` |
+
+The standalone serial fixture prewarm median is `112.131417 ms`; it is setup
+diagnostic only and is not counted as a product cost or benefit. Retained
+logical storage averages about `96,685 bytes` (`94.419 KiB`) per plan. Actual
+allocator overhead and cache metadata are not measured by this logical byte
+count.
+
+### Decision And Boundary
+
+`PROCEED_SESSION_CACHE_STAGE`
+
+The measured workload justifies one narrow next stage: retain exact-key
+`AxisPlan` results for repeated frames within a video session, populate the
+session cache from the existing Stage 1 batch build, and benchmark cold plus
+ready-hit calls again. No production cache was implemented in this baseline.
+
+This result does not authorize an unbounded process-global cache, concurrent
+miss single-flight, public error publication, a general planner service,
+persistent worker pools, packed GPU-plan caching, or GPU/backend changes. Those
+directions still require their own workload and benchmark evidence.
