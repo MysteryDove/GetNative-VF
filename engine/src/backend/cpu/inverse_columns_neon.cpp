@@ -19,65 +19,81 @@ void inverse_columns_neon_impl(
         ? plan.half_bandwidth : FixedHalfBandwidth;
     const auto factor_row_width = static_cast<std::size_t>(destination_size);
     std::int32_t column = 0;
-    for (; column <= column_count - 4; column += 4) {
+    for (; column <= column_count - 8; column += 8) {
         for (std::int32_t i = 0; i < destination_size; ++i) {
-            float32x4_t sum = vdupq_n_f32(0.0F);
+            float32x4_t sum_low = vdupq_n_f32(0.0F);
+            float32x4_t sum_high = vdupq_n_f32(0.0F);
             for (std::uint32_t p = plan.transpose_offsets[static_cast<std::size_t>(i)];
                  p < plan.transpose_offsets[static_cast<std::size_t>(i) + 1U]; ++p) {
-                const float32x4_t values = vld1q_f32(
-                    input + static_cast<std::ptrdiff_t>(plan.transpose_indices[p])
-                        * input_row_stride + column);
-                const float32x4_t product = vmulq_n_f32(values, plan.transpose_weights[p]);
-                sum = vaddq_f32(sum, product);
+                const float *values = input
+                    + static_cast<std::ptrdiff_t>(plan.transpose_indices[p])
+                        * input_row_stride + column;
+                const float factor = plan.transpose_weights[p];
+                const float32x4_t product_low = vmulq_n_f32(vld1q_f32(values), factor);
+                const float32x4_t product_high = vmulq_n_f32(vld1q_f32(values + 4), factor);
+                sum_low = vaddq_f32(sum_low, product_low);
+                sum_high = vaddq_f32(sum_high, product_high);
             }
             const std::int32_t available = std::min(half_bandwidth, i);
             for (std::int32_t distance = available; distance >= 1; --distance) {
-                const float32x4_t previous = vld1q_f32(
-                    output + static_cast<std::ptrdiff_t>(i - distance)
-                        * output_row_stride + column);
+                const float *previous = output
+                    + static_cast<std::ptrdiff_t>(i - distance)
+                        * output_row_stride + column;
                 const float factor = plan.lower_ld[
                     static_cast<std::size_t>(distance - 1) * factor_row_width
                     + static_cast<std::size_t>(i)];
-                const float32x4_t product = vmulq_n_f32(previous, factor);
-                sum = vsubq_f32(sum, product);
+                const float32x4_t product_low = vmulq_n_f32(vld1q_f32(previous), factor);
+                const float32x4_t product_high = vmulq_n_f32(vld1q_f32(previous + 4), factor);
+                sum_low = vsubq_f32(sum_low, product_low);
+                sum_high = vsubq_f32(sum_high, product_high);
             }
-            sum = vmulq_n_f32(sum, plan.inverse_diagonal[static_cast<std::size_t>(i)]);
-            vst1q_f32(output + static_cast<std::ptrdiff_t>(i) * output_row_stride + column,
-                       sum);
+            const float inverse_diagonal = plan.inverse_diagonal[static_cast<std::size_t>(i)];
+            sum_low = vmulq_n_f32(sum_low, inverse_diagonal);
+            sum_high = vmulq_n_f32(sum_high, inverse_diagonal);
+            float *current = output
+                + static_cast<std::ptrdiff_t>(i) * output_row_stride + column;
+            vst1q_f32(current, sum_low);
+            vst1q_f32(current + 4, sum_high);
         }
 
         for (std::int32_t i = destination_size - 2; i >= 0; --i) {
-            float32x4_t sum = vdupq_n_f32(0.0F);
+            float32x4_t sum_low = vdupq_n_f32(0.0F);
+            float32x4_t sum_high = vdupq_n_f32(0.0F);
             const std::int32_t available = std::min(
                 half_bandwidth, destination_size - i - 1);
             if constexpr (FixedHalfBandwidth == 3) {
                 for (std::int32_t distance = 1; distance <= available; ++distance) {
-                    const float32x4_t next = vld1q_f32(
-                        output + static_cast<std::ptrdiff_t>(i + distance)
-                            * output_row_stride + column);
+                    const float *next = output
+                        + static_cast<std::ptrdiff_t>(i + distance)
+                            * output_row_stride + column;
                     const float factor = plan.upper_l[
                         static_cast<std::size_t>(distance - 1) * factor_row_width
                         + static_cast<std::size_t>(i)];
-                    const float32x4_t product = vmulq_n_f32(next, factor);
-                    sum = vaddq_f32(sum, product);
+                    const float32x4_t product_low = vmulq_n_f32(vld1q_f32(next), factor);
+                    const float32x4_t product_high = vmulq_n_f32(vld1q_f32(next + 4), factor);
+                    sum_low = vaddq_f32(sum_low, product_low);
+                    sum_high = vaddq_f32(sum_high, product_high);
                 }
             } else {
                 for (std::int32_t distance = available; distance >= 1; --distance) {
-                    const float32x4_t next = vld1q_f32(
-                        output + static_cast<std::ptrdiff_t>(i + distance)
-                            * output_row_stride + column);
+                    const float *next = output
+                        + static_cast<std::ptrdiff_t>(i + distance)
+                            * output_row_stride + column;
                     const float factor = plan.upper_l[
                         static_cast<std::size_t>(distance - 1) * factor_row_width
                         + static_cast<std::size_t>(i)];
-                    const float32x4_t product = vmulq_n_f32(next, factor);
-                    sum = vaddq_f32(sum, product);
+                    const float32x4_t product_low = vmulq_n_f32(vld1q_f32(next), factor);
+                    const float32x4_t product_high = vmulq_n_f32(vld1q_f32(next + 4), factor);
+                    sum_low = vaddq_f32(sum_low, product_low);
+                    sum_high = vaddq_f32(sum_high, product_high);
                 }
             }
-            float32x4_t current = vld1q_f32(
-                output + static_cast<std::ptrdiff_t>(i) * output_row_stride + column);
-            current = vsubq_f32(current, sum);
-            vst1q_f32(output + static_cast<std::ptrdiff_t>(i) * output_row_stride + column,
-                       current);
+            float *current = output
+                + static_cast<std::ptrdiff_t>(i) * output_row_stride + column;
+            const float32x4_t current_low = vsubq_f32(vld1q_f32(current), sum_low);
+            const float32x4_t current_high = vsubq_f32(vld1q_f32(current + 4), sum_high);
+            vst1q_f32(current, current_low);
+            vst1q_f32(current + 4, current_high);
         }
     }
 

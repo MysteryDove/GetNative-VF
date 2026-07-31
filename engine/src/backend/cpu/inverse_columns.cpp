@@ -32,7 +32,11 @@ bool column_simd_available() noexcept {
 }
 
 std::string_view column_simd_name() noexcept {
-    return column_simd_available() ? "neon-f32x4" : "scalar";
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    return "neon-f32x8";
+#else
+    return "scalar";
+#endif
 }
 
 void inverse_columns_scalar_f32(

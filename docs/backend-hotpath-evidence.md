@@ -406,3 +406,45 @@ Rejected experiment identities and artifacts:
 - Post-removal validation: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/mk4-f16-removed-baseline/metal-validation-ctest.log`
 - Final Metal evaluator: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/20260731T002104755Z-pid57234/metal-kernel-report.json`
 - Final CPU evaluator: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/20260731T002113686Z-pid57462/cpu-column-report.json`
+
+## Post-Merge Adjacent RHS Widening
+
+The retained CPU column path now advances eight adjacent RHS columns per loop
+using two independent NEON Float32x4 chains. Each lane preserves the scalar
+tap and band-solve operation order, and columns outside complete eight-wide
+batches continue through the scalar tail.
+
+Against the immutable 21-pair NEON x4 baseline, the final 21-pair primary run
+reduced normalized whole-candidate time by 33.00% and normalized inverse time
+by 41.48%. The selected `neon-f32x8` path improved the primary inverse by
+83.76% and the whole candidate by 80.71% versus the paired scalar oracle, with
+paired-delta MAD of 0.00284 and 0.00129. Inverse output, the complete CPU
+workspace, and the final metric were bit-identical; thermal and process checks
+were stable.
+
+The seven-pair full-matrix regression reference reduced normalized
+whole-candidate time by 33.67% for `bilinear@810` and 36.40% for
+`bicubic-catrom@810`. Both cases passed their directional gates, with no case
+approaching the 3% regression ceiling. Release Metal/upstream CTest passed
+11/11, and focused ThreadSanitizer runs for the column SIMD and axis planner
+tests passed 2/2.
+
+SME2 was implemented and executed on the M4 Max with a 64-byte streaming
+vector length. After preserving the AAPCS callee-saved FP/SIMD registers in the
+streaming-mode bridge, its output, workspace, and metric were bit-identical and
+its seven-pair run was thermally stable with no concurrent benchmark process.
+It was nevertheless rejected: normalized SME2 whole-candidate time was 71.42%
+slower than NEON x8, and normalized inverse time was 101.64% slower. The SME2
+source, build wiring, feature probe, and dispatch were removed from the final
+tree.
+
+Evidence:
+
+- NEON x4 baseline: `build/rhs-parallel-evaluator/artifacts/rhs-parallel/baseline-neon/20260731T045454482Z-pid76243/cpu-column-report.json`
+- Rejected SME2 tuning: `build/rhs-parallel-evaluator/artifacts/rhs-parallel/sme2-tuning-abi-fixed/20260731T050611705Z-pid95759/cpu-column-report.json`
+- Final NEON x8 primary: `build/rhs-parallel-evaluator/artifacts/rhs-parallel/final-neon-x8-primary/20260731T050814764Z-pid99514/cpu-column-report.json`
+- Exact evaluator replay: `build/rhs-parallel-evaluator/artifacts/rhs-parallel/20260731T051013208Z-pid3536/cpu-column-report.json`
+- Final NEON x8 full matrix: `build/rhs-parallel-evaluator/artifacts/rhs-parallel/final-neon-x8-full-matrix/20260731T050839089Z-pid247/cpu-column-report.json`
+- Baseline benchmark binary SHA-256: `7588b5dd07f739b0393dfc3745b9dd9aac0913711823d57c1ec4d68d1f6d073c`
+- Rejected SME2 benchmark binary SHA-256: `1fc5b9b7957b1e452f8bdfd7a026f2697741e83820b94f2d5c9f4bd738aca87c`
+- Final NEON x8 benchmark binary SHA-256: `90be463f34fa63d91251e8855f4b56d2b8e92a58c366cd930f494f43da1223a7`
