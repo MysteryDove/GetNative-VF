@@ -49,10 +49,9 @@ The dev command builds and stages the C++ engine before starting Tauri.
 
 ## Publication Status
 
-This development snapshot does not yet grant a project-wide redistribution
-license. Select and add a root `LICENSE` before publishing the repository as
-open source. `THIRD_PARTY_NOTICES.md` covers the pinned conformance references;
-the real-image benchmark fixture is local-only until redistribution rights are
+GetNative VF is licensed under the MIT License. See `LICENSE` for details.
+`THIRD_PARTY_NOTICES.md` covers the pinned conformance references; the
+real-image benchmark fixture remains local-only until redistribution rights are
 established.
 
 ## Verify
