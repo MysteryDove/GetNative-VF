@@ -29,7 +29,7 @@
 | MK3a persistent working buffers | `KEPT` | Repeated source/workspace/partial allocation falls 3 to 0; the 112-case final matrix has zero path and working-set differences, improves the primary Bicubic case 4.90%, and has no paired-median regression |
 | MK3b plan-upload arena/ring | `REMOVED_AFTER_TEST` | Two/four-slot rings removed all 288 warm plan-buffer allocations and cut allocation/wiring time over 99%, but improved the primary wall only 0.689%/1.043%, below the 3% gate |
 | MK3c packed-content cache | `DEFERRED_IDENTITY_CHECKPOINT` | The backend-only digest fallback must hash about 82.09 MB before every hit and has no measured headroom for the wall gate; propagating the planner's canonical key would cross the isolated planner/frontend boundary |
-| MK4 Float16 coefficient storage | `PENDING_EVALUATION` | MK1-MK3 and CPU/PL decisions are terminal; strict Float32 remains the retained baseline |
+| MK4 Float16 coefficient storage | `REMOVED_AFTER_TEST` | Payload fell to 50% and working set declined, but Lanczos8 argmin moved 12 steps, the top-five valley identity failed, and the directional smoke improvement was only 0.957% versus the 8% gate |
 
 ## Final Identity Set
 
@@ -59,17 +59,17 @@ cmake --build build/backend-hotpath-evaluator \
 Result:
 
 - 11/11 CTest cases passed.
-- Metal B3/F2 control: 6.93% median improvement, paired MAD 0.006.
-- Metal B7/F4 control: 8.08% median improvement, paired MAD 0.003.
+- Metal B3/F2 control: 6.82% median improvement, paired MAD 0.007.
+- Metal B7/F4 control: 8.05% median improvement, paired MAD 0.006.
 - CPU Bicubic Catmull-Rom 1080 to representative 810 candidate:
-  73.80% inverse-stage improvement and 61.24% whole-candidate improvement.
+  73.29% inverse-stage improvement and 61.07% whole-candidate improvement.
 - Thermal state stayed nominal, no concurrent benchmark was detected, and all
   identities remained stable.
 
 Artifacts:
 
-- `build/backend-hotpath-evaluator/artifacts/backend-hotpath/20260730T225151167Z-pid47073/metal-kernel-report.json`
-- `build/backend-hotpath-evaluator/artifacts/backend-hotpath/20260730T225200066Z-pid47268/cpu-column-report.json`
+- `build/backend-hotpath-evaluator/artifacts/backend-hotpath/20260731T002104755Z-pid57234/metal-kernel-report.json`
+- `build/backend-hotpath-evaluator/artifacts/backend-hotpath/20260731T002113686Z-pid57462/cpu-column-report.json`
 
 ## CPU0 Full Matrix
 
@@ -352,3 +352,57 @@ not implemented with pointer identity or an expensive content digest. Reopen it
 only after the planner interface deliberately exposes an immutable canonical key
 and the private Metal packing ABI is versioned; that future change must be
 coordinated when the parallel planner/frontend branch is merged.
+
+## MK4 Float16 Coefficient Storage - Removed After Test
+
+The explicit, non-default experiment converted only transpose weights,
+lower/upper factors, inverse diagonal, and forward weights to IEEE Float16 on
+upload. Separate half-buffer entry points covered all five stages for B3, B7,
+B11, B15, and generic shapes. Every shader load promoted to Float32; source,
+descriptors, indices, workspace, accumulators, metric partials, and CPU merge
+remained unchanged Float32. The strict engine kept its original pipeline names,
+buffers, and default option.
+
+The first `lanczos8@810` gate probe passed the storage gates but failed the
+deterministic correctness gates:
+
+- Coefficient payload fell exactly from 238,316,568 to 119,158,284 bytes, a
+  ratio of 0.500. Total explicit peak working set fell from 522,093,136 to
+  402,934,852 bytes, so neither the 0.52 payload ceiling nor the no-growth gate
+  was the blocker.
+- Float32 selected candidate 749 and ranked local valleys
+  `[749, 754, 747, 739, 751]`. Float16 selected candidate 761 and ranked
+  `[761, 748, 755, 729, 783]`. Exact argmin and top-five identity both failed.
+- Absolute metric drift had median `1.1102e-7`, mean `1.2846e-7`, p95
+  `3.0333e-7`, and maximum `4.7657e-7`. The Float16 result also failed the
+  existing CPU tolerance and moved the minimum by 12 candidate steps.
+- The single alternating smoke pair moved backend wall from 304.190 to
+  301.280 ms, only 0.957% in the favorable direction versus the required 8%.
+  GPU time moved from 301.295 to 298.461 ms, while host coefficient conversion
+  cost 9.171 ms across the call. This one-pair timing is directional only and
+  is not presented as a statistically accepted performance result.
+
+One failed exact-valley fixture is a terminal MK4 remove condition, independent
+of timing variance. The planned 21-pair sustained run and full filter/resolution
+corpus were therefore not run after the correctness stop condition; doing so
+could not make the experiment retainable.
+
+Before removal, both Lanczos8 generic and B7 generic/specialized strict result
+vectors exactly matched their pre-experiment JSON baselines. After removal, a
+fresh build restored the production benchmark and metallib hashes exactly to
+the MK3a baseline, Release CTest passed 11/11, and Metal API plus GPU Shader
+Validation passed. The public fast-mode option, half upload path, telemetry,
+benchmark mode, and all half-buffer kernels were removed; strict Float32 remains
+the only production coefficient representation.
+
+Rejected experiment identities and artifacts:
+
+- Experimental benchmark binary: `3639ac40a83a0010ae712753724929e005224d3cd3bbd3a5617a3fce673c43e1`
+- Experimental metallib: `a338395e2e13093f0d6672fc13048ee9dafbddd696989bc78ef25f8c930e42af`
+- Float16 failure: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/mk4-f16-smoke-lanczos8/20260731T001629369Z-pid42616/metal-f16-coefficient-report.json`
+- Strict pre/post source-change baselines: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/mk4-strict-baseline-lanczos8.json` and `build/backend-hotpath-evaluator/artifacts/backend-hotpath/mk4-strict-post-experiment-lanczos8.json`
+- Restored production benchmark binary: `144a6c2986c4df12c01a37b1ee834c4fddd5aac394bbb8cc34985fe8a7310489`
+- Restored production metallib: `a2e647dabf08b575c252600713eb5cf29b48e1687496088d6cb47af53ab7567c`
+- Post-removal validation: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/mk4-f16-removed-baseline/metal-validation-ctest.log`
+- Final Metal evaluator: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/20260731T002104755Z-pid57234/metal-kernel-report.json`
+- Final CPU evaluator: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/20260731T002113686Z-pid57462/cpu-column-report.json`
