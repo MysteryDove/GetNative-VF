@@ -1,6 +1,7 @@
 #include "getnative/axis_plan.hpp"
 
 #include "axis_plan_key.hpp"
+#include "axis_planner.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -362,6 +363,19 @@ std::size_t AxisPlan::packed_factor_elements() const noexcept {
     return lower_ld.size() + upper_l.size() + inverse_diagonal.size();
 }
 
+std::size_t axis_plan_storage_bytes(const AxisPlan &plan) noexcept {
+    return sizeof(plan)
+        + plan.forward_offsets.size() * sizeof(std::uint32_t)
+        + plan.forward_indices.size() * sizeof(std::int32_t)
+        + plan.forward_weights.size() * sizeof(float)
+        + plan.transpose_offsets.size() * sizeof(std::uint32_t)
+        + plan.transpose_indices.size() * sizeof(std::int32_t)
+        + plan.transpose_weights.size() * sizeof(float)
+        + plan.lower_ld.size() * sizeof(float)
+        + plan.upper_l.size() * sizeof(float)
+        + plan.inverse_diagonal.size() * sizeof(float);
+}
+
 AxisPlan build_axis_plan(const AxisPlanRequest &request) {
     if (request.source_size <= 0 || request.destination_size <= 0) {
         throw std::invalid_argument("axis dimensions must be positive");
@@ -462,12 +476,26 @@ AxisPlan build_axis_plan(const AxisPlanRequest &request) {
 }
 
 struct AxisPlanCache::Impl {
+    struct Entry {
+        std::shared_ptr<const AxisPlan> plan;
+        std::size_t bytes = 0U;
+    };
+
+    explicit Impl(AxisPlanCacheLimits limits) : limits(limits) {}
+
+    [[nodiscard]] bool can_admit(std::size_t bytes) const noexcept {
+        return plans.size() < limits.maximum_entries
+            && bytes <= limits.maximum_resident_bytes - resident_bytes;
+    }
+
     mutable std::mutex mutex;
-    std::unordered_map<detail::PlanKey, std::shared_ptr<const AxisPlan>,
-                       detail::PlanKeyHash> plans;
+    AxisPlanCacheLimits limits;
+    std::unordered_map<detail::PlanKey, Entry, detail::PlanKeyHash> plans;
+    std::size_t resident_bytes = 0U;
 };
 
-AxisPlanCache::AxisPlanCache() : impl_(std::make_unique<Impl>()) {}
+AxisPlanCache::AxisPlanCache(AxisPlanCacheLimits limits)
+    : impl_(std::make_unique<Impl>(limits)) {}
 AxisPlanCache::~AxisPlanCache() = default;
 
 std::shared_ptr<const AxisPlan> AxisPlanCache::get_or_build(const AxisPlanRequest &request) {
@@ -475,13 +503,116 @@ std::shared_ptr<const AxisPlan> AxisPlanCache::get_or_build(const AxisPlanReques
     {
         const std::scoped_lock lock(impl_->mutex);
         if (const auto found = impl_->plans.find(key); found != impl_->plans.end()) {
-            return found->second;
+            return found->second.plan;
         }
     }
     auto candidate = std::make_shared<const AxisPlan>(build_axis_plan(request));
+    const std::size_t candidate_bytes = axis_plan_storage_bytes(*candidate);
     const std::scoped_lock lock(impl_->mutex);
-    const auto [position, inserted] = impl_->plans.emplace(key, candidate);
-    return inserted ? std::move(candidate) : position->second;
+    if (const auto found = impl_->plans.find(key); found != impl_->plans.end()) {
+        return found->second.plan;
+    }
+    if (impl_->can_admit(candidate_bytes)) {
+        impl_->plans.emplace(key, Impl::Entry{candidate, candidate_bytes});
+        impl_->resident_bytes += candidate_bytes;
+    }
+    return candidate;
+}
+
+AxisPlanCacheBatchResult AxisPlanCache::get_or_build_batch(
+    std::span<const AxisPlanRequest> requests,
+    std::size_t worker_count) {
+    AxisPlanCacheBatchResult result;
+    if (requests.empty()) {
+        const std::scoped_lock lock(impl_->mutex);
+        result.resident_entry_count = impl_->plans.size();
+        result.resident_bytes = impl_->resident_bytes;
+        return result;
+    }
+
+    std::vector<detail::PlanKey> unique_keys;
+    std::vector<AxisPlanRequest> unique_requests;
+    std::vector<std::size_t> request_to_unique;
+    std::unordered_map<detail::PlanKey, std::size_t, detail::PlanKeyHash> unique_indices;
+    unique_keys.reserve(requests.size());
+    unique_requests.reserve(requests.size());
+    request_to_unique.reserve(requests.size());
+    unique_indices.reserve(requests.size());
+    for (const AxisPlanRequest &request : requests) {
+        const detail::PlanKey key = detail::plan_key(request);
+        const auto [position, inserted] = unique_indices.emplace(key, unique_keys.size());
+        if (inserted) {
+            unique_keys.push_back(key);
+            unique_requests.push_back(request);
+        }
+        request_to_unique.push_back(position->second);
+    }
+
+    result.unique_key_count = unique_keys.size();
+    std::vector<std::shared_ptr<const AxisPlan>> unique_plans(unique_keys.size());
+    std::vector<bool> ready(unique_keys.size(), false);
+    {
+        const std::scoped_lock lock(impl_->mutex);
+        for (std::size_t index = 0; index < unique_keys.size(); ++index) {
+            if (const auto found = impl_->plans.find(unique_keys[index]);
+                found != impl_->plans.end()) {
+                unique_plans[index] = found->second.plan;
+                ready[index] = true;
+            }
+        }
+    }
+    for (const std::size_t unique_index : request_to_unique) {
+        if (ready[unique_index]) ++result.ready_hit_count;
+    }
+
+    std::vector<AxisPlanRequest> missing_requests;
+    std::vector<std::size_t> missing_to_unique;
+    missing_requests.reserve(unique_keys.size());
+    missing_to_unique.reserve(unique_keys.size());
+    for (std::size_t index = 0; index < unique_keys.size(); ++index) {
+        if (!ready[index]) {
+            missing_requests.push_back(unique_requests[index]);
+            missing_to_unique.push_back(index);
+        }
+    }
+
+    detail::AxisPlanBatchResult built = detail::build_axis_plans(
+        missing_requests, {worker_count, {}, {}});
+    result.physical_build_count = built.physical_build_count;
+    result.peak_active_builds = built.peak_active_builds;
+    result.effective_worker_count = built.effective_worker_count;
+    {
+        const std::scoped_lock lock(impl_->mutex);
+        for (std::size_t index = 0; index < missing_to_unique.size(); ++index) {
+            const std::size_t unique_index = missing_to_unique[index];
+            if (const auto found = impl_->plans.find(unique_keys[unique_index]);
+                found != impl_->plans.end()) {
+                unique_plans[unique_index] = found->second.plan;
+                continue;
+            }
+            const auto &candidate = built.plans[index];
+            const std::size_t candidate_bytes = axis_plan_storage_bytes(*candidate);
+            unique_plans[unique_index] = candidate;
+            if (impl_->can_admit(candidate_bytes)) {
+                impl_->plans.emplace(
+                    unique_keys[unique_index], Impl::Entry{candidate, candidate_bytes});
+                impl_->resident_bytes += candidate_bytes;
+                ++result.published_plan_count;
+            }
+        }
+        result.resident_entry_count = impl_->plans.size();
+        result.resident_bytes = impl_->resident_bytes;
+    }
+
+    result.plans.reserve(requests.size());
+    for (const std::size_t unique_index : request_to_unique) {
+        result.plans.push_back(unique_plans[unique_index]);
+    }
+    return result;
+}
+
+AxisPlanCacheLimits AxisPlanCache::limits() const noexcept {
+    return impl_->limits;
 }
 
 std::size_t AxisPlanCache::size() const {
@@ -489,9 +620,15 @@ std::size_t AxisPlanCache::size() const {
     return impl_->plans.size();
 }
 
+std::size_t AxisPlanCache::resident_bytes() const {
+    const std::scoped_lock lock(impl_->mutex);
+    return impl_->resident_bytes;
+}
+
 void AxisPlanCache::clear() {
     const std::scoped_lock lock(impl_->mutex);
     impl_->plans.clear();
+    impl_->resident_bytes = 0U;
 }
 
 namespace {

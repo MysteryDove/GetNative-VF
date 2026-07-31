@@ -169,6 +169,146 @@ void test_exact_bit_key_distinctions_and_call_isolation() {
     }
 }
 
+void test_session_cache_batch_publish_and_ready_reuse() {
+    const auto unique = fixture_requests();
+    std::vector<getnative::AxisPlanRequest> requests;
+    requests.reserve(1000U);
+    for (std::size_t index = 0; index < 1000U; ++index) {
+        requests.push_back(unique[index % unique.size()]);
+    }
+    getnative::AxisPlanCache cache({
+        unique.size(), 64U * 1024U * 1024U,
+    });
+
+    const auto cold = cache.get_or_build_batch(requests, 4U);
+    expect(cold.plans.size() == requests.size(),
+           "session-cache cold call preserves request count");
+    expect(cold.unique_key_count == unique.size() && cold.ready_hit_count == 0U,
+           "session-cache cold call identifies every unique miss");
+    expect(cold.physical_build_count == unique.size()
+               && cold.published_plan_count == unique.size(),
+           "session-cache cold call batch-builds and publishes every unique miss");
+    expect(cold.effective_worker_count == 4U
+               && cold.peak_active_builds <= cold.effective_worker_count,
+           "session-cache cold call uses the bounded Stage 1 worker group");
+    expect(cold.resident_entry_count == unique.size()
+               && cold.resident_bytes == cache.resident_bytes(),
+           "session-cache cold call reports retained ownership");
+
+    std::size_t expected_bytes = 0U;
+    for (std::size_t index = 0; index < unique.size(); ++index) {
+        expected_bytes += getnative::axis_plan_storage_bytes(*cold.plans[index]);
+    }
+    expect(cold.resident_bytes == expected_bytes,
+           "session-cache retained bytes equal unique logical plan storage");
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+        expect(cold.plans[index].get() == cold.plans[index % unique.size()].get(),
+               "session-cache cold result preserves stable pointer sharing");
+    }
+
+    const auto warm = cache.get_or_build_batch(requests, 8U);
+    expect(warm.unique_key_count == unique.size()
+               && warm.ready_hit_count == requests.size(),
+           "session-cache warm call serves every request from retained plans");
+    expect(warm.physical_build_count == 0U && warm.published_plan_count == 0U
+               && warm.effective_worker_count == 0U && warm.peak_active_builds == 0U,
+           "session-cache warm call starts no planner work");
+    expect(warm.resident_entry_count == cold.resident_entry_count
+               && warm.resident_bytes == cold.resident_bytes,
+           "session-cache warm call does not grow residency");
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+        expect(warm.plans[index].get() == cold.plans[index].get(),
+               "session-cache warm call returns the published plan pointers");
+    }
+
+    std::vector<getnative::AxisPlanCacheBatchResult> concurrent(8U);
+    std::vector<std::jthread> threads;
+    threads.reserve(concurrent.size());
+    for (std::size_t thread = 0; thread < concurrent.size(); ++thread) {
+        threads.emplace_back([&, thread] {
+            concurrent[thread] = cache.get_or_build_batch(requests, 8U);
+        });
+    }
+    threads.clear();
+    for (const auto &result : concurrent) {
+        expect(result.ready_hit_count == requests.size()
+                   && result.physical_build_count == 0U,
+               "concurrent warm session calls remain ready-only");
+        for (std::size_t index = 0; index < requests.size(); ++index) {
+            expect(result.plans[index].get() == cold.plans[index].get(),
+                   "concurrent warm calls preserve published pointer identity");
+        }
+    }
+
+    cache.clear();
+    expect(cache.size() == 0U && cache.resident_bytes() == 0U,
+           "session-cache clear releases retained ownership and byte accounting");
+    expect(cold.plans.front()->valid(),
+           "externally held plans survive session-cache clear");
+}
+
+void test_session_cache_enforces_fixed_admission_limits() {
+    const auto requests = fixture_requests();
+    getnative::AxisPlanCache entry_bounded({
+        2U, 64U * 1024U * 1024U,
+    });
+    const auto cold = entry_bounded.get_or_build_batch(
+        std::span<const getnative::AxisPlanRequest>{requests}.first(3U), 4U);
+    expect(cold.physical_build_count == 3U && cold.published_plan_count == 2U
+               && cold.resident_entry_count == 2U,
+           "entry bound admits only the stable first two unique plans");
+    const auto repeated = entry_bounded.get_or_build_batch(
+        std::span<const getnative::AxisPlanRequest>{requests}.first(3U), 4U);
+    expect(repeated.ready_hit_count == 2U && repeated.physical_build_count == 1U
+               && repeated.published_plan_count == 0U,
+           "non-admitted plans rebuild without evicting retained session plans");
+    expect(repeated.plans[0].get() == cold.plans[0].get()
+               && repeated.plans[1].get() == cold.plans[1].get()
+               && repeated.plans[2].get() != cold.plans[2].get(),
+           "fixed admission preserves retained pointers and leaves overflow transient");
+
+    const auto first_plan = getnative::build_axis_plan(requests.front());
+    const std::size_t first_bytes = getnative::axis_plan_storage_bytes(first_plan);
+    getnative::AxisPlanCache byte_bounded({8U, first_bytes});
+    const auto byte_result = byte_bounded.get_or_build_batch(
+        std::span<const getnative::AxisPlanRequest>{requests}.first(2U), 2U);
+    expect(byte_result.physical_build_count == 2U
+               && byte_result.published_plan_count == 1U,
+           "byte bound admits the first fitting plan only");
+    expect(byte_bounded.size() == 1U && byte_bounded.resident_bytes() == first_bytes,
+           "session-cache logical bytes never exceed the configured ceiling");
+
+    getnative::AxisPlanCache no_residency({0U, 0U});
+    const auto transient_first = no_residency.get_or_build(requests.front());
+    const auto transient_second = no_residency.get_or_build(requests.front());
+    expect(transient_first->valid() && transient_second->valid()
+               && transient_first.get() != transient_second.get(),
+           "zero-capacity compatibility calls return uncached transient plans");
+    expect(no_residency.size() == 0U && no_residency.resident_bytes() == 0U,
+           "zero-capacity compatibility calls retain no ownership");
+}
+
+void test_session_cache_failed_batch_publishes_nothing() {
+    const auto requests = fixture_requests();
+    getnative::AxisPlanCache cache({8U, 64U * 1024U * 1024U});
+    const auto seeded = cache.get_or_build(requests.front());
+    const std::size_t seeded_bytes = cache.resident_bytes();
+    auto invalid = requests[1U];
+    invalid.source_size = 0;
+    const std::vector<getnative::AxisPlanRequest> failing{requests[2U], invalid};
+
+    bool caught = false;
+    try {
+        (void)cache.get_or_build_batch(failing, 2U);
+    } catch (const std::invalid_argument &) {
+        caught = true;
+    }
+    expect(caught, "session-cache batch propagates planner validation failure");
+    expect(cache.size() == 1U && cache.resident_bytes() == seeded_bytes
+               && cache.get_or_build(requests.front()).get() == seeded.get(),
+           "failed session-cache batch publishes no partial result");
+}
+
 void test_worker_bounds_and_peak_concurrency() {
     auto requests = fixture_requests();
     const auto explicit_many = getnative::detail::build_axis_plans(
@@ -276,6 +416,9 @@ int main() {
         test_empty_and_stable_deduplication();
         test_exact_plans_for_all_worker_modes();
         test_exact_bit_key_distinctions_and_call_isolation();
+        test_session_cache_batch_publish_and_ready_reuse();
+        test_session_cache_enforces_fixed_admission_limits();
+        test_session_cache_failed_batch_publishes_nothing();
         test_worker_bounds_and_peak_concurrency();
         test_lowest_stable_failure_is_rethrown_after_join();
         test_failure_stops_claiming_and_joins_started_builds();
