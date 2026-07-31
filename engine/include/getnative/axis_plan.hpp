@@ -58,16 +58,44 @@ struct AxisPlan {
 };
 
 [[nodiscard]] AxisPlan build_axis_plan(const AxisPlanRequest &request);
+[[nodiscard]] std::size_t axis_plan_storage_bytes(const AxisPlan &plan) noexcept;
 
+struct AxisPlanCacheLimits {
+    std::size_t maximum_entries = 1024U;
+    std::size_t maximum_resident_bytes = 256U * 1024U * 1024U;
+};
+
+struct AxisPlanCacheBatchResult {
+    std::vector<std::shared_ptr<const AxisPlan>> plans;
+    std::size_t unique_key_count = 0;
+    // Counts input requests whose plan was resident when this call began.
+    std::size_t ready_hit_count = 0;
+    std::size_t physical_build_count = 0;
+    std::size_t published_plan_count = 0;
+    std::size_t peak_active_builds = 0;
+    std::size_t effective_worker_count = 0;
+    std::size_t resident_entry_count = 0;
+    std::size_t resident_bytes = 0;
+};
+
+// Caller-owned cache for a bounded scan/video session. Batch misses use the
+// bounded planner workers and publish only after the complete batch succeeds.
+// Concurrent cold calls may duplicate construction; this is not single-flight.
+// Limits use fixed admission: overflow plans are returned but not retained.
 class AxisPlanCache {
 public:
-    AxisPlanCache();
+    explicit AxisPlanCache(AxisPlanCacheLimits limits = {});
     ~AxisPlanCache();
     AxisPlanCache(const AxisPlanCache &) = delete;
     AxisPlanCache &operator=(const AxisPlanCache &) = delete;
 
     [[nodiscard]] std::shared_ptr<const AxisPlan> get_or_build(const AxisPlanRequest &request);
+    [[nodiscard]] AxisPlanCacheBatchResult get_or_build_batch(
+        std::span<const AxisPlanRequest> requests,
+        std::size_t worker_count = 0U);
+    [[nodiscard]] AxisPlanCacheLimits limits() const noexcept;
     [[nodiscard]] std::size_t size() const;
+    [[nodiscard]] std::size_t resident_bytes() const;
     void clear();
 
 private:
