@@ -630,6 +630,9 @@ void test_persistent_working_buffer_reuse_and_ceiling() {
     getnative::MetalAnalysisOptions persistent_options{
         8, 2, 0, false, 32, getnative::MetalKernelDispatchPolicy::automatic,
     };
+    expect(getnative::MetalAnalysisOptions{}.retained_working_buffer_limit_bytes
+               == 2ULL * 1024ULL * 1024ULL * 1024ULL,
+           "default retained working-buffer ceiling is exactly two GiB");
     persistent_options.reuse_working_buffers = true;
     persistent_options.retained_working_buffer_limit_bytes = 1024U * 1024U;
     getnative::MetalAnalysisEngine persistent(persistent_options);
@@ -670,6 +673,17 @@ void test_persistent_working_buffer_reuse_and_ceiling() {
                && std::isfinite(reused_telemetry.buffer_wiring_ms),
            "Metal runtime reports finite allocation, upload, and wiring timings");
 
+    persistent.trim_working_buffers();
+    expect(persistent.runtime_telemetry().working_buffer_retained_bytes == 0,
+           "explicit trim releases all retained Metal working buffers");
+    persistent.reset_analysis_telemetry();
+    const auto after_trim = persistent.analyze_axis_batch_f32(view, large, metric);
+    const auto after_trim_telemetry = persistent.runtime_telemetry();
+    expect(after_trim_telemetry.working_buffer_allocation_count == 3
+               && after_trim_telemetry.working_buffer_reuse_count == 0
+               && after_trim_telemetry.working_buffer_retained_bytes > 0,
+           "first call after trim reallocates and retains all working buffers");
+
     getnative::MetalAnalysisOptions transient_options = persistent_options;
     transient_options.reuse_working_buffers = false;
     getnative::MetalAnalysisEngine transient(transient_options);
@@ -692,16 +706,17 @@ void test_persistent_working_buffer_reuse_and_ceiling() {
            "working-buffer request above the retained ceiling falls back to transient buffers");
 
     expect(first.size() == small.size() && grown.size() == large.size()
-               && reused.size() == large.size()
+               && reused.size() == large.size() && after_trim.size() == large.size()
                && transient_results.size() == large.size()
                && constrained_results.size() == large.size(),
            "working-buffer paths return every candidate");
     for (std::size_t index = 0; index < large.size(); ++index) {
         const std::uint64_t expected = std::bit_cast<std::uint64_t>(grown[index].error);
         expect(std::bit_cast<std::uint64_t>(reused[index].error) == expected
+                   && std::bit_cast<std::uint64_t>(after_trim[index].error) == expected
                    && std::bit_cast<std::uint64_t>(transient_results[index].error) == expected
                    && std::bit_cast<std::uint64_t>(constrained_results[index].error) == expected,
-               "persistent, reused, transient, and ceiling-fallback metrics are bit-identical");
+               "persistent, trimmed, transient, and ceiling-fallback metrics are bit-identical");
     }
 }
 

@@ -101,7 +101,8 @@ static inline void inverse_axis_impl(
         const uint half_bandwidth = fixed_half_bandwidth == 0u
             ? plan.half_bandwidth : fixed_half_bandwidth;
         const uint available = min(half_bandwidth, plan.destination_size - i - 1);
-        if (bandwidth7_order) {
+        if (bandwidth7_order
+            || (fixed_half_bandwidth == 0u && plan.half_bandwidth == 3u)) {
             // Descale's bandwidth-7 path accumulates backward near-to-far.
             for (uint distance = 1; distance <= available; ++distance) {
                 sum += upper_l[plan.upper_l_base
@@ -236,7 +237,8 @@ static inline void inverse_axis_matrix_impl(
     for (uint i = plan.destination_size - 1; i-- > 0;) {
         float sum = 0.0f;
         const uint available = min(half_bandwidth, plan.destination_size - i - 1);
-        if (bandwidth7_order) {
+        if (bandwidth7_order
+            || (fixed_half_bandwidth == 0u && plan.half_bandwidth == 3u)) {
             for (uint distance = 1; distance <= available; ++distance) {
                 sum += upper_l[plan.upper_l_base
                                + (distance - 1) * plan.destination_size + i]

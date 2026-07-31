@@ -167,8 +167,10 @@ struct PackedTile {
 
 struct TileSignature {
     AnalysisAxes axes = AnalysisAxes::vertical;
-    KernelShape horizontal_shape = KernelShape::generic;
-    KernelShape vertical_shape = KernelShape::generic;
+    KernelShape horizontal_inverse_shape = KernelShape::generic;
+    KernelShape horizontal_forward_shape = KernelShape::generic;
+    KernelShape vertical_inverse_shape = KernelShape::generic;
+    KernelShape vertical_forward_shape = KernelShape::generic;
     ForwardOrder forward_order = ForwardOrder::vertical_first;
 
     friend bool operator==(const TileSignature &, const TileSignature &) = default;
@@ -183,18 +185,47 @@ struct TileRange {
 
 [[nodiscard]] bool uses_specialized_pipeline(const TileSignature &signature) noexcept {
     if (signature.axes == AnalysisAxes::horizontal) {
-        return signature.horizontal_shape != KernelShape::generic;
+        return signature.horizontal_inverse_shape != KernelShape::generic
+            || signature.horizontal_forward_shape != KernelShape::generic;
     }
     if (signature.axes == AnalysisAxes::vertical) {
-        return signature.vertical_shape != KernelShape::generic;
+        return signature.vertical_inverse_shape != KernelShape::generic
+            || signature.vertical_forward_shape != KernelShape::generic;
     }
-    return signature.horizontal_shape != KernelShape::generic
-        || signature.vertical_shape != KernelShape::generic;
+    return signature.horizontal_inverse_shape != KernelShape::generic
+        || signature.horizontal_forward_shape != KernelShape::generic
+        || signature.vertical_inverse_shape != KernelShape::generic
+        || signature.vertical_forward_shape != KernelShape::generic;
 }
 
-[[nodiscard]] KernelShape axis_shape(const std::shared_ptr<const AxisPlan> &plan_pointer,
-                                     std::int32_t expected_source,
-                                     MetalKernelDispatchPolicy policy) {
+struct AxisKernelShapes {
+    KernelShape inverse = KernelShape::generic;
+    KernelShape forward = KernelShape::generic;
+};
+
+[[nodiscard]] KernelShape inverse_shape(std::int32_t half_bandwidth) noexcept {
+    switch (half_bandwidth) {
+    case 1: return KernelShape::bandwidth3;
+    case 3: return KernelShape::bandwidth7;
+    case 5: return KernelShape::bandwidth11;
+    case 7: return KernelShape::bandwidth15;
+    default: return KernelShape::generic;
+    }
+}
+
+[[nodiscard]] KernelShape forward_shape(std::int32_t forward_width) noexcept {
+    switch (forward_width) {
+    case 2: return KernelShape::bandwidth3;
+    case 4: return KernelShape::bandwidth7;
+    case 6: return KernelShape::bandwidth11;
+    case 8: return KernelShape::bandwidth15;
+    default: return KernelShape::generic;
+    }
+}
+
+[[nodiscard]] AxisKernelShapes axis_shapes(
+    const std::shared_ptr<const AxisPlan> &plan_pointer,
+    std::int32_t expected_source, MetalKernelDispatchPolicy policy) {
     if (!plan_pointer || !plan_pointer->valid()) {
         throw std::invalid_argument("Metal candidate contains an invalid axis plan");
     }
@@ -207,27 +238,23 @@ struct TileRange {
         throw std::invalid_argument(
             "Metal supports half-bandwidth 1..15 and forward width 1..16");
     }
-    KernelShape shape = KernelShape::generic;
-    if (plan.half_bandwidth == 1 && plan.forward_width == 2) {
-        shape = KernelShape::bandwidth3;
-    } else if (plan.half_bandwidth == 3 && plan.forward_width == 4) {
-        shape = KernelShape::bandwidth7;
-    } else if (plan.half_bandwidth == 5 && plan.forward_width == 6) {
-        shape = KernelShape::bandwidth11;
-    } else if (plan.half_bandwidth == 7 && plan.forward_width == 8) {
-        shape = KernelShape::bandwidth15;
-    }
     if (policy == MetalKernelDispatchPolicy::generic_only) {
-        return KernelShape::generic;
+        return {};
     }
+    const AxisKernelShapes shapes{
+        inverse_shape(plan.half_bandwidth), forward_shape(plan.forward_width),
+    };
     if (policy == MetalKernelDispatchPolicy::required_specialized
-        && shape == KernelShape::generic) {
+        && (shapes.inverse == KernelShape::generic
+            || shapes.forward == KernelShape::generic)) {
+        const std::string unavailable = shapes.inverse == KernelShape::generic
+            ? "inverse" : "forward";
         throw std::runtime_error(
-            "required Metal specialization is unavailable for B"
+            "required Metal " + unavailable + " specialization is unavailable for B"
             + std::to_string(2 * plan.half_bandwidth + 1) + "/F"
             + std::to_string(plan.forward_width));
     }
-    return shape;
+    return shapes;
 }
 
 [[nodiscard]] TileSignature candidate_signature(ConstImageView source,
@@ -236,10 +263,14 @@ struct TileRange {
     TileSignature signature;
     signature.axes = candidate.axes;
     if (candidate.axes == AnalysisAxes::horizontal || candidate.axes == AnalysisAxes::both) {
-        signature.horizontal_shape = axis_shape(candidate.horizontal, source.width, policy);
+        const AxisKernelShapes shapes = axis_shapes(candidate.horizontal, source.width, policy);
+        signature.horizontal_inverse_shape = shapes.inverse;
+        signature.horizontal_forward_shape = shapes.forward;
     }
     if (candidate.axes == AnalysisAxes::vertical || candidate.axes == AnalysisAxes::both) {
-        signature.vertical_shape = axis_shape(candidate.vertical, source.height, policy);
+        const AxisKernelShapes shapes = axis_shapes(candidate.vertical, source.height, policy);
+        signature.vertical_inverse_shape = shapes.inverse;
+        signature.vertical_forward_shape = shapes.forward;
     }
     if (candidate.axes == AnalysisAxes::both) {
         signature.forward_order = select_forward_order(*candidate.horizontal, *candidate.vertical);
@@ -852,6 +883,11 @@ void MetalAnalysisEngine::reset_analysis_telemetry() {
     impl_->gpu_execution_ms = 0.0;
 }
 
+void MetalAnalysisEngine::trim_working_buffers() {
+    const std::scoped_lock lock(impl_->mutex);
+    impl_->clear_retained_working_buffers();
+}
+
 std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
     ConstImageView source, std::span<const CandidateAnalysis> candidates,
     const MetricSpec &metric, std::stop_token stop) {
@@ -1237,12 +1273,16 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                 };
 
                 if (tile.signature.axes != AnalysisAxes::both) {
-                    const KernelShape shape = tile.signature.axes == AnalysisAxes::horizontal
-                        ? tile.signature.horizontal_shape : tile.signature.vertical_shape;
+                    const KernelShape inverse_shape = tile.signature.axes == AnalysisAxes::horizontal
+                        ? tile.signature.horizontal_inverse_shape
+                        : tile.signature.vertical_inverse_shape;
+                    const KernelShape forward_shape = tile.signature.axes == AnalysisAxes::horizontal
+                        ? tile.signature.horizontal_forward_shape
+                        : tile.signature.vertical_forward_shape;
                     id<MTLComputePipelineState> inverse_pipeline = impl_->pipeline(
-                        shape, PipelineStage::image_inverse);
+                        inverse_shape, PipelineStage::image_inverse);
                     id<MTLComputePipelineState> metric_pipeline = impl_->pipeline(
-                        shape, PipelineStage::metric);
+                        forward_shape, PipelineStage::metric);
                     AnalysisJob inverse_job = job;
                     inverse_job.maximum_vector_count = packed.maximum_vector_count;
                     const std::size_t inverse_count = checked_product(
@@ -1267,9 +1307,9 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                         checked_product(tile_candidate_count, sizeof(AxisPlanDescriptor),
                                         "vertical descriptor offset"));
                     id<MTLComputePipelineState> horizontal_inverse_pipeline = impl_->pipeline(
-                        tile.signature.horizontal_shape, PipelineStage::image_inverse);
+                        tile.signature.horizontal_inverse_shape, PipelineStage::image_inverse);
                     id<MTLComputePipelineState> vertical_inverse_pipeline = impl_->pipeline(
-                        tile.signature.vertical_shape, PipelineStage::matrix_inverse);
+                        tile.signature.vertical_inverse_shape, PipelineStage::matrix_inverse);
                     AnalysisJob horizontal_inverse_job = job;
                     horizontal_inverse_job.maximum_vector_count = static_cast<std::uint32_t>(source.height);
                     AnalysisJob vertical_inverse_job = job;
@@ -1290,14 +1330,16 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     const bool vertical_first =
                         tile.signature.forward_order == ForwardOrder::vertical_first;
                     const KernelShape first_forward_shape = vertical_first
-                        ? tile.signature.vertical_shape : tile.signature.horizontal_shape;
+                        ? tile.signature.vertical_forward_shape
+                        : tile.signature.horizontal_forward_shape;
                     id<MTLComputePipelineState> first_forward_pipeline = impl_->pipeline(
                         first_forward_shape, PipelineStage::matrix_forward);
                     const NSUInteger first_forward_descriptor_offset =
                         vertical_first ? vertical_descriptor_offset : 0;
                     id<MTLComputePipelineState> final_metric = vertical_first
-                        ? impl_->pipeline(tile.signature.horizontal_shape, PipelineStage::metric)
-                        : impl_->pipeline(tile.signature.vertical_shape,
+                        ? impl_->pipeline(tile.signature.horizontal_forward_shape,
+                                          PipelineStage::metric)
+                        : impl_->pipeline(tile.signature.vertical_forward_shape,
                                           PipelineStage::horizontal_first_metric);
                     const NSUInteger final_metric_descriptor_offset =
                         vertical_first ? 0 : vertical_descriptor_offset;
@@ -1353,7 +1395,11 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
             }
         } catch (...) {
             const std::exception_ptr original = std::current_exception();
-            drain_commands();
+            try {
+                drain_commands();
+            } catch (...) {
+                // Draining is mandatory, but the initiating failure owns the API result.
+            }
             std::rethrow_exception(original);
         }
 

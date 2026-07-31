@@ -89,6 +89,9 @@ public:
     [[nodiscard]] MetalRuntimeTelemetry runtime_telemetry() const;
     // Preserves immutable pipeline-creation telemetry and resets per-analysis counters.
     void reset_analysis_telemetry();
+    // Releases grow-to-fit source, workspace, and metric buffers. A concurrent
+    // analysis finishes before the buffers are released.
+    void trim_working_buffers();
 
     [[nodiscard]] std::vector<CandidateResult> analyze_axis_batch_f32(
         ConstImageView source, std::span<const CandidateAnalysis> candidates,

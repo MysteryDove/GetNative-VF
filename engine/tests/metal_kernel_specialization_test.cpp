@@ -46,6 +46,100 @@ using NamedFilter = std::pair<std::string_view, getnative::Filter>;
     return filters;
 }
 
+[[nodiscard]] std::shared_ptr<const getnative::AxisPlan> widen_b7_forward(
+    const std::shared_ptr<const getnative::AxisPlan> &input,
+    std::int32_t forward_width) {
+    expect(input && input->half_bandwidth == 3 && input->forward_width == 4,
+           "widened B7 test starts from a valid B7/F4 plan");
+    expect(forward_width >= 4 && forward_width <= input->destination_size,
+           "widened B7 test uses a supported forward width");
+    getnative::AxisPlan result = *input;
+    const std::vector<std::uint32_t> old_offsets = result.forward_offsets;
+    const std::vector<std::int32_t> old_indices = result.forward_indices;
+    const std::vector<float> old_weights = result.forward_weights;
+    result.forward_width = forward_width;
+    result.forward_offsets.resize(static_cast<std::size_t>(result.source_size) + 1U);
+    result.forward_indices.resize(
+        static_cast<std::size_t>(result.source_size)
+        * static_cast<std::size_t>(forward_width));
+    result.forward_weights.assign(
+        static_cast<std::size_t>(result.source_size)
+            * static_cast<std::size_t>(forward_width),
+        0.0F);
+    for (std::int32_t row = 0; row < result.source_size; ++row) {
+        const std::size_t old_begin = old_offsets[static_cast<std::size_t>(row)];
+        const std::int32_t old_left = old_indices[old_begin];
+        const std::int32_t new_left = std::clamp(
+            old_left - (forward_width - 4) / 2,
+            0, result.destination_size - result.forward_width);
+        const std::size_t new_begin = static_cast<std::size_t>(row)
+            * static_cast<std::size_t>(forward_width);
+        result.forward_offsets[static_cast<std::size_t>(row)] =
+            static_cast<std::uint32_t>(new_begin);
+        for (std::int32_t tap = 0; tap < result.forward_width; ++tap) {
+            const std::int32_t index = new_left + tap;
+            result.forward_indices[new_begin + static_cast<std::size_t>(tap)] = index;
+            for (std::int32_t old_tap = 0; old_tap < 4; ++old_tap) {
+                if (old_indices[old_begin + static_cast<std::size_t>(old_tap)] == index) {
+                    result.forward_weights[new_begin + static_cast<std::size_t>(tap)] =
+                        old_weights[old_begin + static_cast<std::size_t>(old_tap)];
+                    break;
+                }
+            }
+        }
+    }
+    result.forward_offsets[static_cast<std::size_t>(result.source_size)] =
+        static_cast<std::uint32_t>(result.forward_weights.size());
+    expect(result.valid(), "widened B7 test constructs a valid independently shaped plan");
+    return std::make_shared<const getnative::AxisPlan>(std::move(result));
+}
+
+[[nodiscard]] std::shared_ptr<const getnative::AxisPlan> make_b7_plan(
+    getnative::AxisPlanCache &cache, std::int32_t source_size,
+    std::int32_t native_size, double active_length, double shift,
+    bool forward_width_six) {
+    auto plan = cache.get_or_build({
+        source_size, native_size, active_length, shift,
+        getnative::Filter::bicubic(), getnative::BorderMode::mirror,
+    });
+    return forward_width_six ? widen_b7_forward(plan, 6) : plan;
+}
+
+[[nodiscard]] std::vector<getnative::CandidateAnalysis> make_b7_axis_candidate(
+    getnative::AxisPlanCache &cache, std::int32_t width, std::int32_t height,
+    getnative::AnalysisAxes axes, bool forward_width_six) {
+    const bool horizontal = axes == getnative::AnalysisAxes::horizontal;
+    auto plan = make_b7_plan(cache, horizontal ? width : height,
+                            horizontal ? 58 : 48,
+                            horizontal ? 58.25 : 48.125,
+                            horizontal ? 0.125 : -0.0625,
+                            forward_width_six);
+    return {{
+        forward_width_six ? "b7-f6-axis" : "b7-f4-axis",
+        horizontal ? plan : nullptr, horizontal ? nullptr : plan, axes,
+    }};
+}
+
+[[nodiscard]] std::vector<getnative::CandidateAnalysis> make_b7_dual_candidate(
+    getnative::AxisPlanCache &cache, std::int32_t width, std::int32_t height,
+    getnative::ForwardOrder order, bool forward_width_six) {
+    const bool horizontal_first = order == getnative::ForwardOrder::horizontal_first;
+    const std::int32_t native_width = horizontal_first ? 88 : 44;
+    const std::int32_t native_height = horizontal_first ? 38 : 72;
+    auto horizontal = make_b7_plan(
+        cache, width, native_width, static_cast<double>(native_width) + 0.25,
+        0.125, forward_width_six);
+    auto vertical = make_b7_plan(
+        cache, height, native_height, static_cast<double>(native_height) + 0.125,
+        -0.0625, forward_width_six);
+    expect(getnative::select_forward_order(*horizontal, *vertical) == order,
+           "independent B7 dispatch test selects its intended forward order");
+    return {{
+        forward_width_six ? "b7-f6-dual" : "b7-f4-dual",
+        std::move(horizontal), std::move(vertical), getnative::AnalysisAxes::both,
+    }};
+}
+
 [[nodiscard]] std::vector<getnative::CandidateAnalysis> make_axis_candidates(
     getnative::AxisPlanCache &cache, std::int32_t width, std::int32_t height,
     getnative::AnalysisAxes axes) {
@@ -202,6 +296,85 @@ void test_wider_fixed_shapes() {
            "wider fixed specialization remains below the absolute memory gate");
 }
 
+void test_b7_inverse_and_forward_dispatch_are_independent() {
+    constexpr std::int32_t width = 96;
+    constexpr std::int32_t height = 80;
+    const auto pixels = make_source(width, height);
+    const getnative::ConstImageView source{pixels.data(), width, height, width};
+    const getnative::MetricSpec metric{5, 5, 5, 5, 0.015F, 1U};
+    getnative::AxisPlanCache cache;
+    getnative::MetalAnalysisEngine generic({
+        1, 8, 0, false, 32, getnative::MetalKernelDispatchPolicy::generic_only,
+    });
+    getnative::MetalAnalysisEngine specialized({
+        1, 8, 0, false, 32,
+        getnative::MetalKernelDispatchPolicy::required_specialized,
+    });
+
+    for (const bool forward_width_six : {false, true}) {
+        const std::string label = forward_width_six ? "B7/F6" : "B7/F4";
+        compare_paths(source, make_b7_axis_candidate(
+                                  cache, width, height,
+                                  getnative::AnalysisAxes::vertical,
+                                  forward_width_six),
+                      metric, generic, specialized, label + " vertical");
+        compare_paths(source, make_b7_axis_candidate(
+                                  cache, width, height,
+                                  getnative::AnalysisAxes::horizontal,
+                                  forward_width_six),
+                      metric, generic, specialized, label + " horizontal");
+        compare_paths(source, make_b7_dual_candidate(
+                                  cache, width, height,
+                                  getnative::ForwardOrder::vertical_first,
+                                  forward_width_six),
+                      metric, generic, specialized, label + " vertical-first");
+        compare_paths(source, make_b7_dual_candidate(
+                                  cache, width, height,
+                                  getnative::ForwardOrder::horizontal_first,
+                                  forward_width_six),
+                      metric, generic, specialized, label + " horizontal-first");
+    }
+
+    const auto generic_telemetry = generic.runtime_telemetry();
+    const auto specialized_telemetry = specialized.runtime_telemetry();
+    expect(generic_telemetry.created_pipeline_names.size() == 5
+               && generic_telemetry.generic_tile_count > 0
+               && generic_telemetry.specialized_tile_count == 0,
+           "forced generic B7 paths remain fully generic");
+    expect(specialized_telemetry.specialized_tile_count > 0
+               && specialized_telemetry.generic_tile_count == 0,
+           "B7/F4 and B7/F6 both satisfy component-wise specialization");
+    for (const std::string_view name : {
+             "metric_axis_p1_b11", "forward_axis_matrix_b11",
+             "metric_axis_p1_horizontal_first_b11"}) {
+        expect(std::find(specialized_telemetry.created_pipeline_names.begin(),
+                         specialized_telemetry.created_pipeline_names.end(), name)
+                   != specialized_telemetry.created_pipeline_names.end(),
+               "B7/F6 selects the F6 forward or metric specialization");
+    }
+    for (const std::string_view name : {
+             "inverse_axis_b11", "inverse_axis_matrix_b11"}) {
+        expect(std::find(specialized_telemetry.created_pipeline_names.begin(),
+                         specialized_telemetry.created_pipeline_names.end(), name)
+                   == specialized_telemetry.created_pipeline_names.end(),
+               "B7/F6 keeps inverse dispatch on the B7 specialization");
+    }
+
+    auto mixed_plan = widen_b7_forward(make_b7_plan(
+        cache, height, 48, 48.125, -0.0625, false), 10);
+    const std::vector<getnative::CandidateAnalysis> mixed_candidate{{
+        "b7-f10-mixed", nullptr, std::move(mixed_plan),
+        getnative::AnalysisAxes::vertical,
+    }};
+    getnative::MetalAnalysisEngine mixed({
+        1, 8, 0, false, 32, getnative::MetalKernelDispatchPolicy::automatic,
+    });
+    (void)mixed.analyze_axis_batch_f32(source, mixed_candidate, metric);
+    expect(mixed.runtime_telemetry().specialized_tile_count == 1
+               && mixed.runtime_telemetry().generic_tile_count == 0,
+           "mixed B7/F10 tile reports its specialized inverse dispatch");
+}
+
 } // namespace
 
 int main() {
@@ -210,6 +383,7 @@ int main() {
             std::cout << "metal kernel specialization tests skipped: no Metal device\n";
             return 0;
         }
+        test_b7_inverse_and_forward_dispatch_are_independent();
         test_wider_fixed_shapes();
         std::cout << "metal kernel specialization tests passed\n";
         return 0;

@@ -11,6 +11,10 @@
 #include <stdexcept>
 #include <thread>
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+
 namespace getnative {
 namespace {
 
@@ -126,6 +130,76 @@ private:
     double scale_ = 0.0;
     double scaled_sum_ = 0.0;
 };
+
+void add_absolute_difference_row(
+    const float *source, const float *reconstruction,
+    std::int32_t x_begin, std::int32_t x_end,
+    MetricAccumulator &accumulator, bool allow_simd = true) {
+    std::int32_t x = x_begin;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    if (allow_simd) {
+        alignas(16) float differences[4];
+        for (; x <= x_end - 4; x += 4) {
+            const float32x4_t source_values = vld1q_f32(source + x);
+            const float32x4_t reconstruction_values = vld1q_f32(reconstruction + x);
+            const float32x4_t difference = vabsq_f32(
+                vsubq_f32(source_values, reconstruction_values));
+            vst1q_f32(differences, difference);
+            accumulator.add(differences[0]);
+            accumulator.add(differences[1]);
+            accumulator.add(differences[2]);
+            accumulator.add(differences[3]);
+        }
+    }
+#else
+    (void)allow_simd;
+#endif
+    for (; x < x_end; ++x) {
+        accumulator.add(std::abs(source[x] - reconstruction[x]));
+    }
+}
+
+void add_vertical_reconstruction_row(
+    const AxisPlan &plan, std::uint32_t begin, std::int32_t left,
+    const float *source, const float *native, std::ptrdiff_t native_stride,
+    std::int32_t x_begin, std::int32_t x_end,
+    MetricAccumulator &accumulator, bool allow_simd = true) {
+    std::int32_t x = x_begin;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    if (allow_simd) {
+        alignas(16) float differences[4];
+        for (; x <= x_end - 4; x += 4) {
+            float32x4_t reconstructed = vdupq_n_f32(0.0F);
+            for (std::int32_t tap = 0; tap < plan.forward_width; ++tap) {
+                const float32x4_t values = vld1q_f32(
+                    native + static_cast<std::ptrdiff_t>(left + tap) * native_stride + x);
+                const float32x4_t product = vmulq_n_f32(
+                    values, plan.forward_weights[begin + static_cast<std::uint32_t>(tap)]);
+                reconstructed = vaddq_f32(reconstructed, product);
+            }
+            const float32x4_t source_values = vld1q_f32(source + x);
+            const float32x4_t difference = vabsq_f32(
+                vsubq_f32(source_values, reconstructed));
+            vst1q_f32(differences, difference);
+            accumulator.add(differences[0]);
+            accumulator.add(differences[1]);
+            accumulator.add(differences[2]);
+            accumulator.add(differences[3]);
+        }
+    }
+#else
+    (void)allow_simd;
+#endif
+    for (; x < x_end; ++x) {
+        float reconstructed = 0.0F;
+        for (std::int32_t tap = 0; tap < plan.forward_width; ++tap) {
+            reconstructed += plan.forward_weights[
+                begin + static_cast<std::uint32_t>(tap)]
+                * native[static_cast<std::ptrdiff_t>(left + tap) * native_stride + x];
+        }
+        accumulator.add(std::abs(source[x] - reconstructed));
+    }
+}
 
 } // namespace
 
@@ -264,10 +338,8 @@ double thresholded_p_norm(ConstImageView source, ConstImageView reconstruction,
         const float *source_row = source.data + static_cast<std::ptrdiff_t>(y) * source.stride;
         const float *reconstruction_row = reconstruction.data
             + static_cast<std::ptrdiff_t>(y) * reconstruction.stride;
-        for (std::int32_t x = bounds.x_begin; x < bounds.x_end; ++x) {
-            const float difference = std::abs(source_row[x] - reconstruction_row[x]);
-            accumulator.add(difference);
-        }
+        add_absolute_difference_row(
+            source_row, reconstruction_row, bounds.x_begin, bounds.x_end, accumulator);
     }
     return accumulator.finish(bounds.count);
 }
@@ -308,11 +380,9 @@ double analyze_candidate_f32(ConstImageView source, const AxisPlan &horizontal,
                              1, workspace.reconstruction_row.data(), 1);
             const float *source_row = source.data
                 + static_cast<std::ptrdiff_t>(y) * source.stride;
-            for (std::int32_t x = bounds.x_begin; x < bounds.x_end; ++x) {
-                accumulator.add(
-                    std::abs(source_row[x]
-                             - workspace.reconstruction_row[static_cast<std::size_t>(x)]));
-            }
+            add_absolute_difference_row(
+                source_row, workspace.reconstruction_row.data(),
+                bounds.x_begin, bounds.x_end, accumulator);
         }
     } else {
         const std::ptrdiff_t intermediate_stride = source.width;
@@ -330,18 +400,9 @@ double analyze_candidate_f32(ConstImageView source, const AxisPlan &horizontal,
             const std::int32_t left = vertical.forward_indices[begin];
             const float *source_row = source.data
                 + static_cast<std::ptrdiff_t>(y) * source.stride;
-            for (std::int32_t x = bounds.x_begin; x < bounds.x_end; ++x) {
-                float reconstructed = 0.0F;
-                for (std::int32_t tap = 0; tap < vertical.forward_width; ++tap) {
-                    reconstructed += vertical.forward_weights[
-                        begin + static_cast<std::uint32_t>(tap)]
-                        * workspace.intermediate[
-                            static_cast<std::size_t>(left + tap)
-                                * static_cast<std::size_t>(intermediate_stride)
-                            + static_cast<std::size_t>(x)];
-                }
-                accumulator.add(std::abs(source_row[x] - reconstructed));
-            }
+            add_vertical_reconstruction_row(
+                vertical, begin, left, source_row, workspace.intermediate.data(),
+                intermediate_stride, bounds.x_begin, bounds.x_end, accumulator);
         }
     }
     return accumulator.finish(bounds.count);
@@ -375,11 +436,10 @@ double analyze_axis_candidate_impl(ConstImageView source, const AxisPlan &axis,
                              workspace.reconstruction_row.data(), 1);
             if (y < bounds.y_begin || y >= bounds.y_end) continue;
             const float *source_row = source.data + static_cast<std::ptrdiff_t>(y) * source.stride;
-            for (std::int32_t x = bounds.x_begin; x < bounds.x_end; ++x) {
-                accumulator.add(std::abs(
-                    source_row[x]
-                    - workspace.reconstruction_row[static_cast<std::size_t>(x)]));
-            }
+            add_absolute_difference_row(
+                source_row, workspace.reconstruction_row.data(),
+                bounds.x_begin, bounds.x_end, accumulator,
+                column_policy != detail::ColumnDispatchPolicy::scalar_only);
         }
     } else {
         if (axis.source_size != source.height) {
@@ -395,17 +455,10 @@ double analyze_axis_candidate_impl(ConstImageView source, const AxisPlan &axis,
             const std::uint32_t begin = axis.forward_offsets[static_cast<std::size_t>(y)];
             const std::int32_t left = axis.forward_indices[begin];
             const float *source_row = source.data + static_cast<std::ptrdiff_t>(y) * source.stride;
-            for (std::int32_t x = bounds.x_begin; x < bounds.x_end; ++x) {
-                float reconstructed = 0.0F;
-                for (std::int32_t tap = 0; tap < axis.forward_width; ++tap) {
-                    reconstructed += axis.forward_weights[
-                        begin + static_cast<std::uint32_t>(tap)]
-                        * workspace.native[static_cast<std::size_t>(left + tap)
-                                               * static_cast<std::size_t>(native_stride)
-                                           + static_cast<std::size_t>(x)];
-                }
-                accumulator.add(std::abs(source_row[x] - reconstructed));
-            }
+            add_vertical_reconstruction_row(
+                axis, begin, left, source_row, workspace.native.data(), native_stride,
+                bounds.x_begin, bounds.x_end, accumulator,
+                column_policy != detail::ColumnDispatchPolicy::scalar_only);
         }
     }
     return accumulator.finish(bounds.count);
