@@ -28,8 +28,8 @@
 | PL1 packed topology interning | `REMOVED_AFTER_TEST` | Exact interning removed 77.99% of topology upload bytes but reduced total explicit working set only 6.44% and regressed primary Metal wall 1.16%, missing both alternative keep gates |
 | MK3a persistent working buffers | `KEPT` | Repeated source/workspace/partial allocation falls 3 to 0; the 112-case final matrix has zero path and working-set differences, improves the primary Bicubic case 4.90%, and has no paired-median regression |
 | MK3b plan-upload arena/ring | `REMOVED_AFTER_TEST` | Two/four-slot rings removed all 288 warm plan-buffer allocations and cut allocation/wiring time over 99%, but improved the primary wall only 0.689%/1.043%, below the 3% gate |
-| MK3c packed-content cache | `PENDING_ABI_CHECKPOINT` | Content caching still requires its own exact identity/private packing-ABI checkpoint and independent cold/warm/eviction gate |
-| MK4 Float16 coefficient storage | `PENDING_PREREQUISITES` | Strict Float32 remains the only retained path |
+| MK3c packed-content cache | `DEFERRED_IDENTITY_CHECKPOINT` | The backend-only digest fallback must hash about 82.09 MB before every hit and has no measured headroom for the wall gate; propagating the planner's canonical key would cross the isolated planner/frontend boundary |
+| MK4 Float16 coefficient storage | `PENDING_EVALUATION` | MK1-MK3 and CPU/PL decisions are terminal; strict Float32 remains the retained baseline |
 
 ## Final Identity Set
 
@@ -318,7 +318,7 @@ Rejected experiment identities and artifacts:
 - Experimental validation: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/mk3-plan-ring-validation/metal-validation-ctest.log`
 - Post-removal validation: `build/backend-hotpath-evaluator/artifacts/backend-hotpath/mk3-plan-ring-removed-baseline/metal-validation-ctest.log`
 
-## MK3c Readiness Boundary
+## MK3c Packed-Content Cache - Deferred at Identity Boundary
 
 The transient controls allocate 291 Metal buffers per 1000-candidate run; MK3a
 reduces that to 288. The remaining allocations are exactly the nine plan buffers
@@ -328,7 +328,27 @@ allocation API time per call. Those counters overlap GPU execution and must not
 be summed into `wall-GPU` residual, but they identify the next host-side target.
 
 The terminal Stage 1 commit `6eda3ef`, combined integration commit `00e53b9`,
-and terminal PL1/MK3a/MK3b decisions leave packed-content caching as a separate
-experiment. It still requires the stable exact plan identity and private
-packing-ABI checkpoint defined in the design plan; neither the rejected PL1 ABI
-nor the removed MK3b arena establishes that checkpoint.
+and terminal PL1/MK3a/MK3b decisions leave packed-content caching dependent on a
+stable exact plan identity and private packing-ABI checkpoint. Neither the
+rejected PL1 ABI nor the removed MK3b arena establishes that checkpoint.
+
+The planner has an exact request-derived `PlanKey`, but it remains private to
+`src/planner` and is not carried by `AxisPlan` or `CandidateAnalysis`. Propagating
+it would change the planner/backend contract owned by the parallel planner and
+frontend worktree. The only isolated Metal-backend fallback is to digest plan
+content before packing and then perform the required size and byte equality
+check before every hit.
+
+That fallback has no credible performance headroom on the measured primary:
+each call uploads 82,092,704 plan bytes, while local SHA-256 throughput for large
+blocks is 3.413 GB/s. One digest alone therefore costs approximately 24.1 ms,
+before the equality pass. By comparison, removing every warm plan allocation
+and reducing plan upload by about 3.3 ms improved backend wall only
+0.689%-1.043%. A digest-keyed cache has no measured headroom for the required 3%
+wall improvement and would likely regress the cold and eviction-heavy gates.
+
+MK3c is therefore `DEFERRED_IDENTITY_CHECKPOINT` in this isolated backend branch,
+not implemented with pointer identity or an expensive content digest. Reopen it
+only after the planner interface deliberately exposes an immutable canonical key
+and the private Metal packing ABI is versioned; that future change must be
+coordinated when the parallel planner/frontend branch is merged.
