@@ -272,13 +272,15 @@ void inverse_columns_x86_tile(
     }
 }
 
-template <class Operations, std::int32_t FixedHalfBandwidth>
+template <class Operations, std::int32_t FixedHalfBandwidth,
+          std::int32_t TileVectors = Operations::tile_vectors>
 void inverse_columns_x86_impl(
     const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
     float *output, std::ptrdiff_t output_row_stride,
     std::int32_t column_count) noexcept {
     constexpr std::int32_t lanes = Operations::lanes;
-    constexpr std::int32_t tile_vectors = Operations::tile_vectors;
+    constexpr std::int32_t tile_vectors = TileVectors;
+    static_assert(tile_vectors >= 1 && tile_vectors <= 3);
     constexpr std::int32_t tile_columns = lanes * tile_vectors;
 
     std::int32_t column = 0;

@@ -223,7 +223,7 @@ void test_materialized_inverse_columns(
         getnative::BorderMode::mirror,
     };
     const std::vector<std::int32_t> column_counts{
-        0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63,
+        0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63,
     };
     const std::int32_t lanes = lane_count(selected_isa);
 

@@ -2,6 +2,14 @@
 
 #include <immintrin.h>
 
+#if defined(_MSC_VER)
+#define GETNATIVE_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define GETNATIVE_NOINLINE __attribute__((noinline))
+#else
+#define GETNATIVE_NOINLINE
+#endif
+
 namespace getnative::detail {
 namespace {
 
@@ -51,12 +59,30 @@ struct Avx2Operations {
     return sum;
 }
 
+GETNATIVE_NOINLINE void inverse_columns_avx2_support3_b5_f6_f32(
+    const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
+    float *output, std::ptrdiff_t output_row_stride,
+    std::int32_t column_count) noexcept;
+
 } // namespace
 
 void inverse_columns_avx2_f32(
     const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
     float *output, std::ptrdiff_t output_row_stride,
     std::int32_t column_count) noexcept {
+    // Keep both the default 24-column and specialized 16-column paths tail-free.
+    constexpr std::int32_t specialized_tile_columns = Avx2Operations::lanes * 2;
+    constexpr std::int32_t default_tile_columns = Avx2Operations::lanes * 3;
+    if (column_count >= specialized_tile_columns * 3
+        && column_count % specialized_tile_columns == 0
+        && column_count % default_tile_columns == 0
+        && plan.support == 3 && plan.half_bandwidth == 5
+        && plan.forward_width == 6) {
+        inverse_columns_avx2_support3_b5_f6_f32(
+            plan, input, input_row_stride, output, output_row_stride,
+            column_count);
+        return;
+    }
     inverse_columns_x86<Avx2Operations>(
         plan, input, input_row_stride, output, output_row_stride, column_count);
 }
@@ -116,4 +142,18 @@ double vertical_reconstruction_norm1_avx2_f32(
     return sum;
 }
 
+namespace {
+
+GETNATIVE_NOINLINE void inverse_columns_avx2_support3_b5_f6_f32(
+    const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
+    float *output, std::ptrdiff_t output_row_stride,
+    std::int32_t column_count) noexcept {
+    inverse_columns_x86_impl<Avx2Operations, 0, 2>(
+        plan, input, input_row_stride, output, output_row_stride, column_count);
+}
+
+} // namespace
+
 } // namespace getnative::detail
+
+#undef GETNATIVE_NOINLINE
