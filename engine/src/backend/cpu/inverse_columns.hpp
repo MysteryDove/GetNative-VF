@@ -23,11 +23,17 @@ using VerticalReconstructionBlockFunction = void (*)(
     const AxisPlan &plan, std::uint32_t begin, std::int32_t left,
     const float *source, const float *native, std::ptrdiff_t native_stride,
     std::int32_t x, float *differences) noexcept;
+using VerticalReconstructionNorm1RowFunction = double (*)(
+    const AxisPlan &plan, std::uint32_t begin, std::int32_t left,
+    const float *source, const float *native, std::ptrdiff_t native_stride,
+    std::int32_t x_begin, std::int32_t x_end, float threshold,
+    double sum) noexcept;
 
 struct AnalysisRowDispatch {
     std::int32_t lanes = 1;
     AbsoluteDifferenceBlockFunction absolute_difference = nullptr;
     VerticalReconstructionBlockFunction vertical_reconstruction = nullptr;
+    VerticalReconstructionNorm1RowFunction vertical_reconstruction_norm1 = nullptr;
 };
 
 [[nodiscard]] bool column_simd_available() noexcept;

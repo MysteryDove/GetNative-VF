@@ -109,6 +109,11 @@ public:
                                  1.0 / static_cast<double>(metric_.norm));
     }
 
+    [[nodiscard]] bool is_norm1() const noexcept { return metric_.norm == 1U; }
+    [[nodiscard]] float threshold() const noexcept { return metric_.threshold; }
+    [[nodiscard]] double norm1_sum() const noexcept { return sum_; }
+    void set_norm1_sum(double sum) noexcept { sum_ = sum; }
+
 private:
     void add_scaled(double difference) {
         const double exponent = static_cast<double>(metric_.norm);
@@ -199,7 +204,17 @@ void add_vertical_reconstruction_row(
         }
     }
 #endif
-    if (dispatch.vertical_reconstruction != nullptr) {
+    if (accumulator.is_norm1()
+        && dispatch.vertical_reconstruction_norm1 != nullptr) {
+        const std::int32_t vector_end = x
+            + (x_end - x) / dispatch.lanes * dispatch.lanes;
+        if (x < vector_end) {
+            accumulator.set_norm1_sum(dispatch.vertical_reconstruction_norm1(
+                plan, begin, left, source, native, native_stride,
+                x, vector_end, accumulator.threshold(), accumulator.norm1_sum()));
+            x = vector_end;
+        }
+    } else if (dispatch.vertical_reconstruction != nullptr) {
         alignas(64) float differences[16];
         for (; x <= x_end - dispatch.lanes; x += dispatch.lanes) {
             dispatch.vertical_reconstruction(

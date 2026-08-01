@@ -615,6 +615,71 @@ void test_absolute_difference_block_boundaries(
     }
 }
 
+void test_vertical_reconstruction_norm1_fusion(
+    getnative::detail::ColumnDispatchPolicy policy) {
+    const getnative::detail::AnalysisRowDispatch dispatch =
+        getnative::detail::analysis_row_dispatch(policy);
+    if (dispatch.vertical_reconstruction == nullptr
+        || dispatch.vertical_reconstruction_norm1 == nullptr) {
+        return;
+    }
+
+    constexpr float threshold = 0.015F;
+    const float below = std::nextafter(threshold, 0.0F);
+    const float above = std::nextafter(threshold, 1.0F);
+    const std::vector<float> values{
+        0.0F,
+        -0.0F,
+        std::numeric_limits<float>::denorm_min(),
+        -std::numeric_limits<float>::denorm_min(),
+        below,
+        threshold,
+        above,
+        -below,
+        -threshold,
+        -above,
+        0.125F,
+        -0.25F,
+    };
+    const std::int32_t x_begin = 1;
+    const std::int32_t x_end = x_begin + 3 * dispatch.lanes;
+    std::vector<float> source(static_cast<std::size_t>(x_end), 0.0F);
+    for (std::int32_t x = x_begin; x < x_end; ++x) {
+        source[static_cast<std::size_t>(x)] = values[
+            static_cast<std::size_t>(x - x_begin) % values.size()];
+    }
+
+    const auto plan = getnative::build_axis_plan({
+        31, 17, 17.25, 0.125, getnative::Filter::bicubic(0.0, 0.5),
+        getnative::BorderMode::mirror,
+    });
+    const std::int32_t y = 15;
+    const std::uint32_t begin = plan.forward_offsets[static_cast<std::size_t>(y)];
+    const std::int32_t left = plan.forward_indices[begin];
+    const std::ptrdiff_t native_stride = x_end + 3;
+    std::vector<float> native(
+        static_cast<std::size_t>(plan.destination_size * native_stride), 0.0F);
+
+    double expected = 0.375;
+    alignas(64) float differences[16];
+    for (std::int32_t x = x_begin; x < x_end; x += dispatch.lanes) {
+        dispatch.vertical_reconstruction(
+            plan, begin, left, source.data(), native.data(), native_stride,
+            x, differences);
+        for (std::int32_t lane = 0; lane < dispatch.lanes; ++lane) {
+            if (differences[lane] > threshold) {
+                expected += static_cast<double>(differences[lane]);
+            }
+        }
+    }
+    const double actual = dispatch.vertical_reconstruction_norm1(
+        plan, begin, left, source.data(), native.data(), native_stride,
+        x_begin, x_end, threshold, 0.375);
+    expect(std::bit_cast<std::uint64_t>(actual)
+               == std::bit_cast<std::uint64_t>(expected),
+           "fused norm-1 row preserves strict threshold and accumulation order");
+}
+
 void test_batch_surface(getnative::detail::ColumnDispatchPolicy policy) {
     constexpr std::int32_t width = 33;
     constexpr std::int32_t height = 31;
@@ -736,6 +801,7 @@ int main(int argc, char **argv) {
         test_all_filters_across_axes(policy);
         test_all_cpu_shape_widths(policy);
         test_absolute_difference_block_boundaries(policy);
+        test_vertical_reconstruction_norm1_fusion(policy);
         test_batch_surface(policy);
         test_threshold_boundary();
         test_mxcsr_unchanged(policy);

@@ -20,6 +20,11 @@ void vertical_reconstruction_sse2_f32(
     const AxisPlan &plan, std::uint32_t begin, std::int32_t left,
     const float *source, const float *native, std::ptrdiff_t native_stride,
     std::int32_t x, float *differences) noexcept;
+double vertical_reconstruction_norm1_sse2_f32(
+    const AxisPlan &plan, std::uint32_t begin, std::int32_t left,
+    const float *source, const float *native, std::ptrdiff_t native_stride,
+    std::int32_t x_begin, std::int32_t x_end, float threshold,
+    double sum) noexcept;
 #endif
 #if GETNATIVE_X86_AVX2_COMPILED
 void inverse_columns_avx2_f32(
@@ -32,6 +37,11 @@ void vertical_reconstruction_avx2_f32(
     const AxisPlan &plan, std::uint32_t begin, std::int32_t left,
     const float *source, const float *native, std::ptrdiff_t native_stride,
     std::int32_t x, float *differences) noexcept;
+double vertical_reconstruction_norm1_avx2_f32(
+    const AxisPlan &plan, std::uint32_t begin, std::int32_t left,
+    const float *source, const float *native, std::ptrdiff_t native_stride,
+    std::int32_t x_begin, std::int32_t x_end, float threshold,
+    double sum) noexcept;
 #endif
 #if GETNATIVE_X86_AVX512_COMPILED
 void inverse_columns_avx512_f32(
@@ -44,6 +54,11 @@ void vertical_reconstruction_avx512_f32(
     const AxisPlan &plan, std::uint32_t begin, std::int32_t left,
     const float *source, const float *native, std::ptrdiff_t native_stride,
     std::int32_t x, float *differences) noexcept;
+double vertical_reconstruction_norm1_avx512_f32(
+    const AxisPlan &plan, std::uint32_t begin, std::int32_t left,
+    const float *source, const float *native, std::ptrdiff_t native_stride,
+    std::int32_t x_begin, std::int32_t x_end, float threshold,
+    double sum) noexcept;
 #endif
 
 namespace {
@@ -135,19 +150,22 @@ AnalysisRowDispatch analysis_row_dispatch(ColumnDispatchPolicy policy) {
         return {};
     case CpuIsa::sse2:
 #if GETNATIVE_X86_SSE2_COMPILED
-        return {4, absolute_difference_sse2_f32, vertical_reconstruction_sse2_f32};
+        return {4, absolute_difference_sse2_f32, vertical_reconstruction_sse2_f32,
+                vertical_reconstruction_norm1_sse2_f32};
 #else
         break;
 #endif
     case CpuIsa::avx2:
 #if GETNATIVE_X86_AVX2_COMPILED
-        return {8, absolute_difference_avx2_f32, vertical_reconstruction_avx2_f32};
+        return {8, absolute_difference_avx2_f32, vertical_reconstruction_avx2_f32,
+                vertical_reconstruction_norm1_avx2_f32};
 #else
         break;
 #endif
     case CpuIsa::avx512:
 #if GETNATIVE_X86_AVX512_COMPILED
-        return {16, absolute_difference_avx512_f32, vertical_reconstruction_avx512_f32};
+        return {16, absolute_difference_avx512_f32, vertical_reconstruction_avx512_f32,
+                vertical_reconstruction_norm1_avx512_f32};
 #else
         break;
 #endif
