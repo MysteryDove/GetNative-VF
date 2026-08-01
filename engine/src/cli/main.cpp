@@ -1,7 +1,14 @@
 #include "getnative/crop_geometry.hpp"
+#include "getnative/cpu_features.hpp"
 #include "getnative/profile.hpp"
 #if defined(GETNATIVE_HAS_METAL)
 #include "getnative/metal_analysis.hpp"
+#endif
+#if defined(GETNATIVE_HAS_CUDA)
+#include "getnative/cuda_analysis.hpp"
+#endif
+#if defined(GETNATIVE_HAS_VULKAN)
+#include "getnative/vulkan_analysis.hpp"
 #endif
 
 #include <charconv>
@@ -62,7 +69,6 @@ std::string number(double value) {
     return stream.str();
 }
 
-#if defined(GETNATIVE_HAS_METAL)
 std::string json_string(std::string_view value) {
     std::string result;
     result.reserve(value.size() + 2U);
@@ -80,10 +86,26 @@ std::string json_string(std::string_view value) {
     result.push_back('"');
     return result;
 }
-#endif
+
+void print_isa_set(const getnative::CpuIsaSet &set) {
+    std::cout << '[';
+    bool first = true;
+    auto append = [&](getnative::CpuIsa isa, bool present) {
+        if (!present) return;
+        if (!first) std::cout << ',';
+        first = false;
+        std::cout << json_string(getnative::cpu_isa_name(isa));
+    };
+    append(getnative::CpuIsa::scalar, set.scalar);
+    append(getnative::CpuIsa::sse2, set.sse2);
+    append(getnative::CpuIsa::avx2, set.avx2);
+    append(getnative::CpuIsa::avx512, set.avx512);
+    std::cout << ']';
+}
 
 void print_capabilities() {
-    std::cout << "{\"schema_version\":2,\"engine\":\"getnative-engine\",\"version\":\"0.1.0\","
+    const getnative::CpuDispatchInfo cpu = getnative::cpu_dispatch_info();
+    std::cout << "{\"schema_version\":3,\"engine\":\"getnative-engine\",\"version\":\"0.1.0\","
                  "\"commands\":{\"capabilities\":true,\"geometry\":true,\"analyze\":false},"
                  "\"kernels\":["
                  "{\"id\":\"bilinear\",\"parameters\":{\"kind\":\"none\"}},"
@@ -99,7 +121,14 @@ void print_capabilities() {
                  "\"analysis_command_available\":false,"
                  "\"axes\":[\"horizontal\",\"vertical\",\"both\"],"
                  "\"p_norms\":{\"minimum\":1,\"maximum\":4294967295},"
-                 "\"max_half_bandwidth\":29,\"max_forward_width\":30}";
+                 "\"max_half_bandwidth\":29,\"max_forward_width\":30,"
+                 "\"compiled_isa\":";
+    print_isa_set(cpu.compiled);
+    std::cout << ",\"available_isa\":";
+    print_isa_set(cpu.available);
+    std::cout << ",\"selected_isa\":" << json_string(getnative::cpu_isa_name(cpu.selected))
+              << ",\"math_modes\":[\"production\"],\"selected_math_mode\":\"production\","
+                 "\"selection_reason\":" << json_string(cpu.selection_reason) << '}';
 #if defined(GETNATIVE_HAS_METAL)
     try {
         const getnative::MetalAnalysisEngine metal;
@@ -127,10 +156,65 @@ void print_capabilities() {
                  "\"max_half_bandwidth\":null,\"max_forward_width\":null,"
                  "\"reason\":\"not compiled\"}";
 #endif
+#if defined(GETNATIVE_HAS_CUDA)
+    try {
+        const getnative::CudaAnalysisEngine cuda;
+        const auto &device = cuda.device_info();
+        std::cout << ",{\"id\":\"cuda\",\"compiled\":true,\"device_available\":true,"
+                     "\"analysis_command_available\":false,"
+                     "\"axes\":[\"horizontal\",\"vertical\",\"both\"],"
+                     "\"p_norms\":{\"minimum\":1,\"maximum\":1},"
+                     "\"max_half_bandwidth\":15,\"max_forward_width\":16,\"device\":"
+                  << json_string(device.name)
+                  << ",\"uuid\":" << json_string(device.uuid)
+                  << ",\"compute_capability\":"
+                  << json_string(std::to_string(device.compute_capability_major) + "."
+                                 + std::to_string(device.compute_capability_minor))
+                  << ",\"driver_version\":" << device.driver_version
+                  << ",\"total_memory_bytes\":" << device.total_memory_bytes << '}';
+    } catch (const std::exception &error) {
+        std::cout << ",{\"id\":\"cuda\",\"compiled\":true,\"device_available\":false,"
+                     "\"analysis_command_available\":false,"
+                     "\"axes\":[\"horizontal\",\"vertical\",\"both\"],"
+                     "\"p_norms\":{\"minimum\":1,\"maximum\":1},"
+                     "\"max_half_bandwidth\":15,\"max_forward_width\":16,\"reason\":"
+                  << json_string(error.what()) << '}';
+    }
+#else
     std::cout << ",{\"id\":\"cuda\",\"compiled\":false,\"device_available\":false,"
                  "\"analysis_command_available\":false,\"axes\":[],\"p_norms\":null,"
                  "\"max_half_bandwidth\":null,\"max_forward_width\":null,"
                  "\"reason\":\"not compiled\"}";
+#endif
+#if defined(GETNATIVE_HAS_VULKAN)
+    try {
+        const getnative::VulkanAnalysisEngine vulkan;
+        const auto &device = vulkan.device_info();
+        std::cout << ",{\"id\":\"vulkan\",\"compiled\":true,\"device_available\":true,"
+                     "\"analysis_command_available\":false,"
+                     "\"axes\":[\"horizontal\",\"vertical\",\"both\"],"
+                     "\"p_norms\":{\"minimum\":1,\"maximum\":1},"
+                     "\"max_half_bandwidth\":15,\"max_forward_width\":16,\"device\":"
+                  << json_string(device.name)
+                  << ",\"selector\":" << json_string(device.stable_selector)
+                  << ",\"vendor_id\":" << device.vendor_id
+                  << ",\"device_id\":" << device.device_id
+                  << ",\"api_version\":" << device.api_version
+                  << ",\"driver_version\":" << device.driver_version << '}';
+    } catch (const std::exception &error) {
+        std::cout << ",{\"id\":\"vulkan\",\"compiled\":true,\"device_available\":false,"
+                     "\"analysis_command_available\":false,"
+                     "\"axes\":[\"horizontal\",\"vertical\",\"both\"],"
+                     "\"p_norms\":{\"minimum\":1,\"maximum\":1},"
+                     "\"max_half_bandwidth\":15,\"max_forward_width\":16,\"reason\":"
+                  << json_string(error.what()) << '}';
+    }
+#else
+    std::cout << ",{\"id\":\"vulkan\",\"compiled\":false,\"device_available\":false,"
+                 "\"analysis_command_available\":false,\"axes\":[],\"p_norms\":null,"
+                 "\"max_half_bandwidth\":null,\"max_forward_width\":null,"
+                 "\"reason\":\"not compiled\"}";
+#endif
     std::cout << "],\"profiles\":[";
     bool first = true;
     for (const auto& value : getnative::profiles()) {

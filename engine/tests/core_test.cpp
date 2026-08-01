@@ -514,8 +514,26 @@ void test_invalid_inputs_are_rejected() {
     expect_throws([] { (void)getnative::build_axis_plan({0, 8, 8.0}); }, "zero source size is rejected");
     expect_throws([] { (void)getnative::build_axis_plan({8, 0, 8.0}); }, "zero destination size is rejected");
     expect_throws([] { (void)getnative::build_axis_plan({8, 8, 0.0}); }, "zero active length is rejected");
-    expect_throws([] { (void)getnative::build_axis_plan({8, 8, 8.0, std::numeric_limits<double>::infinity()}); },
-                  "nonfinite shift is rejected");
+    for (const double nonfinite : {
+             std::numeric_limits<double>::quiet_NaN(),
+             std::numeric_limits<double>::infinity(),
+             -std::numeric_limits<double>::infinity(),
+         }) {
+        expect_throws([=] { (void)getnative::build_axis_plan({8, 8, nonfinite}); },
+                      "nonfinite active length is rejected");
+        expect_throws([=] { (void)getnative::build_axis_plan({8, 8, 8.0, nonfinite}); },
+                      "nonfinite shift is rejected");
+        expect_throws<std::runtime_error>([=] {
+            (void)getnative::build_axis_plan({
+                8, 8, 8.0, 0.0, getnative::Filter::bicubic(nonfinite, 0.5),
+            });
+        }, "nonfinite bicubic B is rejected");
+        expect_throws<std::runtime_error>([=] {
+            (void)getnative::build_axis_plan({
+                8, 8, 8.0, 0.0, getnative::Filter::bicubic(0.0, nonfinite),
+            });
+        }, "nonfinite bicubic C is rejected");
+    }
     expect_throws<std::out_of_range>([] {
         (void)getnative::build_axis_plan({
             8, 8, 8.0, std::numeric_limits<double>::max(),

@@ -3,7 +3,9 @@
 #include "getnative/axis_plan.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace getnative::detail {
 
@@ -19,6 +21,16 @@ enum class BicubicGeometryMode {
 
 struct AxisPlanGeometry;
 
+struct AxisPlanBuildScratch {
+    std::vector<std::uint32_t> descale_offsets;
+    std::vector<std::int32_t> descale_indices;
+    std::vector<double> descale_weights;
+    std::vector<std::uint32_t> forward_offsets;
+    std::vector<std::int32_t> forward_indices;
+    std::vector<double> forward_weights;
+    std::vector<double> normal_bands;
+};
+
 [[nodiscard]] AxisPlan build_axis_plan_with_tap_evaluation(
     const AxisPlanRequest &request,
     TapEvaluationMode mode);
@@ -30,6 +42,7 @@ struct AxisPlanGeometry;
 [[nodiscard]] AxisPlan build_axis_plan_with_geometry(
     const AxisPlanRequest &request,
     TapEvaluationMode tap_evaluation,
-    const AxisPlanGeometry *geometry);
+    const AxisPlanGeometry *geometry,
+    AxisPlanBuildScratch *scratch = nullptr);
 
 } // namespace getnative::detail

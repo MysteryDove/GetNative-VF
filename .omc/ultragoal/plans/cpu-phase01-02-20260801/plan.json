@@ -1,0 +1,37 @@
+﻿{
+    "created":  "2026-08-01T00:30:54.2743715+08:00",
+    "goals":  [
+                  {
+                      "status":  "in_progress",
+                      "title":  "Monitor Phase0 baseline",
+                      "id":  "G001",
+                      "objective":  "Track 12-run serial baseline to completion; no competing CPU load"
+                  },
+                  {
+                      "status":  "pending",
+                      "title":  "Close Phase1",
+                      "id":  "G002",
+                      "objective":  "FMA scan, production tolerance, ISA uplift table, math_mode=production"
+                  },
+                  {
+                      "status":  "pending",
+                      "title":  "Architecture layer map",
+                      "id":  "G003",
+                      "objective":  "Document algorithm/structure/ISA/microarch layers vs current tree"
+                  },
+                  {
+                      "status":  "pending",
+                      "title":  "uProf profiles",
+                      "id":  "G004",
+                      "objective":  "Capture typical hotspots for bicubic-catrom@810 avx2/auto"
+                  },
+                  {
+                      "status":  "pending",
+                      "title":  "Phase2 structure opts",
+                      "id":  "G005",
+                      "objective":  "Profiler-guided generic structure opts only; freeze denominator"
+                  }
+              ],
+    "mode":  "aggregate",
+    "planId":  "cpu-phase01-02-20260801"
+}

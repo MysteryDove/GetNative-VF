@@ -2,17 +2,26 @@
 
 ## 1. 任务目标和交付边界
 
-本文件用于把 GetNative VF 的 Windows backend 开发交给另一名 agent。目标不是写独立 SIMD/CUDA/Vulkan demo，而是在现有 C++23 engine 中交付一个可回退的 x86 CPU 优化路径，以及两个可选、可诊断、可测试的 strict GPU backend：
+本文件用于把 GetNative VF 的 Windows backend 开发交给另一名 agent。目标不是写独立 SIMD/CUDA/Vulkan demo，而是在现有 C++23 engine 中交付一个可回退的 x86 CPU 优化路径，以及两个可选、可诊断、可测试的 **极致优化 GPU backend**：
 
-1. Windows x64 CPU：SSE2 strict fallback、AVX2 strict tier 和 AVX-512 strict tier。
-2. Windows x64 + NVIDIA CUDA Driver API。
-3. Windows x64 + Vulkan Compute。
+1. Windows x64 CPU：SSE2 / AVX2 / AVX-512 **production** ISA 分层（允许 FMA；正确性用 tolerance，不要求与 scalar bit-identical）。
+2. Windows x64 + NVIDIA CUDA Driver API：**单一生产 artifact**，以数学输出精度 + 端到端性能为成功标准，并用 PTX/SASS 把 codegen 推到极限。
+3. Windows x64 + Vulkan Compute：**单一生产 SPIR-V 路径**，目标与 CUDA 相同。
 
-x86 CPU strict 路径先完成，因为它既是 Windows fallback，也是 CUDA/Vulkan 性能结论的真实分母。随后 CUDA 优先；Vulkan 在共享 GPU packing、数值契约和测试矩阵稳定后实现。三个执行路径都必须消费 CPU planner 生成的同一份 Float32 `AxisPlan`。x86 SIMD 以当前 scalar/NEON 路径为语义参考，CUDA/Vulkan 以当前 Metal backend 的算法、调度、失败处理和遥测为主要实现参考。
+**CPU / GPU 数学路径政策（本 handover 权威定义，覆盖任何旧草稿或中间实现）：**
+
+- CPU 与 GPU 均为 **production** 路径：允许并鼓励 FP32 FMA；目标是输出精度 + 性能，不是“与 scalar 逐位同路径”。
+- CPU capability 使用 `math_modes: ["production"]` / `selected_math_mode: "production"`（单档，不是 multi-mode 切换面）。
+- **不实现** CUDA/Vulkan 的 `strict` 数学通路（禁 FMA / 字面 SASS 无 HFMA / 为过扫描而 `-Xptxas=-O0` 等）。
+- **不实现** 独立的 `fast-math` 产品/测试数学通路，也不得并列维护多套 math-mode fatbin/SPIR-V 供运行时切换。
+- GPU 正确性由真实设备上的 metric tolerance、valley/order 与 generic/specialized 一致性判定。
+- capability / provenance 对 GPU **不要** 暴露 `math_modes: [strict, relaxed-fma, fast-math]` 多档切换。
+
+x86 CPU production 路径先完成，因为它既是 Windows fallback，也是 CUDA/Vulkan 性能结论的真实分母。随后 CUDA 优先；Vulkan 在共享 GPU packing、数值契约和测试矩阵稳定后实现。三个执行路径都必须消费 CPU planner 生成的同一份 Float32 `AxisPlan`。AArch64 NEON 与 x86 production 同样允许 FMA；planner 的 Float64/LDLT 契约不变。
 
 本任务有两个不同完成层级，不能混称：
 
-- **Backend 完成**：x86 CPU runtime dispatch 与 strict SIMD、GPU C++ library、真实 GPU 执行、conformance、benchmark、capability 和 Windows packaging 完成。此时如果真实 `analyze` 命令仍不存在，`commands.analyze` 与 `analysis_command_available` 必须保持 `false`。
+- **Backend 完成**：x86 CPU runtime dispatch 与 production SIMD、GPU C++ library、真实 GPU 执行、conformance、benchmark、capability 和 Windows packaging 完成。此时如果真实 `analyze` 命令仍不存在，`commands.analyze` 与 `analysis_command_available` 必须保持 `false`。
 - **产品端到端完成**：持久 worker/CLI analyze protocol、Tauri job controller、前端 analysis planner、进度、取消和结果展示也已接通。当前仓库尚未达到这一层。
 
 本次不包含媒体解码、色彩转换、导出格式或新滤镜语义。不要为了接 SIMD/GPU 而扩展这些范围。也不要把 planner 的 Float64 tap、normal-band 或 LDLT 构造纳入 x86 SIMD 第一阶段；当前 planner 已有独立的 batch/cache 性能证据和边界。
@@ -113,7 +122,7 @@ Get-FileHash -Path @(
 - Verification：一个 engine Run 是一个 Source、一个固定 locked Recipe、多个 frame。
 - 多 Sample、多固定 kernel 或多 Source 是 UI-level `RunGroup`，成员失败、取消和 provenance 独立；不能拼成一个越界 engine request。
 - H+W、H-only、W-only 都是一级轴模式。
-- Recipe 锁定 geometry、kernel、MetricSpec、compatibility profile 和 math mode；backend/device 属于 Run provenance。
+- Recipe 锁定 geometry、kernel、MetricSpec、compatibility profile；CPU 侧 math mode 固定 strict。GPU 无多档 math mode。backend/device 属于 Run provenance。
 - backend fallback 必须可见并写 provenance，不能静默发生。
 
 这些是 Windows backend 最终要服务的调用形状，但当前 tree 中没有 `HeightRun`、`KernelRun`、`VerificationRun`、`RunGroup` 或 Recipe persistence 的实现。不要在 backend 内发明临时 JSON schema 来替代产品 integration lane。
@@ -382,7 +391,7 @@ CPU core 支持 Lanczos1-15，因此 capability 为 `max_half_bandwidth=29`、`m
 
 CPU 精确参考见 `engine/src/planner/axis_plan.cpp:1010-1097` 和 `engine/src/backend/cpu/cpu_analysis.cpp:327-408`。Metal 对应见 `engine/src/backend/metal/getnative.metal:47-121` 与 `engine/src/backend/metal/getnative.metal:331-402`。
 
-strict 不是 bitwise CPU/GPU 相等承诺。CUDA 禁止 `--use_fast_math`，应以 `--fmad=false` 等 strict artifact flags 起步；Vulkan 关键结果使用 SPIR-V `NoContraction`。最终正确性仍由真实设备逐 candidate tolerance 和 valley 测试决定。
+GPU **不是** bitwise CPU/GPU 相等承诺，也 **不是** “与 CPU 相同中间舍入路径”的承诺。CUDA/Vulkan 的正确性以真实设备上逐 candidate metric tolerance、finite、order 与 valley/top-k 门槛为准（见第 15.4 节）。允许 FP32 FMA 与正常后端优化；不得为了“SASS 里看不到 FMA 字样”而关闭 ptxas 优化或维护第二条 slow/reference 数学通路。
 
 Float16 coefficient storage 已因 Lanczos8 valley 漂移被移除，见 `docs/backend-hotpath-evidence.md:32`。不得在 Windows MVP 中重新引入。
 
@@ -648,18 +657,18 @@ engine/bench/vulkan_benchmark.cpp
 
 当前 `engine/src/backend/cpu/inverse_columns.cpp` 只有编译期 AArch64 NEON 分支；x86 上 `column_simd_available()` 返回 false，`column_simd_name()` 返回 `scalar`。`engine/src/backend/cpu/cpu_analysis.cpp:134-202` 的 absolute-difference row 和 vertical reconstruction row 也只有 NEON/scalar 两套实现。因此 Windows x64 目前可正确运行，但实际执行路径是 scalar，不得把 C++ 编译器可能发生的自动向量化称为 x86 backend。
 
-本任务必须保留 scalar oracle，并新增三个可诊断的 strict 执行层级：
+本任务必须保留 scalar **forced 回退**，并交付三个可诊断的 **production** ISA 执行层级（均可使用 FMA；正确性用 tolerance，不要求与 scalar 逐位一致）：
 
-| ISA/math tier | 向量宽度 | 必须能力 | 语义 |
+| ISA tier | 向量宽度 | 必须能力 | 语义 |
 | --- | ---: | --- | --- |
-| `scalar/strict` | 1 | baseline C++ | 永久保留的 oracle、强制测试和最终回退 |
-| `sse2/strict` | 4 x Float32 | SSE2 | Windows x64 的“SSE 回退”；不要实现成要求 SSE4.1/AVX 的伪 fallback |
-| `avx2/strict` | 8 x Float32 | AVX、OSXSAVE、XMM/YMM state、AVX2 | 使用 AVX2 数据宽度，但关键乘加仍拆成 multiply 后 add/sub，不发射 FMA |
-| `avx512/strict` | 16 x Float32 | AVX-512 OS state、AVX512F 和实际代码发射的全部扩展 | 关键乘加不 contraction；只使用 capability probe 已验证的指令子集 |
+| `scalar` | 1 | baseline C++ | 强制回退与诊断；实现使用 `std::fma` |
+| `sse2` | 4 x Float32 | SSE2 | Windows x64 最低 SIMD 回退；无硬件 FMA 时用 mul+add 仿真 fused 接口 |
+| `avx2` | 8 x Float32 | AVX、OSXSAVE、XMM/YMM state、AVX2、FMA | 使用 `_mm256_fmadd_ps` / `_mm256_fnmadd_ps` |
+| `avx512` | 16 x Float32 | AVX-512 OS state、AVX512F（及代码实际用到的扩展）、FMA | 使用 `_mm512_fmadd_ps` / `_mm512_fnmadd_ps` |
 
-FMA 优化明确不在本 handover 范围内。它虽然可能减少指令，但 fused operation 只舍入一次，会改变当前 scalar/NEON 的 Float32 bits；而当前 engine、CLI、Tauri 和 React 尚无可执行的 fast-math job 链路。Windows agent 不得增加此执行路径。
+AArch64 NEON production 路径同样使用 `vfmaq`/`vfmsq`。CPU 与 GPU 一致：**允许并鼓励 FMA**。
 
-默认 strict dispatch 的候选顺序是：
+默认 production dispatch 的候选顺序是：
 
 ```text
 AVX-512 -> AVX2 -> SSE2 -> scalar
@@ -687,30 +696,31 @@ CPUID 能力不代表 OS 已保存扩展寄存器。禁止只看 AVX/AVX2/AVX-51
 --cpu-isa auto|scalar|sse2|avx2|avx512
 ```
 
-本 handover 的 CPU math mode 固定为 `strict`。测试 override 不应变成不受校验的全局环境开关；若使用环境变量，只允许 test/benchmark process 读取，并输出 forced provenance。
+本 handover 的 CPU math mode 固定为 **`production`**（允许 FMA）。测试 override 不应变成不受校验的全局环境开关；若使用环境变量，只允许 test/benchmark process 读取，并输出 forced provenance。
 
 ### 10.3 Translation unit 和编译隔离
 
 ISA-specific code 必须放在独立 translation unit 或 object library；baseline dispatcher、planner、CLI 和公共 CPU API 不得继承高阶 ISA flag：
 
 - baseline/feature probe：x64 baseline，不含 AVX 指令；
-- SSE2 strict：MSVC x64 baseline 或 source-local SSE2，clang-cl `-msse2`；
-- AVX2 strict：仅该 object 使用 `/arch:AVX2`，或 clang-cl `-mavx2 -ffp-contract=off`；
-- AVX-512 strict：仅该 object 使用 `/arch:AVX512`，或 clang-cl 按实际最低子集启用 `-mavx512f` 等 flags，并保持 contraction off。
+- SSE2 production：MSVC x64 baseline 或 source-local SSE2，clang-cl `-msse2`；
+- AVX2 production：仅该 object 使用 `/arch:AVX2`，或 clang-cl `-mavx2 -mfma`；
+- AVX-512 production：仅该 object 使用 `/arch:AVX512`，或 clang-cl `-mavx512f -mfma`（及代码实际需要的子集）。
 
 若 P1 被保留，`cpu_analysis.cpp` 只负责调用 baseline-safe private dispatcher；SSE2/AVX2/AVX-512 row intrinsics 仍分别编译在对应 ISA object 中。
 
-不得对 `getnative_core`、engine executable、tests 或 package 全局设置 `/arch:AVX2`、`/arch:AVX512`、`-mavx2` 或 `-mavx512*`。否则 dispatcher 本身可能在 feature check 前执行高阶指令，使 SSE2 fallback 失效。构建后必须反汇编 baseline/SSE2/AVX2-strict/AVX-512 objects：baseline/SSE2 不得出现 VEX/EVEX 指令；全部 strict objects 不得出现 `vfmadd*`/`vfnmadd*`。
+不得对 `getnative_core`、engine executable、tests 或 package 全局设置 `/arch:AVX2`、`/arch:AVX512`、`-mavx2` 或 `-mavx512*`。否则 dispatcher 本身可能在 feature check 前执行高阶指令，使 SSE2 fallback 失效。构建后必须反汇编 baseline/SSE2/AVX2/AVX-512 objects：baseline/SSE2 不得出现高阶 VEX/EVEX 泄漏；**AVX2/AVX-512 production objects 应出现 FMA**（`vfmadd*`/`vfnmadd*` 或等价），作为优化证据而非失败条件。
 
 现有 public `analyze_batch_f32()` 不需要为了 SIMD 改签名。可以扩展 private dispatch policy 和 benchmark/test override；只有产品 planner 真正需要显式 CPU math mode 时，才把受版本控制的 mode 放入 job/Recipe schema。不要让 public caller 传裸 function pointer。
 
-### 10.4 strict 数值契约
+### 10.4 production 数值契约
 
-所有 strict SIMD tier 必须与 scalar 逐 Float32 bit-identical，并保持最终 `double` metric bits 一致：
+CPU production 路径以 **输出精度与性能** 为目标，不要求与 scalar 逐 Float32 bit-identical：
 
-- 每个 lane 内严格保持第 6.5 节的 transpose、forward solve、backward solve 和 reconstruction 次序；
-- 使用显式 multiply，再使用 add/sub；编译器 contraction 关闭；
-- 不能用 horizontal reduction 改变像素顺序。向量 difference 先按 x 递增顺序写回/提取，再依次调用现有 `MetricAccumulator::add()`；
+- 每个 lane 内保持第 6.5 节的 transpose、forward solve、backward solve 和 reconstruction **循环次序**；
+- **允许并鼓励** FP32 FMA（`std::fma`、`vfma*`、`_mm*_fmadd_ps` 等）；SSE2 无硬件 FMA 时用 mul+add 仿真 fused 接口；
+- 正确性：相对 forced scalar（或同次 reference）的 metric 使用与 GPU 同量级的 relative tolerance（默认约 `max(1e-7, 5e-4 * |ref|)`），并保持 finite、candidate id/order、valley 门槛；
+- 不能用 horizontal reduction 改变像素提交顺序。向量 difference 先按 x 递增顺序写回/提取，再依次调用现有 `MetricAccumulator::add()`；
 - 不改变 MXCSR 的 FTZ/DAZ 或 rounding mode；若调用方已有非默认 MXCSR，记录测试边界，不在 library 内修改全局线程状态；
 - fixed `half_bandwidth==1`、`==3` 和 generic path 只可减少 branch，不能重排 B7 的特殊 backward order。
 
@@ -719,13 +729,13 @@ ISA-specific code 必须放在独立 translation unit 或 object library；basel
 | 优先级 | CPU operator | 要求 | 当前参考 |
 | --- | --- | --- | --- |
 | P0 | adjacent-column inverse | SSE2/AVX2/AVX-512 跨相邻列并行；覆盖 `A^T b`、forward solve、B7/generic backward solve；fixed B3/B7 + generic；scalar tail | `inverse_columns_neon.cpp`；descale AVX2 只作寄存器/复用参考 |
-| P1 | vertical reconstruction row | 按 x 向量化 tap multiply/add，再生成 abs difference；strict 保持 tap 顺序和 metric lane 提交顺序 | `cpu_analysis.cpp:162-202` |
+| P1 | vertical reconstruction row | 按 x 向量化 tap FMA/mul-add，再生成 abs difference；保持 tap 顺序和 metric lane 提交顺序 | `cpu_analysis.cpp` |
 | P1 | absolute-difference row | SSE2/AVX2/AVX-512 load/sub/abs，按 x 顺序送入现有 accumulator | `cpu_analysis.cpp:134-160` |
 | P2 | 其他 CPU execution loops | 只在 profiler 证明占比后处理；可评估跨 row/candidate 并行，但不得改变 batch result 顺序 | `cpu_analysis.cpp:274-549` |
 
 P0 完成并通过 conformance/benchmark 后再做 P1；P2 必须有 before/after profiler。不要 SIMD 化 Float64 tap 生成、normal-band 构造、LDLT、`AxisPlanCache` key/admission 或 product planner。它们不是这个 x86 backend 的 kernel，且重排会破坏现有 bit-level upstream 证据。
 
-descale 的 x86 AVX2 代码可以帮助理解宽 load、临时寄存器和 fixed/generic loop，但 GetNative 的 `AxisPlan` 布局、B7 backward order、border semantics 和 bit-identical strict 要求优先。不得复制 descale dense core 或它的 runtime dispatch 作为新架构。
+descale 的 x86 AVX2 代码可以帮助理解宽 load、临时寄存器、FMA 和 fixed/generic loop，但 GetNative 的 `AxisPlan` 布局、B7 backward order 和 border semantics 优先。不得复制 descale dense core 或它的 runtime dispatch 作为新架构。
 
 ### 10.6 Alignment、stride、tail 和边界
 
@@ -801,7 +811,24 @@ Generic 必须先覆盖全部 `half_bandwidth<=15`、`forward_width<=16` 的合�
 17. Vulkan pipeline cache，key 包含 shader hash、device、driver。
 18. p>1，仅在产品需求和新数值契约明确后。
 
-FMA、`half2`、hardware sampler interpolation 和其他 relaxed/fast-math 路径不因“极限优化”重新进入本 handover。性能工作必须优化相同的 `math_mode=strict` artifact。
+### 11.4 GPU 数学路径：仅一条极致优化生产 artifact
+
+本 handover **明确废除** 下列 GPU 设计（若代码树中已出现，必须收敛为单路径，不得继续并列交付）：
+
+- `math_mode=strict` / `--fmad=false` 参考通路，以及任何“为字面 SASS 无 `FFMA|DFMA|HFMA` 而 `-Xptxas=-O0`”的实现；
+- `math_mode=fast-math` / 独立 `--use_fast_math` 产品或测试通路；
+- 运行时在多套 fatbin/SPIR-V 之间切换数学模式的 API（`CudaMathMode`、`VulkanMathMode`、`--cuda-math-mode` 等）。
+
+**唯一允许的 GPU 数学配置** 是极致优化生产路径：
+
+| 目标 | 要求 |
+| --- | --- |
+| 输出精度 | 第 15.4 节 tolerance / valley / order；不以 CPU 中间 Float32 bits 为金标准 |
+| 性能 | 正常 ptxas/驱动优化；FMA、指令调度、寄存器分配全部允许，只要通过正确性门槛 |
+| PTX/SASS | 用来找坏 codegen、spill、访存与指令选择，并把优化推到极限；**不是** 用来证明“没有 FMA” |
+| 交付物 | 每个 backend **一个** 主 fatbin / 主 SPIR-V 集合；profile 构建可加 `-lineinfo`，但数学语义与 release 相同 |
+
+仍禁止：`half2` / Float16 coefficient storage、hardware sampler interpolation 替代 `AxisPlan` 权重、为刷分而改 threshold/crop/candidate order。
 
 ## 12. CUDA 后端要求
 
@@ -809,26 +836,28 @@ FMA、`half2`、hardware sampler interpolation 和其他 relaxed/fast-math 路�
 
 新增 `GETNATIVE_ENABLE_CUDA`，默认 `OFF`。启用时需要 build-time CUDA Toolkit/nvcc，关闭时不查找 CUDA Toolkit。
 
-推荐用 custom command 生成 fatbin，而不是让 host target 自动链接 CUDA runtime：
+推荐用 custom command 生成 **单一** 生产 fatbin，而不是让 host target 自动链接 CUDA runtime：
 
 ```text
 nvcc --fatbin getnative_cuda.cu
-  --fmad=false --ftz=false --prec-div=true --prec-sqrt=true
+  -O3
   -gencode arch=compute_X,code=sm_X
   -gencode arch=compute_Y,code=[sm_Y,compute_Y]
 ```
 
-架构列表由 Windows CI/目标 GPU 决定，不在 handover 中猜测。fatbin 至少包含每个已验证目标的 native cubin 和一个不依赖 architecture-specific feature 的 PTX fallback。`sm_XXa`/`compute_XXa` 之类 architecture-specific feature 不得成为通用 fallback；对应优化只放入匹配的 native cubin，其他 GPU 回到 generic strict kernel。使用现有 `engine/cmake/embed_binary.cmake` 嵌入 binary。
+架构列表由 Windows CI/目标 GPU 决定，不在 handover 中猜测。fatbin 至少包含每个已验证目标的 native cubin 和一个不依赖 architecture-specific feature 的 PTX fallback。`sm_XXa`/`compute_XXa` 之类 architecture-specific feature 不得成为通用 fallback；对应优化只放入匹配的 native cubin，其他 GPU 回到 generic 优化 kernel。使用现有 `engine/cmake/embed_binary.cmake` 嵌入 binary。
 
 要求：
 
 - 不链接 cudart。
 - 不链接 CUDA Driver import library。
 - 主 executable 的 import table 无 `nvcuda.dll`、`cudart64_*.dll`。
-- `--use_fast_math` 禁止进入 strict artifact。
-- strict build 显式固定 `--fmad=false --ftz=false --prec-div=true --prec-sqrt=true`；即使当前 kernel 没有除法/平方根也记录完整 flags。
-- profile build 增加 `-lineinfo -Xptxas=-v`，保存每个 kernel 的 registers、shared/local memory 和 spill 输出；release strict build 与 profile build 的数学 flags 相同。
-- 保存 nvcc 生成的 PTX、每个 native cubin 和最终 fatbin hash。PTX 是虚拟 ISA，不能作为最终指令证明；完成判断看每个目标 cubin 的 SASS。
+- **只构建并嵌入一套** 生产 fatbin（可含 generic + specialized + 经批准的 architecture/PTX variants 的 **kernel 变体**，但不是多套 math mode）。
+- **允许并鼓励** FP32 FMA 与正常 ptxas 优化。默认 **不要** 使用 `--fmad=false`，**不要** 使用 `-Xptxas=-O0` 作为生产配置。
+- 不需要、也不允许并行维护 `strict` / `relaxed-fma` / `fast-math` 三套 fatbin 或运行时 math-mode 选择。
+- 源码可用普通 `float` 乘加（或等价可收缩写法），让编译器生成高效 SASS；不得为“语义可解析”强制全程 `__fmul_rn`+`__fadd_rn` 再另开一条 FMA 档。
+- profile build 增加 `-lineinfo -Xptxas=-v`，保存每个 kernel 的 registers、shared/local memory 和 spill 输出；release 与 profile 的优化级别与数学配置相同（仅调试信息不同）。
+- 保存 nvcc 生成的 PTX、每个 native cubin 和最终 fatbin hash。PTX 是虚拟 ISA，不能作为最终指令证明；完成判断看每个目标 cubin 的 SASS **是否达到预期优化效果**（吞吐、spill、访存），而不是是否“零 FMA”。
 - Driver API 的 PTX fallback 使用 module JIT；需要 JIT 诊断时通过 `cuModuleLoadDataEx` 保存 info/error log。产品不链接 `nvptxcompiler_static.lib`，也不在运行时引入 CUDA Toolkit/PTX Compiler API。
 
 ### 12.2 Driver API 动态加载
@@ -876,13 +905,15 @@ M5A 启用 CUDA Graph 时再增加可选 Driver API function table：stream capt
 | 路线 | 本 handover 决策 | GetNative 约束 |
 | --- | --- | --- |
 | CUDA C++ template/specialization | 必做 | 按 `AxisShape`、axis 和 stage 专用化；Bilinear/Lanczos1 同属 B3/F2，不为滤镜名重复 kernel |
-| CUDA intrinsics / libcu++ async primitives | 优先于 PTX | warp shuffle、vector load/store、`cuda::memcpy_async`/pipeline、cooperative groups 必须有实际数据流收益且保持 strict order |
-| SASS inspection | 必做 | 每个 native SM 都看最终 cubin；PTX 数量不等于 SASS 数量，不能从 PTX 推断寄存器、spill 或调度 |
+| CUDA intrinsics / libcu++ async primitives | 优先于 PTX | warp shuffle、vector load/store、`cuda::memcpy_async`/pipeline、cooperative groups 必须有实际数据流收益且保持第 6.5 节循环/归约顺序 |
+| SASS inspection | 必做 | 每个 native SM 都看最终 cubin；用 SASS 证明优化到位（调度、spill、访存、是否生成预期 FMA/向量访存），不能从 PTX 行数推断性能 |
 | 局部 inline PTX | 条件必做 | 只有编译器持续不能生成目标指令且第 16.6 节 A/B 通过时保留；必须有 CUDA C++ fallback |
 | 独立手写 `.ptx` kernel | 例外路径 | 仅当局部 wrapper 仍不足且热点已稳定；需要独立 ABI、ptxas、SASS 和每个 SM conformance |
 | 直接写/patch SASS | 不属于支持路径 | 不使用 maxas、TuringAs、CuAssembler 或其他非官方 assembler/patcher 生成 shipping artifact |
-| `half2`、Float16 coefficient、texture interpolation | strict 禁止 | Float16 已有 valley 漂移；硬件插值不消费 CPU `AxisPlan` 的准确权重/顺序 |
-| FMA / fast math | strict 禁止 | 保持 `--fmad=false`，不重新增加 fast-math product/job mode |
+| `half2`、Float16 coefficient、texture interpolation | 禁止 | Float16 已有 valley 漂移；硬件插值不消费 CPU `AxisPlan` 的准确权重/顺序 |
+| FP32 FMA | **允许且优先** | 单一生产路径应利用 FMA；禁止再拆 strict/fast-math 数学档 |
+| 多 math-mode fatbin | **禁止** | 不维护 strict / relaxed-fma / fast-math 并行 artifact |
+| `-Xptxas=-O0` 生产构建 | **禁止** | 不得为 SASS 扫描或“语义证明”关闭优化 |
 | PTX Compiler API | shipping 不采用 | 当前 runtime 只动态依赖 Driver API；offline nvcc/ptxas + embedded fatbin 已覆盖目标，避免新增 Toolkit static-library 依赖和自管 JIT cache |
 
 “模板实例化 Lanczos1-8”需要改写为 shape specialization。滤镜名称只影响 CPU planner 生成的 coefficients；GPU 看到的是 `half_bandwidth`、`forward_width` 和已打包的 Float32 arrays。首批只保留当前 Metal 已有证据的 B3/F2、B7/F4、B11/F6、B15/F8 加 generic。B19/F10 到 B31/F16 若 profiler 证明 generic loop/control 是实际瓶颈，再逐 shape 增加；每个实例都要计入 cubin size 和 instruction-cache 影响。
@@ -919,13 +950,13 @@ M5A 启用 CUDA Graph 时再增加可选 Driver API function table：stream capt
 - `sm_80+` 可评估 CUDA pipeline/`cuda::memcpy_async` 对 global -> shared 的硬件 async copy；前提是该 shared tile 被重复消费并能与计算重叠。单次读取数据不应为了 `cp.async` 多走 shared memory。
 - Hopper `sm_90a`/后续支持 TMA 的目标可评估 1D/2D tile transfer 和 double buffering。TMA variant 单独编译、单独 dispatch、单独 benchmark；generic cubin/PTX fallback 不含 `a` feature。
 - `__launch_bounds__` 和 `--maxrregcount` 都是 trade-off，不是越低越好。只有 ptxas/occupancy/Nsight 同时证明 register limiter 或 spill 问题时按 kernel、按 SM 调整；禁止全 artifact 统一硬压 register count。
-- CUDA Tile 不是 M4/M5 依赖。当前 workload 是有序 Float32 banded solve 和 reduction，不是 dense tensor-core tile；只有目标 Toolkit 上的独立原型证明它改善相同 strict kernel 的数据移动或代码生成时再立项。
+- CUDA Tile 不是 M4/M5 依赖。当前 workload 是有序 Float32 banded solve 和 reduction，不是 dense tensor-core tile；只有目标 Toolkit 上的独立原型证明它改善同一生产 kernel 的数据移动或代码生成时再立项。
 
 ### 12.7 inline PTX 准入和实现契约
 
 inline PTX 是最后的 codegen 修正层，不是完整 kernel 的首选语言。每个候选必须遵守：
 
-1. 先有同一 binary 内可 forced 的纯 CUDA C++ strict baseline；baseline 已通过第 15.3/15.4 节并有 Nsight/SASS 证据。
+1. 先有同一 binary 内可 forced 的纯 CUDA C++ 生产 baseline（单一数学路径）；baseline 已通过第 15.3/15.4 节并有 Nsight/SASS 证据。
 2. 写一份候选记录：目标 kernel/SM、当前 CUDA C++/PTX/SASS、具体坏 codegen、预期替换指令、受影响数据和第 16.6 节成功门槛。
 3. inline asm 限制在一个 `__device__ __forceinline__` wrapper 的一个语义操作；放入 `cuda_ptx_intrinsics.cuh`。调用点仍保留 C++ fallback，使用 `__CUDA_ARCH__` 和 PTX ISA/SM capability guard。
 4. operand constraint 与 C++ scalar size/type 严格匹配；pointer 先确认 generic/global/shared address space。局部 PTX register 放在 `{}` scope，避免 wrapper 多次 inline 的 namespace collision。
@@ -938,24 +969,26 @@ inline PTX 是最后的 codegen 修正层，不是完整 kernel 的首选语言�
 - 编译器无法稳定表达的 cache-policy/eviction-hint load，且 Nsight 已证明对应 cache miss/scoreboard 是瓶颈；
 - 没有等价 CUDA intrinsic 的目标 SM 新指令；
 - 可减少已在 SASS 中确认的多余 address conversion、packed integer/bit 操作；
-- 需要精确定义且 CUDA primitive 无法表达的 memory ordering。
+- 需要精确定义且 CUDA primitive 无法表达的 memory ordering；
+- 在已证明 hotspot 上，用更紧的 load/store 或数据搬运指令把吞吐推到极限（仍须通过第 15.4/16.6 节）。
 
 以下不准作为首批 inline PTX：
 
-- `A^T b`、forward/backward solve 或 reconstruction 的完整手写 PTX；
-- 任何 `fma`/`mad` 浮点融合、approximate math、Float16/`half2`；
+- `A^T b`、forward/backward solve 或 reconstruction 的完整手写 PTX（先把 C++ specialization/layout 做满）；
+- approximate math 改变第 15.4 节输出门槛、Float16/`half2`；
 - 已能由 `__shfl_*_sync`、cooperative groups、`cuda::memcpy_async` 等官方接口产生同等 SASS 的操作；
 - 为追求特定 SASS 排列而塞入无语义依赖的 barrier、volatile load 或 dummy instruction；
-- undocumented opcode、raw SASS encoding 或 binary patch。
+- undocumented opcode、raw SASS encoding 或 binary patch；
+- 仅为“去掉 FMA”或“制造可解析舍入语义”而写的 PTX。
 
 独立手写 `.ptx` kernel 需要比 inline wrapper 更高的 gate：固定 `.version/.target/.address_size`、导出参数 ABI test、逐目标 ptxas、Driver module-load failure test、完整 CUDA C++ fallback 和逐 SM benchmark。没有这些证据时不创建 `.ptx` source。
 
 ### 12.8 cubin/PTX 分发、选择和可维护性
 
 - 每个 Windows release 记录 Toolkit、nvcc、ptxas 和 driver version；不同 compiler/driver 可能从相同 PTX 生成不同 SASS，因此优化批准表必须带 toolchain 与 SM。
-- fatbin 放入已验证 GPU 的 native cubin，另放一个在最低 driver/device policy 上可用的最高通用 virtual architecture 的 generic strict PTX，以保留尽可能新的 PTX codegen 和未来 GPU JIT。用 `CUDA_FORCE_PTX_JIT=1` 在真实设备验证 fallback；测试后清除环境变量。
+- fatbin 放入已验证 GPU 的 native cubin，另放一个在最低 driver/device policy 上可用的最高通用 virtual architecture 的 generic 生产 PTX，以保留尽可能新的 PTX codegen 和未来 GPU JIT。用 `CUDA_FORCE_PTX_JIT=1` 在真实设备验证 fallback；测试后清除环境变量。
 - architecture-specific `sm_XXa` kernel 只能在匹配 device 上选中。runtime provenance 至少记录 device UUID、compute capability、kernel variant、native cubin/PTX-JIT 路径、artifact hash 和批准 benchmark id。
-- 如果同一 fatbin 含 baseline、specialized、async/TMA 和 PTX-optimized kernels，host 必须按稳定 function table/variant id 选择；缺 symbol 或 variant 未获该 SM benchmark 批准时回到 generic strict，不得静默切换 math mode。
+- 如果同一 fatbin 含 baseline、specialized、async/TMA 和 PTX-optimized kernels，host 必须按稳定 function table/variant id 选择；缺 symbol 或 variant 未获该 SM benchmark 批准时回到 generic 生产 kernel。**不得** 用 math-mode 切换替代 variant 选择，也不得存在第二套数学 fatbin。
 - 不以删除 PTX、去符号或混淆 kernel 名作为本任务的“性能/保密优化”。cubin 仍可反汇编；删除 PTX 会失去 forward-compatible fallback。若产品以后优先保护实现，应单独做分发 ADR，而不是由 Windows backend agent 擅自决定。
 - 直接 SASS patch 没有进入仓库、CI 或 package 的批准路径。若所有受支持层完成后仍需要最后几个百分点，先提交独立 R&D 结果、固定 GPU/driver/toolkit 商业收益和维护预算，再由项目 owner 决定是否另立非 portable artifact。
 
@@ -1006,16 +1039,18 @@ MVP 目标 Vulkan 1.2。至少要求：
 - 40-byte push constants；
 - inverse stage 所需的 9 个 storage buffer binding；
 - storage buffer range、allocation 和 heap 能容纳一个 tile；
-- Float32 strict shader 能力与实际 conformance 通过。
+- Float32 compute 能力与实际 conformance 通过。
 
 不要求 subgroup、descriptor indexing、buffer device address、timeline semaphore 或 shader Int64。
 
-### 13.3 Strict shader
+### 13.3 单一优化 shader 路径
 
-- 关键 multiply/add/sub 结果禁止 contraction，检查 SPIR-V `NoContraction`。
-- 不使用 relaxed precision 或 subgroup reduction。
-- 查询并记录 Float32 float-controls properties。
-- capability 不能仅因 loader 存在而报告可执行 strict backend。
+- **只交付一套** 生产 SPIR-V / pipeline 数学配置；不实现 `strict`（`NoContraction` 强制）与 `fast-math`/`RelaxedPrecision` 并行通路。
+- 允许编译器与驱动在 Float32 上做 contraction/FMA，只要第 15.4 节输出门槛通过。
+- 不为“语义可解析”强制关键乘加带 `NoContraction`；也不为刷分默认打开未经验证的 `RelaxedPrecision` 产品档。
+- 不使用 subgroup reduction 改变第 6.5 节归约顺序。
+- 查询并记录 Float32 float-controls properties，作为 provenance，不作为多 mode 切换面。
+- capability 不能仅因 loader 存在而报告可执行 backend。
 - NVIDIA 上通过不代表 AMD；至少一台目标 AMD GPU 才能形成 AMD 支持证据。
 
 ### 13.4 Descriptor、barrier 和 memory
@@ -1067,7 +1102,7 @@ Discrete GPU 默认 device-local + host-visible staging。UMA 直接 host-visibl
 - RenderDoc / Nsight Graphics：descriptor、barrier、dispatch capture。
 - Nsight Systems：Vulkan API 和 CPU/GPU timeline。
 - Radeon GPU Profiler：只在真实 AMD 机器使用。
-- `spirv-val`、`spirv-dis`：离线 artifact 校验和 NoContraction 证据。
+- `spirv-val`、`spirv-dis`：离线 artifact 校验与反汇编证据（用于优化与正确性排查，不是 no-contraction 门禁）。
 
 ## 14. Capability、CLI、Tauri 和 React 集成
 
@@ -1105,22 +1140,21 @@ Capability schema v3 的 CPU entry 除现有 backend 三态外，必须能表达
 - `compiled_isa`：本 binary 实际包含的 `scalar/sse2/avx2/avx512`；
 - `available_isa`：当前 CPUID + XCR0 + compiled mask 共同允许的 tiers；
 - `selected_isa`：本 process 在 `auto` 下最终使用的 tier；
-- `math_modes`：本 handover 只允许 `strict`；
-- `selected_math_mode`：固定为 `strict`；
-- `selection_reason`：例如 `widest benchmark-approved strict tier`、`avx512 not benchmark-approved`、`forced by test` 或 stable fallback reason。
+- `math_modes` / `selected_math_mode`：CPU 侧固定为 **`production`**（允许 FMA 的单档）；**不要** 为 GPU 复制多档 math mode。
+- `selection_reason`：例如 `widest available production tier`、`avx512 not benchmark-approved`、`forced by test` 或 stable fallback reason。
 
 字段名可在 v3 schema 设计时调整，但上述信息不能丢失。普通 capability 不必暴露所有 raw CPUID bits；benchmark/debug handback 必须包含 raw feature snapshot 和 XCR0。CPU `compiled=true` 不代表 `analysis_command_available=true`，仍遵守第 14.1 节三态。
 
-Recipe 锁定的是 `math_mode`，不是某台机器的 ISA。`auto` 在 job 创建时解析到具体 `selected_isa`，结果 provenance 至少保存 `backend=cpu`、ISA、`math_mode=strict`、是否 forced、CPU signature、compiler/strict flags 和 benchmark source id。相同 Recipe 在另一台 CPU 上可以选择不同 ISA，但本 handover 不得改变 math mode。
+Recipe 对 CPU 锁定的是 CPU `math_mode=production` 与滤镜/几何，不是某台机器的 ISA。`auto` 在 job 创建时解析到具体 `selected_isa`，结果 provenance 至少保存 `backend=cpu`、ISA、`math_mode=production`、是否 forced、CPU signature、compiler flags 和 benchmark source id。相同 Recipe 在另一台 CPU 上可以选择不同 ISA，但 CPU math mode 保持 production。
 
-CUDA capability/debug 输出还要列出 device compute capability、fatbin 中的 native/PTX targets，以及该 device 已获批准的 kernel variants。每个 CUDA result provenance 至少保存 `math_mode=strict`、device UUID、compute capability、driver/toolkit、kernel variant、native cubin 或 PTX-JIT 路径、strict flags、fatbin hash 和 benchmark approval id。普通用户不需要选择 PTX/SASS；forced variant 只开放给 test/benchmark。
+CUDA/Vulkan capability **不要** 暴露 `strict|relaxed-fma|fast-math` 选择面。CUDA debug/provenance 至少保存：device UUID、compute capability、driver/toolkit、kernel variant、native cubin 或 PTX-JIT 路径、**单一** fatbin hash、nvcc/ptxas 版本与生产优化 flags、benchmark approval id。普通用户不需要选择 PTX/SASS；forced **kernel variant**（generic/specialized/…）只开放给 test/benchmark，不是 math mode。
 
 ### 14.4 需要修改的现有文件
 
 - `engine/CMakeLists.txt`：x86 ISA object-library/逐文件 flags、独立 CUDA/Vulkan options、artifact build/embed、可组合 link targets、backend tests/benchmarks。
 - `engine/src/backend/cpu/inverse_columns.hpp`、`inverse_columns.cpp`：从 coarse `required_simd` 扩展为可测试的 ISA/math dispatch，同时保持现有 automatic/scalar 调用兼容。
-- `engine/src/backend/cpu/cpu_analysis.cpp`：把 P1 row kernels 接到相同 dispatch snapshot，strict metric 提交顺序不变。
-- `engine/tests/cpu_column_simd_test.cpp`：扩为 SSE2/AVX2/AVX-512 forced conformance、feature matrix、tail/alignment 和 no-contraction tests。
+- `engine/src/backend/cpu/cpu_analysis.cpp`：把 P1 row kernels 接到相同 dispatch snapshot，metric lane 提交顺序不变，允许 FMA。
+- `engine/tests/cpu_column_simd_test.cpp`：扩为 SSE2/AVX2/AVX-512 forced conformance、feature matrix、tail/alignment 和 **tolerance**（非 bit-identical）tests。
 - `engine/src/cli/main.cpp:85-145`：CUDA/Vulkan capability probe；始终保留 disabled stub。
 - `engine/src/cli/main.cpp:194-208`：只有真实 analyze command 完成后才扩命令表。
 - `app/src-tauri/src/lib.rs:140-257`：backend id-map validation，接受 Vulkan 和真实 CUDA/Vulkan compiled/device 状态。
@@ -1136,7 +1170,7 @@ CUDA capability/debug 输出还要列出 device compute capability、fatbin 中�
 - `auto` 若以后加入，job 创建时必须解析为具体 backend 并写 provenance。
 - “Retry on CPU”创建新 job，保留原 GPU failure。
 - NVIDIA 机器上 CUDA/Vulkan 都可见、可独立选择、独立测量。
-- strict 不静默切 fast。
+- GPU 不得静默切换到未批准的 kernel variant，也不得存在第二套数学 artifact 可被静默选中。
 
 ### 14.6 真实 analyze/front-end planner 的额外工作
 
@@ -1180,7 +1214,7 @@ CUDA capability/debug 输出还要列出 device compute capability、fatbin 中�
 
 ### 15.2 x86 CPU SIMD conformance
 
-扩展现有 `getnative_cpu_column_simd_tests`，让每个已编译且 available 的 strict tier 都可被单独 forced；不能只比较 `automatic` 和 scalar。至少覆盖：
+扩展现有 `getnative_cpu_column_simd_tests`，让每个已编译且 available 的 production tier 都可被单独 forced；不能只比较 `automatic` 和 scalar。至少覆盖：
 
 1. `scalar`、`sse2`、`avx2`、`avx512` forced dispatch；unsupported/uncompiled tier 在进入 kernel 前稳定拒绝。
 2. H、V、both 和两种 forward order；Bilinear、任意有限 B/C Bicubic、Spline16/36/64、Lanczos1-15，所有实际 CPU `half_bandwidth=1..29`、`forward_width=1..30`。
@@ -1189,9 +1223,9 @@ CUDA capability/debug 输出还要列出 device compute capability、fatbin 中�
 5. base address 偏移 `0..lane_bytes-1` 的代表性 misalignment、non-contiguous input/output stride、crop 起点、row padding canary；无越界读写。
 6. positive/negative zero、subnormal、最小 normal、有限大值和 threshold 的 `<,==,>` 邻域；library 不改变调用线程 MXCSR。
 7. `p=1,2,3,4` 和至少一个 `p>4`，empty batch、multi-worker batch、candidate id/order、workspace reuse。
-8. 每个 strict tier 的 inverse workspace 逐 Float32 bit 与 forced scalar 相同，最终 metric 逐 `uint64_t` bit 相同。
+8. 每个 production tier 相对 forced scalar 的 inverse/workspace/metric 在 relative tolerance 内（默认约 `5e-4`），finite 且 order 正确；不要求 bit-identical。
 9. feature detector 使用可注入 CPUID/XCR0 provider 覆盖 SSE2-only、AVX2 bit 但 OSXSAVE/XCR0 缺失、完整 AVX2、AVX512F 但 ZMM state 缺失、完整 AVX-512，以及 compiled mask 缺 tier。
-10. baseline/SSE2/AVX2-strict/AVX-512-strict object 的 disassembly assertion 或保存的检查证据，证明 ISA 隔离且无 FMA contraction。
+10. baseline/SSE2/AVX2/AVX-512 object 的 disassembly 或保存证据：ISA 隔离；AVX2/AVX-512 应含 FMA；baseline/SSE2 无高阶 ISA 泄漏。
 
 除 mock feature tests 外，还必须在至少一台无 AVX2 的 Windows x64 host/VM 和一台有 AVX2 的真实 host 运行 package；AVX-512 完成声明需要真实 AVX-512 host。CPUID masking/mock 不能替代真实指令执行证据。
 
@@ -1224,9 +1258,9 @@ CUDA 额外：
 - warp-shuffle reduction 与 shared-memory 256-thread binary tree 的 partial/result bits 一致；
 - alignment/vector-load tail、horizontal transpose/repack、kernel fusion、CUDA Graph update/replay 各有启用/禁用 A/B correctness；
 - 每个包含的 native cubin 在对应真实 SM 上执行 conformance；mock compute capability 不能替代实际指令执行；
-- `CUDA_FORCE_PTX_JIT=1` 下完整 conformance，证明 generic strict PTX fallback 存在且可 JIT；architecture-specific `a` variant 不得污染该 fallback；
+- `CUDA_FORCE_PTX_JIT=1` 下完整 conformance，证明 generic 生产 PTX fallback 存在且可 JIT；architecture-specific `a` variant 不得污染该 fallback；
 - inline PTX wrapper 的 capability guard、C++ fallback、每个目标 ptxas assembly 和 Compute Sanitizer；
-- strict SASS 不含 `FFMA`/`DFMA`/`HFMA` contraction，ptxas 无未解释 spill；若 local memory 是显式设计，必须逐项说明而不能归因于 compiler spill。
+- SASS/resource 证据证明生产路径使用正常优化（无 `-Xptxas=-O0`）、热点合理，ptxas 无未解释 spill；若 local memory 是显式设计，必须逐项说明而不能归因于 compiler spill。**不要求** SASS 零 `FFMA`/`HFMA`；出现 FMA 是预期优化结果。
 
 Vulkan 额外：no `vulkan-1.dll`、no compute queue、insufficient limits、validation clean、device lost。
 
@@ -1342,22 +1376,22 @@ CUDA 每个 kernel variant 另报：
 - total explicit GPU working set `< 2 GiB`；
 - strict numeric gates 全过；
 - cancel latency不超过两次 tile duration；
-- 同机、同输入、同 candidate、同 strict compiler/math mode，相对 `auto + strict` 最快正确 CPU end-to-end `>=3x` 才可考虑默认启用。
+- 同机、同输入、同 candidate，相对 `auto + strict` 最快正确 **CPU** end-to-end `>=3x` 才可考虑默认启用 GPU（CPU 分母仍是 strict ISA 路径；GPU 自身是单一优化路径）。
 
 CUDA 和 Vulkan 分别 go/no-go。一个通过不能替另一个背书。
 
 ### 16.6 CUDA 低层优化保留门槛
 
-每个 CUDA C++ layout/fusion/graph/architecture/inline-PTX 变体必须与同一 binary 中的前一层 baseline 做单变量 A/B。至少 21 个预热后的交错 raw samples，保持输入、tile、clock/power 状态、driver、toolkit、strict flags 和其他 kernel variants 不变。
+每个 CUDA C++ layout/fusion/graph/architecture/inline-PTX 变体必须与同一 binary 中的前一层 baseline 做单变量 A/B。至少 21 个预热后的交错 raw samples，保持输入、tile、clock/power 状态、driver、toolkit、**同一生产数学配置** 和其他 kernel variants 不变。
 
 inline PTX 或独立手写 PTX 只有同时满足以下条件才可进入自动选择：
 
-- 第 15.3/15.4 节全部 green，输出与 `cpp-generic`/对应 C++ specialized path bit-identical；
+- 第 15.3/15.4 节全部 green，输出与 `cpp-generic`/对应 C++ specialized path bit-identical（在同一生产数学配置下）；
 - 目标 hotspot kernel median 改善至少 3%，end-to-end median 改善至少 1%；
 - observed gain 大于 baseline/candidate 两者 relative MAD 较大值的 2 倍；
 - primary matrix 没有 case 回退超过 2%，cold/JIT/multiframe/memory/cancel 没有实质回归；
 - 无新增 compiler spill；register/shared-memory 增长有 occupancy 和 wall-time 证据；
-- SASS 确认目标 codegen 缺口确实消失，且没有 FMA、relaxed precision、越界 wide load 或额外 barrier。
+- SASS 确认目标 codegen 缺口确实消失，且没有越界 wide load 或无收益的额外 barrier。**允许并期望** FP32 FMA；不得以“出现 FMA”否决优化。
 
 CUDA C++ specialization、layout、fusion、Graph、async/TMA 等较高层优化至少满足同样的噪声显著性和无 correctness 回归；是否保留可依据其 end-to-end gain、复杂度和通用性单独记录。批准必须按 GPU 型号/device class、compute capability、driver/toolkit 和 artifact hash 建表，并保存验证机 UUID；不得把一个 `sm_XX` 的结论外推到另一代或同 SM 的明显不同资源档位。profile 未发现合理的 PTX codegen 缺口时记录 `NO_PTX_CANDIDATE`；有候选但没有达到门槛时记录 `NO_PTX_WINNER`。两者都比提交无收益的 asm 更完整。
 
@@ -1377,13 +1411,13 @@ GETNATIVE_BUILD_UPSTREAM_CONFORMANCE
 要求：
 
 - `GETNATIVE_ENABLE_X86_SIMD` 在 x86/x64 默认 ON、其他架构 OFF；在 x86 关闭后只编译 scalar，AArch64 NEON 和 GPU options 不受影响。`GETNATIVE_ENABLE_X86_AVX512` 在 Windows x64 且 compiler 支持时默认 ON，只控制 AVX-512 object，不能改变 AVX2/SSE2 fallback；显式 ON 但 compiler 不支持时 configure 必须明确失败。
-- x86 baseline/SSE2、AVX2-strict 和 AVX-512-strict 使用独立 object libraries 或逐 source compile options；高阶 `/arch`/`-m` flag 不得传播到 `getnative_core` 的其他 source 或 consumer。
-- AVX2/AVX-512 object 编译存在不等于运行时 available；所有入口仍经过 CPUID/XCR0 dispatch，math mode 固定为 strict。
+- x86 baseline/SSE2、AVX2 和 AVX-512 使用独立 object libraries 或逐 source compile options；高阶 `/arch`/`-m` flag 不得传播到 `getnative_core` 的其他 source 或 consumer。
+- AVX2/AVX-512 object 编译存在不等于运行时 available；所有入口仍经过 CPUID/XCR0 dispatch，math mode 固定为 **production**。
 - CUDA/Vulkan 默认 OFF。
 - CPU-only configure 不寻找 CUDA/Vulkan SDK。
 - CUDA-only、Vulkan-only、两者同时 ON 都能 build。
 - Metal option 与 Windows options 独立，不写互斥 `if/else` link 逻辑。
-- host C++ 和全部 strict CPU objects 继续 C++23、MSVC `/fp:strict`、非 MSVC `-ffp-contract=off`。
+- host C++ 继续 C++23。AVX2/AVX-512 production objects 使用 FMA（MSVC `/arch:AVX2|AVX512`，clang `-mfma`）；不得再为 CPU production 强制 `-ffp-contract=off` 以禁止 FMA。
 - generated fatbin/SPIR-V 加入 configure/build dependency 和 benchmark source identity。
 - engine install/bundle 包含 embedded artifacts，不依赖开发机路径。
 - package 包含 `THIRD_PARTY_NOTICES.md`。
@@ -1402,29 +1436,29 @@ GETNATIVE_BUILD_UPSTREAM_CONFORMANCE
 
 完成标准：scalar、planner 和可运行的 upstream conformance green，baseline raw samples 可复现。失败时不开始 SIMD 或 GPU correctness。
 
-### M1: x86 feature dispatch 和 SSE2 strict fallback
+### M1: x86 feature dispatch 和 SSE2 production fallback
 
 交付：
 
 - 可注入测试的 CPUID/XCR0 snapshot 与 compiled/available/selected 状态。
 - baseline/SSE2 独立 object，`auto|scalar|sse2` forced surface。
-- P0 adjacent-column SSE2 strict，fixed B3/B7 + generic + scalar tail。
-- 第 15.2 节 SSE2 bit-identity、alignment/stride/tail、unsupported tier tests。
+- P0 adjacent-column SSE2 production，fixed B3/B7 + generic + scalar tail。
+- 第 15.2 节 SSE2 tolerance、alignment/stride/tail、unsupported tier tests。
 - baseline/SSE2 disassembly 和无 AVX Windows x64 package run。
 
-完成标准：SSE2 逐 bit 等于 scalar；无 AVX host 不触发 illegal instruction；scalar forced 仍可运行。
+完成标准：SSE2 相对 scalar 在 tolerance 内；无 AVX host 不触发 illegal instruction；scalar forced 仍可运行。
 
 ### M2: AVX2、AVX-512 和 x86 自动选择
 
 交付：
 
-- AVX2 strict、AVX-512 strict objects 和 runtime dispatch。
+- AVX2/AVX-512 production objects（含 FMA）和 runtime dispatch。
 - P0 完整 conformance；P1 vertical reconstruction/absolute difference 只在 P0 green 后加入。
-- 全 forced ISA matrix、bit-identity、disassembly 和真实 AVX2/AVX-512 host evidence。
+- 全 forced ISA matrix、tolerance correctness、disassembly（含 FMA 证据）和真实 AVX2/AVX-512 host evidence。
 - `getnative_cpu_backend_benchmark`、raw samples、median/MAD、5%/3% selection gate。
 - AVX-512 downclock 结论；未过门槛时 available 但自动选择 AVX2。
 
-完成标准：所有 strict tiers 与 scalar bit-identical，`auto + strict` 在每台验证 CPU 上选择有证据的最快 tier。CPU strict 任一 gate 失败时不开始 GPU correctness。
+完成标准：所有 production tiers 相对 scalar 在 tolerance 内，`auto + production` 在每台验证 CPU 上选择有证据的最快 tier。CPU 任一 gate 失败时不开始 GPU correctness。
 
 ### M3: 共享 GPU contract
 
@@ -1438,19 +1472,19 @@ GETNATIVE_BUILD_UPSTREAM_CONFORMANCE
 
 完成标准：无 GPU SDK 机器仍能 build/start；shared packing test 覆盖 H/V/both 和全部 shapes。
 
-### M4: CUDA vertical generic strict MVP
+### M4: CUDA vertical generic 生产 MVP
 
 交付：
 
 - Driver loader、device/context/module/stream/memory RAII。
-- embedded strict fatbin/PTX。
+- embedded **单一** 生产 fatbin/PTX（允许 FMA、正常 ptxas 优化）。
 - generic image inverse + generic metric。
 - vertical p=1 batch、partial merge、cancel/drain。
 - vertical full filter conformance 和 benchmark。
 
 完成标准：真实 NVIDIA GPU 逐 candidate pass；无 driver VM 正常启动并报告 reason。
 
-### M5: CUDA 完整 strict backend
+### M5: CUDA 完整生产 backend
 
 交付：
 
@@ -1460,7 +1494,7 @@ GETNATIVE_BUILD_UPSTREAM_CONFORMANCE
 - mixed shape、buffer reuse/trim、multi-device、failure tests。
 - Nsight/Compute Sanitizer evidence。
 
-完成标准：完整 CUDA matrix、memory、cancel、artifact/dependency gates green。
+完成标准：完整 CUDA matrix、memory、cancel、artifact/dependency gates green；仍为单一数学路径。
 
 ### M5A: CUDA C++ / intrinsic 极限优化
 
@@ -1469,11 +1503,11 @@ GETNATIVE_BUILD_UPSTREAM_CONFORMANCE
 - Nsight Systems/Compute baseline 和逐 kernel roofline/bottleneck 分类。
 - axis/stage/shape compile-time variants、二维 candidate/vector grid 和 address simplification。
 - coalescing/alignment/vector-load 证据；horizontal transpose/repack 的含 setup/amortization A/B。
-- 可行的 matrix inverse + same-axis first-forward fusion，以及 strict-order warp-shuffle reduction。
+- 可行的 matrix inverse + same-axis first-forward fusion，以及第 6.5 节顺序的 warp-shuffle reduction。
 - fixed-recipe CUDA Graph；只有可复用 shared tile 才增加 `sm_80+` async-copy 或匹配硬件的 TMA variant。
 - 每个优化的 forced fallback、correctness、resource、SASS、raw samples 和第 16.6 节保留决定。
 
-完成标准：所有 selected variants 逐 SM 有 correctness/performance approval；未获益或回归的变体删除，generic strict 始终可 forced。M5A 先于 inline PTX，但 Vulkan correctness 的 M6 不必等待没有依赖关系的 CUDA profile 实验。
+完成标准：所有 selected variants 逐 SM 有 correctness/performance approval；未获益或回归的变体删除，generic 生产 kernel 始终可 forced。M5A 先于 inline PTX，但 Vulkan correctness 的 M6 不必等待没有依赖关系的 CUDA profile 实验。
 
 ### M5B: inline PTX 终局优化
 
@@ -1484,21 +1518,21 @@ GETNATIVE_BUILD_UPSTREAM_CONFORMANCE
 - 同一 artifact forced A/B、21-sample raw data、逐 SM 第 16.6 节决定。
 - native cubin + generic PTX-JIT fallback 验证，以及 direct-SASS/nonofficial-tooling exclusion 证明。
 
-完成标准：达到门槛的 wrapper 才进入对应 device approval table；没有合理 codegen 缺口时提交 `NO_PTX_CANDIDATE`，有候选但未达门槛时提交 `NO_PTX_WINNER`，并以 M5A C++ strict variant 完成，不保留零收益 asm。
+完成标准：达到门槛的 wrapper 才进入对应 device approval table；没有合理 codegen 缺口时提交 `NO_PTX_CANDIDATE`，有候选但未达门槛时提交 `NO_PTX_WINNER`，并以 M5A C++ 生产 variant 完成，不保留零收益 asm。
 
-### M6: Vulkan vertical generic strict MVP
+### M6: Vulkan vertical generic 生产 MVP
 
 交付：
 
 - dynamic loader、instance/device/queue RAII。
-- embedded validated SPIR-V。
+- embedded validated **单一** 生产 SPIR-V。
 - descriptor/push constants/barriers/staging。
 - generic vertical inverse + metric。
 - no-loader/no-device tests 和真实 GPU conformance。
 
 完成标准：至少一台真实 Windows Vulkan GPU pass；无 loader 环境正常启动。
 
-### M7: Vulkan 完整 strict backend
+### M7: Vulkan 完整生产 backend
 
 交付：
 
@@ -1592,14 +1626,17 @@ Forced command 请求当前 host 不 available 的 tier 时，预期结果是非
 
 ```powershell
 llvm-objdump --disassemble <baseline-or-sse2.obj> | Set-Content build/engine-win-x86/artifacts/cpu-backend/sse2.asm
-llvm-objdump --disassemble <avx2-strict.obj> | Set-Content build/engine-win-x86/artifacts/cpu-backend/avx2-strict.asm
-llvm-objdump --disassemble <avx512-strict.obj> | Set-Content build/engine-win-x86/artifacts/cpu-backend/avx512-strict.asm
+llvm-objdump --disassemble <avx2-production.obj> | Set-Content build/engine-win-x86/artifacts/cpu-backend/avx2.asm
+llvm-objdump --disassemble <avx512-production.obj> | Set-Content build/engine-win-x86/artifacts/cpu-backend/avx512.asm
 
-Select-String build/engine-win-x86/artifacts/cpu-backend/avx2-strict.asm -Pattern 'vfmadd|vfnmadd'
-Select-String build/engine-win-x86/artifacts/cpu-backend/avx512-strict.asm -Pattern 'vfmadd|vfnmadd'
+# Production AVX2/AVX-512 should contain FMA (count > 0).
+Select-String build/engine-win-x86/artifacts/cpu-backend/avx2.asm -Pattern 'vfmadd|vfnmadd' |
+  Measure-Object | Select-Object -ExpandProperty Count
+Select-String build/engine-win-x86/artifacts/cpu-backend/avx512.asm -Pattern 'vfmadd|vfnmadd' |
+  Measure-Object | Select-Object -ExpandProperty Count
 ```
 
-两个 strict 搜索都必须无结果。另检查 baseline/SSE2 object 不含 VEX/EVEX 指令。可用 `dumpbin /DISASM` 替代 `llvm-objdump`，但 handback 必须保存命令、tool version 和原始输出。
+AVX2/AVX-512 的 FMA 搜索计数应 **大于 0**。另检查 baseline/SSE2 object 不含高阶 VEX/EVEX 泄漏。可用 `dumpbin /DISASM` 替代 `llvm-objdump`，但 handback 必须保存命令、tool version 和原始输出。
 
 至少在以下真实运行环境重复 CPU tests/package startup：无 AVX2 的 Windows x64、AVX2、AVX-512。若暂时没有 AVX-512 host，只能报告 compiled + mock dispatch green，不能完成第 22.1 节 AVX-512 runtime 条件。
 
@@ -1674,11 +1711,15 @@ nvdisasm --print-line-info-inline --print-life-ranges `
   build/engine-win-cuda/artifacts/cuda/cubins/<target-sm.cubin> |
   Set-Content build/engine-win-cuda/artifacts/cuda/<target-sm>.nvdisasm
 
+# SASS 用于优化与资源审计，不是 no-FMA 门禁。
+# 可按需统计 FMA / 访存 / 控制流，但不得因出现 FFMA/HFMA 判失败。
 Select-String build/engine-win-cuda/artifacts/cuda/all-targets.sass `
-  -Pattern 'FFMA|DFMA|HFMA'
+  -Pattern 'FFMA|DFMA|HFMA' |
+  Measure-Object |
+  Select-Object -ExpandProperty Count
 ```
 
-strict SASS 的 contraction 搜索必须无结果。另保存 `-Xptxas=-v` 原始输出；spill load/store 非零时先定位原因，不能仅用 `--maxrregcount` 压数字。
+保存 `-Xptxas=-v` 原始输出；spill load/store 非零时先定位原因，不能仅用 `--maxrregcount` 压数字。生产 cubin **不得** 以 `-Xptxas=-O0` 构建。
 
 benchmark/test 增加等价的内部 forced variant surface；名字可调整，但 handback 必须能复现每层 A/B：
 
@@ -1749,15 +1790,16 @@ dumpbin /DEPENDENTS path/to/GetNative-VF.exe
 
 - 丢失或覆盖接收时 dirty changes。
 - CPU/planner/upstream conformance 失败。
-- x86 strict SSE2/AVX2/AVX-512 任一 available tier 与 scalar bits 不一致，或 tail/unaligned path 越界、覆盖 padding。
+- x86 production SSE2/AVX2/AVX-512 任一 available tier 相对 scalar 超出 tolerance，或 tail/unaligned path 越界、覆盖 padding。
 - 只检查 CPUID、不检查 OSXSAVE/XCR0，或 forced unavailable ISA 触发 illegal instruction。
 - 对整个 `getnative_core`/executable/package 使用 `/arch:AVX2`、`/arch:AVX512`、`-mavx2` 或 `-mavx512*`，使 baseline/SSE2 fallback 含高阶指令。
-- strict object 反汇编出现 `vfmadd*`/`vfnmadd*` 或其他 contraction。
+- AVX2/AVX-512 production object 反汇编 **缺少** FMA（在支持 FMA 的编译目标上），或 baseline/SSE2 泄漏高阶 ISA。
+- 重新把 CPU 正确性改回 bit-identical / 禁 FMA 契约。
 - AVX-512 只因 available 就自动优先，未比较 AVX2，或在 primary matrix 更慢仍选中。
 - GPU 为通过测试而修改 CPU oracle、threshold、crop 或 candidate order。
 - GPU 生成 filter taps、normal matrix 或 LDLT。
-- strict artifact 使用 fast math、未记录 contraction 或 relaxed precision。
-- strict CUDA SASS 出现 `FFMA`/`DFMA`/`HFMA`，或重新引入 Float16/`half2`/hardware interpolation。
+- 重新引入 GPU 多 math-mode（`strict` / `fast-math` / 并行 fatbin 切换），或为“语义扫描”使用 `-Xptxas=-O0` 生产构建。
+- 重新引入 Float16/`half2`/hardware interpolation。
 - 在 CUDA C++ baseline、profile、SASS 和逐 SM A/B 之前加入 inline PTX；inline wrapper 无 C++ fallback、无 `__CUDA_ARCH__` guard 或跨 address space 错用 pointer。
 - 仅因 PTX 指令数更少就宣称优化；没有检查目标 cubin SASS、register/spill、Nsight 和 end-to-end wall time。
 - 为指定 SASS 排列加入 dummy dependency/barrier，或使用非官方 SASS assembler/patcher 生成 shipping artifact。
@@ -1768,8 +1810,8 @@ dumpbin /DEPENDENTS path/to/GetNative-VF.exe
 - PE import table 硬依赖 CUDA/Vulkan runtime。
 - 只有 compile proof 却报告 device available。
 - 真实 analyze path 不存在却报告 command available。
-- GPU 失败静默跑 CPU 或 strict 静默转 fast。
-- specialized 与 generic 不一致。
+- GPU 失败静默跑 CPU，或静默切换到未批准 kernel variant / 第二套数学 artifact。
+- specialized 与 generic 在同一生产数学配置下不一致。
 - candidate 超 workspace 仍提交。
 - cancel 返回时仍有 GPU 写入可复用/已释放 buffer。
 - total explicit working set达到或超过 2 GiB。
@@ -1787,16 +1829,16 @@ Handback 必须包含：
 2. 每个新增/修改文件的职责。
 3. Windows version、CPU/RAM、CPU vendor/family/model/stepping、GPU、UUID/PCI、driver。
 4. VS/MSVC 或 clang-cl、CMake、Ninja、CUDA Toolkit/nvcc、Vulkan SDK/glslc 版本。
-5. x86 raw CPUID/XCR0、compiled/available/selected ISA、selection reason、`math_mode=strict`、是否 forced；每台 CPU 单独记录。
-6. scalar/SSE2/AVX2/AVX-512 strict forced conformance、unsupported-tier rejection 和无 illegal-instruction 结果。
-7. baseline/SSE2、AVX2-strict、AVX-512-strict object 的 compile flags、hash 和反汇编检查。
-8. fatbin、PTX、SPIR-V、engine、benchmark 和 package hashes。
+5. x86 raw CPUID/XCR0、compiled/available/selected ISA、selection reason、CPU `math_mode=production`、是否 forced；每台 CPU 单独记录。
+6. scalar/SSE2/AVX2/AVX-512 production forced conformance、unsupported-tier rejection 和无 illegal-instruction 结果。
+7. baseline/SSE2、AVX2、AVX-512 object 的 compile flags、hash 和反汇编检查（含 FMA 证据）。
+8. **单一** CUDA fatbin、PTX、Vulkan SPIR-V、engine、benchmark 和 package hashes（不得交付多套 GPU math-mode artifact）。
 9. 完整 configure/build/test/benchmark/package 命令和 exit code。
 10. scalar-only、x86 SIMD、CPU-only、CUDA-only、Vulkan-only、both build 结果。
 11. no-AVX2、no-driver、no-loader 的 engine/package capability 和 startup 输出。
-12. 每个 CPU/GPU conformance case 的最大误差、argmin distance、top-k、失败数；strict CPU 另报 bit-identity。
-13. GPU generic vs specialized bit-identity 结果。
-14. raw benchmark samples、median、MAD、speedup、cold/warm/amortized totals；GPU speedup 明确给出同次 `auto + strict` CPU 分母。
+12. 每个 CPU/GPU conformance case 的最大误差、argmin distance、top-k、失败数；CPU/GPU 均报 relative tolerance 结果。
+13. GPU generic vs specialized bit-identity 结果（同一生产数学配置）。
+14. raw benchmark samples、median、MAD、speedup、cold/warm/amortized totals；GPU speedup 明确给出同次 `auto + production` CPU 分母。
 15. AVX-512 相对 AVX2 的选择 gate 和可获得的 downclock/frequency 证据。
 16. allocation/reuse、workspace、queued plan、total peak bytes。
 17. cancel latency、tile duration、submission/completion counts。
@@ -1805,10 +1847,10 @@ Handback 必须包含：
 20. Grok/其他 agent 的输出只能作为建议；最终以 Windows checkout diff 和 host tests 为证据。
 21. 未验证 CPU/ISA、平台、GPU、driver、shape 和剩余风险。
 22. fatbin 内 native cubin/PTX target list、逐 artifact hash、forced PTX-JIT conformance 和 cold/warm JIT 时间。
-23. 每个 CUDA kernel variant 的 ptxas resource、register/spill、SASS/`nvdisasm` 和 Nsight Systems/Compute report 路径。
+23. 每个 CUDA kernel variant 的 ptxas resource、register/spill、SASS/`nvdisasm` 和 Nsight Systems/Compute report 路径（用于证明优化，而非 no-FMA）。
 24. CUDA C++ specialization、layout/transpose、fusion/reduction、Graph、async/TMA 的逐项 A/B 和保留/删除理由。
 25. 每个 inline PTX candidate 的 codegen 缺口、wrapper/guard/fallback、逐 SM raw samples、approval，或 `NO_PTX_CANDIDATE`/`NO_PTX_WINNER` 结论。
-26. CUDA runtime provenance sample：device UUID、compute capability、driver/toolkit、variant、native/PTX-JIT、strict flags、artifact/benchmark id。
+26. CUDA runtime provenance sample：device UUID、compute capability、driver/toolkit、variant、native/PTX-JIT、生产优化 flags、单一 artifact/benchmark id。
 
 ## 22. 完成定义
 
@@ -1816,9 +1858,9 @@ Handback 必须包含：
 
 以下全部满足，才可称 Windows x86 CPU backend 工作完成：
 
-- SSE2 strict fallback、AVX2 strict、AVX-512 strict 和 scalar forced path 均有独立、安全的 runtime dispatch；CPUID、XCR0、compiled/available/selected 状态已验证。
-- 所有 available strict tier 在第 15.2 节完整矩阵中与 scalar intermediate/final bits 一致，无越界、padding overwrite 或 MXCSR 全局副作用。
-- ISA-specific translation units/flags 隔离，baseline/SSE2 可在无 AVX2 host 运行，反汇编证明 strict 无 FMA、全局 target 无高阶 ISA 泄漏。
+- SSE2/AVX2/AVX-512 production 与 scalar forced path 均有独立、安全的 runtime dispatch；CPUID、XCR0、compiled/available/selected 状态已验证；`math_mode=production`。
+- 所有 available production tier 在第 15.2 节完整矩阵中相对 scalar 在 tolerance 内，无越界、padding overwrite 或 MXCSR 全局副作用。
+- ISA-specific translation units/flags 隔离，baseline/SSE2 可在无 AVX2 host 运行；反汇编证明 AVX2/AVX-512 含 FMA，全局 target 无高阶 ISA 泄漏到 baseline/SSE2。
 - P0 adjacent-column inverse 完成；P1 完成或用 profiler/benchmark 明确证明不保留的原因；planner Float64/LDLT/cache 契约未被改写。
 - 自动选择由真实同机 benchmark 驱动；AVX-512 只有优于 AVX2 时才选中，available 与 selected 可不同。
 - CPU capability/provenance 和第 21 节 handback 证据完整。缺少真实 AVX-512 host 时只能报告 AVX-512 compiled/mock-dispatch，不得宣称此完成定义全部满足。
@@ -1832,10 +1874,10 @@ Handback 必须包含：
 - Generic 全覆盖；B3/B7/B11/B15 optimization 已实现或以 profiler 明确记录未保留原因。
 - CPU tolerance、valley、order、generic/specialized、memory、cancel 和 failure-path tests 通过。
 - CUDA 的 `cpp-generic`、selected C++/intrinsic/architecture/inline-PTX variants 可被 forced；每个 selected variant 与 generic bit-identical，并有对应真实 SM 的 sanitizer、SASS、resource、Nsight 和第 16.6 节 approval。
-- CUDA strict SASS 无浮点 contraction；native cubin 和 forced generic PTX-JIT 都通过。inline PTX 有逐 candidate 通过记录，或明确的 `NO_PTX_CANDIDATE`/`NO_PTX_WINNER`，direct SASS patch 未进入 artifact。
+- CUDA/Vulkan 均为 **单一极致优化数学路径**；native cubin 与 forced generic PTX-JIT 都通过第 15.4 节。inline PTX 有逐 candidate 通过记录，或明确的 `NO_PTX_CANDIDATE`/`NO_PTX_WINNER`，direct SASS patch 未进入 artifact。不存在 strict/fast-math 并行通路，生产构建未使用 `-Xptxas=-O0`。
 - caller-owned planner/cache 契约未被绕过。
 - CPU-only build 与无 GPU runtime package startup 不回归。
-- capability 只报告事实；command availability 可继续 false。
+- capability 只报告事实；command availability 可继续 false；GPU capability 不暴露多 math mode。
 - runtime 可选且 PE import table 无硬依赖。
 - handback 包含第 21 节证据。
 

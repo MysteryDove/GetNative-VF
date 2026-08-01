@@ -42,6 +42,12 @@ type BackendCapability = {
   max_forward_width: number | null;
   device?: string;
   reason?: string;
+  compiled_isa?: string[];
+  available_isa?: string[];
+  selected_isa?: string;
+  math_modes?: string[];
+  selected_math_mode?: string;
+  selection_reason?: string;
 };
 
 type EngineEnvelope = {
@@ -340,6 +346,11 @@ function BackendRow({ backend }: { backend: BackendCapability }) {
   const shape = backend.max_half_bandwidth && backend.max_forward_width
     ? ` | shape ${backend.max_half_bandwidth}/${backend.max_forward_width}`
     : "";
+  const executionMode = backend.selected_isa
+    ? ` | ${backend.selected_isa} / ${backend.selected_math_mode ?? "production"}`
+    : backend.selected_math_mode
+      ? ` | ${backend.selected_math_mode}`
+      : "";
   return (
     <div className="backend-row">
       <div className={`backend-icon ${ready ? "ready" : "unavailable"}`}>
@@ -350,7 +361,7 @@ function BackendRow({ backend }: { backend: BackendCapability }) {
         <span>{status}</span>
         <small>
           {backend.axes.length
-            ? `${backend.analysis_command_available ? "command ready" : "no analyze command"} | ${backend.axes.join(" / ")} | ${pNorm}${shape}`
+              ? `${backend.analysis_command_available ? "command ready" : "no analyze command"} | ${backend.axes.join(" / ")} | ${pNorm}${shape}${executionMode}`
             : backend.reason}
         </small>
       </div>

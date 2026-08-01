@@ -29,10 +29,8 @@ void inverse_columns_neon_impl(
                     + static_cast<std::ptrdiff_t>(plan.transpose_indices[p])
                         * input_row_stride + column;
                 const float factor = plan.transpose_weights[p];
-                const float32x4_t product_low = vmulq_n_f32(vld1q_f32(values), factor);
-                const float32x4_t product_high = vmulq_n_f32(vld1q_f32(values + 4), factor);
-                sum_low = vaddq_f32(sum_low, product_low);
-                sum_high = vaddq_f32(sum_high, product_high);
+                sum_low = vfmaq_n_f32(sum_low, vld1q_f32(values), factor);
+                sum_high = vfmaq_n_f32(sum_high, vld1q_f32(values + 4), factor);
             }
             const std::int32_t available = std::min(half_bandwidth, i);
             for (std::int32_t distance = available; distance >= 1; --distance) {
@@ -42,10 +40,8 @@ void inverse_columns_neon_impl(
                 const float factor = plan.lower_ld[
                     static_cast<std::size_t>(distance - 1) * factor_row_width
                     + static_cast<std::size_t>(i)];
-                const float32x4_t product_low = vmulq_n_f32(vld1q_f32(previous), factor);
-                const float32x4_t product_high = vmulq_n_f32(vld1q_f32(previous + 4), factor);
-                sum_low = vsubq_f32(sum_low, product_low);
-                sum_high = vsubq_f32(sum_high, product_high);
+                sum_low = vfmsq_n_f32(sum_low, vld1q_f32(previous), factor);
+                sum_high = vfmsq_n_f32(sum_high, vld1q_f32(previous + 4), factor);
             }
             const float inverse_diagonal = plan.inverse_diagonal[static_cast<std::size_t>(i)];
             sum_low = vmulq_n_f32(sum_low, inverse_diagonal);
@@ -69,10 +65,8 @@ void inverse_columns_neon_impl(
                     const float factor = plan.upper_l[
                         static_cast<std::size_t>(distance - 1) * factor_row_width
                         + static_cast<std::size_t>(i)];
-                    const float32x4_t product_low = vmulq_n_f32(vld1q_f32(next), factor);
-                    const float32x4_t product_high = vmulq_n_f32(vld1q_f32(next + 4), factor);
-                    sum_low = vaddq_f32(sum_low, product_low);
-                    sum_high = vaddq_f32(sum_high, product_high);
+                    sum_low = vfmaq_n_f32(sum_low, vld1q_f32(next), factor);
+                    sum_high = vfmaq_n_f32(sum_high, vld1q_f32(next + 4), factor);
                 }
             } else {
                 for (std::int32_t distance = available; distance >= 1; --distance) {
@@ -82,10 +76,8 @@ void inverse_columns_neon_impl(
                     const float factor = plan.upper_l[
                         static_cast<std::size_t>(distance - 1) * factor_row_width
                         + static_cast<std::size_t>(i)];
-                    const float32x4_t product_low = vmulq_n_f32(vld1q_f32(next), factor);
-                    const float32x4_t product_high = vmulq_n_f32(vld1q_f32(next + 4), factor);
-                    sum_low = vaddq_f32(sum_low, product_low);
-                    sum_high = vaddq_f32(sum_high, product_high);
+                    sum_low = vfmaq_n_f32(sum_low, vld1q_f32(next), factor);
+                    sum_high = vfmaq_n_f32(sum_high, vld1q_f32(next + 4), factor);
                 }
             }
             float *current = output

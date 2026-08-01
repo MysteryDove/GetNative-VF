@@ -19,6 +19,18 @@
 #include <unordered_map>
 #include <vector>
 
+#ifndef GETNATIVE_PLANNER_REUSE_TAPS
+#define GETNATIVE_PLANNER_REUSE_TAPS 1
+#endif
+
+#ifndef GETNATIVE_PLANNER_FAST_INTERIOR
+#define GETNATIVE_PLANNER_FAST_INTERIOR 1
+#endif
+
+#ifndef GETNATIVE_PLANNER_DIRECT_TRANSPOSE
+#define GETNATIVE_PLANNER_DIRECT_TRANSPOSE 1
+#endif
+
 // The sampling geometry and banded LDLT strategy are independently expressed from
 // Frechdachs/descale (MIT, Copyright 2021 Frechdachs). See upstream/descale/LICENSE.
 
@@ -48,6 +60,17 @@ struct AxisPlanGeometry {
 } // namespace detail
 
 namespace {
+
+constexpr bool reuse_tap_weights = GETNATIVE_PLANNER_REUSE_TAPS != 0;
+constexpr bool fast_interior_indices = GETNATIVE_PLANNER_FAST_INTERIOR != 0;
+constexpr bool direct_transpose = GETNATIVE_PLANNER_DIRECT_TRANSPOSE != 0;
+
+[[nodiscard]] constexpr bool finite_binary64(double value) noexcept {
+    static_assert(sizeof(double) == sizeof(std::uint64_t));
+    static_assert(std::numeric_limits<double>::is_iec559);
+    constexpr std::uint64_t exponent_mask = 0x7ff0000000000000ULL;
+    return (std::bit_cast<std::uint64_t>(value) & exponent_mask) != exponent_mask;
+}
 
 [[nodiscard]] double round_half_up(double x) noexcept {
     // Preserves round(x - 1) == round(x) - 1 on the pixel grid, as zimg does.
@@ -156,7 +179,7 @@ private:
         static_cast<double>(std::numeric_limits<std::int32_t>::min());
     constexpr double maximum_index_exclusive =
         static_cast<double>(std::numeric_limits<std::int32_t>::max()) + 1.0;
-    if (!std::isfinite(mapped) || mapped < minimum_index
+    if (!finite_binary64(mapped) || mapped < minimum_index
         || mapped >= maximum_index_exclusive) {
         throw std::out_of_range("shift places filter support outside the 32-bit pixel grid");
     }
@@ -168,8 +191,8 @@ private:
     if (request.source_size <= 0 || request.destination_size <= 0) {
         throw std::invalid_argument("axis dimensions must be positive");
     }
-    if (!(request.active_length > 0.0) || !std::isfinite(request.active_length)
-        || !std::isfinite(request.shift)) {
+    if (!finite_binary64(request.active_length) || !(request.active_length > 0.0)
+        || !finite_binary64(request.shift)) {
         throw std::invalid_argument(
             "active length and shift must be finite, with positive active length");
     }
@@ -239,6 +262,23 @@ make_axis_plan_geometry(const AxisPlanRequest &request) {
         std::int32_t unique_count = 0;
         const std::size_t row_base = static_cast<std::size_t>(row)
             * static_cast<std::size_t>(tap_count);
+        if constexpr (fast_interior_indices) {
+            const double final_center = begin + static_cast<double>(tap_count - 1);
+            if (begin >= 0.0
+                && final_center < static_cast<double>(request.destination_size)) {
+                const auto first_index = static_cast<std::int32_t>(std::floor(begin));
+                for (std::int32_t tap = 0; tap < tap_count; ++tap) {
+                    const std::size_t offset = row_base + static_cast<std::size_t>(tap);
+                    geometry->descale_distances[offset] =
+                        begin + static_cast<double>(tap) - position;
+                    geometry->descale_unique_indices.push_back(first_index + tap);
+                    geometry->descale_tap_slots[offset] = tap;
+                }
+                geometry->descale_row_offsets.push_back(static_cast<std::uint32_t>(
+                    geometry->descale_unique_indices.size()));
+                continue;
+            }
+        }
         for (std::int32_t tap = 0; tap < tap_count; ++tap) {
             const double center = begin + static_cast<double>(tap);
             const std::size_t offset = row_base + static_cast<std::size_t>(tap);
@@ -275,7 +315,7 @@ make_axis_plan_geometry(const AxisPlanRequest &request) {
     geometry->forward_step = std::min(scale, 1.0);
     const double expanded_support = static_cast<double>(support)
         / geometry->forward_step;
-    if (!std::isfinite(expanded_support)
+    if (!finite_binary64(expanded_support)
         || expanded_support
             > static_cast<double>(std::numeric_limits<std::int32_t>::max() / 2)) {
         throw std::length_error("zimg forward filter width is too large");
@@ -301,6 +341,25 @@ make_axis_plan_geometry(const AxisPlanRequest &request) {
         std::int32_t right = 0;
         const std::size_t row_base = static_cast<std::size_t>(row)
             * static_cast<std::size_t>(geometry->forward_filter_size);
+        if constexpr (fast_interior_indices) {
+            const double final_center = begin
+                + static_cast<double>(geometry->forward_filter_size - 1);
+            if (begin >= 0.0
+                && final_center < static_cast<double>(request.destination_size)) {
+                const auto first_index = static_cast<std::int32_t>(std::floor(begin));
+                for (std::int32_t tap = 0; tap < geometry->forward_filter_size; ++tap) {
+                    const std::size_t offset = row_base + static_cast<std::size_t>(tap);
+                    geometry->forward_distances[offset] =
+                        (begin + static_cast<double>(tap) - position)
+                        * geometry->forward_step;
+                    geometry->forward_tap_indices[offset] = first_index + tap;
+                }
+                geometry->forward_left[static_cast<std::size_t>(row)] = first_index;
+                geometry->forward_right[static_cast<std::size_t>(row)] =
+                    first_index + geometry->forward_filter_size;
+                continue;
+            }
+        }
         for (std::int32_t tap = 0; tap < geometry->forward_filter_size; ++tap) {
             const double pixel_center = begin + static_cast<double>(tap);
             const std::size_t offset = row_base + static_cast<std::size_t>(tap);
@@ -331,10 +390,17 @@ struct DoubleCsr {
     std::vector<double> weights;
 };
 
+struct DoubleCsrView {
+    std::vector<std::uint32_t> &offsets;
+    std::vector<std::int32_t> &indices;
+    std::vector<double> &weights;
+};
+
 template <bool ReuseTapWeights, bool ReuseGeometry = false>
-[[nodiscard]] DoubleCsr make_descale_matrix(const AxisPlanRequest &request,
-                                            std::int32_t support,
-                                            const detail::AxisPlanGeometry *geometry = nullptr) {
+void make_descale_matrix(DoubleCsrView result,
+                         const AxisPlanRequest &request,
+                         std::int32_t support,
+                         const detail::AxisPlanGeometry *geometry = nullptr) {
     const std::int32_t rows = request.source_size;
     const std::int32_t columns = request.destination_size;
     const double ratio = static_cast<double>(rows) / request.active_length;
@@ -344,7 +410,9 @@ template <bool ReuseTapWeights, bool ReuseGeometry = false>
         }
     }
 
-    DoubleCsr result;
+    result.offsets.clear();
+    result.indices.clear();
+    result.weights.clear();
     result.offsets.reserve(static_cast<std::size_t>(rows) + 1U);
     result.indices.reserve(static_cast<std::size_t>(rows) * static_cast<std::size_t>(2 * support));
     result.weights.reserve(result.indices.capacity());
@@ -380,8 +448,28 @@ template <bool ReuseTapWeights, bool ReuseGeometry = false>
             }
             total += weight;
         }
-        if (!std::isfinite(total) || total == 0.0) {
+        if (!finite_binary64(total) || total == 0.0) {
             throw std::runtime_error("filter produced a zero or non-finite weight sum");
+        }
+
+        if constexpr (!ReuseGeometry && fast_interior_indices) {
+            const double final_center = begin + static_cast<double>(2 * support - 1);
+            if (begin >= 0.0 && final_center < static_cast<double>(columns)) {
+                const auto first_index = static_cast<std::int32_t>(std::floor(begin));
+                for (std::int32_t tap = 0; tap < 2 * support; ++tap) {
+                    const double raw_weight = ReuseTapWeights
+                        ? tap_weights[static_cast<std::size_t>(tap)]
+                        : request.filter.weight(
+                            begin + static_cast<double>(tap) - position);
+                    const double weight = raw_weight / total;
+                    if (weight == 0.0) continue;
+                    result.indices.push_back(first_index + tap);
+                    result.weights.push_back(weight);
+                }
+                result.offsets.push_back(static_cast<std::uint32_t>(
+                    result.indices.size()));
+                continue;
+            }
         }
 
         if constexpr (ReuseGeometry) {
@@ -458,13 +546,13 @@ template <bool ReuseTapWeights, bool ReuseGeometry = false>
         }
         result.offsets.push_back(static_cast<std::uint32_t>(result.indices.size()));
     }
-    return result;
 }
 
 template <bool ReuseTapWeights, bool ReuseGeometry = false>
-[[nodiscard]] DoubleCsr make_zimg_forward(const AxisPlanRequest &request,
-                                          std::int32_t support,
-                                          const detail::AxisPlanGeometry *geometry = nullptr) {
+void make_zimg_forward(DoubleCsrView result,
+                       const AxisPlanRequest &request,
+                       std::int32_t support,
+                       const detail::AxisPlanGeometry *geometry = nullptr) {
     const std::int32_t rows = request.source_size;
     const std::int32_t columns = request.destination_size;
     const double scale = static_cast<double>(rows) / request.active_length;
@@ -478,7 +566,7 @@ template <bool ReuseTapWeights, bool ReuseGeometry = false>
         filter_size = geometry->forward_filter_size;
     } else {
         const double expanded_support = static_cast<double>(support) / step;
-        if (!std::isfinite(expanded_support)
+        if (!finite_binary64(expanded_support)
             || expanded_support
                 > static_cast<double>(std::numeric_limits<std::int32_t>::max() / 2)) {
             throw std::length_error("zimg forward filter width is too large");
@@ -488,7 +576,9 @@ template <bool ReuseTapWeights, bool ReuseGeometry = false>
     }
     const ZimgKernel kernel(request.filter);
 
-    DoubleCsr result;
+    result.offsets.clear();
+    result.indices.clear();
+    result.weights.clear();
     result.offsets.reserve(static_cast<std::size_t>(rows) + 1U);
     result.indices.reserve(static_cast<std::size_t>(rows)
                            * static_cast<std::size_t>(std::min(filter_size, columns)));
@@ -526,8 +616,28 @@ template <bool ReuseTapWeights, bool ReuseGeometry = false>
             }
             total += weight;
         }
-        if (!std::isfinite(total) || total == 0.0) {
+        if (!finite_binary64(total) || total == 0.0) {
             throw std::runtime_error("zimg forward filter produced a zero or non-finite weight sum");
+        }
+
+        if constexpr (!ReuseGeometry && fast_interior_indices) {
+            const double final_center = begin + static_cast<double>(filter_size - 1);
+            if (begin >= 0.0 && final_center < static_cast<double>(columns)) {
+                const auto first_index = static_cast<std::int32_t>(std::floor(begin));
+                for (std::int32_t tap = 0; tap < filter_size; ++tap) {
+                    const double raw_weight = ReuseTapWeights
+                        ? tap_weights[static_cast<std::size_t>(tap)]
+                        : kernel.weight(
+                            (begin + static_cast<double>(tap) - position) * step);
+                    double weight = 0.0;
+                    weight += raw_weight / total;
+                    result.indices.push_back(first_index + tap);
+                    result.weights.push_back(weight);
+                }
+                result.offsets.push_back(static_cast<std::uint32_t>(
+                    result.indices.size()));
+                continue;
+            }
         }
 
         std::int32_t left = ReuseGeometry
@@ -588,11 +698,10 @@ template <bool ReuseTapWeights, bool ReuseGeometry = false>
         }
         result.offsets.push_back(static_cast<std::uint32_t>(result.indices.size()));
     }
-    return result;
 }
 
-[[nodiscard]] DoubleCsr transpose_csr(const DoubleCsr &input, std::int32_t rows,
-                                      std::int32_t columns) {
+[[nodiscard]] DoubleCsr transpose_csr(const DoubleCsrView &input, std::int32_t rows,
+                                       std::int32_t columns) {
     DoubleCsr result;
     result.offsets.assign(static_cast<std::size_t>(columns) + 1U, 0U);
     for (const std::int32_t index : input.indices) {
@@ -617,12 +726,44 @@ template <bool ReuseTapWeights, bool ReuseGeometry = false>
     return result;
 }
 
-[[nodiscard]] std::vector<double> form_normal_bands(const DoubleCsr &forward,
-                                                    std::int32_t rows,
-                                                    std::int32_t columns,
-                                                    std::int32_t half_bandwidth) {
+void transpose_csr_direct(const DoubleCsrView &input,
+                          std::int32_t rows,
+                          std::int32_t columns,
+                          AxisPlan &plan) {
+    plan.transpose_offsets.assign(static_cast<std::size_t>(columns) + 1U, 0U);
+    for (const std::int32_t index : input.indices) {
+        ++plan.transpose_offsets[static_cast<std::size_t>(index) + 1U];
+    }
+    for (std::int32_t column = 0; column < columns; ++column) {
+        plan.transpose_offsets[static_cast<std::size_t>(column) + 1U] +=
+            plan.transpose_offsets[static_cast<std::size_t>(column)];
+    }
+    plan.transpose_indices.resize(input.indices.size());
+    plan.transpose_weights.resize(input.weights.size());
+    for (std::int32_t row = 0; row < rows; ++row) {
+        const std::uint32_t begin = input.offsets[static_cast<std::size_t>(row)];
+        const std::uint32_t end = input.offsets[static_cast<std::size_t>(row) + 1U];
+        for (std::uint32_t position = begin; position < end; ++position) {
+            const auto column = static_cast<std::size_t>(input.indices[position]);
+            const std::uint32_t target = plan.transpose_offsets[column]++;
+            plan.transpose_indices[target] = row;
+            plan.transpose_weights[target] = static_cast<float>(input.weights[position]);
+        }
+    }
+    for (std::size_t column = static_cast<std::size_t>(columns);
+         column > 0U; --column) {
+        plan.transpose_offsets[column] = plan.transpose_offsets[column - 1U];
+    }
+    plan.transpose_offsets[0] = 0U;
+}
+
+void form_normal_bands(const DoubleCsrView &forward,
+                       std::int32_t rows,
+                       std::int32_t columns,
+                       std::int32_t half_bandwidth,
+                       std::vector<double> &bands) {
     const auto n = static_cast<std::size_t>(columns);
-    std::vector<double> bands((static_cast<std::size_t>(half_bandwidth) + 1U) * n, 0.0);
+    bands.assign((static_cast<std::size_t>(half_bandwidth) + 1U) * n, 0.0);
     for (std::int32_t row = 0; row < rows; ++row) {
         const std::uint32_t begin = forward.offsets[static_cast<std::size_t>(row)];
         const std::uint32_t end = forward.offsets[static_cast<std::size_t>(row) + 1U];
@@ -639,7 +780,6 @@ template <bool ReuseTapWeights, bool ReuseGeometry = false>
             }
         }
     }
-    return bands;
 }
 
 void factor_banded_ldlt(std::vector<double> &bands, std::int32_t n,
@@ -672,7 +812,7 @@ bool AxisPlan::valid() const noexcept {
     const auto factors = static_cast<std::size_t>(std::max(half_bandwidth, 0)) * dst;
     const auto forward_elements = src * static_cast<std::size_t>(std::max(forward_width, 0));
     return source_size > 0 && destination_size > 0 && support > 0 && forward_width > 0
-        && active_length > 0.0 && std::isfinite(active_length) && std::isfinite(shift)
+        && active_length > 0.0 && finite_binary64(active_length) && finite_binary64(shift)
         && forward_offsets.size() == src + 1U
         && forward_indices.size() == forward_elements
         && forward_weights.size() == forward_elements
@@ -704,33 +844,63 @@ namespace {
 [[nodiscard]] AxisPlan build_axis_plan_impl(
     const AxisPlanRequest &request,
     detail::TapEvaluationMode tap_evaluation,
-    const detail::AxisPlanGeometry *geometry) {
+    const detail::AxisPlanGeometry *geometry,
+    detail::AxisPlanBuildScratch *reusable_scratch) {
     const std::int32_t support = validated_support(request);
     const std::int32_t half_bandwidth = std::min(2 * support - 1, request.destination_size - 1);
-    DoubleCsr descale_matrix;
-    DoubleCsr zimg_forward;
+    detail::AxisPlanBuildScratch local_scratch;
+    detail::AxisPlanBuildScratch &scratch = reusable_scratch != nullptr
+        ? *reusable_scratch : local_scratch;
+    DoubleCsrView descale_matrix{
+        scratch.descale_offsets,
+        scratch.descale_indices,
+        scratch.descale_weights,
+    };
+    DoubleCsrView zimg_forward{
+        scratch.forward_offsets,
+        scratch.forward_indices,
+        scratch.forward_weights,
+    };
     if (geometry != nullptr) {
-        descale_matrix = tap_evaluation == detail::TapEvaluationMode::reuse
-            ? make_descale_matrix<true, true>(request, support, geometry)
-            : make_descale_matrix<false, true>(request, support, geometry);
-        zimg_forward = tap_evaluation == detail::TapEvaluationMode::reuse
-            ? make_zimg_forward<true, true>(request, support, geometry)
-            : make_zimg_forward<false, true>(request, support, geometry);
+        if (tap_evaluation == detail::TapEvaluationMode::reuse) {
+            make_descale_matrix<true, true>(
+                descale_matrix, request, support, geometry);
+            make_zimg_forward<true, true>(
+                zimg_forward, request, support, geometry);
+        } else {
+            make_descale_matrix<false, true>(
+                descale_matrix, request, support, geometry);
+            make_zimg_forward<false, true>(
+                zimg_forward, request, support, geometry);
+        }
     } else {
-        descale_matrix = tap_evaluation == detail::TapEvaluationMode::reuse
-            ? make_descale_matrix<true>(request, support)
-            : make_descale_matrix<false>(request, support);
-        zimg_forward = tap_evaluation == detail::TapEvaluationMode::reuse
-            ? make_zimg_forward<true>(request, support)
-            : make_zimg_forward<false>(request, support);
+        if (tap_evaluation == detail::TapEvaluationMode::reuse) {
+            make_descale_matrix<true>(descale_matrix, request, support);
+            make_zimg_forward<true>(zimg_forward, request, support);
+        } else {
+            make_descale_matrix<false>(descale_matrix, request, support);
+            make_zimg_forward<false>(zimg_forward, request, support);
+        }
     }
-    DoubleCsr transpose = transpose_csr(
-        descale_matrix, request.source_size, request.destination_size);
-    std::vector<double> factors = form_normal_bands(
-        descale_matrix, request.source_size, request.destination_size, half_bandwidth);
-    factor_banded_ldlt(factors, request.destination_size, half_bandwidth);
 
     AxisPlan plan;
+    if constexpr (direct_transpose) {
+        transpose_csr_direct(
+            descale_matrix, request.source_size, request.destination_size, plan);
+    } else {
+        DoubleCsr transpose = transpose_csr(
+            descale_matrix, request.source_size, request.destination_size);
+        plan.transpose_offsets = std::move(transpose.offsets);
+        plan.transpose_indices = std::move(transpose.indices);
+        plan.transpose_weights.assign(
+            transpose.weights.begin(), transpose.weights.end());
+    }
+    form_normal_bands(
+        descale_matrix, request.source_size, request.destination_size,
+        half_bandwidth, scratch.normal_bands);
+    factor_banded_ldlt(
+        scratch.normal_bands, request.destination_size, half_bandwidth);
+
     plan.source_size = request.source_size;
     plan.destination_size = request.destination_size;
     plan.support = support;
@@ -781,10 +951,6 @@ namespace {
     }
     plan.forward_offsets[static_cast<std::size_t>(request.source_size)] =
         static_cast<std::uint32_t>(forward_elements);
-    plan.transpose_offsets = std::move(transpose.offsets);
-    plan.transpose_indices = std::move(transpose.indices);
-    plan.transpose_weights.assign(transpose.weights.begin(), transpose.weights.end());
-
     const auto n = static_cast<std::size_t>(request.destination_size);
     const auto factor_count = static_cast<std::size_t>(half_bandwidth) * n;
     plan.lower_ld.assign(factor_count, 0.0F);
@@ -792,17 +958,18 @@ namespace {
     plan.inverse_diagonal.resize(n);
     constexpr double epsilon = std::numeric_limits<double>::epsilon();
     for (std::int32_t i = 0; i < request.destination_size; ++i) {
-        const double diagonal = factors[static_cast<std::size_t>(i)];
+        const double diagonal = scratch.normal_bands[static_cast<std::size_t>(i)];
         plan.inverse_diagonal[static_cast<std::size_t>(i)] = static_cast<float>(1.0 / (diagonal + epsilon));
         const std::int32_t available = std::min(half_bandwidth, request.destination_size - i - 1);
         for (std::int32_t distance = 1; distance <= available; ++distance) {
-            const float l = static_cast<float>(factors[static_cast<std::size_t>(distance) * n
-                                                        + static_cast<std::size_t>(i)]);
+            const float l = static_cast<float>(scratch.normal_bands[
+                static_cast<std::size_t>(distance) * n + static_cast<std::size_t>(i)]);
             plan.upper_l[static_cast<std::size_t>(distance - 1) * n + static_cast<std::size_t>(i)] = l;
             const std::int32_t row = i + distance;
             plan.lower_ld[static_cast<std::size_t>(distance - 1) * n + static_cast<std::size_t>(row)] =
-                static_cast<float>(factors[static_cast<std::size_t>(distance) * n + static_cast<std::size_t>(i)]
-                                   * diagonal);
+                static_cast<float>(scratch.normal_bands[
+                    static_cast<std::size_t>(distance) * n + static_cast<std::size_t>(i)]
+                    * diagonal);
         }
     }
     return plan;
@@ -812,7 +979,10 @@ namespace {
 
 AxisPlan build_axis_plan(const AxisPlanRequest &request) {
     return build_axis_plan_impl(
-        request, detail::TapEvaluationMode::reuse, nullptr);
+        request,
+        reuse_tap_weights ? detail::TapEvaluationMode::reuse
+                          : detail::TapEvaluationMode::recompute,
+        nullptr, nullptr);
 }
 
 namespace detail {
@@ -820,7 +990,7 @@ namespace detail {
 AxisPlan build_axis_plan_with_tap_evaluation(
     const AxisPlanRequest &request,
     TapEvaluationMode mode) {
-    return build_axis_plan_impl(request, mode, nullptr);
+    return build_axis_plan_impl(request, mode, nullptr, nullptr);
 }
 
 std::shared_ptr<const AxisPlanGeometry> build_axis_plan_geometry(
@@ -843,8 +1013,9 @@ std::size_t axis_plan_geometry_bytes(const AxisPlanGeometry &geometry) noexcept 
 AxisPlan build_axis_plan_with_geometry(
     const AxisPlanRequest &request,
     TapEvaluationMode tap_evaluation,
-    const AxisPlanGeometry *geometry) {
-    return build_axis_plan_impl(request, tap_evaluation, geometry);
+    const AxisPlanGeometry *geometry,
+    AxisPlanBuildScratch *scratch) {
+    return build_axis_plan_impl(request, tap_evaluation, geometry, scratch);
 }
 
 } // namespace detail
@@ -1018,14 +1189,20 @@ void inverse_axis_impl(const AxisPlan &plan, const float *input,
         float sum = 0.0F;
         for (std::uint32_t p = plan.transpose_offsets[static_cast<std::size_t>(i)];
              p < plan.transpose_offsets[static_cast<std::size_t>(i) + 1U]; ++p) {
-            sum += plan.transpose_weights[p]
-                * input[static_cast<std::ptrdiff_t>(plan.transpose_indices[p]) * input_stride];
+            sum = std::fma(
+                plan.transpose_weights[p],
+                input[static_cast<std::ptrdiff_t>(plan.transpose_indices[p])
+                      * input_stride],
+                sum);
         }
         const std::int32_t available = std::min(c, i);
         // Far-to-near ordering matches descale's scalar float solve.
         for (std::int32_t distance = available; distance >= 1; --distance) {
-            sum -= plan.lower_ld[static_cast<std::size_t>(distance - 1) * width + static_cast<std::size_t>(i)]
-                * output[static_cast<std::ptrdiff_t>(i - distance) * output_stride];
+            sum = std::fma(
+                -plan.lower_ld[static_cast<std::size_t>(distance - 1) * width
+                               + static_cast<std::size_t>(i)],
+                output[static_cast<std::ptrdiff_t>(i - distance) * output_stride],
+                sum);
         }
         output[static_cast<std::ptrdiff_t>(i) * output_stride] =
             sum * plan.inverse_diagonal[static_cast<std::size_t>(i)];
@@ -1036,13 +1213,19 @@ void inverse_axis_impl(const AxisPlan &plan, const float *input,
         if constexpr (FixedHalfBandwidth == 3) {
             // Descale's bandwidth-7 path accumulates the backward solve near-to-far.
             for (std::int32_t distance = 1; distance <= available; ++distance) {
-                sum += plan.upper_l[static_cast<std::size_t>(distance - 1) * width + static_cast<std::size_t>(i)]
-                    * output[static_cast<std::ptrdiff_t>(i + distance) * output_stride];
+                sum = std::fma(
+                    plan.upper_l[static_cast<std::size_t>(distance - 1) * width
+                                 + static_cast<std::size_t>(i)],
+                    output[static_cast<std::ptrdiff_t>(i + distance) * output_stride],
+                    sum);
             }
         } else {
             for (std::int32_t distance = available; distance >= 1; --distance) {
-                sum += plan.upper_l[static_cast<std::size_t>(distance - 1) * width + static_cast<std::size_t>(i)]
-                    * output[static_cast<std::ptrdiff_t>(i + distance) * output_stride];
+                sum = std::fma(
+                    plan.upper_l[static_cast<std::size_t>(distance - 1) * width
+                                 + static_cast<std::size_t>(i)],
+                    output[static_cast<std::ptrdiff_t>(i + distance) * output_stride],
+                    sum);
             }
         }
         output[static_cast<std::ptrdiff_t>(i) * output_stride] -= sum;
@@ -1060,8 +1243,10 @@ void forward_axis_impl(const AxisPlan &plan, const float *input,
         const std::int32_t left = plan.forward_indices[begin];
         float sum = 0.0F;
         for (std::int32_t tap = 0; tap < width; ++tap) {
-            sum += plan.forward_weights[begin + static_cast<std::size_t>(tap)]
-                * input[static_cast<std::ptrdiff_t>(left + tap) * input_stride];
+            sum = std::fma(
+                plan.forward_weights[begin + static_cast<std::size_t>(tap)],
+                input[static_cast<std::ptrdiff_t>(left + tap) * input_stride],
+                sum);
         }
         output[static_cast<std::ptrdiff_t>(row) * output_stride] = sum;
     }

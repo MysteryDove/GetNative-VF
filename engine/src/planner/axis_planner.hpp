@@ -9,13 +9,18 @@
 #include <span>
 #include <vector>
 
+#ifndef GETNATIVE_PLANNER_REUSE_TAPS
+#define GETNATIVE_PLANNER_REUSE_TAPS 1
+#endif
+
 namespace getnative::detail {
 
 struct AxisPlanBatchOptions {
     std::size_t worker_count = 0;
     std::function<void(std::size_t)> before_build;
     std::function<void(std::size_t)> failure_observed;
-    TapEvaluationMode tap_evaluation = TapEvaluationMode::reuse;
+    TapEvaluationMode tap_evaluation = GETNATIVE_PLANNER_REUSE_TAPS != 0
+        ? TapEvaluationMode::reuse : TapEvaluationMode::recompute;
     BicubicGeometryMode bicubic_geometry = BicubicGeometryMode::reuse;
 };
 

@@ -29,6 +29,7 @@
     "targets": "all",
     "resources": {
       "bundle-stage/bin/": "bin/",
+      "bundle-stage/build-provenance.json": "build-provenance.json",
       "bundle-stage/share/getnative/THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
     },
     "icon": [

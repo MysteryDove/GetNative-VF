@@ -28,11 +28,13 @@ require VapourSynth, Python, plugins, or `.vpy` scripts at runtime.
   fixed engine process boundary; the webview has no general shell permission.
 - macOS development and `.app` packaging automatically build and include the
   engine under `Contents/Resources/bin`.
-- The GUI exposes the real geometry command and validates capability schema v2.
+- The GUI exposes the real geometry command and validates capability schema v3.
   It reports compile, device, and analysis-command availability separately and
   does not display placeholder curves, valleys, or analysis controls while the
-  `analyze` command is unavailable. Decode, the long-running worker protocol,
-  CUDA, exports, and real GUI analysis remain incomplete.
+  `analyze` command is unavailable. Windows builds can embed optional CUDA and
+  Vulkan compute backends without adding loader/driver imports to CPU-only
+  startup. Decode, the long-running worker protocol, exports, and real GUI
+  analysis remain incomplete.
 
 The accepted architecture and implementation sequence are documented in
 `docs/architecture.md` and `.omx/plans/standalone-getnative.md`.
@@ -88,3 +90,30 @@ On Apple platforms CMake enables Metal when both `metal` and `metallib` are
 installed. If the optional MetalToolchain component is unavailable it emits a
 warning and produces the CPU-only engine instead. Other platforms are CPU-only
 unless a later backend is enabled explicitly.
+
+## Windows Backends
+
+The Windows engine has four explicit CMake switches:
+
+- `GETNATIVE_ENABLE_X86_SIMD` builds the runtime-dispatched SSE2 and AVX2 tiers.
+- `GETNATIVE_ENABLE_X86_AVX512` additionally builds the forced experimental
+  AVX-512 tier; runtime CPUID/XCR0 checks still decide whether it is available.
+- `GETNATIVE_ENABLE_CUDA` embeds a strict CUDA fatbin plus forward-compatible
+  PTX. `GETNATIVE_CUDA_ARCHITECTURES` is the semicolon-separated native target
+  list; its last entry also supplies the PTX target.
+- `GETNATIVE_ENABLE_VULKAN` embeds validated Vulkan 1.2 SPIR-V shaders.
+
+CUDA and Vulkan use runtime-loaded driver APIs. A package built with either
+backend still starts without the corresponding loader or driver and reports
+`compiled`, `device_available`, and `analysis_command_available` separately.
+The product has no analysis worker yet, so `commands.analyze` and every
+`analysis_command_available` field remain `false`.
+
+On Windows, `npm run build:engine` and the Tauri package build use
+`GETNATIVE_WINDOWS_BACKENDS=both` by default. Set it to `cpu`, `cuda`, or
+`vulkan` for an explicit reduced build. Set
+`GETNATIVE_CUDA_ARCHITECTURES` when targeting a device other than the default
+`120`; `GETNATIVE_VSDEVCMD`, `CMAKE`, and `CTEST` can override tool locations.
+The build script configures the requested backend set, builds it, runs CTest,
+installs that exact engine, and writes its SHA-256 and backend provenance into
+the package resources.

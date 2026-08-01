@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build:engine:debug": "cmake -S ../engine -B ../build/engine -DCMAKE_BUILD_TYPE=Debug && cmake --build ../build/engine --config Debug --parallel && cmake --install ../build/engine --config Debug --prefix src-tauri/bundle-stage",
-    "build:engine": "cmake -S ../engine -B ../build/engine -DCMAKE_BUILD_TYPE=Release && cmake --build ../build/engine --config Release --parallel && cmake --install ../build/engine --config Release --prefix src-tauri/bundle-stage",
+    "build:engine:debug": "node scripts/build-engine.mjs --debug",
+    "build:engine": "node scripts/build-engine.mjs --release",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri"

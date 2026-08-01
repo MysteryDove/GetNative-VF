@@ -1,0 +1,45 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "getnative_common.glsl"
+
+layout(local_size_x_id = 4, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 1) const uint fixed_forward_width = 0u;
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint candidate = gid / job.maximum_vector_count;
+    const uint vector = gid - candidate * job.maximum_vector_count;
+    if (candidate >= job.candidate_count) {
+        return;
+    }
+    const uint descriptor_index = job.crop_left;
+    const AxisPlanDescriptor plan = plans[descriptor_index + candidate];
+    const bool horizontal = plan.direction == horizontal_axis;
+    const uint vector_count = horizontal ? plan.native_height : plan.vector_count;
+    if (vector >= vector_count) {
+        return;
+    }
+
+    const uint width = fixed_forward_width == 0u
+        ? plan.forward_width : fixed_forward_width;
+    const uint input_stride = horizontal ? 1u : plan.vector_count;
+    const uint output_stride = horizontal ? 1u : plan.vector_count;
+    const uint input_base = horizontal
+        ? plan.intermediate_or_native_base + vector * plan.destination_size
+        : plan.workspace_base + vector;
+    const uint output_base = horizontal
+        ? plan.workspace_base + vector * plan.source_size
+        : plan.intermediate_or_native_base + vector;
+    for (uint row = 0u; row < plan.source_size; ++row) {
+        const uint weight_base = plan.forward_weights_base + row * plan.forward_width;
+        const uint left = uint(forward_left[plan.forward_left_base + row]);
+        float sum = 0.0;
+        for (uint tap = 0u; tap < width; ++tap) {
+            float weighted = forward_weights[weight_base + tap]
+                * workspace[input_base + (left + tap) * input_stride];
+            sum = sum + weighted;
+        }
+        workspace[output_base + row * output_stride] = sum;
+    }
+}

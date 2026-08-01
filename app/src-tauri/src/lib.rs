@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -62,6 +63,20 @@ struct BackendCapability {
     p_norms: Option<PNormRange>,
     max_half_bandwidth: Option<u32>,
     max_forward_width: Option<u32>,
+    #[serde(default)]
+    compiled_isa: Option<Vec<String>>,
+    #[serde(default)]
+    available_isa: Option<Vec<String>>,
+    #[serde(default)]
+    selected_isa: Option<String>,
+    #[serde(default)]
+    math_modes: Option<Vec<String>>,
+    #[serde(default)]
+    selected_math_mode: Option<String>,
+    #[serde(default)]
+    selection_reason: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -142,7 +157,7 @@ fn validate_capabilities(payload: &Value) -> Result<(), String> {
         serde_json::from_value(payload.clone()).map_err(|error| {
             format!("getnative-engine returned an invalid capability schema: {error}")
         })?;
-    if capabilities.schema_version != 2 || capabilities.engine != "getnative-engine" {
+    if capabilities.schema_version != 3 || capabilities.engine != "getnative-engine" {
         return Err("getnative-engine returned an unsupported capability schema".to_owned());
     }
     if !capabilities.commands.capabilities
@@ -181,15 +196,21 @@ fn validate_capabilities(payload: &Value) -> Result<(), String> {
         }
     }
 
-    let backend_ids = capabilities
-        .backends
-        .iter()
-        .map(|backend| backend.id.as_str())
-        .collect::<Vec<_>>();
-    if backend_ids != ["cpu", "metal", "cuda"] {
-        return Err("getnative-engine returned an unexpected backend contract".to_owned());
+    let mut backends = HashMap::new();
+    for backend in &capabilities.backends {
+        if !matches!(backend.id.as_str(), "cpu" | "metal" | "cuda" | "vulkan") {
+            return Err("getnative-engine returned an unknown backend id".to_owned());
+        }
+        if backends.insert(backend.id.as_str(), backend).is_some() {
+            return Err("getnative-engine returned a duplicate backend id".to_owned());
+        }
     }
-    let cpu = &capabilities.backends[0];
+    if backends.len() != 4 {
+        return Err("getnative-engine did not return all required backends".to_owned());
+    }
+    let cpu = backends
+        .get("cpu")
+        .ok_or_else(|| "getnative-engine did not return the CPU backend".to_owned())?;
     if !cpu.compiled
         || !cpu.device_available
         || cpu.analysis_command_available
@@ -203,41 +224,76 @@ fn validate_capabilities(payload: &Value) -> Result<(), String> {
         )
         || cpu.max_half_bandwidth != Some(29)
         || cpu.max_forward_width != Some(30)
+        || cpu.compiled_isa.as_deref().is_none_or(|values| {
+            values.first().map(String::as_str) != Some("scalar")
+                || values
+                    .iter()
+                    .any(|value| !matches!(value.as_str(), "scalar" | "sse2" | "avx2" | "avx512"))
+        })
+        || cpu.available_isa.as_deref().is_none_or(|values| {
+            values.first().map(String::as_str) != Some("scalar")
+                || values
+                    .iter()
+                    .any(|value| !matches!(value.as_str(), "scalar" | "sse2" | "avx2" | "avx512"))
+        })
+        || !matches!(
+            cpu.selected_isa.as_deref(),
+            Some("scalar" | "sse2" | "avx2" | "avx512")
+        )
+        || cpu
+            .math_modes
+            .as_deref()
+            .is_none_or(|values| values.len() != 1 || values[0] != "production")
+        || cpu.selected_math_mode.as_deref() != Some("production")
+        || cpu.selection_reason.as_deref().is_none_or(str::is_empty)
     {
         return Err("getnative-engine returned invalid CPU capabilities".to_owned());
     }
-    let metal = &capabilities.backends[1];
-    let valid_metal_shape = if metal.compiled {
-        metal.axes == ["horizontal", "vertical", "both"]
-            && matches!(
-                metal.p_norms,
-                Some(PNormRange {
-                    minimum: 1,
-                    maximum: 1
-                })
-            )
-            && metal.max_half_bandwidth == Some(15)
-            && metal.max_forward_width == Some(16)
-    } else {
-        !metal.device_available
-            && metal.axes.is_empty()
-            && metal.p_norms.is_none()
-            && metal.max_half_bandwidth.is_none()
-            && metal.max_forward_width.is_none()
-    };
-    if metal.analysis_command_available || !valid_metal_shape {
-        return Err("getnative-engine returned invalid Metal capabilities".to_owned());
-    }
-    let cuda = &capabilities.backends[2];
-    if cuda.compiled
-        || cuda.device_available
-        || cuda.analysis_command_available
-        || !cuda.axes.is_empty()
-        || cuda.p_norms.is_some()
-        || cuda.max_half_bandwidth.is_some()
-        || cuda.max_forward_width.is_some()
-    {
-        return Err("getnative-engine returned invalid CUDA capabilities".to_owned());
+
+    for id in ["metal", "cuda", "vulkan"] {
+        let backend = backends
+            .get(id)
+            .ok_or_else(|| format!("getnative-engine did not return the {id} backend"))?;
+        let valid_shape = if backend.compiled {
+            backend.axes == ["horizontal", "vertical", "both"]
+                && matches!(
+                    backend.p_norms,
+                    Some(PNormRange {
+                        minimum: 1,
+                        maximum: 1
+                    })
+                )
+                && backend.max_half_bandwidth == Some(15)
+                && backend.max_forward_width == Some(16)
+                && (backend.device_available
+                    || backend
+                        .reason
+                        .as_deref()
+                        .is_some_and(|reason| !reason.is_empty()))
+        } else {
+            !backend.device_available
+                && backend.axes.is_empty()
+                && backend.p_norms.is_none()
+                && backend.max_half_bandwidth.is_none()
+                && backend.max_forward_width.is_none()
+                && backend.reason.as_deref() == Some("not compiled")
+        };
+        // GPU backends use a single production math path; no multi-mode surface.
+        let valid_math_mode = match id {
+            "cuda" | "vulkan" => {
+                backend.math_modes.is_none() && backend.selected_math_mode.is_none()
+            }
+            _ => true,
+        };
+        if backend.analysis_command_available
+            || backend.device_available && !backend.compiled
+            || !valid_shape
+            || !valid_math_mode
+        {
+            return Err(format!(
+                "getnative-engine returned invalid {id} capabilities"
+            ));
+        }
     }
     let profile_contract = capabilities
         .profiles
@@ -371,7 +427,7 @@ mod tests {
 
     fn valid_capabilities() -> serde_json::Value {
         json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "engine": "getnative-engine",
             "commands": {"capabilities": true, "geometry": true, "analyze": false},
             "kernels": [
@@ -383,9 +439,10 @@ mod tests {
                 {"id": "spline64", "parameters": {"kind": "none"}}
             ],
             "backends": [
-                {"id": "cpu", "compiled": true, "device_available": true, "analysis_command_available": false, "axes": ["horizontal", "vertical", "both"], "p_norms": {"minimum": 1, "maximum": 4294967295_u64}, "max_half_bandwidth": 29, "max_forward_width": 30},
+                {"id": "cpu", "compiled": true, "device_available": true, "analysis_command_available": false, "axes": ["horizontal", "vertical", "both"], "p_norms": {"minimum": 1, "maximum": 4294967295_u64}, "max_half_bandwidth": 29, "max_forward_width": 30, "compiled_isa": ["scalar", "sse2", "avx2", "avx512"], "available_isa": ["scalar", "sse2", "avx2"], "selected_isa": "avx2", "math_modes": ["production"], "selected_math_mode": "production", "selection_reason": "avx512 not benchmark-approved"},
                 {"id": "metal", "compiled": true, "device_available": true, "analysis_command_available": false, "axes": ["horizontal", "vertical", "both"], "p_norms": {"minimum": 1, "maximum": 1}, "max_half_bandwidth": 15, "max_forward_width": 16},
-                {"id": "cuda", "compiled": false, "device_available": false, "analysis_command_available": false, "axes": [], "p_norms": null, "max_half_bandwidth": null, "max_forward_width": null}
+                {"id": "cuda", "compiled": false, "device_available": false, "analysis_command_available": false, "axes": [], "p_norms": null, "max_half_bandwidth": null, "max_forward_width": null, "reason": "not compiled"},
+                {"id": "vulkan", "compiled": false, "device_available": false, "analysis_command_available": false, "axes": [], "p_norms": null, "max_half_bandwidth": null, "max_forward_width": null, "reason": "not compiled"}
             ],
             "profiles": [
                 {"id": "muf-d278cd3", "default_crop": 5},
@@ -464,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_schema_rejects_false_analysis_or_cuda_claims() {
+    fn capability_schema_rejects_false_analysis_and_inconsistent_gpu_claims() {
         let mut analysis = valid_capabilities();
         analysis["commands"]["analyze"] = json!(true);
         assert!(validate_capabilities(&analysis).is_err());
@@ -476,5 +533,37 @@ mod tests {
         let mut profiles = valid_capabilities();
         profiles["profiles"] = json!([]);
         assert!(validate_capabilities(&profiles).is_err());
+    }
+
+    #[test]
+    fn capability_schema_maps_backends_by_id_and_rejects_duplicates_or_missing_ids() {
+        let mut reordered = valid_capabilities();
+        reordered["backends"].as_array_mut().unwrap().reverse();
+        assert!(validate_capabilities(&reordered).is_ok());
+
+        let mut no_device = valid_capabilities();
+        no_device["backends"][2] = json!({
+            "id": "cuda", "compiled": true, "device_available": false,
+            "analysis_command_available": false,
+            "axes": ["horizontal", "vertical", "both"],
+            "p_norms": {"minimum": 1, "maximum": 1},
+            "max_half_bandwidth": 15, "max_forward_width": 16,
+            "reason": "CUDA driver is unavailable"
+        });
+        assert!(validate_capabilities(&no_device).is_ok());
+
+        let mut invalid_math_mode = no_device.clone();
+        invalid_math_mode["backends"][2]["math_modes"] =
+            json!(["strict", "relaxed-fma", "fast-math"]);
+        invalid_math_mode["backends"][2]["selected_math_mode"] = json!("strict");
+        assert!(validate_capabilities(&invalid_math_mode).is_err());
+
+        let mut duplicate = valid_capabilities();
+        duplicate["backends"][3]["id"] = json!("cuda");
+        assert!(validate_capabilities(&duplicate).is_err());
+
+        let mut missing = valid_capabilities();
+        missing["backends"].as_array_mut().unwrap().pop();
+        assert!(validate_capabilities(&missing).is_err());
     }
 }
