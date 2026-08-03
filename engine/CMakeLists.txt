@@ -5,12 +5,12 @@ project(getnative_engine VERSION 0.1.0 LANGUAGES C CXX)
 include(CTest)
 find_package(Threads REQUIRED)
 option(GETNATIVE_BUILD_UPSTREAM_CONFORMANCE
-       "Build test-only exact comparisons against pinned descale and zimg" OFF)
+       "Build test-only planner bitwise and output numerical comparisons against pinned descale and zimg" OFF)
 option(GETNATIVE_ENABLE_METAL "Build the Metal analysis backend on macOS" ${APPLE})
 option(GETNATIVE_ENABLE_CUDA
-       "Build the optional Windows CUDA Driver API analysis backend" OFF)
-option(GETNATIVE_ENABLE_VULKAN
-       "Build the optional Windows Vulkan Compute analysis backend" OFF)
+       "Build the new generic CUDA C++ baseline backend on Windows or Linux" OFF)
+option(GETNATIVE_BUILD_CUDA_AUTOTUNER
+       "Build the standalone distributable CUDA launch-policy autotuner" OFF)
 set(GETNATIVE_PLANNER_FP_MODE "fast" CACHE STRING
     "Floating-point mode for planner math (fast, strict, or precise; precise is MSVC-only)")
 set_property(CACHE GETNATIVE_PLANNER_FP_MODE PROPERTY STRINGS fast strict precise)
@@ -57,13 +57,21 @@ elseif(GETNATIVE_PLANNER_STRUCTURE_MODE MATCHES "^(profiled|workers|optimized)$"
     endif()
 endif()
 
-set(GETNATIVE_CUDA_ARCHITECTURES "120" CACHE STRING
-    "Semicolon-separated CUDA SM versions to embed as native cubins")
-if(GETNATIVE_ENABLE_CUDA AND NOT WIN32)
-    message(FATAL_ERROR "GETNATIVE_ENABLE_CUDA currently requires Windows")
+set(GETNATIVE_CUDA_MIN_ARCHITECTURE "75" CACHE STRING
+    "Minimum compute capability accepted by the CUDA backend")
+set(GETNATIVE_CUDA_ARCHITECTURES
+    "75;80;86;87;88;89;90;100;103;110;120;121" CACHE STRING
+    "Native SM targets embedded in the CUDA fatbin")
+set(GETNATIVE_CUDA_PTX_ARCHITECTURES "75;121" CACHE STRING
+    "Virtual compute targets embedded as CUDA PTX fallbacks")
+if(GETNATIVE_ENABLE_CUDA
+   AND NOT WIN32
+   AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "GETNATIVE_ENABLE_CUDA currently requires Windows or Linux")
 endif()
-if(GETNATIVE_ENABLE_VULKAN AND NOT WIN32)
-    message(FATAL_ERROR "GETNATIVE_ENABLE_VULKAN currently requires Windows")
+if(GETNATIVE_BUILD_CUDA_AUTOTUNER AND NOT GETNATIVE_ENABLE_CUDA)
+    message(FATAL_ERROR
+        "GETNATIVE_BUILD_CUDA_AUTOTUNER requires GETNATIVE_ENABLE_CUDA=ON")
 endif()
 
 string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" GETNATIVE_SYSTEM_PROCESSOR_LOWER)
@@ -278,101 +286,105 @@ if(GETNATIVE_ENABLE_X86_SIMD)
     endif()
 endif()
 
-add_library(getnative_gpu_common STATIC
-    src/backend/gpu/gpu_batch.cpp
-)
-target_compile_features(getnative_gpu_common PUBLIC cxx_std_23)
-target_include_directories(getnative_gpu_common PRIVATE src/backend/gpu)
-target_link_libraries(getnative_gpu_common PUBLIC getnative_core)
-
 if(GETNATIVE_ENABLE_CUDA)
     find_program(GETNATIVE_NVCC_EXECUTABLE
         NAMES nvcc.exe nvcc
         HINTS "$ENV{CUDA_PATH}/bin")
+    find_program(GETNATIVE_CUOBJDUMP_EXECUTABLE
+        NAMES cuobjdump.exe cuobjdump
+        HINTS "$ENV{CUDA_PATH}/bin")
     find_path(GETNATIVE_CUDA_INCLUDE_DIR
         NAMES cuda.h
         HINTS "$ENV{CUDA_PATH}/include")
-    if(NOT GETNATIVE_NVCC_EXECUTABLE OR NOT GETNATIVE_CUDA_INCLUDE_DIR)
+    if(NOT GETNATIVE_NVCC_EXECUTABLE OR NOT GETNATIVE_CUOBJDUMP_EXECUTABLE
+       OR NOT GETNATIVE_CUDA_INCLUDE_DIR)
         message(FATAL_ERROR
-            "GETNATIVE_ENABLE_CUDA requires a CUDA Toolkit with nvcc and cuda.h")
+            "GETNATIVE_ENABLE_CUDA requires a CUDA Toolkit with nvcc, cuobjdump, and cuda.h")
     endif()
-    execute_process(
-        COMMAND "${GETNATIVE_NVCC_EXECUTABLE}" --version
-        RESULT_VARIABLE GETNATIVE_NVCC_VERSION_RESULT
-        OUTPUT_VARIABLE GETNATIVE_NVCC_VERSION_OUTPUT
-        ERROR_VARIABLE GETNATIVE_NVCC_VERSION_ERROR)
-    if(NOT GETNATIVE_NVCC_VERSION_RESULT EQUAL 0)
+    if(NOT GETNATIVE_CUDA_MIN_ARCHITECTURE MATCHES "^[0-9]+$")
         message(FATAL_ERROR
-            "nvcc --version failed: ${GETNATIVE_NVCC_VERSION_ERROR}")
+            "GETNATIVE_CUDA_MIN_ARCHITECTURE must be one numeric SM value such as 75")
     endif()
-    string(REGEX MATCH "V([0-9]+\\.[0-9]+\\.[0-9]+)"
-        GETNATIVE_NVCC_VERSION_MATCH "${GETNATIVE_NVCC_VERSION_OUTPUT}")
-    if(NOT GETNATIVE_NVCC_VERSION_MATCH)
-        set(GETNATIVE_CUDA_TOOLKIT_VERSION "unknown")
-    else()
-        set(GETNATIVE_CUDA_TOOLKIT_VERSION "${CMAKE_MATCH_1}")
+    if(GETNATIVE_CUDA_ARCHITECTURES STREQUAL ""
+       OR GETNATIVE_CUDA_PTX_ARCHITECTURES STREQUAL "")
+        message(FATAL_ERROR
+            "CUDA native and PTX architecture lists must not be empty")
     endif()
-    if(NOT GETNATIVE_CUDA_ARCHITECTURES)
-        message(FATAL_ERROR "GETNATIVE_CUDA_ARCHITECTURES must not be empty")
+    list(REMOVE_DUPLICATES GETNATIVE_CUDA_ARCHITECTURES)
+    list(REMOVE_DUPLICATES GETNATIVE_CUDA_PTX_ARCHITECTURES)
+    foreach(GETNATIVE_CUDA_ARCHITECTURE IN LISTS
+            GETNATIVE_CUDA_ARCHITECTURES GETNATIVE_CUDA_PTX_ARCHITECTURES)
+        if(NOT GETNATIVE_CUDA_ARCHITECTURE MATCHES "^[0-9]+$")
+            message(FATAL_ERROR
+                "CUDA architecture lists must contain numeric SM values")
+        endif()
+        if(GETNATIVE_CUDA_ARCHITECTURE LESS GETNATIVE_CUDA_MIN_ARCHITECTURE)
+            message(FATAL_ERROR
+                "CUDA architecture ${GETNATIVE_CUDA_ARCHITECTURE} is below the configured minimum ${GETNATIVE_CUDA_MIN_ARCHITECTURE}")
+        endif()
+    endforeach()
+    list(FIND GETNATIVE_CUDA_ARCHITECTURES
+         "${GETNATIVE_CUDA_MIN_ARCHITECTURE}" GETNATIVE_CUDA_MIN_NATIVE_INDEX)
+    list(FIND GETNATIVE_CUDA_PTX_ARCHITECTURES
+         "${GETNATIVE_CUDA_MIN_ARCHITECTURE}" GETNATIVE_CUDA_MIN_PTX_INDEX)
+    if(GETNATIVE_CUDA_MIN_NATIVE_INDEX EQUAL -1
+       OR GETNATIVE_CUDA_MIN_PTX_INDEX EQUAL -1)
+        message(FATAL_ERROR
+            "The minimum CUDA architecture must be present in both native and PTX target lists")
     endif()
 
-    set(GETNATIVE_CUDA_GENCODE_ARGS)
-    foreach(GETNATIVE_CUDA_ARCH IN LISTS GETNATIVE_CUDA_ARCHITECTURES)
-        if(NOT GETNATIVE_CUDA_ARCH MATCHES "^[0-9]+$")
-            message(FATAL_ERROR
-                "Invalid CUDA architecture '${GETNATIVE_CUDA_ARCH}'; use values such as 120")
-        endif()
-        list(APPEND GETNATIVE_CUDA_GENCODE_ARGS
-            "--generate-code=arch=compute_${GETNATIVE_CUDA_ARCH},code=sm_${GETNATIVE_CUDA_ARCH}")
+    set(GETNATIVE_CUDA_GENERATE_CODE_ARGS)
+    set(GETNATIVE_CUDA_NATIVE_TARGET_NAMES)
+    foreach(GETNATIVE_CUDA_ARCHITECTURE IN LISTS GETNATIVE_CUDA_ARCHITECTURES)
+        list(APPEND GETNATIVE_CUDA_GENERATE_CODE_ARGS
+            "--generate-code=arch=compute_${GETNATIVE_CUDA_ARCHITECTURE},code=sm_${GETNATIVE_CUDA_ARCHITECTURE}")
+        list(APPEND GETNATIVE_CUDA_NATIVE_TARGET_NAMES
+            "sm_${GETNATIVE_CUDA_ARCHITECTURE}")
     endforeach()
-    list(GET GETNATIVE_CUDA_ARCHITECTURES -1 GETNATIVE_CUDA_PTX_ARCH)
-    list(APPEND GETNATIVE_CUDA_GENCODE_ARGS
-        "--generate-code=arch=compute_${GETNATIVE_CUDA_PTX_ARCH},code=compute_${GETNATIVE_CUDA_PTX_ARCH}")
+    set(GETNATIVE_CUDA_PTX_TARGET_NAMES)
+    foreach(GETNATIVE_CUDA_ARCHITECTURE IN LISTS GETNATIVE_CUDA_PTX_ARCHITECTURES)
+        list(APPEND GETNATIVE_CUDA_GENERATE_CODE_ARGS
+            "--generate-code=arch=compute_${GETNATIVE_CUDA_ARCHITECTURE},code=compute_${GETNATIVE_CUDA_ARCHITECTURE}")
+        list(APPEND GETNATIVE_CUDA_PTX_TARGET_NAMES
+            "compute_${GETNATIVE_CUDA_ARCHITECTURE}")
+    endforeach()
+    list(JOIN GETNATIVE_CUDA_NATIVE_TARGET_NAMES "," GETNATIVE_CUDA_NATIVE_TARGET_TEXT)
+    list(JOIN GETNATIVE_CUDA_PTX_TARGET_NAMES "," GETNATIVE_CUDA_PTX_TARGET_TEXT)
+    set(GETNATIVE_CUDA_ARTIFACT_TARGET
+        "native=[${GETNATIVE_CUDA_NATIVE_TARGET_TEXT}]+ptx=[${GETNATIVE_CUDA_PTX_TARGET_TEXT}]")
 
     set(GETNATIVE_CUDA_GENERATED_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/cuda")
     set(GETNATIVE_CUDA_KERNEL_SOURCE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/cuda/getnative_cuda.cu")
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/cuda/getnative_cuda_baseline.cu")
     set(GETNATIVE_CUDA_KERNEL_HEADER
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/cuda/getnative_cuda_kernels.cuh")
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/cuda/cuda_baseline.hpp")
 
-    # Single production CUDA artifact: optimized path with FP32 FMA allowed.
-    # Do not build parallel strict/fast-math fatbins or use -Xptxas=-O0.
     set(GETNATIVE_CUDA_FATBIN
-        "${GETNATIVE_CUDA_GENERATED_DIR}/getnative_cuda.fatbin")
-    set(GETNATIVE_CUDA_PTX
-        "${GETNATIVE_CUDA_GENERATED_DIR}/getnative_cuda_compute_${GETNATIVE_CUDA_PTX_ARCH}.ptx")
-    set(GETNATIVE_CUDA_FATBIN_SYMBOL "getnative_cuda_fatbin")
+        "${GETNATIVE_CUDA_GENERATED_DIR}/getnative_cuda_staged.fatbin")
+    set(GETNATIVE_CUDA_FATBIN_SYMBOL "getnative_cuda_staged_fatbin")
     set(GETNATIVE_CUDA_FATBIN_HEADER
         "${GETNATIVE_CUDA_GENERATED_DIR}/${GETNATIVE_CUDA_FATBIN_SYMBOL}.hpp")
+
+    set(GETNATIVE_CUDA_NVCC_HOST_OPTIONS)
+    if(CMAKE_HOST_WIN32)
+        list(APPEND GETNATIVE_CUDA_NVCC_HOST_OPTIONS -Xcompiler=/utf-8)
+    endif()
 
     add_custom_command(
         OUTPUT "${GETNATIVE_CUDA_FATBIN}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory
                 "${GETNATIVE_CUDA_GENERATED_DIR}"
         COMMAND "${GETNATIVE_NVCC_EXECUTABLE}"
-                --fatbin --machine=64 --std=c++17 -O3 -lineinfo
-                -Xptxas=-v
-                ${GETNATIVE_CUDA_GENCODE_ARGS}
+                --fatbin --cudart=none --machine=64 --std=c++17 -O2 -lineinfo
+                ${GETNATIVE_CUDA_NVCC_HOST_OPTIONS}
+                ${GETNATIVE_CUDA_GENERATE_CODE_ARGS}
                 "-I${CMAKE_CURRENT_SOURCE_DIR}/src/backend/cuda"
                 "${GETNATIVE_CUDA_KERNEL_SOURCE}"
                 -o "${GETNATIVE_CUDA_FATBIN}"
         DEPENDS "${GETNATIVE_CUDA_KERNEL_SOURCE}"
                 "${GETNATIVE_CUDA_KERNEL_HEADER}"
-        COMMENT "Building production CUDA native cubin and PTX fatbin"
-        VERBATIM
-    )
-    add_custom_command(
-        OUTPUT "${GETNATIVE_CUDA_PTX}"
-        COMMAND "${GETNATIVE_NVCC_EXECUTABLE}"
-                --ptx --machine=64 --std=c++17 -O3 -lineinfo
-                "--gpu-architecture=compute_${GETNATIVE_CUDA_PTX_ARCH}"
-                "-I${CMAKE_CURRENT_SOURCE_DIR}/src/backend/cuda"
-                "${GETNATIVE_CUDA_KERNEL_SOURCE}"
-                -o "${GETNATIVE_CUDA_PTX}"
-        DEPENDS "${GETNATIVE_CUDA_KERNEL_SOURCE}"
-                "${GETNATIVE_CUDA_KERNEL_HEADER}"
-        COMMENT "Saving the production CUDA generic PTX fallback"
+        COMMENT "Building the staged generic CUDA C++ fatbin"
         VERBATIM
     )
     add_custom_command(
@@ -387,9 +399,8 @@ if(GETNATIVE_ENABLE_CUDA)
         VERBATIM
     )
 
-    add_custom_target(getnative_cuda_artifacts
+    add_custom_target(getnative_cuda_staged_fatbin
         DEPENDS "${GETNATIVE_CUDA_FATBIN}"
-                "${GETNATIVE_CUDA_PTX}"
                 "${GETNATIVE_CUDA_FATBIN_HEADER}")
 
     add_library(getnative_cuda STATIC
@@ -397,7 +408,7 @@ if(GETNATIVE_ENABLE_CUDA)
         src/backend/cuda/cuda_driver.cpp
         "${GETNATIVE_CUDA_FATBIN_HEADER}"
     )
-    add_dependencies(getnative_cuda getnative_cuda_artifacts)
+    add_dependencies(getnative_cuda getnative_cuda_staged_fatbin)
     target_compile_features(getnative_cuda PUBLIC cxx_std_23)
     target_include_directories(getnative_cuda
         PUBLIC include
@@ -405,98 +416,17 @@ if(GETNATIVE_ENABLE_CUDA)
             "${GETNATIVE_CUDA_INCLUDE_DIR}"
             "${GETNATIVE_CUDA_GENERATED_DIR}"
             src/backend/cuda
-            src/backend/gpu
     )
-    target_link_libraries(getnative_cuda PUBLIC getnative_gpu_common)
-endif()
-
-if(GETNATIVE_ENABLE_VULKAN)
-    find_path(GETNATIVE_VULKAN_INCLUDE_DIR
-        NAMES vulkan/vulkan.h
-        HINTS "$ENV{VULKAN_SDK}/Include")
-    find_program(GETNATIVE_GLSLC_EXECUTABLE
-        NAMES glslc.exe glslc
-        HINTS "$ENV{VULKAN_SDK}/Bin")
-    find_program(GETNATIVE_SPIRV_VAL_EXECUTABLE
-        NAMES spirv-val.exe spirv-val
-        HINTS "$ENV{VULKAN_SDK}/Bin")
-    if(NOT GETNATIVE_VULKAN_INCLUDE_DIR
-       OR NOT GETNATIVE_GLSLC_EXECUTABLE
-       OR NOT GETNATIVE_SPIRV_VAL_EXECUTABLE)
-        message(FATAL_ERROR
-            "GETNATIVE_ENABLE_VULKAN requires Vulkan-Headers, glslc, and spirv-val")
+    target_compile_definitions(getnative_cuda PRIVATE
+        GETNATIVE_CUDA_MIN_ARCHITECTURE=${GETNATIVE_CUDA_MIN_ARCHITECTURE}
+        "GETNATIVE_CUDA_ARTIFACT_TARGET=\"${GETNATIVE_CUDA_ARTIFACT_TARGET}\"")
+    if(MSVC)
+        target_compile_options(getnative_cuda PRIVATE /utf-8)
     endif()
-
-    set(GETNATIVE_VULKAN_SHADER_DIR
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan/shaders")
-    set(GETNATIVE_VULKAN_GENERATED_DIR
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/vulkan")
-    set(GETNATIVE_VULKAN_SHADER_NAMES
-        inverse_axis
-        inverse_axis_matrix
-        forward_axis_matrix
-        metric_axis_p1)
-    set(GETNATIVE_VULKAN_SPV_FILES)
-    set(GETNATIVE_VULKAN_SPV_HEADERS)
-    foreach(GETNATIVE_VULKAN_SHADER IN LISTS GETNATIVE_VULKAN_SHADER_NAMES)
-        set(GETNATIVE_VULKAN_SPV
-            "${GETNATIVE_VULKAN_GENERATED_DIR}/${GETNATIVE_VULKAN_SHADER}.spv")
-        set(GETNATIVE_VULKAN_SYMBOL
-            "getnative_vulkan_${GETNATIVE_VULKAN_SHADER}_spv")
-        set(GETNATIVE_VULKAN_HEADER
-            "${GETNATIVE_VULKAN_GENERATED_DIR}/${GETNATIVE_VULKAN_SYMBOL}.hpp")
-        add_custom_command(
-            OUTPUT "${GETNATIVE_VULKAN_SPV}"
-            COMMAND "${CMAKE_COMMAND}" -E make_directory
-                    "${GETNATIVE_VULKAN_GENERATED_DIR}"
-            # Single production SPIR-V path: optimize for performance; no dual
-            # strict/fast-math shader variants.
-            COMMAND "${GETNATIVE_GLSLC_EXECUTABLE}"
-                    --target-env=vulkan1.2 -fshader-stage=compute -Werror -O
-                    "-I${GETNATIVE_VULKAN_SHADER_DIR}"
-                    "${GETNATIVE_VULKAN_SHADER_DIR}/${GETNATIVE_VULKAN_SHADER}.comp"
-                    -o "${GETNATIVE_VULKAN_SPV}"
-            COMMAND "${GETNATIVE_SPIRV_VAL_EXECUTABLE}"
-                    --target-env vulkan1.2 "${GETNATIVE_VULKAN_SPV}"
-            DEPENDS
-                "${GETNATIVE_VULKAN_SHADER_DIR}/${GETNATIVE_VULKAN_SHADER}.comp"
-                "${GETNATIVE_VULKAN_SHADER_DIR}/getnative_common.glsl"
-            COMMENT "Compiling and validating production ${GETNATIVE_VULKAN_SHADER}.comp"
-            VERBATIM
-        )
-        add_custom_command(
-            OUTPUT "${GETNATIVE_VULKAN_HEADER}"
-            COMMAND "${CMAKE_COMMAND}"
-                    "-DINPUT=${GETNATIVE_VULKAN_SPV}"
-                    "-DOUTPUT=${GETNATIVE_VULKAN_HEADER}"
-                    "-DSYMBOL=${GETNATIVE_VULKAN_SYMBOL}"
-                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake"
-            DEPENDS "${GETNATIVE_VULKAN_SPV}"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake"
-            VERBATIM
-        )
-        list(APPEND GETNATIVE_VULKAN_SPV_FILES "${GETNATIVE_VULKAN_SPV}")
-        list(APPEND GETNATIVE_VULKAN_SPV_HEADERS "${GETNATIVE_VULKAN_HEADER}")
-    endforeach()
-    add_custom_target(getnative_vulkan_artifacts
-        DEPENDS ${GETNATIVE_VULKAN_SPV_FILES} ${GETNATIVE_VULKAN_SPV_HEADERS})
-
-    add_library(getnative_vulkan STATIC
-        src/backend/vulkan/vulkan_backend.cpp
-        src/backend/vulkan/vulkan_loader.cpp
-        ${GETNATIVE_VULKAN_SPV_HEADERS}
-    )
-    add_dependencies(getnative_vulkan getnative_vulkan_artifacts)
-    target_compile_features(getnative_vulkan PUBLIC cxx_std_23)
-    target_include_directories(getnative_vulkan
-        PUBLIC include
-        PRIVATE
-            "${GETNATIVE_VULKAN_INCLUDE_DIR}"
-            "${GETNATIVE_VULKAN_GENERATED_DIR}"
-            src/backend/vulkan
-            src/backend/gpu
-    )
-    target_link_libraries(getnative_vulkan PUBLIC getnative_gpu_common)
+    target_link_libraries(getnative_cuda PUBLIC getnative_core)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_libraries(getnative_cuda PRIVATE ${CMAKE_DL_LIBS})
+    endif()
 endif()
 
 if(GETNATIVE_ENABLE_METAL)
@@ -561,15 +491,9 @@ endfunction()
 
 getnative_enable_warnings(getnative_core)
 getnative_enable_strict_fp(getnative_core)
-getnative_enable_warnings(getnative_gpu_common)
-getnative_enable_strict_fp(getnative_gpu_common)
 if(TARGET getnative_cuda)
     getnative_enable_warnings(getnative_cuda)
     getnative_enable_strict_fp(getnative_cuda)
-endif()
-if(TARGET getnative_vulkan)
-    getnative_enable_warnings(getnative_vulkan)
-    getnative_enable_strict_fp(getnative_vulkan)
 endif()
 if(TARGET getnative_metal)
     getnative_enable_warnings(getnative_metal)
@@ -585,10 +509,6 @@ endif()
 if(GETNATIVE_ENABLE_CUDA)
     target_link_libraries(getnative-engine PRIVATE getnative_cuda)
     target_compile_definitions(getnative-engine PRIVATE GETNATIVE_HAS_CUDA=1)
-endif()
-if(GETNATIVE_ENABLE_VULKAN)
-    target_link_libraries(getnative-engine PRIVATE getnative_vulkan)
-    target_compile_definitions(getnative-engine PRIVATE GETNATIVE_HAS_VULKAN=1)
 endif()
 target_compile_features(getnative-engine PRIVATE cxx_std_23)
 getnative_enable_warnings(getnative-engine)
@@ -638,73 +558,26 @@ if(BUILD_TESTING)
     getnative_enable_strict_fp(getnative_axis_planner_tests)
     add_test(NAME getnative_axis_planner_tests COMMAND getnative_axis_planner_tests)
 
-    add_executable(getnative_gpu_batch_tests tests/gpu_batch_test.cpp)
-    target_link_libraries(getnative_gpu_batch_tests PRIVATE getnative_gpu_common)
-    target_include_directories(getnative_gpu_batch_tests PRIVATE src/backend/gpu)
-    target_compile_features(getnative_gpu_batch_tests PRIVATE cxx_std_23)
-    getnative_enable_warnings(getnative_gpu_batch_tests)
-    getnative_enable_strict_fp(getnative_gpu_batch_tests)
-    add_test(NAME getnative_gpu_batch_tests COMMAND getnative_gpu_batch_tests)
-
     if(GETNATIVE_ENABLE_CUDA)
-        add_executable(getnative_cuda_conformance_tests
-            tests/cuda_conformance_test.cpp)
-        target_link_libraries(getnative_cuda_conformance_tests PRIVATE getnative_cuda)
-        target_compile_features(getnative_cuda_conformance_tests PRIVATE cxx_std_23)
-        getnative_enable_warnings(getnative_cuda_conformance_tests)
-        getnative_enable_strict_fp(getnative_cuda_conformance_tests)
-        add_test(NAME getnative_cuda_conformance_tests
-                 COMMAND getnative_cuda_conformance_tests)
-
-        add_executable(getnative_cuda_artifact_tests
-            tests/cuda_artifact_test.cpp)
-        add_dependencies(getnative_cuda_artifact_tests getnative_cuda_artifacts)
-        target_compile_features(getnative_cuda_artifact_tests PRIVATE cxx_std_23)
-        getnative_enable_warnings(getnative_cuda_artifact_tests)
-        set(GETNATIVE_CUDA_ARTIFACT_TEST_ARGS
-            --fatbin "${GETNATIVE_CUDA_FATBIN}"
-            --cuobjdump "${GETNATIVE_CUDA_INCLUDE_DIR}/../bin/cuobjdump.exe"
-            --pe $<TARGET_FILE:getnative-engine>)
-        foreach(GETNATIVE_CUDA_ARCH IN LISTS GETNATIVE_CUDA_ARCHITECTURES)
-            list(APPEND GETNATIVE_CUDA_ARTIFACT_TEST_ARGS
-                --expect-sm "sm_${GETNATIVE_CUDA_ARCH}")
-        endforeach()
-        list(APPEND GETNATIVE_CUDA_ARTIFACT_TEST_ARGS
-            --expect-ptx "compute_${GETNATIVE_CUDA_PTX_ARCH}")
-        add_test(NAME getnative_cuda_artifact_tests
-            COMMAND getnative_cuda_artifact_tests
-                    ${GETNATIVE_CUDA_ARTIFACT_TEST_ARGS})
-    endif()
-
-    if(GETNATIVE_ENABLE_VULKAN)
-        add_executable(getnative_vulkan_conformance_tests
-            tests/vulkan_conformance_test.cpp)
-        target_link_libraries(getnative_vulkan_conformance_tests
-            PRIVATE getnative_vulkan)
-        target_compile_features(getnative_vulkan_conformance_tests PRIVATE cxx_std_23)
-        getnative_enable_warnings(getnative_vulkan_conformance_tests)
-        getnative_enable_strict_fp(getnative_vulkan_conformance_tests)
-        add_test(NAME getnative_vulkan_conformance_tests
-                 COMMAND getnative_vulkan_conformance_tests)
-
-        add_executable(getnative_vulkan_memory_tests
-            tests/vulkan_memory_test.cpp)
-        target_link_libraries(getnative_vulkan_memory_tests PRIVATE getnative_vulkan)
-        target_include_directories(getnative_vulkan_memory_tests PRIVATE
-            src/backend/vulkan "${GETNATIVE_VULKAN_INCLUDE_DIR}")
-        target_compile_features(getnative_vulkan_memory_tests PRIVATE cxx_std_23)
-        getnative_enable_warnings(getnative_vulkan_memory_tests)
-        getnative_enable_strict_fp(getnative_vulkan_memory_tests)
-        add_test(NAME getnative_vulkan_memory_tests
-                 COMMAND getnative_vulkan_memory_tests)
-
-        foreach(GETNATIVE_VULKAN_SPV IN LISTS GETNATIVE_VULKAN_SPV_FILES)
-            get_filename_component(GETNATIVE_VULKAN_SPV_NAME
-                "${GETNATIVE_VULKAN_SPV}" NAME_WE)
-            add_test(NAME "getnative_vulkan_spirv_${GETNATIVE_VULKAN_SPV_NAME}"
-                COMMAND "${GETNATIVE_SPIRV_VAL_EXECUTABLE}"
-                        --target-env vulkan1.2 "${GETNATIVE_VULKAN_SPV}")
-        endforeach()
+        add_test(NAME getnative_cuda_artifact_inventory
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFATBIN=${GETNATIVE_CUDA_FATBIN}"
+                "-DCUOBJDUMP=${GETNATIVE_CUOBJDUMP_EXECUTABLE}"
+                "-DNATIVE_ARCHITECTURES=${GETNATIVE_CUDA_ARCHITECTURES}"
+                "-DPTX_ARCHITECTURES=${GETNATIVE_CUDA_PTX_ARCHITECTURES}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_cuda_fatbin.cmake")
+        add_executable(getnative_cuda_baseline_tests
+            tests/cuda_baseline_test.cpp)
+        target_link_libraries(getnative_cuda_baseline_tests PRIVATE getnative_cuda)
+        target_include_directories(getnative_cuda_baseline_tests PRIVATE
+            src/backend/cuda)
+        target_compile_features(getnative_cuda_baseline_tests PRIVATE cxx_std_23)
+        getnative_enable_warnings(getnative_cuda_baseline_tests)
+        getnative_enable_strict_fp(getnative_cuda_baseline_tests)
+        add_test(NAME getnative_cuda_baseline_tests
+                 COMMAND getnative_cuda_baseline_tests)
+        set_tests_properties(getnative_cuda_baseline_tests PROPERTIES
+            SKIP_REGULAR_EXPRESSION "^SKIP:")
     endif()
 
     add_test(NAME getnative_cli_capabilities COMMAND getnative-engine capabilities)
@@ -718,13 +591,8 @@ if(BUILD_TESTING)
     else()
         set(GETNATIVE_EXPECTED_CUDA_CAPABILITY "\"id\":\"cuda\",\"compiled\":false")
     endif()
-    if(GETNATIVE_ENABLE_VULKAN)
-        set(GETNATIVE_EXPECTED_VULKAN_CAPABILITY "\"id\":\"vulkan\",\"compiled\":true")
-    else()
-        set(GETNATIVE_EXPECTED_VULKAN_CAPABILITY "\"id\":\"vulkan\",\"compiled\":false")
-    endif()
     set_tests_properties(getnative_cli_capabilities PROPERTIES
-        PASS_REGULAR_EXPRESSION "\\{\"schema_version\":3,\"engine\":\"getnative-engine\".*\"analyze\":false.*\"gui_min\":1,\"gui_max\":8,\"core_min\":1,\"core_max\":15.*\"id\":\"cpu\",\"compiled\":true,\"device_available\":true,\"analysis_command_available\":false.*\"selected_math_mode\":\"production\".*${GETNATIVE_EXPECTED_METAL_CAPABILITY}.*${GETNATIVE_EXPECTED_CUDA_CAPABILITY}.*${GETNATIVE_EXPECTED_VULKAN_CAPABILITY}.*\"muf-d278cd3\""
+        PASS_REGULAR_EXPRESSION "\\{\"schema_version\":2,\"engine\":\"getnative-engine\".*\"analyze\":false.*\"gui_min\":1,\"gui_max\":8,\"core_min\":1,\"core_max\":15.*\"id\":\"cpu\",\"compiled\":true,\"device_available\":true,\"analysis_command_available\":false.*\"selected_math_mode\":\"production\".*${GETNATIVE_EXPECTED_METAL_CAPABILITY}.*${GETNATIVE_EXPECTED_CUDA_CAPABILITY}.*\"muf-d278cd3\""
     )
 
     add_test(NAME getnative_cli_geometry
@@ -847,29 +715,28 @@ getnative_enable_strict_fp(getnative_cpu_memory_profile_benchmark)
 getnative_configure_benchmark_metadata(getnative_cpu_memory_profile_benchmark)
 
 if(GETNATIVE_ENABLE_CUDA)
-    add_executable(getnative_cuda_benchmark
-        bench/cuda_matrix_benchmark.cpp)
-    target_link_libraries(getnative_cuda_benchmark PRIVATE getnative_cuda)
-    target_include_directories(getnative_cuda_benchmark PRIVATE
-        bench
-        src/planner)
-    target_compile_features(getnative_cuda_benchmark PRIVATE cxx_std_23)
-    target_compile_definitions(getnative_cuda_benchmark PRIVATE
-        "GETNATIVE_CUDA_TOOLKIT_VERSION=\"${GETNATIVE_CUDA_TOOLKIT_VERSION}\""
-        "GETNATIVE_CUDA_FATBIN_PATH=\"${GETNATIVE_CUDA_FATBIN}\"")
-    getnative_enable_warnings(getnative_cuda_benchmark)
-    getnative_enable_strict_fp(getnative_cuda_benchmark)
-    getnative_configure_benchmark_metadata(getnative_cuda_benchmark)
-endif()
+    add_executable(getnative_cuda_throughput_benchmark
+        bench/cuda_throughput_benchmark.cpp)
+    target_link_libraries(getnative_cuda_throughput_benchmark PRIVATE
+        getnative_cuda)
+    target_include_directories(getnative_cuda_throughput_benchmark PRIVATE bench)
+    target_compile_features(getnative_cuda_throughput_benchmark PRIVATE cxx_std_23)
+    getnative_enable_warnings(getnative_cuda_throughput_benchmark)
+    getnative_enable_strict_fp(getnative_cuda_throughput_benchmark)
+    getnative_configure_benchmark_metadata(getnative_cuda_throughput_benchmark)
 
-if(GETNATIVE_ENABLE_VULKAN)
-    add_executable(getnative_vulkan_benchmark
-        bench/vulkan_benchmark.cpp)
-    target_link_libraries(getnative_vulkan_benchmark PRIVATE getnative_vulkan)
-    target_compile_features(getnative_vulkan_benchmark PRIVATE cxx_std_23)
-    getnative_enable_warnings(getnative_vulkan_benchmark)
-    getnative_enable_strict_fp(getnative_vulkan_benchmark)
-    getnative_configure_benchmark_metadata(getnative_vulkan_benchmark)
+    if(GETNATIVE_BUILD_CUDA_AUTOTUNER)
+        add_executable(getnative_cuda_autotune
+            bench/cuda_autotune_benchmark.cpp)
+        set_target_properties(getnative_cuda_autotune PROPERTIES
+            OUTPUT_NAME "getnative-cuda-autotune")
+        target_link_libraries(getnative_cuda_autotune PRIVATE getnative_cuda)
+        target_include_directories(getnative_cuda_autotune PRIVATE bench)
+        target_compile_features(getnative_cuda_autotune PRIVATE cxx_std_23)
+        getnative_enable_warnings(getnative_cuda_autotune)
+        getnative_enable_strict_fp(getnative_cuda_autotune)
+        getnative_configure_benchmark_metadata(getnative_cuda_autotune)
+    endif()
 endif()
 
 if(GETNATIVE_ENABLE_METAL)

@@ -22,6 +22,18 @@ struct CudaDeviceInfo {
     std::int32_t driver_version = 0;
     std::size_t total_memory_bytes = 0;
     std::int32_t maximum_threads_per_block = 0;
+    bool backend_compatible = false;
+    std::string incompatibility_reason;
+    std::int32_t multiprocessor_count = 0;
+    std::int32_t maximum_threads_per_multiprocessor = 0;
+    std::int32_t registers_per_multiprocessor = 0;
+    std::int32_t shared_memory_per_block_bytes = 0;
+    std::int32_t shared_memory_per_multiprocessor_bytes = 0;
+    std::int32_t warp_size = 0;
+    std::int32_t clock_rate_khz = 0;
+    std::int32_t memory_clock_rate_khz = 0;
+    std::int32_t memory_bus_width_bits = 0;
+    std::int32_t l2_cache_bytes = 0;
 };
 
 struct CudaRuntimeProbe {
@@ -32,12 +44,25 @@ struct CudaRuntimeProbe {
     std::vector<CudaDeviceInfo> devices;
 };
 
+// The first implementation deliberately exposes only one executable variant.
+// The other names remain reserved so a future specialization cannot silently
+// change the baseline selected by existing callers.
 enum class CudaKernelVariant : std::uint8_t {
     automatic,
     cpp_generic,
     cpp_specialized,
     architecture_specific,
     inline_ptx,
+};
+
+struct CudaKernelResourceInfo {
+    std::string name;
+    std::int32_t register_count = 0;
+    std::int32_t static_shared_bytes = 0;
+    std::int32_t local_bytes = 0;
+    std::int32_t constant_bytes = 0;
+    std::int32_t binary_version = 0;
+    std::int32_t ptx_version = 0;
 };
 
 [[nodiscard]] constexpr std::string_view cuda_kernel_variant_name(
@@ -52,81 +77,74 @@ enum class CudaKernelVariant : std::uint8_t {
     return "unknown";
 }
 
-// Counters and timings accumulate until reset_analysis_telemetry(). Retained
-// byte counts describe current capacities and survive a telemetry reset.
 struct CudaRuntimeTelemetry {
+    std::size_t kernel_launch_count = 0;
+    std::size_t analyzed_candidate_count = 0;
+    std::size_t tile_count = 0;
     std::size_t buffer_allocation_count = 0;
-    std::size_t buffer_allocation_bytes = 0;
-    std::size_t working_buffer_allocation_count = 0;
-    std::size_t working_buffer_allocation_bytes = 0;
-    std::size_t working_buffer_reuse_count = 0;
-    std::size_t working_buffer_active_bytes = 0;
-    std::size_t working_buffer_retained_bytes = 0;
-    std::size_t working_buffer_peak_active_bytes = 0;
-    std::size_t working_buffer_peak_retained_bytes = 0;
-    std::size_t queued_plan_peak_bytes = 0;
-    std::size_t total_peak_explicit_bytes = 0;
-    std::size_t stream_submission_count = 0;
-    std::size_t stream_completion_count = 0;
-    std::size_t plan_upload_bytes = 0;
+    std::size_t plan_cache_hits = 0;
+    std::size_t plan_cache_misses = 0;
     std::size_t source_upload_bytes = 0;
-    std::size_t partial_readback_bytes = 0;
-    std::size_t analyzed_tile_count = 0;
-    std::size_t generic_tile_count = 0;
-    std::size_t specialized_tile_count = 0;
-    double buffer_allocation_ms = 0.0;
-    double working_buffer_allocation_ms = 0.0;
-    double module_load_ms = 0.0;
-    double plan_pack_ms = 0.0;
+    std::size_t plan_upload_bytes = 0;
+    std::size_t result_readback_bytes = 0;
+    std::size_t workspace_bytes = 0;
+    std::size_t pinned_staging_bytes = 0;
+    std::size_t peak_workspace_elements = 0;
+    std::size_t initial_device_free_bytes = 0;
+    std::size_t device_memory_reserve_bytes = 0;
+    std::size_t device_memory_budget_bytes = 0;
+    std::size_t per_slot_memory_budget_bytes = 0;
+    std::size_t effective_workspace_limit_bytes = 0;
+    bool workspace_limit_clamped = false;
+    double execution_slot_wait_ms = 0.0;
+    double host_pack_ms = 0.0;
+    double source_staging_ms = 0.0;
+    // Transfer and kernel fields below are measured with CUDA events.
     double source_upload_ms = 0.0;
     double plan_upload_ms = 0.0;
-    double buffer_wiring_ms = 0.0;
-    double inverse_h_ms = 0.0;
-    double inverse_v_ms = 0.0;
-    double first_forward_ms = 0.0;
+    double source_transpose_ms = 0.0;
+    double horizontal_fused_ms = 0.0;
+    double inverse_horizontal_ms = 0.0;
+    double inverse_vertical_ms = 0.0;
+    double forward_intermediate_ms = 0.0;
     double metric_ms = 0.0;
-    double gpu_execution_ms = 0.0;
-    double partial_readback_ms = 0.0;
-    double cpu_merge_ms = 0.0;
-    std::size_t module_artifact_bytes = 0;
-    std::int32_t module_binary_version = 0;
-    std::int32_t module_ptx_version = 0;
-    std::int32_t maximum_kernel_register_count = 0;
-    std::int32_t maximum_kernel_static_shared_bytes = 0;
-    bool ptx_jit_forced = false;
-    std::vector<std::string> created_kernel_names;
-    std::string module_artifact_name;
-    std::string module_artifact_hash_fnv1a64;
-    std::string module_compile_flags;
-    std::string module_path_provenance;
-    std::string module_jit_info_log;
-    std::string module_jit_error_log;
+    double kernel_ms = 0.0;
+    double result_readback_ms = 0.0;
+    double gpu_total_ms = 0.0;
+    std::string kernel_variant = "cpp-generic";
+    std::string artifact_stage = "staged-cpp";
+    std::string artifact_target;
+    std::string artifact_name;
+    std::string artifact_hash_fnv1a64;
+    std::vector<CudaKernelResourceInfo> kernel_resources;
 };
 
+struct CudaLaunchPolicy {
+    std::uint32_t inverse_threads = 64U;
+    std::uint32_t pixel_threads = 256U;
+    std::uint32_t maximum_metric_blocks = 128U;
+    bool paired_vertical = true;
+};
+
+// Keep the production launch policy explicit and shared with benchmark
+// baselines. Candidate policies may still be supplied by benchmark-only code.
+inline constexpr CudaLaunchPolicy cuda_default_launch_policy{};
+
 struct CudaAnalysisOptions {
-    // An empty UUID selects device_ordinal. A non-empty UUID is authoritative.
     std::string device_uuid;
     std::int32_t device_ordinal = 0;
-    std::size_t tile_size = 32;
-    std::size_t reduction_groups_per_candidate = 8;
     std::size_t workspace_limit_elements = 0;
-    std::size_t inverse_threads_per_block = 32;
+    std::size_t execution_slots = 2;
     CudaKernelVariant kernel_variant = CudaKernelVariant::automatic;
-    bool reuse_working_buffers = true;
-    std::size_t retained_working_buffer_limit_bytes =
-        2ULL * 1024ULL * 1024ULL * 1024ULL;
-    // All explicit device allocations for a call must stay strictly below this
-    // ceiling. The default encodes the handover's "< 2 GiB" requirement.
-    std::size_t maximum_total_working_set_bytes =
-        2ULL * 1024ULL * 1024ULL * 1024ULL - 1ULL;
+    CudaLaunchPolicy launch_policy = cuda_default_launch_policy;
 };
 
 [[nodiscard]] CudaRuntimeProbe cuda_runtime_probe() noexcept;
 [[nodiscard]] bool cuda_backend_available() noexcept;
 [[nodiscard]] std::vector<CudaDeviceInfo> enumerate_cuda_devices();
+[[nodiscard]] std::int32_t cuda_minimum_compute_capability() noexcept;
+[[nodiscard]] std::string_view cuda_compiled_artifact_target() noexcept;
 
-// Consumes caller-owned immutable AxisPlans. Calls are serialized so one
-// engine can safely retain and reuse its context, stream, and working buffers.
 class CudaAnalysisEngine {
 public:
     explicit CudaAnalysisEngine(CudaAnalysisOptions options = {});
@@ -143,8 +161,10 @@ public:
     [[nodiscard]] std::size_t peak_working_set_bytes() const noexcept;
     [[nodiscard]] CudaRuntimeTelemetry runtime_telemetry() const;
     void reset_analysis_telemetry();
-    void trim_working_buffers();
 
+    // Generic staged CUDA C++ path. Axis recurrences remain serial only along
+    // their dependency direction; candidates and orthogonal rows/columns run
+    // in parallel. Reconstruction is fused into the p=1 metric.
     [[nodiscard]] std::vector<CandidateResult> analyze_axis_batch_f32(
         ConstImageView source, std::span<const CandidateAnalysis> candidates,
         const MetricSpec &metric, std::stop_token stop = {});

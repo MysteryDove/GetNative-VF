@@ -22,9 +22,6 @@ compile_commands.json
 *.ilk
 *.exp
 
-# Ad hoc Vulkan shader inspection output.
-/build-vulkan-shader-check/
-
 *.air
 *.metallib
 *.dSYM/
