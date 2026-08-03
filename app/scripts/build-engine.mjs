@@ -83,6 +83,8 @@ const configureArguments = [
 
 let windowsBackends = "not-applicable";
 let cudaArchitectures = "not-applicable";
+let cudaMinimumArchitecture = "not-applicable";
+let cudaPtxArchitectures = "not-applicable";
 if (process.platform === "win32") {
   environment = visualStudioEnvironment(environment);
   const visualStudioCMakeRoot =
@@ -96,20 +98,24 @@ if (process.platform === "win32") {
     configureArguments.push("-G", "Ninja", `-DCMAKE_MAKE_PROGRAM=${bundledNinja}`);
   }
 
-  windowsBackends = (process.env.GETNATIVE_WINDOWS_BACKENDS || "both").toLowerCase();
-  if (!["cpu", "cuda", "vulkan", "both"].includes(windowsBackends)) {
-    fail("GETNATIVE_WINDOWS_BACKENDS must be cpu, cuda, vulkan, or both");
+  windowsBackends = (process.env.GETNATIVE_WINDOWS_BACKENDS || "cpu").toLowerCase();
+  if (!["cpu", "cuda"].includes(windowsBackends)) {
+    fail("GETNATIVE_WINDOWS_BACKENDS must be cpu or cuda");
   }
-  const cudaEnabled = windowsBackends === "cuda" || windowsBackends === "both";
-  const vulkanEnabled = windowsBackends === "vulkan" || windowsBackends === "both";
-  cudaArchitectures = process.env.GETNATIVE_CUDA_ARCHITECTURES || "120";
+  const cudaEnabled = windowsBackends === "cuda";
+  cudaMinimumArchitecture = process.env.GETNATIVE_CUDA_MIN_ARCHITECTURE || "75";
+  cudaArchitectures =
+    process.env.GETNATIVE_CUDA_ARCHITECTURES ||
+    "75;80;86;87;88;89;90;100;103;110;120;121";
+  cudaPtxArchitectures = process.env.GETNATIVE_CUDA_PTX_ARCHITECTURES || "75;121";
   configureArguments.push(
     "-DGETNATIVE_ENABLE_METAL=OFF",
     "-DGETNATIVE_ENABLE_X86_SIMD=ON",
     "-DGETNATIVE_ENABLE_X86_AVX512=ON",
     `-DGETNATIVE_ENABLE_CUDA=${cudaEnabled ? "ON" : "OFF"}`,
-    `-DGETNATIVE_ENABLE_VULKAN=${vulkanEnabled ? "ON" : "OFF"}`,
+    `-DGETNATIVE_CUDA_MIN_ARCHITECTURE=${cudaMinimumArchitecture}`,
     `-DGETNATIVE_CUDA_ARCHITECTURES=${cudaArchitectures}`,
+    `-DGETNATIVE_CUDA_PTX_ARCHITECTURES=${cudaPtxArchitectures}`,
   );
 }
 
@@ -130,7 +136,9 @@ writeFileSync(
       build_type: buildType,
       platform: process.platform,
       windows_backends: windowsBackends,
+      cuda_minimum_architecture: cudaMinimumArchitecture,
       cuda_architectures: cudaArchitectures,
+      cuda_ptx_architectures: cudaPtxArchitectures,
       engine_sha256: sha256,
       ctest_passed: true,
     },

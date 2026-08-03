@@ -157,7 +157,7 @@ fn validate_capabilities(payload: &Value) -> Result<(), String> {
         serde_json::from_value(payload.clone()).map_err(|error| {
             format!("getnative-engine returned an invalid capability schema: {error}")
         })?;
-    if capabilities.schema_version != 3 || capabilities.engine != "getnative-engine" {
+    if capabilities.schema_version != 2 || capabilities.engine != "getnative-engine" {
         return Err("getnative-engine returned an unsupported capability schema".to_owned());
     }
     if !capabilities.commands.capabilities
@@ -198,14 +198,14 @@ fn validate_capabilities(payload: &Value) -> Result<(), String> {
 
     let mut backends = HashMap::new();
     for backend in &capabilities.backends {
-        if !matches!(backend.id.as_str(), "cpu" | "metal" | "cuda" | "vulkan") {
+        if !matches!(backend.id.as_str(), "cpu" | "metal" | "cuda") {
             return Err("getnative-engine returned an unknown backend id".to_owned());
         }
         if backends.insert(backend.id.as_str(), backend).is_some() {
             return Err("getnative-engine returned a duplicate backend id".to_owned());
         }
     }
-    if backends.len() != 4 {
+    if backends.len() != 3 {
         return Err("getnative-engine did not return all required backends".to_owned());
     }
     let cpu = backends
@@ -250,7 +250,7 @@ fn validate_capabilities(payload: &Value) -> Result<(), String> {
         return Err("getnative-engine returned invalid CPU capabilities".to_owned());
     }
 
-    for id in ["metal", "cuda", "vulkan"] {
+    for id in ["metal", "cuda"] {
         let backend = backends
             .get(id)
             .ok_or_else(|| format!("getnative-engine did not return the {id} backend"))?;
@@ -280,9 +280,7 @@ fn validate_capabilities(payload: &Value) -> Result<(), String> {
         };
         // GPU backends use a single production math path; no multi-mode surface.
         let valid_math_mode = match id {
-            "cuda" | "vulkan" => {
-                backend.math_modes.is_none() && backend.selected_math_mode.is_none()
-            }
+            "cuda" => backend.math_modes.is_none() && backend.selected_math_mode.is_none(),
             _ => true,
         };
         if backend.analysis_command_available
@@ -427,7 +425,7 @@ mod tests {
 
     fn valid_capabilities() -> serde_json::Value {
         json!({
-            "schema_version": 3,
+            "schema_version": 2,
             "engine": "getnative-engine",
             "commands": {"capabilities": true, "geometry": true, "analyze": false},
             "kernels": [
@@ -441,8 +439,7 @@ mod tests {
             "backends": [
                 {"id": "cpu", "compiled": true, "device_available": true, "analysis_command_available": false, "axes": ["horizontal", "vertical", "both"], "p_norms": {"minimum": 1, "maximum": 4294967295_u64}, "max_half_bandwidth": 29, "max_forward_width": 30, "compiled_isa": ["scalar", "sse2", "avx2", "avx512"], "available_isa": ["scalar", "sse2", "avx2"], "selected_isa": "avx2", "math_modes": ["production"], "selected_math_mode": "production", "selection_reason": "avx512 not benchmark-approved"},
                 {"id": "metal", "compiled": true, "device_available": true, "analysis_command_available": false, "axes": ["horizontal", "vertical", "both"], "p_norms": {"minimum": 1, "maximum": 1}, "max_half_bandwidth": 15, "max_forward_width": 16},
-                {"id": "cuda", "compiled": false, "device_available": false, "analysis_command_available": false, "axes": [], "p_norms": null, "max_half_bandwidth": null, "max_forward_width": null, "reason": "not compiled"},
-                {"id": "vulkan", "compiled": false, "device_available": false, "analysis_command_available": false, "axes": [], "p_norms": null, "max_half_bandwidth": null, "max_forward_width": null, "reason": "not compiled"}
+                {"id": "cuda", "compiled": false, "device_available": false, "analysis_command_available": false, "axes": [], "p_norms": null, "max_half_bandwidth": null, "max_forward_width": null, "reason": "not compiled"}
             ],
             "profiles": [
                 {"id": "muf-d278cd3", "default_crop": 5},
@@ -559,8 +556,12 @@ mod tests {
         assert!(validate_capabilities(&invalid_math_mode).is_err());
 
         let mut duplicate = valid_capabilities();
-        duplicate["backends"][3]["id"] = json!("cuda");
+        duplicate["backends"][1]["id"] = json!("cuda");
         assert!(validate_capabilities(&duplicate).is_err());
+
+        let mut obsolete = valid_capabilities();
+        obsolete["backends"][1]["id"] = json!("unsupported-backend");
+        assert!(validate_capabilities(&obsolete).is_err());
 
         let mut missing = valid_capabilities();
         missing["backends"].as_array_mut().unwrap().pop();

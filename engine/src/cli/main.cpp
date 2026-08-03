@@ -7,10 +7,7 @@
 #if defined(GETNATIVE_HAS_CUDA)
 #include "getnative/cuda_analysis.hpp"
 #endif
-#if defined(GETNATIVE_HAS_VULKAN)
-#include "getnative/vulkan_analysis.hpp"
-#endif
-
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
@@ -105,7 +102,7 @@ void print_isa_set(const getnative::CpuIsaSet &set) {
 
 void print_capabilities() {
     const getnative::CpuDispatchInfo cpu = getnative::cpu_dispatch_info();
-    std::cout << "{\"schema_version\":3,\"engine\":\"getnative-engine\",\"version\":\"0.1.0\","
+    std::cout << "{\"schema_version\":2,\"engine\":\"getnative-engine\",\"version\":\"0.1.0\","
                  "\"commands\":{\"capabilities\":true,\"geometry\":true,\"analyze\":false},"
                  "\"kernels\":["
                  "{\"id\":\"bilinear\",\"parameters\":{\"kind\":\"none\"}},"
@@ -158,8 +155,22 @@ void print_capabilities() {
 #endif
 #if defined(GETNATIVE_HAS_CUDA)
     try {
-        const getnative::CudaAnalysisEngine cuda;
+        const getnative::CudaRuntimeProbe probe = getnative::cuda_runtime_probe();
+        const auto selected = std::find_if(
+            probe.devices.begin(), probe.devices.end(),
+            [](const getnative::CudaDeviceInfo &device) {
+                return device.backend_compatible;
+            });
+        if (!probe.device_available || selected == probe.devices.end()) {
+            throw std::runtime_error(probe.reason.empty()
+                ? "no compatible CUDA device is available" : probe.reason);
+        }
+        getnative::CudaAnalysisOptions options;
+        options.device_ordinal = selected->ordinal;
+        const getnative::CudaAnalysisEngine cuda(options);
         const auto &device = cuda.device_info();
+        const std::int32_t minimum_cuda =
+            getnative::cuda_minimum_compute_capability();
         std::cout << ",{\"id\":\"cuda\",\"compiled\":true,\"device_available\":true,"
                      "\"analysis_command_available\":false,"
                      "\"axes\":[\"horizontal\",\"vertical\",\"both\"],"
@@ -170,47 +181,33 @@ void print_capabilities() {
                   << ",\"compute_capability\":"
                   << json_string(std::to_string(device.compute_capability_major) + "."
                                  + std::to_string(device.compute_capability_minor))
+                  << ",\"minimum_compute_capability\":"
+                  << json_string(
+                         std::to_string(minimum_cuda / 10) + "."
+                         + std::to_string(minimum_cuda % 10))
+                  << ",\"artifact_target\":"
+                  << json_string(getnative::cuda_compiled_artifact_target())
                   << ",\"driver_version\":" << device.driver_version
                   << ",\"total_memory_bytes\":" << device.total_memory_bytes << '}';
     } catch (const std::exception &error) {
+        const std::int32_t minimum_cuda =
+            getnative::cuda_minimum_compute_capability();
         std::cout << ",{\"id\":\"cuda\",\"compiled\":true,\"device_available\":false,"
                      "\"analysis_command_available\":false,"
                      "\"axes\":[\"horizontal\",\"vertical\",\"both\"],"
                      "\"p_norms\":{\"minimum\":1,\"maximum\":1},"
-                     "\"max_half_bandwidth\":15,\"max_forward_width\":16,\"reason\":"
+                     "\"max_half_bandwidth\":15,\"max_forward_width\":16,"
+                     "\"minimum_compute_capability\":"
+                  << json_string(
+                         std::to_string(minimum_cuda / 10) + "."
+                         + std::to_string(minimum_cuda % 10))
+                  << ",\"artifact_target\":"
+                  << json_string(getnative::cuda_compiled_artifact_target())
+                  << ",\"reason\":"
                   << json_string(error.what()) << '}';
     }
 #else
     std::cout << ",{\"id\":\"cuda\",\"compiled\":false,\"device_available\":false,"
-                 "\"analysis_command_available\":false,\"axes\":[],\"p_norms\":null,"
-                 "\"max_half_bandwidth\":null,\"max_forward_width\":null,"
-                 "\"reason\":\"not compiled\"}";
-#endif
-#if defined(GETNATIVE_HAS_VULKAN)
-    try {
-        const getnative::VulkanAnalysisEngine vulkan;
-        const auto &device = vulkan.device_info();
-        std::cout << ",{\"id\":\"vulkan\",\"compiled\":true,\"device_available\":true,"
-                     "\"analysis_command_available\":false,"
-                     "\"axes\":[\"horizontal\",\"vertical\",\"both\"],"
-                     "\"p_norms\":{\"minimum\":1,\"maximum\":1},"
-                     "\"max_half_bandwidth\":15,\"max_forward_width\":16,\"device\":"
-                  << json_string(device.name)
-                  << ",\"selector\":" << json_string(device.stable_selector)
-                  << ",\"vendor_id\":" << device.vendor_id
-                  << ",\"device_id\":" << device.device_id
-                  << ",\"api_version\":" << device.api_version
-                  << ",\"driver_version\":" << device.driver_version << '}';
-    } catch (const std::exception &error) {
-        std::cout << ",{\"id\":\"vulkan\",\"compiled\":true,\"device_available\":false,"
-                     "\"analysis_command_available\":false,"
-                     "\"axes\":[\"horizontal\",\"vertical\",\"both\"],"
-                     "\"p_norms\":{\"minimum\":1,\"maximum\":1},"
-                     "\"max_half_bandwidth\":15,\"max_forward_width\":16,\"reason\":"
-                  << json_string(error.what()) << '}';
-    }
-#else
-    std::cout << ",{\"id\":\"vulkan\",\"compiled\":false,\"device_available\":false,"
                  "\"analysis_command_available\":false,\"axes\":[],\"p_norms\":null,"
                  "\"max_half_bandwidth\":null,\"max_forward_width\":null,"
                  "\"reason\":\"not compiled\"}";
