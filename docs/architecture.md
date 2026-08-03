@@ -231,7 +231,9 @@ reference implementation allocates dense intermediate matrices even though the
 result is banded; eliminating that work is the first optimization and benefits
 all execution backends.
 
-## Metal Batch Design And CUDA Target
+## Metal And CUDA Batch Design
+
+The optimized Metal backend follows this batch design:
 
 - The CPU planner owns all Float64 coefficient generation. GPU kernels receive
   the same packed Float32 `AxisPlan` buffers.
@@ -257,9 +259,60 @@ The current Metal runtime reuses tiled command-buffer arenas backed by shared
 `MTLBuffer`s, which fits unified-memory Apple Silicon and avoids redundant host
 staging. Private-buffer staging remains a benchmark-driven future option.
 
-CUDA is a future backend design, not an implemented runtime. The intended host
-adapter uses the driver API so the main executable can start without a CUDA
-runtime, with kernels packaged as architecture fatbins plus a PTX fallback.
+CUDA was reset to an independent implementation and consumes immutable
+`AxisPlan` values directly. The host packs forward weights tap-major, caches
+resident plans per execution slot, uses pinned staging, and reuses grow-to-fit
+device buffers. Candidate-local workspaces are bounded by a 640 MiB default,
+and caller limits can only lower it; the explicit working set remains below
+2 GiB. At context creation, the runtime snapshots free device memory, reserves
+the larger of 512 MiB or one eighth of free memory (capped at half of currently
+free memory), divides the remainder across execution slots, and leaves one
+fifth of each slot budget outside the workspace. Retained device-buffer
+capacities are included in the same per-slot and 2 GiB guards. Low-memory or
+high-concurrency devices therefore use smaller candidate tiles instead of
+blindly allocating 640 MiB per slot.
+
+The CUDA dataflow is axis-specific:
+
+- Horizontal input is transposed once so row-vector loads remain coalesced.
+  The horizontal-only solve fuses F6 reconstruction and metric accumulation.
+- Vertical-only solves advance two independent columns per thread. This reuses
+  transpose and LDLT factors while keeping each warp's two column groups
+  separately coalesced. The mixed/both path retains a single-column entry point
+  so its lower register footprint is not contaminated by the paired kernel.
+- Combined-axis horizontal solves use a shared-memory local transpose to emit
+  row-major native data without a full-frame transpose pass. The final
+  vertical-first reconstruction stages a narrow row span in shared memory and
+  fuses thresholding and p=1 partial reduction.
+- Device event telemetry separates staging, transfer, each kernel family,
+  readback, cache hits, allocation counts, tile counts, and slot waits.
+
+The host dynamically loads the CUDA Driver API, creates a dedicated context,
+and embeds one nvcc-generated multi-architecture fatbin. The default CUDA 13.3
+matrix contains native SM75 through SM121 targets and compute_75/compute_121
+PTX fallbacks. Runtime compatibility has an independent SM75 floor; device
+probing reports GPUs below that floor as incompatible. Compiler-generated PTX
+is portability output, not a PTX optimization stage. Every configured cubin
+and PTX entry is checked by CTest, and all native kernels must retain zero
+stack and zero local-memory allocation.
+CUDA promotion is strictly ordered:
+
+1. The `cpp-generic` C++ path must pass real-device H/V/both conformance,
+   tail-shape, cache, concurrency, tiling, and memory guards.
+2. Shape-local C++ specialization is introduced one operation at a time and
+   retained only with same-workload wall-time and counter evidence. These
+   specializations remain internal to `cpp-generic`; the public
+   `cpp-specialized` variant is still unavailable.
+3. Inline or handwritten PTX may only be evaluated after this stage, with
+   per-SM correctness and same-workload A/B evidence. Until then those runtime
+   variants fail closed.
+
+The RTX 5080 path has entered the profiling stage. Production promotion still
+requires wider filter/geometry coverage and validation on additional CUDA
+architectures. Current profile evidence is recorded in
+`docs/performance/cuda-profile-20260802.md`; the SM75+ build, PTX-JIT, artifact,
+and memory-budget evidence is recorded in
+`docs/performance/cuda-portability-20260802.md`.
 
 ## Worker Protocol
 
@@ -313,7 +366,7 @@ levels:
 2. CPU strict output matches frozen reference fixtures within the initial
    bound `max(1e-7, 5e-4 * reference_metric)`; the bound is tightened after a
    representative corpus is measured.
-3. GPU strict output stays within the CPU bound, selects a minimum no farther
+3. GPU production output stays within the CPU bound, selects a minimum no farther
    than one search step, and preserves the top-k local-valley set.
 
 The CPU compatibility backend remains available when a user requires the
