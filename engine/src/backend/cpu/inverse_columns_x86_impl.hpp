@@ -272,6 +272,146 @@ void inverse_columns_x86_tile(
     }
 }
 
+template <class Operations, std::int32_t TileVectors>
+void inverse_columns_x86_row_major_impl(
+    const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
+    float *output, std::ptrdiff_t output_row_stride,
+    std::int32_t column_count) noexcept {
+    using Vector = typename Operations::Vector;
+    constexpr std::int32_t lanes = Operations::lanes;
+    static_assert(TileVectors >= 1 && TileVectors <= 3);
+    constexpr std::int32_t tile_columns = lanes * TileVectors;
+    const std::int32_t destination_size = plan.destination_size;
+    const std::int32_t half_bandwidth = plan.half_bandwidth;
+    const auto factor_row_width = static_cast<std::size_t>(destination_size);
+    const std::int32_t bulk_columns =
+        column_count - column_count % tile_columns;
+
+    // Complete each row across the bulk before advancing vertically. This keeps
+    // the transpose and factorization working sets local without changing any
+    // per-column arithmetic order.
+    for (std::int32_t i = 0; i < destination_size; ++i) {
+        const std::uint32_t transpose_begin =
+            plan.transpose_offsets[static_cast<std::size_t>(i)];
+        const std::uint32_t transpose_end =
+            plan.transpose_offsets[static_cast<std::size_t>(i) + 1U];
+        const std::int32_t available = std::min(half_bandwidth, i);
+        const Vector diagonal = Operations::broadcast(
+            plan.inverse_diagonal[static_cast<std::size_t>(i)]);
+        for (std::int32_t column = 0; column < bulk_columns;
+             column += tile_columns) {
+            Vector sum0 = Operations::zero();
+            Vector sum1 = Operations::zero();
+            Vector sum2 = Operations::zero();
+            for (std::uint32_t p = transpose_begin; p < transpose_end; ++p) {
+                const float *values = input
+                    + static_cast<std::ptrdiff_t>(plan.transpose_indices[p])
+                        * input_row_stride + column;
+                const Vector factor =
+                    Operations::broadcast(plan.transpose_weights[p]);
+                sum0 = Operations::multiply_add(
+                    sum0, Operations::load(values), factor);
+                if constexpr (TileVectors >= 2) {
+                    sum1 = Operations::multiply_add(
+                        sum1, Operations::load(values + lanes), factor);
+                }
+                if constexpr (TileVectors >= 3) {
+                    sum2 = Operations::multiply_add(
+                        sum2, Operations::load(values + 2 * lanes), factor);
+                }
+            }
+
+            for (std::int32_t distance = available; distance >= 1; --distance) {
+                const float *previous = output
+                    + static_cast<std::ptrdiff_t>(i - distance)
+                        * output_row_stride + column;
+                const Vector factor = Operations::broadcast(plan.lower_ld[
+                    static_cast<std::size_t>(distance - 1) * factor_row_width
+                    + static_cast<std::size_t>(i)]);
+                sum0 = Operations::multiply_sub(
+                    sum0, Operations::load(previous), factor);
+                if constexpr (TileVectors >= 2) {
+                    sum1 = Operations::multiply_sub(
+                        sum1, Operations::load(previous + lanes), factor);
+                }
+                if constexpr (TileVectors >= 3) {
+                    sum2 = Operations::multiply_sub(
+                        sum2, Operations::load(previous + 2 * lanes), factor);
+                }
+            }
+
+            float *current = output
+                + static_cast<std::ptrdiff_t>(i) * output_row_stride + column;
+            Operations::store(current, Operations::multiply(sum0, diagonal));
+            if constexpr (TileVectors >= 2) {
+                Operations::store(
+                    current + lanes, Operations::multiply(sum1, diagonal));
+            }
+            if constexpr (TileVectors >= 3) {
+                Operations::store(
+                    current + 2 * lanes, Operations::multiply(sum2, diagonal));
+            }
+        }
+    }
+
+    for (std::int32_t i = destination_size - 2; i >= 0; --i) {
+        const std::int32_t available = std::min(
+            half_bandwidth, destination_size - i - 1);
+        for (std::int32_t column = 0; column < bulk_columns;
+             column += tile_columns) {
+            Vector sum0 = Operations::zero();
+            Vector sum1 = Operations::zero();
+            Vector sum2 = Operations::zero();
+            for (std::int32_t distance = available; distance >= 1; --distance) {
+                const float *next = output
+                    + static_cast<std::ptrdiff_t>(i + distance)
+                        * output_row_stride + column;
+                const Vector factor = Operations::broadcast(plan.upper_l[
+                    static_cast<std::size_t>(distance - 1) * factor_row_width
+                    + static_cast<std::size_t>(i)]);
+                sum0 = Operations::multiply_add(
+                    sum0, Operations::load(next), factor);
+                if constexpr (TileVectors >= 2) {
+                    sum1 = Operations::multiply_add(
+                        sum1, Operations::load(next + lanes), factor);
+                }
+                if constexpr (TileVectors >= 3) {
+                    sum2 = Operations::multiply_add(
+                        sum2, Operations::load(next + 2 * lanes), factor);
+                }
+            }
+
+            float *current = output
+                + static_cast<std::ptrdiff_t>(i) * output_row_stride + column;
+            Operations::store(
+                current, Operations::subtract(Operations::load(current), sum0));
+            if constexpr (TileVectors >= 2) {
+                Operations::store(
+                    current + lanes,
+                    Operations::subtract(Operations::load(current + lanes), sum1));
+            }
+            if constexpr (TileVectors >= 3) {
+                Operations::store(
+                    current + 2 * lanes,
+                    Operations::subtract(
+                        Operations::load(current + 2 * lanes), sum2));
+            }
+        }
+    }
+
+    std::int32_t column = bulk_columns;
+    if constexpr (TileVectors > 1) {
+        for (; column <= column_count - lanes; column += lanes) {
+            inverse_columns_x86_tile<Operations, 0, 1>(
+                plan, input, input_row_stride, output, output_row_stride, column);
+        }
+    }
+    for (; column < column_count; ++column) {
+        inverse_axis_f32(plan, input + column, input_row_stride,
+                         output + column, output_row_stride);
+    }
+}
+
 template <class Operations, std::int32_t FixedHalfBandwidth,
           std::int32_t TileVectors = Operations::tile_vectors>
 void inverse_columns_x86_impl(

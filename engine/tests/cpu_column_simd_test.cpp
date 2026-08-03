@@ -271,6 +271,93 @@ void test_materialized_inverse_columns(
     }
 }
 
+void test_avx2_b5_row_major_boundaries(
+    getnative::detail::ColumnDispatchPolicy policy,
+    getnative::CpuIsa selected_isa) {
+    if (selected_isa != getnative::CpuIsa::avx2) return;
+
+    constexpr std::int32_t source_size = 79;
+    constexpr std::int32_t destination_size = 43;
+    constexpr std::int32_t base_offset = 3;
+    constexpr float padding = -1173.5F;
+    const std::vector<NamedFilter> b5_filters{
+        {"spline36", getnative::Filter::spline36()},
+        {"lanczos3", getnative::Filter::lanczos(3)},
+    };
+    const std::vector<std::int32_t> column_counts{
+        0, 1, 7, 8, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63,
+        1919, 1920, 1921,
+    };
+
+    for (const auto &[name, filter] : b5_filters) {
+        const auto plan = getnative::build_axis_plan({
+            source_size, destination_size, 43.25, -0.1875, filter,
+            getnative::BorderMode::mirror,
+        });
+        expect(plan.support == 3 && plan.half_bandwidth == 5
+                   && plan.forward_width == 6,
+               name + " did not produce the AVX2 B5 specialization shape");
+
+        for (const std::int32_t columns : column_counts) {
+            const std::ptrdiff_t input_stride = columns + 7;
+            const std::ptrdiff_t output_stride = columns + 11;
+            const std::size_t input_count = static_cast<std::size_t>(
+                source_size * input_stride + base_offset + 7);
+            const std::size_t output_count = static_cast<std::size_t>(
+                destination_size * output_stride + base_offset + 7);
+            std::vector<float> input(input_count, padding);
+            for (std::int32_t row = 0; row < source_size; ++row) {
+                for (std::int32_t column = 0; column < columns; ++column) {
+                    input[static_cast<std::size_t>(base_offset)
+                          + static_cast<std::size_t>(row * input_stride + column)] =
+                        source_value(row, column);
+                }
+            }
+            const std::vector<float> original_input = input;
+            std::vector<float> row_major(output_count, padding);
+            std::vector<float> column_major(output_count, padding);
+
+            getnative::detail::inverse_columns_f32(
+                plan, input.data() + base_offset, input_stride,
+                row_major.data() + base_offset, output_stride, columns, policy);
+            std::int32_t reference_column = 0;
+            for (; reference_column + 16 <= columns; reference_column += 16) {
+                getnative::detail::inverse_columns_f32(
+                    plan, input.data() + base_offset + reference_column,
+                    input_stride,
+                    column_major.data() + base_offset + reference_column,
+                    output_stride, 16, policy);
+            }
+            if (reference_column + 8 <= columns) {
+                getnative::detail::inverse_columns_f32(
+                    plan, input.data() + base_offset + reference_column,
+                    input_stride,
+                    column_major.data() + base_offset + reference_column,
+                    output_stride, 8, policy);
+                reference_column += 8;
+            }
+            if (reference_column < columns) {
+                getnative::detail::inverse_columns_f32(
+                    plan, input.data() + base_offset + reference_column,
+                    input_stride,
+                    column_major.data() + base_offset + reference_column,
+                    output_stride, columns - reference_column, policy);
+            }
+
+            expect(input == original_input,
+                   name + " AVX2 B5 kernel modified its input");
+            for (std::size_t index = 0; index < row_major.size(); ++index) {
+                expect(
+                    std::bit_cast<std::uint32_t>(row_major[index])
+                        == std::bit_cast<std::uint32_t>(column_major[index]),
+                    name + " row-major AVX2 differs bitwise at columns="
+                        + std::to_string(columns) + ", storage index="
+                        + std::to_string(index));
+            }
+        }
+    }
+}
+
 [[nodiscard]] std::vector<float> make_source(
     std::int32_t width, std::int32_t height, std::int32_t stride) {
     std::vector<float> pixels(static_cast<std::size_t>(height * stride), -77.0F);
@@ -739,18 +826,18 @@ void test_mxcsr_unchanged(
 #if defined(_M_X64) || defined(_M_IX86) || defined(__i386__) || defined(__x86_64__)
     const unsigned int before = _mm_getcsr();
     const auto plan = getnative::build_axis_plan({
-        17, 11, 11.25, 0.0, getnative::Filter::bilinear(),
+        79, 43, 43.25, -0.1875, getnative::Filter::spline36(),
         getnative::BorderMode::mirror,
     });
-    const auto input = make_source(17, 17, 19);
-    std::vector<float> output(11U * 19U, 0.0F);
+    const auto input = make_source(49, 79, 57);
+    std::vector<float> output(43U * 61U, 0.0F);
     const unsigned int non_default =
         (before & ~static_cast<unsigned int>(_MM_ROUND_MASK))
         | static_cast<unsigned int>(_MM_ROUND_DOWN);
     _mm_setcsr(non_default);
     try {
         getnative::detail::inverse_columns_f32(
-            plan, input.data(), 19, output.data(), 19, 17, policy);
+            plan, input.data(), 57, output.data(), 61, 49, policy);
         expect(_mm_getcsr() == non_default,
                "CPU library changed a caller-provided non-default MXCSR");
     } catch (...) {
@@ -796,6 +883,7 @@ int main(int argc, char **argv) {
         }
         const auto policy = getnative::detail::column_dispatch_policy(request);
         test_materialized_inverse_columns(policy, dispatch.selected);
+        test_avx2_b5_row_major_boundaries(policy, dispatch.selected);
         test_axis_and_two_axis_candidates(policy);
         test_workspace_reuse(policy);
         test_all_filters_across_axes(policy);
