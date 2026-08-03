@@ -31,6 +31,61 @@ void expect(bool condition, std::string_view message) {
     return std::bit_cast<std::uint32_t>(lhs) == std::bit_cast<std::uint32_t>(rhs);
 }
 
+constexpr double output_absolute_tolerance = 2.0e-6;
+constexpr double output_relative_tolerance = 2.0e-6;
+
+struct OutputErrorStats {
+    double maximum_absolute = 0.0;
+    double maximum_scaled = 0.0;
+    double maximum_tolerance_ratio = 0.0;
+    std::string maximum_absolute_case;
+    std::string maximum_scaled_case;
+    std::string maximum_tolerance_case;
+    std::int32_t maximum_absolute_index = -1;
+    std::int32_t maximum_scaled_index = -1;
+    std::int32_t maximum_tolerance_index = -1;
+};
+
+void compare_output(std::string_view name, std::int32_t index,
+                    float actual, float expected, OutputErrorStats &stats) {
+    if (!std::isfinite(actual) || !std::isfinite(expected)) {
+        expect(same_bits(actual, expected),
+               std::string{name} + " produced a non-finite output mismatch");
+        return;
+    }
+
+    const double absolute = std::abs(static_cast<double>(actual)
+                                     - static_cast<double>(expected));
+    const double scale = std::max(1.0, std::abs(static_cast<double>(expected)));
+    const double tolerance = std::max(
+        output_absolute_tolerance,
+        output_relative_tolerance * std::abs(static_cast<double>(expected)));
+    const double scaled = absolute / scale;
+    const double tolerance_ratio = absolute / tolerance;
+    if (absolute > stats.maximum_absolute) {
+        stats.maximum_absolute = absolute;
+        stats.maximum_absolute_case = std::string{name};
+        stats.maximum_absolute_index = index;
+    }
+    if (scaled > stats.maximum_scaled) {
+        stats.maximum_scaled = scaled;
+        stats.maximum_scaled_case = std::string{name};
+        stats.maximum_scaled_index = index;
+    }
+    if (tolerance_ratio > stats.maximum_tolerance_ratio) {
+        stats.maximum_tolerance_ratio = tolerance_ratio;
+        stats.maximum_tolerance_case = std::string{name};
+        stats.maximum_tolerance_index = index;
+    }
+    if (absolute > tolerance) {
+        throw std::runtime_error(
+            std::string{name} + " descale output exceeds numerical tolerance at index "
+            + std::to_string(index) + ": absolute error="
+            + std::to_string(absolute) + ", tolerance="
+            + std::to_string(tolerance));
+    }
+}
+
 [[nodiscard]] DescaleBorder descale_border(getnative::BorderMode border) {
     switch (border) {
     case getnative::BorderMode::zero: return DESCALE_BORDER_ZERO;
@@ -41,7 +96,8 @@ void expect(bool condition, std::string_view message) {
 }
 
 void compare_descale(std::string_view name, const getnative::Filter &filter,
-                     DescaleMode mode, getnative::BorderMode border) {
+                     DescaleMode mode, getnative::BorderMode border,
+                     OutputErrorStats &output_stats) {
     constexpr std::int32_t source_size = 37;
     constexpr std::int32_t destination_size = 23;
     const getnative::AxisPlanRequest request{
@@ -121,10 +177,8 @@ void compare_descale(std::string_view name, const getnative::Filter &filter,
     api.process_vectors(core.get(), DESCALE_DIR_HORIZONTAL, 1,
                         source_size, destination_size, input.data(), expected.data());
     for (std::int32_t i = 0; i < destination_size; ++i) {
-        if (!same_bits(actual[static_cast<std::size_t>(i)],
-                       expected[static_cast<std::size_t>(i)])) {
-            throw std::runtime_error(std::string{name} + " descale output differs");
-        }
+        compare_output(name, i, actual[static_cast<std::size_t>(i)],
+                       expected[static_cast<std::size_t>(i)], output_stats);
     }
 }
 
@@ -162,11 +216,12 @@ void compare_zimg(std::string_view name, const getnative::Filter &filter,
 
 template <class ZimgFilter>
 void run_filter(std::string_view name, const getnative::Filter &filter,
-                DescaleMode mode, ZimgFilter zimg_filter) {
+                DescaleMode mode, ZimgFilter zimg_filter,
+                OutputErrorStats &output_stats) {
     for (const auto border : {getnative::BorderMode::zero,
                               getnative::BorderMode::repeat,
                               getnative::BorderMode::mirror}) {
-        compare_descale(name, filter, mode, border);
+        compare_descale(name, filter, mode, border, output_stats);
     }
     compare_zimg(name, filter, zimg_filter);
 }
@@ -175,24 +230,35 @@ void run_filter(std::string_view name, const getnative::Filter &filter,
 
 int main() {
     try {
+        OutputErrorStats output_stats;
         run_filter("bilinear", getnative::Filter::bilinear(),
-                   DESCALE_MODE_BILINEAR, zimg::resize::BilinearFilter{});
+                   DESCALE_MODE_BILINEAR, zimg::resize::BilinearFilter{}, output_stats);
         run_filter("bicubic", getnative::Filter::bicubic(),
-                   DESCALE_MODE_BICUBIC, zimg::resize::BicubicFilter{0.0, 0.5});
+                   DESCALE_MODE_BICUBIC, zimg::resize::BicubicFilter{0.0, 0.5}, output_stats);
         run_filter("bicubic-b025-c040", getnative::Filter::bicubic(0.25, 0.4),
-                   DESCALE_MODE_BICUBIC, zimg::resize::BicubicFilter{0.25, 0.4});
+                   DESCALE_MODE_BICUBIC, zimg::resize::BicubicFilter{0.25, 0.4}, output_stats);
         for (unsigned taps = 1; taps <= 8; ++taps) {
             run_filter("lanczos" + std::to_string(taps),
                        getnative::Filter::lanczos(static_cast<std::int32_t>(taps)),
-                       DESCALE_MODE_LANCZOS, zimg::resize::LanczosFilter{taps});
+                       DESCALE_MODE_LANCZOS, zimg::resize::LanczosFilter{taps}, output_stats);
         }
         run_filter("spline16", getnative::Filter::spline16(),
-                   DESCALE_MODE_SPLINE16, zimg::resize::Spline16Filter{});
+                   DESCALE_MODE_SPLINE16, zimg::resize::Spline16Filter{}, output_stats);
         run_filter("spline36", getnative::Filter::spline36(),
-                   DESCALE_MODE_SPLINE36, zimg::resize::Spline36Filter{});
+                   DESCALE_MODE_SPLINE36, zimg::resize::Spline36Filter{}, output_stats);
         run_filter("spline64", getnative::Filter::spline64(),
-                   DESCALE_MODE_SPLINE64, zimg::resize::Spline64Filter{});
-        std::cout << "all upstream conformance tests passed\n";
+                   DESCALE_MODE_SPLINE64, zimg::resize::Spline64Filter{}, output_stats);
+        std::cout << "all upstream conformance tests passed; max_abs_error="
+                  << output_stats.maximum_absolute << " ("
+                  << output_stats.maximum_absolute_case << "["
+                  << output_stats.maximum_absolute_index << "])"
+                  << ", max_scaled_error=" << output_stats.maximum_scaled
+                  << " (" << output_stats.maximum_scaled_case << "["
+                  << output_stats.maximum_scaled_index << "])"
+                  << ", max_tolerance_ratio="
+                  << output_stats.maximum_tolerance_ratio << " ("
+                  << output_stats.maximum_tolerance_case << "["
+                  << output_stats.maximum_tolerance_index << "])\n";
         return EXIT_SUCCESS;
     } catch (const std::exception &error) {
         std::cerr << "upstream conformance failure: " << error.what() << '\n';

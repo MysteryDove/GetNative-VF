@@ -330,7 +330,7 @@ make_axis_plan_geometry(const AxisPlanRequest &request) {
     geometry->forward_right.resize(static_cast<std::size_t>(request.source_size));
     const double maximum_mapped = std::nextafter(
         static_cast<double>(request.destination_size),
-        -std::numeric_limits<double>::infinity());
+        -std::numeric_limits<double>::max());
     for (std::int32_t row = 0; row < request.source_size; ++row) {
         const double position = (static_cast<double>(row) + 0.5) / scale
             + request.shift;
@@ -661,7 +661,7 @@ void make_zimg_forward(DoubleCsrView result,
                 mapped = std::clamp(
                     mapped, 0.0,
                     std::nextafter(static_cast<double>(columns),
-                                   -std::numeric_limits<double>::infinity()));
+                                   -std::numeric_limits<double>::max()));
                 index = static_cast<std::int32_t>(std::floor(mapped));
                 tap_indices[static_cast<std::size_t>(tap)] = index;
             }
