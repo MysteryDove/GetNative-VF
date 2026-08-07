@@ -44,10 +44,10 @@ Consequences for frontend development:
 ## Language and terminology contract
 
 - Supported locales are Simplified Chinese (`zh-CN`) and English (`en`). First launch defaults to `zh-CN`; a persisted application preference takes precedence afterward.
-- Do not coin UI terminology. For concepts covered by `总监培训2026_20260725.html` or `总监培训2026_20260726.html`, the approved UI wording must prefer terms already present in those sources.
+- Do not coin UI terminology. For concepts covered by `总监培训2026_20260725.html` or `总监培训2026_20260726.html`, the approved UI wording must follow the reviewed core-workflow mapping in `DESIGN.md`, which prefers terms already present in those sources.
 - Preserve canonical technical spellings such as `getnative`, `descale`, `Bicubic`, `Bilinear`, `Spline`, and `Lanczos` in both locales.
 - English route, page, and domain names in this specification are architectural identifiers. They are not permission to hard-code English display text.
-- Maintain one reviewed bilingual terminology mapping for navigation, commands, parameters, statuses, errors, and accessibility labels. When a required concept is absent from both source HTML files, use established industry terminology and document the mapping; never fabricate a new word.
+- Extend that reviewed bilingual mapping before adding new navigation, commands, parameters, statuses, errors, or accessibility labels. When a required concept is absent from both source HTML files, use established industry terminology and document the mapping; never fabricate a new word.
 - Store complete phrases per locale. Do not concatenate translated fragments, and do not mix locales except for canonical technical names, formats, code values, and user content.
 - Locale selection is application state, not Project state. Project manifests, Recipes, Runs, metrics, and exports remain language-neutral.
 - Rust and engine boundaries return stable codes and structured values; React localizes user-facing messages. Raw diagnostic text may be shown separately and clearly labeled.
@@ -169,7 +169,7 @@ Primary controls:
 - New Project.
 - Open Project.
 - Quick Analysis as an untitled recoverable Project.
-- Recent Project row actions: open, reveal, remove from recents.
+- Recent Project row actions: open, `在文件夹中显示 / Show in Folder`, remove from recents.
 
 Acceptance:
 
