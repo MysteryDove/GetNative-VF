@@ -90,3 +90,31 @@ was removed. 8/8 consecutive full-suite runs pass after the fix.
 - The worker capabilities envelope now reports CUDA
   `analysis_command_available=true` when the device is usable; Metal
   remains false until the Metal lane wires its worker path.
+
+## 7. Addendum (2026-08-08): same-session interleaved A/B correction
+
+Re-verification on the merge into main used an interleaved A/B against
+the pre-change commit (`afce7a3`, detached worktree, same toolchain,
+alternating PRE/POST runs to share GPU clock state). Same shape as §3.
+
+| Run | frame_ms PRE | frame_ms POST | c/s PRE | c/s POST | upload PRE | upload POST |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 7.955 | 7.675 | 8,045 | 8,339 | 1,327,104,000 | 0 |
+| 2 | 7.821 | 7.454 | 8,183 | 8,587 | 1,327,104,000 | 0 |
+| 3 | 7.681 | 7.551 | 8,332 | 8,476 | 1,327,104,000 | 0 |
+| median | 7.821 | 7.551 | 8,183 | 8,476 | | |
+
+- Same-session delta: frame_ms **-3.5%**, candidates/s **+3.6%** — not the
+  -14.5%/+16.9% recorded in §3. The §3 PRE number (7.500) was measured in
+  a different moment than the POST runs; GPU clock residency between
+  sessions (observed ~2,000 vs up to 3,105 MHz, clocks not lockable
+  without root) inflated the cross-session delta. The interleaved A/B is
+  the reliable estimate for this shape.
+- The structural win is unaffected: 1.33 GB of H2D uploads plus 160
+  transpose launches eliminated per run, checksum bit-identical across
+  PRE/POST (`0.34542664490478819`), `source_cache_hits` 160/160.
+- Telemetry caveat discovered during re-verification: on cache hits the
+  `source_upload_ms` / `source_transpose_ms` event-pair timers measure
+  stream backlog between the bracketing events, not skipped work (bytes
+  counters are the authoritative residency signal). Only interpret the
+  `*_ms` fields when the corresponding byte counter is non-zero.
