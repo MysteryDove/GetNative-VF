@@ -11,7 +11,12 @@ import { formatProjectError, ProjectHub } from "./components/ProjectHub";
 import { ProjectShell } from "./components/ProjectShell";
 import type { UiError } from "./components/ErrorNotice";
 import type { EngineEnvelope, EngineState } from "./engine/types";
-import { emptyExecutionState, type ExecutionState } from "./engine/runReducer";
+import { engineWorker } from "./engine/workerClient";
+import {
+  emptyExecutionState,
+  reduceWorkerEvent,
+  type ExecutionState,
+} from "./engine/runReducer";
 import { applyOpenResult, createTauriProjectStorage } from "./project/storage";
 import { restoredProjectRoute } from "./project/normalize";
 import type {
@@ -49,7 +54,7 @@ function App() {
   const [enginePath, setEnginePath] = useState("");
   const [engineError, setEngineError] = useState("");
   const [capabilities, setCapabilities] = useState<EngineEnvelope | null>(null);
-  const [execution] = useState<ExecutionState>(() => emptyExecutionState());
+  const [execution, setExecution] = useState<ExecutionState>(() => emptyExecutionState());
 
   const t = useMemo(() => createTranslator(locale), [locale]);
 
@@ -79,18 +84,67 @@ function App() {
       .finally(() => setPrefsReady(true));
   }, []);
 
+  // Worker session lifecycle: stream engine events into the Job Tray state,
+  // and prefer the resident worker's capability envelope (analyze=true per the
+  // backend contract) over the one-shot CLI, which stays analyze=false.
   useEffect(() => {
-    invoke<EngineEnvelope>("engine_capabilities")
-      .then((result) => {
+    const unsubscribe = engineWorker.subscribe((event) => {
+      setExecution((state) => reduceWorkerEvent(state, event));
+    });
+    const unsubscribeExit = engineWorker.onExit(() => {
+      // The resident worker died: fall back to the one-shot envelope so
+      // analyze gating reflects what the app can actually run.
+      invoke<EngineEnvelope>("engine_capabilities")
+        .then((result) => {
+          setCapabilities(result);
+          setEnginePath(result.path);
+          setEngineState("ready");
+          setEngineError("worker_exit: resident engine worker exited; analysis is unavailable until restart");
+        })
+        .catch((error: unknown) => {
+          setCapabilities(null);
+          setEngineState("missing");
+          setEngineError(String(error));
+        });
+    });
+    return () => {
+      unsubscribe();
+      unsubscribeExit();
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        await engineWorker.connect();
+        const envelope = await engineWorker.capabilities();
+        if (cancelled) return;
+        setCapabilities(envelope);
+        setEnginePath(envelope.path);
+        setEngineState("ready");
+        setEngineError("");
+        return;
+      } catch {
+        // Fall through to the one-shot CLI transport below.
+      }
+      if (cancelled) return;
+      try {
+        const result = await invoke<EngineEnvelope>("engine_capabilities");
+        if (cancelled) return;
         setCapabilities(result);
         setEnginePath(result.path);
         setEngineState("ready");
         setEngineError("");
-      })
-      .catch((error: unknown) => {
+      } catch (error: unknown) {
+        if (cancelled) return;
         setEngineState("missing");
         setEngineError(String(error));
-      });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
