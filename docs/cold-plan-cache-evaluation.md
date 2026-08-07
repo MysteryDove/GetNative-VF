@@ -63,14 +63,18 @@ Lookup: L1 hit → return; L1 miss → L2 file `<cache>/plans/v1/<key_hash>.gnpl
 → validate → publish into L1 → return; L2 miss → build (batch workers) →
 publish L1 → write-behind to L2 (atomic tmp+rename, no-replace publish).
 
-File format (little-endian, self-validating):
+File format (little-endian, self-validating). The payload is the cooked
+structural encoding (§3.1), compressed with zstd1, one pack per candidate
+grid:
 
 ```
-magic "GNPL" | format_version u32 | key_hash u64 | build_fingerprint u64
-payload_len u32 | payload (counts + arrays) | checksum u64 (fnv1a64)
+magic "GNPK" | format_version u32 | grid_hash u64 | build_fingerprint u64
+plan_count u32 | index[plan_count] {key_hash u64, offset u32, length u32}
+payload_len u32 | zstd1(cooked plans concatenated) | checksum u64
 ```
 
-- `key_hash`: FNV-1a over the canonical PlanKey (already implemented).
+- `key_hash` / `grid_hash`: FNV-1a over the canonical PlanKey / the ordered
+  key list (already implemented primitives).
 - `build_fingerprint`: compiler id+version, FP mode (`planner_fp`
   strict/fast), build type, planner source identity. Mismatch → treat as
   miss and rebuild; **never** load plans whose provenance differs, because
@@ -82,6 +86,66 @@ payload_len u32 | payload (counts + arrays) | checksum u64 (fnv1a64)
   Corrupt cache can never fail a job.
 - Eviction: bounded directory (default 1 GiB), mtime-LRU sweep at session
   start; atomic publish makes concurrent workers safe.
+
+### 3.1 Codec selection, measured (2026-08-08, supersedes the earlier assumption)
+
+The first draft of this document assumed plan data was "mostly
+incompressible float data". That assumption was **wrong**; measurements on
+a 400-plan corpus per kernel family (1080 → 700..1099, mirror border,
+`engine/bench/plan_compression_probe.cpp` on branch
+`engine/worker-protocol`) show:
+
+Structural pre-transform ("cooked") applied before entropy coding —
+lossless, exploits invariants verified on every plan:
+
+- `forward_offsets` is always the uniform stride `row * forward_width`
+  (drop entirely, reconstruct from two scalars);
+- `forward_indices` is always per-row consecutive runs (keep one `left`
+  anchor per row instead of `destination × forward_width` entries);
+- `transpose_offsets`/`transpose_indices` delta-varint encoded.
+
+| Variant (bicubic corpus, raw 41.18 MB) | Bytes | Ratio | Compress | Decompress |
+| --- | --- | --- | --- | --- |
+| raw + zstd1 | 10.46 MB | 3.94x | 1037 MB/s | 2470 MB/s |
+| **cooked + zstd1** | **8.69 MB** | **4.74x** | **1448 MB/s** | **2990 MB/s** |
+| cooked + zstd3 | 7.03 MB | 5.86x | 554 MB/s | 2345 MB/s |
+| cooked + zstd9 | 6.60 MB | 6.24x | 229 MB/s | 2722 MB/s |
+| cooked + lz4 | 12.11 MB | 3.40x | 2888 MB/s | 13027 MB/s |
+| cooked + lz4hc9 | 10.98 MB | 3.75x | 187 MB/s | 8532 MB/s |
+
+Ratios are consistent across families (cooked+zstd1: bicubic 4.74x,
+lanczos3 4.26x, spline64 4.13x; cooked+zstd3: 5.86x/5.47x/5.25x). zstd9
+adds little over zstd3 — level 1/3 is the sweet spot. lz4 decompresses at
+a remarkable 13 GB/s but costs ~40% more storage than zstd1.
+
+Whole-corpus (one pack per grid) vs per-plan file, measured with a trained
+zstd dictionary (110 KiB, `--train` on the cooked corpus):
+
+| Store shape | bicubic | spline64 |
+| --- | --- | --- |
+| Grid pack, cooked+zstd1 | 4.74x | 4.13x |
+| Per-plan file + plain zstd1 | 3.21x | 3.20x |
+| Per-plan file + trained dictionary | 3.92x | 3.69x |
+
+The grid pack beats even the dictionary-assisted per-plan store and needs
+no dictionary lifecycle management; it is also exactly the "preheat: one
+read" shape. Decision: **cooked pre-transform + zstd1, one pack per
+(candidate grid × build fingerprint)**; per-plan dict-assisted files are a
+recorded fallback for sparse access patterns.
+
+Projected footprint for a 30,000-candidate stress grid (bicubic,
+100.7 KiB logical/plan):
+
+| Store | Size | Preheat read+decode (3 GB/s class) |
+| --- | --- | --- |
+| raw | 2.95 GiB | — |
+| **grid pack, cooked+zstd1** | **~630 MiB** | **~0.2-0.3 s** |
+| grid pack, cooked+zstd3 | ~510 MiB | ~0.3-0.4 s |
+| per-plan + dictionary | ~770 MiB | ~0.3 s |
+
+zstd1 is the default: within ~20% of the zstd9 ratio at 4-5x the
+compression speed and full decompress speed. lz4 remains the "fastest
+possible preheat" escape hatch (13 GB/s) if load time ever dominates.
 
 ## 4. Risks and mitigations
 
@@ -117,7 +181,7 @@ Feasible and worth doing, in this order, as one planner-lane change:
 
 Explicitly not now: cross-machine sharing (fingerprint-gated), CUDA packed
 batch persistence (device layouts are internal and version-sensitive),
-compression (plans are small and mostly incompressible float data).
+trained zstd dictionaries (grid packs already beat them, §3.1).
 
 Priority: below the Tauri transport merge and E2 verification; above any
 further kernel micro-optimization, because it removes a measured

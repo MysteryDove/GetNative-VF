@@ -229,12 +229,30 @@ device-resident stream per Source.
   specialization. Benchmark both on the formal matrix before adopting; ours
   already has per-shape dispatch (`inverse_columns_avx2.cpp:69-84`).
 
-### D4 — Explicitly not now
+### D4 — Persistent plan store (cold cache), with measured codec
 
-Plan disk serialization (dsmvc has none; the PackedPlan single-blob device
-mirror is the layout reference if we ever design one); persistent
-cudaHostRegister of frame buffers (revisit when decode lives engine-side);
-AVX-512 approval matrix (unchanged policy).
+`docs/cold-plan-cache-evaluation.md` evaluates this fully. Plans are
+content-independent of image pixels (the key is geometry + kernel only), so
+repeated same-resolution workloads reuse 100% of plans across images and
+process restarts. The win is not throughput (a 1,000-plan batch builds in
+15.81 ms) but removing the measured fixed-admission cliff: 1,000-plan
+Lanczos-6/7/8 scans currently force 7-30% rebuilds. Design: L1 memory
+single-flight LRU (adopt dsmvc SingleFlightLru semantics) + L2 disk store,
+one zstd1-compressed pack per candidate grid with a lossless structural
+pre-transform (uniform forward offsets dropped, forward indices reduced
+to per-row anchors, CSR arrays delta-varint). Measured on real corpora:
+4.74x/4.26x/4.13x (bicubic/lanczos3/spline64) at ~1.5 GB/s compress and
+~3 GB/s decompress; a 30,000-candidate grid is ~630 MiB on disk and
+preheats in ~0.2-0.3 s. Build fingerprints gate cross-build loading;
+corrupt packs always degrade to rebuild.
+
+### D5 — Explicitly not now
+
+CUDA packed batch persistence (device layouts are internal and
+version-sensitive); persistent cudaHostRegister of frame buffers (revisit
+when decode lives engine-side); AVX-512 approval matrix (unchanged
+policy); trained zstd dictionaries for the plan store (grid packs already
+beat them, §3.1 of the evaluation).
 
 ## 5. Port inventory
 
@@ -278,6 +296,7 @@ and ctest green before merge.
 | E1 Candidate batch scheduler (D1) | Device-resident batch execution for height/kernel scans | c/s per kernel family vs frozen baseline on the 1,000-point fixture; Nsight occupancy; memory ceiling respected (`cuda_memory_policy.hpp`) |
 | E2 Verification pipeline (D2) | Frame-parallel product path + decode/analyze overlap | Episode-scale fps vs 2,056 fps prototype baseline; GUI-5 acceptance scenarios |
 | E3 Kernel increments (D3) | Metric SIMD; large-taps CUDA study; cache policy A/B | Per-item keep/reject notes with benchmark JSON |
+| E4 Persistent plan store (D4) | L1 single-flight LRU + L2 zstd1 grid packs | Hit rate 79.7/69.8% → ~100% on repeated 1,000-plan Lanczos-6/8 scans; preheated vs cold first-scan latency |
 
 Phase ordering rationale: E0 is structural and unblocks the UI lane; E1 is
 where the largest measured headroom lives (4.32x kernel ceiling, currently
@@ -293,5 +312,5 @@ incremental and safe to interleave.
   verification).
 - Whether the CPU packed-plan layout from dsmvc beats our CSR + row-major
   specialization at production shapes — formal-matrix A/B required.
-- Session cache limits per workload class (301-point default scans are far
-  under caps; 10,000-point stress scans are not — pick policy with data).
+- ~~Session cache limits per workload class~~ — resolved by D4: L1 LRU
+  plus the L2 pack store; eviction policy per the evaluation document.
