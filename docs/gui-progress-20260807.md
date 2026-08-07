@@ -114,6 +114,22 @@ analyze loop); clippy clean; locale parity 454 keys; `npm run build` clean.
 GUI click-through on video Samples still needs the staged-FFmpeg host
 (recorded boundary).
 
+## Update 2 — QoL batch (2026-08-08, commit cf3c822)
+
+- Samples page accepts file drops: still images become included Samples
+  directly (dedup-safe), videos import as Sources with a Media-page hint.
+  The import pipeline is now shared (`media/importSources.ts` +
+  `useFileDrop`); Media page picker/drop behavior unchanged.
+- Height plot reading aids: valley (best point) highlight, perfectly-descale
+  1e-6 threshold line (raw and log display), perfect-point styling in the
+  data table — the training-workflow reading actions are now first-class UI.
+- Base-canvas overrides (baseHeight/baseWidth = the parity exploration
+  contract) flow into every height request and intent snapshot with decimal
+  validation; engine v1 ignores them safely, v1.1 consumes them.
+- Training-coverage assessment (总监培训 day1/day2) drove these; remaining
+  gaps: verify review loop (timeline/threshold/Top-N/add-to-Samples) awaits
+  the engine verify mode; kernel mode likewise.
+
 ## Suggested next step
 
 GUI-3's remaining acceptance item is a manual click-through smoke (still
