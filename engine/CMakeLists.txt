@@ -500,7 +500,11 @@ if(TARGET getnative_metal)
     getnative_enable_strict_fp(getnative_metal)
 endif()
 
-add_executable(getnative-engine src/cli/main.cpp)
+add_executable(getnative-engine
+    src/cli/capabilities.cpp
+    src/cli/json.cpp
+    src/cli/main.cpp
+    src/cli/worker.cpp)
 target_link_libraries(getnative-engine PRIVATE getnative_core)
 if(GETNATIVE_ENABLE_METAL)
     target_link_libraries(getnative-engine PRIVATE getnative_metal)
@@ -557,6 +561,20 @@ if(BUILD_TESTING)
     getnative_enable_warnings(getnative_axis_planner_tests)
     getnative_enable_strict_fp(getnative_axis_planner_tests)
     add_test(NAME getnative_axis_planner_tests COMMAND getnative_axis_planner_tests)
+
+    add_executable(getnative_json_tests tests/json_test.cpp src/cli/json.cpp)
+    target_include_directories(getnative_json_tests PRIVATE src/cli)
+    target_compile_features(getnative_json_tests PRIVATE cxx_std_23)
+    getnative_enable_warnings(getnative_json_tests)
+    add_test(NAME getnative_json_tests COMMAND getnative_json_tests)
+
+    find_program(GETNATIVE_PYTHON3 NAMES python3 python)
+    if(GETNATIVE_PYTHON3)
+        add_test(NAME getnative_worker_protocol_tests
+            COMMAND "${GETNATIVE_PYTHON3}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_protocol_test.py"
+                $<TARGET_FILE:getnative-engine>)
+    endif()
 
     if(GETNATIVE_ENABLE_CUDA)
         add_test(NAME getnative_cuda_artifact_inventory
