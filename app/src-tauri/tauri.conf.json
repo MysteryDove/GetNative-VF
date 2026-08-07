@@ -30,7 +30,7 @@
     "resources": {
       "bundle-stage/bin/": "bin/",
       "bundle-stage/build-provenance.json": "build-provenance.json",
-      "bundle-stage/share/getnative/THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
+      "bundle-stage/share/": "share/"
     },
     "icon": [
       "icons/32x32.png",

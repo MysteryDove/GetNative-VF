@@ -48,3 +48,21 @@ TERMS AND CONDITIONS FOR COPYING, DISTRIBUTION AND MODIFICATION
 0. You just DO WHAT THE FUCK YOU WANT TO.
 
 Source: https://github.com/sekrit-twc/zimg
+
+## FFmpeg
+
+The desktop application may distribute `ffmpeg` and `ffprobe` from FFmpeg
+8.1.2 as separate executables. They are built without GPL or nonfree
+components and are licensed under the GNU Lesser General Public License,
+version 2.1 or later.
+
+The packaged `share/ffmpeg/` directory contains the corresponding unmodified
+source archive, license text, and exact build configuration. The reproducible
+staging command is:
+
+```text
+npm run stage:ffmpeg:macos
+```
+
+Source: https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
+SHA-256: 464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
