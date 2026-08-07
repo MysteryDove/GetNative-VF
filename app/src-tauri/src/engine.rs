@@ -117,7 +117,7 @@ fn engine_candidates(app: &AppHandle) -> Vec<PathBuf> {
     paths
 }
 
-fn find_engine(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn find_engine(app: &AppHandle) -> Result<PathBuf, String> {
     let candidates = engine_candidates(app);
     candidates
         .iter()
@@ -152,7 +152,7 @@ fn run_engine(path: &Path, args: &[String]) -> Result<Value, String> {
         .map_err(|error| format!("getnative-engine returned invalid JSON: {error}"))
 }
 
-fn validate_capabilities(payload: &Value) -> Result<(), String> {
+pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
     let capabilities: EngineCapabilities =
         serde_json::from_value(payload.clone()).map_err(|error| {
             format!("getnative-engine returned an invalid capability schema: {error}")

@@ -4,15 +4,23 @@ mod export;
 mod media;
 mod prefs;
 mod project;
+mod worker;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(worker::WorkerManager::default())
         .invoke_handler(tauri::generate_handler![
             engine::engine_capabilities,
             engine::engine_geometry,
             export::export_artifact,
+            worker::engine_worker_start,
+            worker::engine_worker_capabilities,
+            worker::engine_worker_analyze,
+            worker::engine_worker_cancel,
+            worker::engine_worker_shutdown,
             media::media_capabilities,
+            media::media_frame_asset,
             media::media_frame_window,
             media::media_pick_files,
             media::media_probe,

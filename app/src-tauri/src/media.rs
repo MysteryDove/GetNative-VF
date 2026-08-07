@@ -21,6 +21,8 @@ const DEFAULT_FRAME_WINDOW_RADIUS: u32 = 12;
 const MAX_FRAME_WINDOW_RADIUS: u32 = 120;
 const FRAME_PREVIEW_CACHE_MAX_FILES: usize = 512;
 const FRAME_PREVIEW_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const FRAME_ASSET_CACHE_MAX_FILES: usize = 64;
+const FRAME_ASSET_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct MediaToolCapability {
@@ -75,6 +77,30 @@ pub struct MediaFrameWindowRequest {
     pub frame_index: Option<u64>,
     pub timestamp_seconds: Option<f64>,
     pub window_radius: Option<u32>,
+}
+
+/// Engine frame-asset export request (worker protocol v1 side channel).
+/// The producer owns creation and eviction; the engine only reads the file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaFrameAssetRequest {
+    pub path: String,
+    pub fingerprint: Option<String>,
+    pub stream_index: Option<u32>,
+    /// Required for video sources; ignored for stills.
+    pub frame_index: Option<u64>,
+    /// Probed native dimensions; required for video, cross-checked for stills.
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MediaFrameAsset {
+    pub path: String,
+    pub format: String,
+    pub width: u32,
+    pub height: u32,
+    pub from_cache: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -226,6 +252,247 @@ fn frame_window(
         build_frame_index(&ffprobe.path, &path, request.stream_index, &cache_path)?;
     }
     read_frame_window(&cache_path, &request)
+}
+
+#[tauri::command]
+pub async fn media_frame_asset(
+    app: AppHandle,
+    request: MediaFrameAssetRequest,
+) -> Result<MediaFrameAsset, String> {
+    tauri::async_runtime::spawn_blocking(move || frame_asset(&app, request))
+        .await
+        .map_err(|error| format!("frame_asset_task_error: {error}"))?
+}
+
+fn frame_asset(app: &AppHandle, request: MediaFrameAssetRequest) -> Result<MediaFrameAsset, String> {
+    let path = validated_media_path(&request.path)?;
+    validate_expected_fingerprint(&path, request.fingerprint.as_deref())?;
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("frame_asset_cache_error: {error}"))?
+        .join("frame-assets");
+
+    if image_format(&path).is_some() {
+        return frame_asset_still(&path, &request, &cache_dir);
+    }
+
+    let fingerprint = request.fingerprint.clone().unwrap_or_else(|| {
+        // validated_media_path + validate_expected_fingerprint passed; when the
+        // caller did not pin a fingerprint, derive the same quick one so the
+        // cache key still tracks file identity.
+        let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        quick_fingerprint(&path, size).unwrap_or_default()
+    });
+    frame_asset_video(app, &path, &fingerprint, &request, &cache_dir)
+}
+
+fn frame_asset_cache_path(
+    cache_dir: &Path,
+    fingerprint: &str,
+    stream_index: u32,
+    frame_index: u64,
+    width: u32,
+    height: u32,
+) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(fingerprint.as_bytes());
+    hasher.update(stream_index.to_le_bytes());
+    hasher.update(frame_index.to_le_bytes());
+    hasher.update(width.to_le_bytes());
+    hasher.update(height.to_le_bytes());
+    cache_dir.join(format!("{:x}.f32le", hasher.finalize()))
+}
+
+fn frame_asset_expected_bytes(width: u32, height: u32) -> Result<u64, String> {
+    if width < 2 || height < 2 {
+        return Err("frame_asset_invalid: frame dimensions must be at least 2x2".to_owned());
+    }
+    Ok(u64::from(width) * u64::from(height) * 4)
+}
+
+fn frame_asset_cached(
+    cache_path: &Path,
+    width: u32,
+    height: u32,
+) -> Result<Option<MediaFrameAsset>, String> {
+    let expected = frame_asset_expected_bytes(width, height)?;
+    if cache_path.is_file() && fs::metadata(cache_path).map(|m| m.len()).unwrap_or(0) == expected {
+        return Ok(Some(MediaFrameAsset {
+            path: cache_path.display().to_string(),
+            format: "f32le".to_owned(),
+            width,
+            height,
+            from_cache: true,
+        }));
+    }
+    Ok(None)
+}
+
+fn frame_asset_commit(
+    cache_dir: &Path,
+    cache_path: &Path,
+    temporary: &Path,
+    width: u32,
+    height: u32,
+) -> Result<MediaFrameAsset, String> {
+    let expected = frame_asset_expected_bytes(width, height)?;
+    let written = fs::metadata(temporary)
+        .map_err(|error| format!("frame_asset_error: {error}"))?
+        .len();
+    if written != expected {
+        let _ = fs::remove_file(temporary);
+        return Err(format!(
+            "frame_asset_error: decoded frame has {written} bytes, expected {expected} ({width}x{height} f32le)"
+        ));
+    }
+    match fs::rename(temporary, cache_path) {
+        Ok(()) => {}
+        Err(_) if cache_path.is_file() => {
+            let _ = fs::remove_file(temporary);
+        }
+        Err(error) => {
+            let _ = fs::remove_file(temporary);
+            return Err(format!("frame_asset_cache_error: {error}"));
+        }
+    }
+    prune_frame_asset_cache(cache_dir)?;
+    Ok(MediaFrameAsset {
+        path: cache_path.display().to_string(),
+        format: "f32le".to_owned(),
+        width,
+        height,
+        from_cache: false,
+    })
+}
+
+pub(crate) fn frame_asset_still(
+    path: &Path,
+    request: &MediaFrameAssetRequest,
+    cache_dir: &Path,
+) -> Result<MediaFrameAsset, String> {
+    let image = image::open(path).map_err(|error| format!("image_decode_error: {error}"))?;
+    // Luma float in 0..=1, matching the engine frame-asset contract.
+    let luma = image.to_luma32f();
+    let (width, height) = (luma.width(), luma.height());
+    if let (Some(expected_w), Some(expected_h)) = (request.width, request.height) {
+        if expected_w != width || expected_h != height {
+            return Err(format!(
+                "frame_asset_invalid: probed dimensions {expected_w}x{expected_h} do not match the decoded still {width}x{height}"
+            ));
+        }
+    }
+    let identity = request
+        .fingerprint
+        .clone()
+        .unwrap_or_else(|| path.display().to_string());
+    let cache_path = frame_asset_cache_path(cache_dir, &identity, 0, 0, width, height);
+    if let Some(cached) = frame_asset_cached(&cache_path, width, height)? {
+        return Ok(cached);
+    }
+    fs::create_dir_all(cache_dir).map_err(|error| format!("frame_asset_cache_error: {error}"))?;
+    let temporary = cache_path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    let write_result = (|| -> Result<(), String> {
+        let mut writer = BufWriter::new(
+            File::create(&temporary).map_err(|error| format!("frame_asset_error: {error}"))?,
+        );
+        for pixel in luma.pixels() {
+            writer
+                .write_all(&pixel.0[0].to_le_bytes())
+                .map_err(|error| format!("frame_asset_error: {error}"))?;
+        }
+        writer
+            .flush()
+            .map_err(|error| format!("frame_asset_error: {error}"))
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    frame_asset_commit(cache_dir, &cache_path, &temporary, width, height)
+}
+
+fn frame_asset_video(
+    app: &AppHandle,
+    path: &Path,
+    fingerprint: &str,
+    request: &MediaFrameAssetRequest,
+    cache_dir: &Path,
+) -> Result<MediaFrameAsset, String> {
+    let (width, height) = match (request.width, request.height) {
+        (Some(width), Some(height)) => (width, height),
+        _ => {
+            return Err(
+                "frame_asset_invalid: video frame assets require the probed width and height"
+                    .to_owned(),
+            )
+        }
+    };
+    frame_asset_expected_bytes(width, height)?;
+    let frame_index = request.frame_index.ok_or_else(|| {
+        "frame_asset_invalid: video frame assets require a frame index".to_owned()
+    })?;
+    let stream_index = request.stream_index.unwrap_or(0);
+    let ffmpeg = resolve_media_tool(app, "ffmpeg", "GETNATIVE_FFMPEG_PATH")
+        .ok_or_else(|| "video_backend_unavailable: bundled FFmpeg is not available".to_owned())?;
+
+    let cache_path =
+        frame_asset_cache_path(cache_dir, fingerprint, stream_index, frame_index, width, height);
+    if let Some(cached) = frame_asset_cached(&cache_path, width, height)? {
+        return Ok(cached);
+    }
+    fs::create_dir_all(cache_dir).map_err(|error| format!("frame_asset_cache_error: {error}"))?;
+    let temporary = cache_path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+
+    // grayf32le is FFmpeg's full-range float luma (0..=1), row-major, tightly
+    // packed — exactly the engine's f32le frame-asset layout.
+    let decode = Command::new(&ffmpeg.path)
+        .args(["-v", "error"])
+        .arg("-i")
+        .arg(path)
+        .args(["-map", &format!("0:{stream_index}")])
+        .args(["-vf", &format!("select=eq(n\\,{frame_index})")])
+        .args(["-frames:v", "1"])
+        .args(["-f", "rawvideo", "-pix_fmt", "grayf32le", "-y"])
+        .arg(&temporary)
+        .output();
+    let output = decode.map_err(|error| format!("video_decode_start_error: {error}"))?;
+    if !output.status.success() || !temporary.is_file() {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "video_decode_error: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    frame_asset_commit(cache_dir, &cache_path, &temporary, width, height)
+}
+
+fn prune_frame_asset_cache(cache_dir: &Path) -> Result<(), String> {
+    let mut files = fs::read_dir(cache_dir)
+        .map_err(|error| format!("frame_asset_cache_error: {error}"))?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "f32le"))
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            metadata
+                .is_file()
+                .then(|| (entry.path(), metadata.len(), metadata.modified().ok()))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_key(|(_, _, modified)| *modified);
+    let mut total_bytes = files.iter().map(|(_, size, _)| *size).sum::<u64>();
+    let mut total_files = files.len();
+    for (path, size, _) in files {
+        if total_files <= FRAME_ASSET_CACHE_MAX_FILES && total_bytes <= FRAME_ASSET_CACHE_MAX_BYTES
+        {
+            break;
+        }
+        if fs::remove_file(path).is_ok() {
+            total_files = total_files.saturating_sub(1);
+            total_bytes = total_bytes.saturating_sub(size);
+        }
+    }
+    Ok(())
 }
 
 fn validated_media_path(raw: &str) -> Result<PathBuf, String> {
@@ -1358,6 +1625,67 @@ mod tests {
             );
         }
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn still_frame_asset_exports_luma_f32le_and_caches() {
+        let path = temp_png();
+        let cache_dir = env::temp_dir().join(format!("getnative_frame_assets_{}", Uuid::new_v4()));
+        let request = MediaFrameAssetRequest {
+            path: path.display().to_string(),
+            fingerprint: None,
+            stream_index: None,
+            frame_index: None,
+            width: Some(8),
+            height: Some(6),
+        };
+        let asset = frame_asset_still(&path, &request, &cache_dir).unwrap();
+        assert_eq!(asset.format, "f32le");
+        assert_eq!((asset.width, asset.height), (8, 6));
+        assert!(!asset.from_cache);
+        let bytes = fs::read(&asset.path).unwrap();
+        assert_eq!(bytes.len(), 8 * 6 * 4);
+        let first = f32::from_le_bytes(bytes[..4].try_into().unwrap());
+        assert!((0.0..=1.0).contains(&first));
+
+        let again = frame_asset_still(&path, &request, &cache_dir).unwrap();
+        assert!(again.from_cache);
+        assert_eq!(again.path, asset.path);
+
+        let mut mismatched = request.clone();
+        mismatched.width = Some(7);
+        assert!(frame_asset_still(&path, &mismatched, &cache_dir).is_err());
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn frame_asset_commit_rejects_truncated_decodes() {
+        let cache_dir = env::temp_dir().join(format!("getnative_frame_assets_{}", Uuid::new_v4()));
+        fs::create_dir_all(&cache_dir).unwrap();
+        let temporary = cache_dir.join("partial.tmp");
+        fs::write(&temporary, vec![0_u8; 100]).unwrap();
+        let cache_path = cache_dir.join("target.f32le");
+        assert!(frame_asset_commit(&cache_dir, &cache_path, &temporary, 8, 6).is_err());
+        assert!(!temporary.is_file());
+        assert!(!cache_path.is_file());
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn frame_asset_requests_validate_video_requirements() {
+        assert!(frame_asset_expected_bytes(8, 6).unwrap() == 8 * 6 * 4);
+        assert!(frame_asset_expected_bytes(1, 6).is_err());
+        // Cache keys partition by stream, frame, and dimensions.
+        let dir = Path::new("/tmp/getnative-frame-asset-keys");
+        let a = frame_asset_cache_path(dir, "fp", 0, 17, 1920, 1080);
+        let b = frame_asset_cache_path(dir, "fp", 1, 17, 1920, 1080);
+        let c = frame_asset_cache_path(dir, "fp", 0, 18, 1920, 1080);
+        let d = frame_asset_cache_path(dir, "fp", 0, 17, 1280, 720);
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, d);
     }
 
     #[test]

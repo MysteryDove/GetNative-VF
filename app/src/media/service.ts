@@ -108,3 +108,26 @@ export async function getMediaPreview(request: {
         : new Uint8Array(payload);
   return URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
 }
+
+export type MediaFrameAsset = {
+  path: string;
+  format: "f32le";
+  width: number;
+  height: number;
+  from_cache: boolean;
+};
+
+/**
+ * Export one frame as an engine frame asset (f32le luma file). The returned
+ * path feeds `frameAsset` in worker analyze requests; pixels never cross JSON.
+ */
+export function exportFrameAsset(request: {
+  path: string;
+  fingerprint?: string | null;
+  streamIndex?: number | null;
+  frameIndex?: number | null;
+  width?: number | null;
+  height?: number | null;
+}): Promise<MediaFrameAsset> {
+  return invoke("media_frame_asset", { request });
+}
