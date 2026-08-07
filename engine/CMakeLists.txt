@@ -706,6 +706,25 @@ getnative_enable_warnings(getnative_core_benchmark)
 getnative_enable_strict_fp(getnative_core_benchmark)
 getnative_configure_benchmark_metadata(getnative_core_benchmark)
 
+find_library(GETNATIVE_ZSTD_LIBRARY NAMES zstd libzstd.so.1)
+find_library(GETNATIVE_LZ4_LIBRARY NAMES lz4 liblz4.so.1)
+find_path(GETNATIVE_COMPRESSION_INCLUDE_DIR NAMES zstd.h lz4.h
+    HINTS "${GETNATIVE_COMPRESSION_INCLUDE_DIR}" /tmp/compression-headers)
+if(GETNATIVE_ZSTD_LIBRARY AND GETNATIVE_LZ4_LIBRARY
+   AND GETNATIVE_COMPRESSION_INCLUDE_DIR)
+    add_executable(getnative_plan_compression_probe
+        bench/plan_compression_probe.cpp)
+    target_link_libraries(getnative_plan_compression_probe PRIVATE
+        getnative_core
+        "${GETNATIVE_ZSTD_LIBRARY}"
+        "${GETNATIVE_LZ4_LIBRARY}")
+    target_include_directories(getnative_plan_compression_probe PRIVATE
+        "${GETNATIVE_COMPRESSION_INCLUDE_DIR}")
+    target_compile_features(getnative_plan_compression_probe PRIVATE cxx_std_23)
+    getnative_enable_warnings(getnative_plan_compression_probe)
+    getnative_enable_strict_fp(getnative_plan_compression_probe)
+endif()
+
 add_executable(getnative_cpu_backend_benchmark
     bench/cpu_backend_benchmark.cpp)
 target_link_libraries(getnative_cpu_backend_benchmark PRIVATE getnative_core)
