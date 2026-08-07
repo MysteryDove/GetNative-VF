@@ -81,6 +81,15 @@ export type HeightAnalyzeRequest = {
   heightGrid: CandidateGridSpec;
   widthGrid?: CandidateGridSpec | null;
   geometry?: GeometrySnapshot | null;
+  /**
+   * Fractional-scan context (engine worker v1.1): explicit base-canvas
+   * overrides as decimal strings. Choosing an odd base height/width is how
+   * the user explores base parity (the reverse-peak check). Engine v1 ignores
+   * these (fixed shift=0, floor canvas); the semantic contract carries them
+   * so v1.1 wiring needs no app-side reshaping.
+   */
+  baseHeight?: string | null;
+  baseWidth?: string | null;
   metric: MetricSpec;
   profileId: string;
   mathMode: MathMode;

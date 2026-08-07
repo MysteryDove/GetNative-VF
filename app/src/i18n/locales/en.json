@@ -452,5 +452,12 @@
   "verify.modeUnsupported": "Engine worker v1 supports Resolution Test only; Full Video Check unlocks in a later engine version.",
   "analyze.noRealRunsTitle": "No real results yet",
   "analyze.noRealRunsBody": "Run a Resolution Test and real engine curves appear here; no fabricated curves.",
-  "analyze.k.modeUnsupportedTitle": "Algorithm Test awaits engine support"
+  "analyze.k.modeUnsupportedTitle": "Algorithm Test awaits engine support",
+  "samples.dropHint": "Drop images here to create Samples directly; pick frames on the Media page for videos.",
+  "samples.dropNow": "Release to import and create Samples",
+  "samples.dropResult": "Created {sampled} still Samples; {videos} videos imported as Sources (pick frames on the Media page); {failed} failed.",
+  "analyze.bestPoint": "Best {height} · error {metric}",
+  "analyze.perfectThreshold": "Error ≤1e-6 counts as perfectly descale",
+  "analyze.perfectCount": "{count}/{total} points ≤1e-6",
+  "analyze.baseParityHint": "Leave the base canvas empty for automatic even alignment; when a reverse peak appears, retry with an odd base (engine v1.1)."
 }

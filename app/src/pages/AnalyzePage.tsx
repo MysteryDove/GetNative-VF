@@ -107,6 +107,29 @@ export function AnalyzePage({
     [heightRuns, state, hiddenSampleIds, activeMetricKey, logDisplay],
   );
 
+  // Reading aids for the getnative workflow: valley (best point) and the
+  // perfectly-descale threshold (error <= 1e-6), in whatever display mode the
+  // plot currently uses.
+  const plotAids = useMemo(() => {
+    const pts = seriesRows.points;
+    if (!pts.length) return null;
+    let best = pts[0];
+    for (const point of pts) if (point.metric < best.metric) best = point;
+    const perfectCount = pts.filter(
+      (point) => point.metric <= PERFECTLY_DESCALE_THRESHOLD,
+    ).length;
+    const thresholdValue = logDisplay
+      ? Math.abs(Math.log10(PERFECTLY_DESCALE_THRESHOLD + 1e-9))
+      : PERFECTLY_DESCALE_THRESHOLD;
+    return {
+      bestKey: `${best.runId}-${best.height}`,
+      bestHeight: best.height,
+      bestMetric: best.metric,
+      perfectCount,
+      thresholdNormalized: Math.min(1, thresholdValue / seriesRows.maxAbs),
+    };
+  }, [seriesRows, logDisplay]);
+
   const runBlockedReason = !analyzeAvailable
     ? t("analyze.runBlocked.noCommand")
     : includedSamples.length === 0
@@ -342,16 +365,43 @@ export function AnalyzePage({
               {seriesRows.points.length > 0 ? (
                 <div className="plot-skeleton" aria-label={t("analyze.plotTitle")}>
                   <div className="plot-skeleton-bars">
+                    {plotAids ? (
+                      <div
+                        className="plot-threshold"
+                        style={{ bottom: `${plotAids.thresholdNormalized * 100}%` }}
+                        title={t("analyze.perfectThreshold")}
+                      >
+                        <span>1e-6</span>
+                      </div>
+                    ) : null}
                     {seriesRows.points.slice(0, 40).map((point) => (
                       <div
                         key={`${point.runId}-${point.height}`}
-                        className={`plot-bar ${selectedHeight === point.height ? "selected" : ""}`}
+                        className={[
+                          "plot-bar",
+                          selectedHeight === point.height ? "selected" : "",
+                          point.metric <= PERFECTLY_DESCALE_THRESHOLD ? "perfect" : "",
+                          plotAids?.bestKey === `${point.runId}-${point.height}` ? "best" : "",
+                        ].join(" ")}
                         style={{ height: `${Math.max(4, point.displayNormalized * 100)}%` }}
                         title={`${point.height}: ${point.displayValue}`}
                         onClick={() => setSelectedHeight(point.height)}
                       />
                     ))}
                   </div>
+                  {plotAids ? (
+                    <p className="help-copy plot-aids">
+                      {t("analyze.bestPoint", {
+                        height: plotAids.bestHeight,
+                        metric: plotAids.bestMetric.toPrecision(3),
+                      })}
+                      {" · "}
+                      {t("analyze.perfectCount", {
+                        count: String(plotAids.perfectCount),
+                        total: String(seriesRows.points.length),
+                      })}
+                    </p>
+                  ) : null}
                   <p className="help-copy">{t("analyze.plotFromRealRuns")}</p>
                 </div>
               ) : (
@@ -421,7 +471,11 @@ export function AnalyzePage({
                   {seriesRows.rows.slice(0, 200).map((row) => (
                     <button
                       type="button"
-                      className={`result-table-row ${selectedHeight === row.height ? "selected" : ""}`}
+                      className={[
+                        "result-table-row",
+                        selectedHeight === row.height ? "selected" : "",
+                        row.metric <= PERFECTLY_DESCALE_THRESHOLD ? "perfect" : "",
+                      ].join(" ")}
                       role="row"
                       key={`${row.runId}-${row.height}`}
                       onClick={() => setSelectedHeight(row.height)}
@@ -537,15 +591,6 @@ export function AnalyzePage({
                     onChange={(event) => patch({ step: event.target.value })}
                   />
                 </label>
-                <label className="block">
-                  <span>{t("diagnostics.baseH")}</span>
-                  <input
-                    value={draft.baseHeight}
-                    disabled={!canEdit}
-                    onChange={(event) => patch({ baseHeight: event.target.value })}
-                    placeholder={t("analyze.optional")}
-                  />
-                </label>
               </>
             ) : (
               <>
@@ -575,6 +620,30 @@ export function AnalyzePage({
                 </label>
               </>
             )}
+
+            {draft.preset !== "integer_coarse" ? (
+              <>
+                <label className="block">
+                  <span>{t("diagnostics.baseH")}</span>
+                  <input
+                    value={draft.baseHeight}
+                    disabled={!canEdit}
+                    onChange={(event) => patch({ baseHeight: event.target.value })}
+                    placeholder={t("analyze.optional")}
+                  />
+                </label>
+                <label className="block">
+                  <span>{t("diagnostics.baseW")}</span>
+                  <input
+                    value={draft.baseWidth}
+                    disabled={!canEdit}
+                    onChange={(event) => patch({ baseWidth: event.target.value })}
+                    placeholder={t("analyze.optional")}
+                  />
+                </label>
+                <p className="help-copy">{t("analyze.baseParityHint")}</p>
+              </>
+            ) : null}
 
             <label className="block">
               <span>{t("analyze.fixedKernel")}</span>
@@ -760,7 +829,7 @@ function buildSeriesTable(
   hiddenSampleIds: Set<string>,
   activeMetricKey: string,
   logDisplay: boolean,
-): { rows: SeriesTableRow[]; points: SeriesTableRow[]; incompatibleCount: number } {
+): { rows: SeriesTableRow[]; points: SeriesTableRow[]; incompatibleCount: number; maxAbs: number } {
   const rows: SeriesTableRow[] = [];
   let incompatibleCount = 0;
   for (const run of runs) {
@@ -799,10 +868,13 @@ function buildSeriesTable(
       displayNormalized: Math.min(1, Math.abs(value) / maxAbs),
     };
   });
-  return { rows, points, incompatibleCount };
+  return { rows, points, incompatibleCount, maxAbs };
 }
 
 function seriesColor(index: number): string {
   const palette = ["#3b82f6", "#22c55e", "#f59e0b", "#a855f7", "#ef4444", "#06b6d4"];
   return palette[index % palette.length];
 }
+
+/** getnative convention: error <= 1e-6 means the candidate perfectly descales. */
+const PERFECTLY_DESCALE_THRESHOLD = 1e-6;

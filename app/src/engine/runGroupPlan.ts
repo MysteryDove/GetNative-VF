@@ -53,6 +53,8 @@ export type HeightRunGroupPlan = {
     heightGrid: CandidateGridSpec;
     kernels: KernelRef[];
     sampleIds: string[];
+    baseHeight: string | null;
+    baseWidth: string | null;
   };
 };
 
@@ -96,6 +98,12 @@ export function planHeightRunGroup(input: {
   let requestSeq = 0;
   const prefix = input.requestIdPrefix ?? "req";
   const now = input.nowMs ?? Date.now();
+  const baseHeight = input.draft.baseHeight?.trim() || null;
+  const baseWidth = input.draft.baseWidth?.trim() || null;
+  const baseValid = (value: string | null) => value === null || /^\d+(\.\d+)?$/.test(value);
+  if (!baseValid(baseHeight) || !baseValid(baseWidth)) {
+    return { ok: false, reason: "base_invalid" };
+  }
 
   for (const sample of included) {
     const source = input.sourcesById[sample.sourceId];
@@ -125,6 +133,8 @@ export function planHeightRunGroup(input: {
         kernel,
         axisMode: input.draft.axisMode,
         heightGrid: grid.grid,
+        baseHeight,
+        baseWidth,
         metric: { ...input.draft.metric },
         profileId: input.draft.profileId,
         mathMode: input.draft.mathMode,
@@ -191,6 +201,8 @@ export function planHeightRunGroup(input: {
         heightGrid: grid.grid,
         kernels,
         sampleIds: included.map((sample) => sample.id),
+        baseHeight: input.draft.baseHeight?.trim() || null,
+        baseWidth: input.draft.baseWidth?.trim() || null,
       },
     },
   };

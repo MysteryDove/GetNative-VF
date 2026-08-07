@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   AlertTriangle,
   ChevronLeft,
@@ -28,10 +27,11 @@ import {
   type FrameWindowTarget,
   type MediaCapabilities,
   type MediaFrameWindow,
-  type MediaProbeResult,
 } from "../media/service";
 import type { ProjectState, Sample, Source } from "../project/types";
 import { findDuplicateSampleId, frameStepFromKeyboard } from "../media/frameBrowser";
+import { fileName, importMediaPaths, sourceFromProbe } from "../media/importSources";
+import { useFileDrop } from "../media/useFileDrop";
 
 type ProjectUpdater = (updater: (state: ProjectState) => ProjectState) => void;
 
@@ -53,7 +53,6 @@ export function MediaPage({
   );
   const [mediaCapabilities, setMediaCapabilities] = useState<MediaCapabilities | null>(null);
   const [importing, setImporting] = useState(0);
-  const [dropActive, setDropActive] = useState(false);
   const [error, setError] = useState("");
   const [frameWindowState, setFrameWindowState] = useState<{
     sourceKey: string;
@@ -126,61 +125,16 @@ export function MediaPage({
   const importPaths = useCallback(
     async (paths: string[]) => {
       if (state.project.readOnly) return;
-      const knownPaths = new Set(Object.values(state.sourcesById).map((source) => source.path));
-      const uniquePaths = paths.filter((path) => {
-        if (!path || knownPaths.has(path)) return false;
-        knownPaths.add(path);
-        return true;
-      });
-      if (!uniquePaths.length) return;
-
-      const records = uniquePaths.map((path) => ({
-        id: `src_${crypto.randomUUID()}`,
-        kind: "still" as const,
-        path,
-        state: "probing" as const,
-        label: fileName(path),
-        videoStreams: [],
-      }));
-      onProjectChange((current) => ({
-        ...current,
-        sourcesById: {
-          ...current.sourcesById,
-          ...Object.fromEntries(records.map((source) => [source.id, source])),
-        },
-      }));
-      selectSource(records[0].id);
-      setImporting((count) => count + records.length);
       setError("");
-
-      await Promise.all(
-        records.map(async (record) => {
-          try {
-            const probe = await probeMedia(record.path);
-            onProjectChange((current) => ({
-              ...current,
-              sourcesById: mergeProbedSource(current.sourcesById, record.id, probe),
-            }));
-          } catch (probeError) {
-            onProjectChange((current) => ({
-              ...current,
-              sourcesById: {
-                ...current.sourcesById,
-                [record.id]: {
-                  ...current.sourcesById[record.id],
-                  state: "error",
-                  errorCode: "media_probe_error",
-                  errorDetail: String(probeError),
-                },
-              },
-            }));
-          } finally {
-            setImporting((count) => Math.max(0, count - 1));
-          }
-        }),
-      );
+      await importMediaPaths({
+        paths,
+        state,
+        onProjectChange,
+        onPending: (id) => selectSource(id),
+        onBusyDelta: (delta) => setImporting((count) => Math.max(0, count + delta)),
+      });
     },
-    [onProjectChange, selectSource, state.project.readOnly, state.sourcesById],
+    [onProjectChange, selectSource, state],
   );
 
   useEffect(() => {
@@ -192,30 +146,7 @@ export function MediaPage({
     getMediaCapabilities().then(setMediaCapabilities).catch((reason) => setError(String(reason)));
   }, []);
 
-  useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-    getCurrentWebview()
-      .onDragDropEvent((event) => {
-        if (event.payload.type === "enter" || event.payload.type === "over") {
-          setDropActive(true);
-        } else if (event.payload.type === "leave") {
-          setDropActive(false);
-        } else if (event.payload.type === "drop") {
-          setDropActive(false);
-          void importPaths(event.payload.paths);
-        }
-      })
-      .then((stop) => {
-        if (disposed) stop();
-        else unlisten = stop;
-      })
-      .catch(() => undefined);
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, [importPaths]);
+  const dropActive = useFileDrop((paths) => void importPaths(paths));
 
   const showPreview = useCallback(async (
     request: Parameters<typeof getMediaPreview>[0],
@@ -1060,59 +991,6 @@ export function MediaPage({
   );
 }
 
-function sourceFromProbe(id: string, probe: MediaProbeResult, label?: string | null): Source {
-  return {
-    id,
-    kind: probe.kind,
-    path: probe.path,
-    fingerprint: probe.fingerprint,
-    state: probe.state,
-    label: label ?? probe.file_name,
-    sizeBytes: probe.size_bytes,
-    width: probe.width,
-    height: probe.height,
-    durationSeconds: probe.duration_seconds,
-    decoder: probe.decoder,
-    videoStreams: probe.video_streams.map((stream) => ({
-      index: stream.index,
-      codecName: stream.codec_name,
-      width: stream.width,
-      height: stream.height,
-      durationSeconds: stream.duration_seconds,
-      frameCount: stream.frame_count,
-      timeBaseNum: stream.time_base_num,
-      timeBaseDen: stream.time_base_den,
-      frameRateNum: stream.frame_rate_num,
-      frameRateDen: stream.frame_rate_den,
-    })),
-    selectedStreamIndex: probe.selected_stream_index,
-    errorCode: probe.diagnostic?.code ?? null,
-    errorDetail: probe.diagnostic?.detail ?? null,
-  };
-}
-
-function mergeProbedSource(
-  sourcesById: Record<string, Source>,
-  provisionalId: string,
-  probe: MediaProbeResult,
-): Record<string, Source> {
-  const duplicate = Object.values(sourcesById).find(
-    (source) =>
-      source.id !== provisionalId &&
-      source.path === probe.path &&
-      source.fingerprint === probe.fingerprint,
-  );
-  if (duplicate) {
-    const next = { ...sourcesById };
-    delete next[provisionalId];
-    return next;
-  }
-  return {
-    ...sourcesById,
-    [provisionalId]: sourceFromProbe(provisionalId, probe),
-  };
-}
-
 function videoSampleLabel(source: Source, frameIndex: number | undefined, t: Translator): string {
   const sourceLabel = source.label ?? fileName(source.path);
   const streamLabel =
@@ -1137,10 +1015,6 @@ function mediaViewState(state: ProjectState): { selectedSourceId?: string } {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as { selectedSourceId?: string })
     : {};
-}
-
-function fileName(path: string): string {
-  return path.split(/[\\/]/).pop() || path;
 }
 
 function dimensionText(source?: Source | null): string {

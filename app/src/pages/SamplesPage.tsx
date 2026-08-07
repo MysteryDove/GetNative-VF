@@ -1,10 +1,11 @@
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import {
   ArrowDown,
   ArrowUp,
   CheckSquare,
   FileImage,
   Film,
+  FolderPlus,
   LoaderCircle,
   Square,
   Tag,
@@ -12,6 +13,8 @@ import {
 } from "lucide-react";
 import type { Translator } from "../i18n";
 import { getMediaPreview } from "../media/service";
+import { importMediaPaths } from "../media/importSources";
+import { useFileDrop } from "../media/useFileDrop";
 import type { ProjectState, Sample } from "../project/types";
 
 type ProjectUpdater = (updater: (state: ProjectState) => ProjectState) => void;
@@ -35,6 +38,7 @@ export function SamplesPage({
   const [focusedId, setFocusedId] = useState<string | null>(samples[0]?.id ?? null);
   const [tag, setTag] = useState("");
   const [groupBySource, setGroupBySource] = useState(false);
+  const [dropNotice, setDropNotice] = useState("");
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [previewError, setPreviewError] = useState("");
@@ -45,6 +49,33 @@ export function SamplesPage({
     () => groupSamples(samples, state, groupBySource),
     [groupBySource, samples, state],
   );
+
+  /**
+   * Drop-to-sample: still images become included Samples directly; videos
+   * import as Sources and keep frame selection on the Media page.
+   */
+  const handleDropPaths = useCallback(
+    async (paths: string[]) => {
+      if (state.project.readOnly) return;
+      setDropNotice("");
+      const outcome = await importMediaPaths({
+        paths,
+        state,
+        onProjectChange,
+        createSamplesForStills: true,
+      });
+      if (outcome.pending === 0) return;
+      setDropNotice(
+        t("samples.dropResult", {
+          sampled: String(outcome.sampled),
+          videos: String(outcome.videos),
+          failed: String(outcome.failed),
+        }),
+      );
+    },
+    [onProjectChange, state, t],
+  );
+  const dropActive = useFileDrop((paths) => void handleDropPaths(paths));
 
   useEffect(() => {
     if (focusedId && state.samplesById[focusedId]) return;
@@ -192,7 +223,7 @@ export function SamplesPage({
   }).length;
 
   return (
-    <div className="page-panel samples-page">
+    <div className={`page-panel samples-page ${dropActive ? "drop-active" : ""}`}>
       <div className="page-header">
         <div>
           <h2>{t("samples.title")}</h2>
@@ -247,6 +278,8 @@ export function SamplesPage({
           <Trash2 size={14} />
         </button>
       </div>
+
+      {dropNotice ? <p className="help-copy samples-drop-notice">{dropNotice}</p> : null}
 
       {samples.length ? (
         <div className="samples-workspace">
@@ -360,8 +393,16 @@ export function SamplesPage({
           <FileImage size={28} />
           <strong>{t("samples.emptyTitle")}</strong>
           <span>{t("samples.emptyBody")}</span>
+          <span className="help-copy">{t("samples.dropHint")}</span>
         </div>
       )}
+
+      {dropActive ? (
+        <div className="drop-overlay">
+          <FolderPlus size={30} />
+          <strong>{t("samples.dropNow")}</strong>
+        </div>
+      ) : null}
     </div>
   );
 }

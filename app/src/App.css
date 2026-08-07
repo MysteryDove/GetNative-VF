@@ -3007,3 +3007,43 @@ button {
 .run-row.indented {
   padding-left: 28px;
 }
+
+/* Height plot reading aids */
+.plot-skeleton-bars {
+  position: relative;
+}
+
+.plot-threshold {
+  position: absolute;
+  left: 0;
+  right: 0;
+  border-top: 1px dashed #c9a24b;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.plot-threshold span {
+  position: absolute;
+  right: 2px;
+  top: -14px;
+  font-size: 9px;
+  color: #c9a24b;
+}
+
+.plot-bar.perfect {
+  background: #3d7a5f;
+}
+
+.plot-bar.best {
+  outline: 2px solid #6e9d83;
+  outline-offset: 1px;
+}
+
+.plot-aids {
+  margin-top: 4px;
+  color: #9ca6a1;
+}
+
+.result-table-row.perfect span:first-child {
+  color: #7fb598;
+}

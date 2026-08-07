@@ -376,3 +376,75 @@ describe("GUI-3 analysis foundation", () => {
     );
   });
 });
+
+describe("height plan base-canvas overrides (engine v1.1 contract)", () => {
+  const baseSamples = [
+    {
+      id: "smp_a",
+      label: "A",
+      sourceId: "src_1",
+      sourceFingerprint: "fp1",
+      included: true,
+      frameIndex: 10,
+      streamIndex: 0,
+    },
+  ];
+  const baseSources = {
+    src_1: { id: "src_1", path: "/tmp/v.mkv", fingerprint: "fp1", state: "ready" },
+  };
+
+  it("carries baseHeight/baseWidth into every member request and intent snapshot", () => {
+    const draft = {
+      ...defaultHeightDraft(null),
+      preset: "fractional_refine" as const,
+      refineSelected: "837",
+      refineHalfSpan: "0.5",
+      step: "0.1",
+      baseHeight: "1001",
+      baseWidth: "2001",
+    };
+    const planned = planHeightRunGroup({
+      draft,
+      samples: baseSamples,
+      sourcesById: baseSources,
+      capabilities: null,
+      nowMs: 1,
+      requestIdPrefix: "t",
+    });
+    assert(planned.ok, "plan ok");
+    if (!planned.ok) return;
+    assert(
+      planned.plan.members.every(
+        (member) => member.request.baseHeight === "1001" && member.request.baseWidth === "2001",
+      ),
+      "base overrides reach every request",
+    );
+    assert(planned.plan.intentSnapshot.baseHeight === "1001", "intent snapshot base height");
+    assert(
+      planned.plan.members[0]?.heightGrid.candidates.includes("836.5"),
+      "fractional grid resolves decimal candidates",
+    );
+  });
+
+  it("rejects malformed base overrides and defaults to null", () => {
+    const bad = planHeightRunGroup({
+      draft: { ...defaultHeightDraft(null), baseHeight: "abc" },
+      samples: baseSamples,
+      sourcesById: baseSources,
+      capabilities: null,
+    });
+    assert(!bad.ok && bad.reason === "base_invalid", "malformed base rejected");
+
+    const clean = planHeightRunGroup({
+      draft: defaultHeightDraft(null),
+      samples: baseSamples,
+      sourcesById: baseSources,
+      capabilities: null,
+      nowMs: 1,
+    });
+    assert(clean.ok, "clean plan ok");
+    if (clean.ok) {
+      assert(clean.plan.members[0]?.request.baseHeight === null, "empty base -> null");
+    }
+  });
+});
