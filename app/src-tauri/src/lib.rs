@@ -1,5 +1,6 @@
 mod atomic_file;
 mod engine;
+mod export;
 mod media;
 mod prefs;
 mod project;
@@ -10,6 +11,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             engine::engine_capabilities,
             engine::engine_geometry,
+            export::export_artifact,
             media::media_capabilities,
             media::media_frame_window,
             media::media_pick_files,

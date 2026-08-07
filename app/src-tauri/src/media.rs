@@ -371,6 +371,25 @@ fn probe_video(
     }
     let value: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("video_probe_schema_error: {error}"))?;
+    Ok(probe_video_value(
+        value,
+        path,
+        file_name,
+        fingerprint,
+        size_bytes,
+        ffprobe,
+    ))
+}
+
+/// Pure mapping from ffprobe JSON to a probe result; unit-testable fixture matrix.
+fn probe_video_value(
+    value: Value,
+    path: &Path,
+    file_name: String,
+    fingerprint: String,
+    size_bytes: u64,
+    ffprobe: &MediaTool,
+) -> MediaProbeResult {
     let duration_seconds = value
         .get("format")
         .and_then(|format| format.get("duration"))
@@ -384,20 +403,20 @@ fn probe_video(
         .filter_map(parse_video_stream)
         .collect::<Vec<_>>();
     let Some(selected) = video_streams.first() else {
-        return Ok(unsupported_probe(
+        return unsupported_probe(
             path,
             file_name,
             fingerprint,
             size_bytes,
             "video_stream_missing",
             "the container does not report a decodable video stream",
-        ));
+        );
     };
     let selected_index = selected.index;
     let selected_width = selected.width;
     let selected_height = selected.height;
     let selected_duration = selected.duration_seconds;
-    Ok(MediaProbeResult {
+    MediaProbeResult {
         path: path.display().to_string(),
         file_name,
         kind: SourceKind::Video,
@@ -411,7 +430,7 @@ fn probe_video(
         video_streams,
         selected_stream_index: Some(selected_index),
         diagnostic: None,
-    })
+    }
 }
 
 fn parse_video_stream(stream: &Value) -> Option<VideoStreamRecord> {
@@ -1198,6 +1217,146 @@ mod tests {
         )
         .unwrap();
         assert_eq!(no_next.selected.frame_index, 7);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn probe_fixture_matrix_multi_stream_vfr_and_unknown_frame_count() {
+        let tool = MediaTool {
+            path: PathBuf::from("/fixtures/ffprobe"),
+            source: "fixture",
+        };
+        let path = Path::new("/fixtures/episode.mkv");
+
+        // Multi-stream: audio is filtered out, both video streams survive in
+        // container order, the first video stream is selected.
+        let multi = serde_json::json!({
+            "format": {"duration": "1430.5"},
+            "streams": [
+                {"index": 0, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 1, "codec_type": "video", "codec_name": "h264",
+                 "width": 1920, "height": 1080, "nb_frames": "34327",
+                 "time_base": "1/1000000", "avg_frame_rate": "24000/1001",
+                 "duration": "1430.5"},
+                {"index": 2, "codec_type": "video", "codec_name": "mjpeg",
+                 "width": 320, "height": 180}
+            ]
+        });
+        let probed = probe_video_value(
+            multi,
+            path,
+            "episode.mkv".to_owned(),
+            "fp".to_owned(),
+            100,
+            &tool,
+        );
+        assert_eq!(probed.state, SourceState::Ready);
+        assert_eq!(probed.video_streams.len(), 2);
+        assert_eq!(probed.selected_stream_index, Some(1));
+        assert_eq!(probed.width, Some(1920));
+        assert_eq!(probed.video_streams[0].frame_count, Some(34327));
+        assert_eq!(probed.video_streams[0].time_base_den, Some(1000000));
+
+        // VFR: no constant average rate and no declared frame count still
+        // probe ready; frame identity comes from the index, not the count.
+        let vfr = serde_json::json!({
+            "format": {"duration": "100.0"},
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "hevc",
+                 "width": 1280, "height": 720, "time_base": "1/90000",
+                 "avg_frame_rate": "0/0", "duration": "100.0"}
+            ]
+        });
+        let probed = probe_video_value(
+            vfr,
+            path,
+            "vfr.mkv".to_owned(),
+            "fp".to_owned(),
+            100,
+            &tool,
+        );
+        assert_eq!(probed.state, SourceState::Ready);
+        assert_eq!(probed.video_streams[0].frame_count, None);
+        assert_eq!(probed.video_streams[0].frame_rate_num, None);
+
+        // Audio-only container: no decodable video stream is an explicit
+        // unsupported state, never a crash.
+        let audio_only = serde_json::json!({
+            "format": {},
+            "streams": [{"index": 0, "codec_type": "audio", "codec_name": "flac"}]
+        });
+        let probed = probe_video_value(
+            audio_only,
+            path,
+            "audio.flac".to_owned(),
+            "fp".to_owned(),
+            100,
+            &tool,
+        );
+        assert_eq!(probed.state, SourceState::Unsupported);
+        assert_eq!(
+            probed.diagnostic.as_ref().map(|d| d.code.as_str()),
+            Some("video_stream_missing")
+        );
+    }
+
+    #[test]
+    fn probe_missing_and_unknown_files_are_actionable() {
+        let missing = probe_path(Path::new("/definitely/missing/clip.mkv"), None);
+        let error = missing.unwrap_err();
+        assert!(error.starts_with("media_read_error"), "unexpected: {error}");
+
+        let unknown = env::temp_dir().join("getnative_media_unknown.bin");
+        fs::write(&unknown, b"not media").unwrap();
+        let probed = probe_path(&unknown, None).unwrap();
+        assert_eq!(probed.state, SourceState::Unsupported);
+        assert_eq!(
+            probed.diagnostic.as_ref().map(|d| d.code.as_str()),
+            Some("unsupported_media")
+        );
+        let _ = fs::remove_file(unknown);
+    }
+
+    #[test]
+    fn frame_window_round_trips_irregular_vfr_timestamps() {
+        let path = env::temp_dir().join(format!("getnative_vfr_index_{}.jsonl", Uuid::new_v4()));
+        let mut writer = BufWriter::new(File::create(&path).unwrap());
+        // Irregular VFR timestamps: mixed 24fps and 30fps segments.
+        let timestamps_ms = [0_i64, 33334, 70000, 100100, 133467, 200200, 233567];
+        for (index, micros) in timestamps_ms.iter().enumerate() {
+            serde_json::to_writer(
+                &mut writer,
+                &FrameIdentity {
+                    frame_index: index as u64,
+                    pts: Some(*micros),
+                    best_effort_timestamp: Some(*micros),
+                    timestamp_seconds: Some(*micros as f64 / 1_000_000.0),
+                    key_frame: index == 0,
+                    picture_type: Some(if index == 0 { "I" } else { "P" }.to_owned()),
+                },
+            )
+            .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+        writer.flush().unwrap();
+
+        // Every frame's exact timestamp resolves back to that same frame.
+        for (index, micros) in timestamps_ms.iter().enumerate() {
+            let request = MediaFrameWindowRequest {
+                path: String::new(),
+                fingerprint: None,
+                stream_index: 0,
+                target: FrameWindowTarget::Timestamp,
+                frame_index: None,
+                timestamp_seconds: Some(*micros as f64 / 1_000_000.0),
+                window_radius: Some(0),
+            };
+            let window = read_frame_window(&path, &request).unwrap();
+            assert_eq!(
+                window.selected.frame_index, index as u64,
+                "timestamp {micros} must round-trip to frame {index}"
+            );
+        }
         let _ = fs::remove_file(path);
     }
 

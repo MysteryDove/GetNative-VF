@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { Play, SlidersHorizontal } from "lucide-react";
-import type { MessageKey, Translator } from "../i18n";
+import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
+import { kernelDisplayName, profileDisplayName } from "../engine/displayNames";
+import { resolveGeometrySnapshot } from "../engine/geometryResolve";
+import { applyPayloadToRecipeDraft } from "../project/recipeApply";
+import { KernelAnalyzePanel } from "./KernelAnalyzePanel";
 import {
   applyPreset,
   defaultHeightDraft,
@@ -28,6 +32,7 @@ export function AnalyzePage({
   analyzeAvailable,
   onOpenDiagnostics,
   onOpenSamples,
+  onProjectChange,
 }: {
   t: Translator;
   state: ProjectState;
@@ -35,12 +40,15 @@ export function AnalyzePage({
   analyzeAvailable: boolean;
   onOpenDiagnostics: () => void;
   onOpenSamples: () => void;
+  onProjectChange: (updater: (state: ProjectState) => ProjectState) => void;
 }) {
   const [draft, setDraft] = useState<HeightDraft>(() => defaultHeightDraft(capabilities));
   const [draftSeeded, setDraftSeeded] = useState(Boolean(capabilities));
   const [hiddenSampleIds, setHiddenSampleIds] = useState<Set<string>>(new Set());
   const [selectedHeight, setSelectedHeight] = useState<string | null>(null);
   const [logDisplay, setLogDisplay] = useState(false);
+  const [applyBusy, setApplyBusy] = useState(false);
+  const [applyNotice, setApplyNotice] = useState("");
 
   useEffect(() => {
     if (draftSeeded || !capabilities) return;
@@ -138,6 +146,57 @@ export function AnalyzePage({
     );
   }
 
+  /**
+   * Apply the selected height as the Recipe Draft geometry: resolve the real
+   * geometry through the engine geometry command (first included Sample's
+   * source shape), then store geometry + MetricSpec + profile into the draft.
+   */
+  async function applyGeometryToRecipeDraft() {
+    if (!selectedHeight || applyBusy) return;
+    const baseHeight = Number(selectedHeight);
+    if (!Number.isFinite(baseHeight) || baseHeight <= 0) return;
+    const sample = includedSamples.find((item) => {
+      const source = state.sourcesById[item.sourceId];
+      return source?.width && source?.height;
+    });
+    const source = sample ? state.sourcesById[sample.sourceId] : null;
+    if (!sample || !source?.width || !source.height) {
+      setApplyNotice(t("recipe.applyNoDims"));
+      return;
+    }
+    setApplyBusy(true);
+    setApplyNotice("");
+    try {
+      const geometry = await resolveGeometrySnapshot({
+        profileId: draft.profileId,
+        sourceWidth: source.width,
+        sourceHeight: source.height,
+        baseHeight,
+      });
+      const result = applyPayloadToRecipeDraft(
+        state,
+        {
+          geometry,
+          metric: { ...draft.metric },
+          profileId: draft.profileId,
+          mathMode: draft.mathMode,
+        },
+        t("recipe.defaultName"),
+      );
+      if (!result.ok) {
+        setApplyNotice(t("recipe.applyFailed"));
+        return;
+      }
+      const next = result.state;
+      onProjectChange(() => next);
+      setApplyNotice(t("recipe.applied", { name: result.recipe.name }));
+    } catch (error) {
+      setApplyNotice(String(error));
+    } finally {
+      setApplyBusy(false);
+    }
+  }
+
   return (
     <div className="page-panel analyze-page">
       <div className="page-header">
@@ -162,9 +221,17 @@ export function AnalyzePage({
       </div>
 
       {draft.subroute === "kernel" ? (
-        <BlockedState
-          title={t("analyze.kernelBlockedTitle")}
-          body={t("analyze.kernelBlockedBody")}
+        <KernelAnalyzePanel
+          t={t}
+          state={state}
+          capabilities={capabilities}
+          analyzeAvailable={analyzeAvailable}
+          inheritedMetric={draft.metric}
+          inheritedProfileId={draft.profileId}
+          inheritedMathMode={draft.mathMode}
+          inheritedBackend={draft.backendPreference}
+          onOpenDiagnostics={onOpenDiagnostics}
+          onProjectChange={onProjectChange}
         />
       ) : (
         <div className="analyze-layout">
@@ -293,6 +360,15 @@ export function AnalyzePage({
                 >
                   {t("analyze.refineAroundSelection")}
                 </button>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  disabled={!selectedHeight || applyBusy || includedSamples.length === 0}
+                  onClick={applyGeometryToRecipeDraft}
+                >
+                  {t("analyze.applyToRecipe")}
+                </button>
+                {applyNotice ? <span className="help-copy">{applyNotice}</span> : null}
               </div>
               {seriesRows.incompatibleCount > 0 ? (
                 <p className="help-copy warning-copy">
@@ -692,29 +768,4 @@ function buildSeriesTable(
 function seriesColor(index: number): string {
   const palette = ["#3b82f6", "#22c55e", "#f59e0b", "#a855f7", "#ef4444", "#06b6d4"];
   return palette[index % palette.length];
-}
-
-const KERNEL_NAME_KEYS: Record<string, MessageKey> = {
-  bilinear: "diagnostics.kernelName.bilinear",
-  bicubic: "diagnostics.kernelName.bicubic",
-  lanczos: "diagnostics.kernelName.lanczos",
-  spline16: "diagnostics.kernelName.spline16",
-  spline36: "diagnostics.kernelName.spline36",
-  spline64: "diagnostics.kernelName.spline64",
-};
-
-const PROFILE_NAME_KEYS: Record<string, MessageKey> = {
-  "muf-d278cd3": "profile.muf-d278cd3",
-  "getfnative-44c8d0f": "profile.getfnative-44c8d0f",
-  modern: "profile.modern",
-};
-
-function kernelDisplayName(t: Translator, id: string): string {
-  const key = KERNEL_NAME_KEYS[id];
-  return key ? t(key) : id;
-}
-
-function profileDisplayName(t: Translator, id: string): string {
-  const key = PROFILE_NAME_KEYS[id];
-  return key ? t(key) : id;
 }

@@ -1,22 +1,5 @@
 import type { ReactNode } from "react";
 import type { Translator } from "../i18n";
-import { BlockedState } from "../components/BlockedState";
-
-export function VerifyPage({ t }: { t: Translator }) {
-  return (
-    <PageFrame title={t("verify.title")}>
-      <BlockedState title={t("verify.blockedTitle")} body={t("verify.blockedBody")} />
-    </PageFrame>
-  );
-}
-
-export function ResultsPage({ t }: { t: Translator }) {
-  return (
-    <PageFrame title={t("results.title")}>
-      <BlockedState title={t("results.emptyTitle")} body={t("results.emptyBody")} />
-    </PageFrame>
-  );
-}
 
 export function SettingsPage({
   t,

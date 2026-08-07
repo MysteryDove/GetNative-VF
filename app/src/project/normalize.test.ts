@@ -160,9 +160,55 @@ export function runPureModuleChecks(): void {
   assert(runnable.kernelReady, "included Sample with a ready source enables Algorithm Test");
   assert(!runnable.verifyReady, "Full Video Check requires an active locked Recipe");
 
-  state.recipesById.recipe_1 = { id: "recipe_1", name: "Bicubic", locked: true, revision: 1 };
+  state.recipesById.recipe_1 = {
+    id: "recipe_1",
+    name: "Bicubic",
+    status: "locked",
+    locked: true,
+    revision: 1,
+    parentRecipeId: null,
+    createdAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-01T00:00:00Z",
+    geometry: null,
+    kernel: { id: "bicubic", parameters: { b: 0, c: 0.5 } },
+    metric: null,
+    profileId: "muf-d278cd3",
+    mathMode: "raw",
+  };
   state.project.activeRecipeId = "recipe_1";
   assert(readiness(state, true).verifyReady, "ready video and active locked Recipe enable checking");
+
+  const recipeManifest = projectStateToManifest(state);
+  const storedRecipe = recipeManifest.recipes[0];
+  assert(storedRecipe?.status === "locked", "recipe status round-trip");
+  assert(storedRecipe?.locked === true, "locked flag written for locked recipe");
+  assert(storedRecipe?.profile_id === "muf-d278cd3", "recipe profile round-trip");
+  assert(
+    (storedRecipe?.kernel as { id?: string } | null)?.id === "bicubic",
+    "recipe kernel payload round-trip",
+  );
+  const reloaded = openedToProjectState({
+    ...sampleOpened(),
+    manifest: recipeManifest,
+  });
+  assert(reloaded.recipesById.recipe_1?.status === "locked", "recipe status reload");
+  assert(reloaded.recipesById.recipe_1?.locked === true, "recipe locked derived on reload");
+
+  const legacy = openedToProjectState({
+    ...sampleOpened(),
+    manifest: {
+      ...sampleOpened().manifest,
+      recipes: [{ id: "legacy_1", name: "Legacy", locked: true, revision: 2 }],
+    },
+  });
+  assert(
+    legacy.recipesById.legacy_1?.status === "locked",
+    "schema-1 locked flag migrates to locked status",
+  );
+  assert(
+    legacy.recipesById.legacy_1?.revision === 2,
+    "schema-1 revision preserved on migration",
+  );
 
   state.sourcesById.src_2.fingerprint = "quick-sha256-v1:changed";
   const staleSample = readiness(state, true);

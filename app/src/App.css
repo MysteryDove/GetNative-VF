@@ -2888,3 +2888,122 @@ button {
     border-left: 0;
   }
 }
+
+/* Recipe review dialog + manager */
+.modal-card {
+  width: min(560px, 100%);
+  max-height: min(720px, calc(100vh - 40px));
+  overflow-y: auto;
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid #3b433f;
+  border-radius: 7px;
+  background: #191d1b;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid #2b302e;
+  padding-bottom: 10px;
+}
+
+.modal-header h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-top: 1px solid #2b302e;
+  padding-top: 12px;
+}
+
+.recipe-row {
+  align-items: flex-start;
+}
+
+.recipe-badge {
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.recipe-badge.active {
+  color: #0e1512;
+  background: #6e9d83;
+}
+
+.recipe-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+
+.link-button.danger {
+  color: #c97b6d;
+}
+
+.link-button.danger:hover:not(:disabled) {
+  color: #e3998a;
+}
+
+.recipe-summary .dense-row span {
+  overflow-wrap: anywhere;
+}
+
+.review-blockers ul {
+  margin: 6px 0 0;
+}
+
+/* Verify scope: Full and Preview must not be visually confusable */
+.scope-option {
+  padding: 8px 10px;
+  border: 1px solid #3a423e;
+  border-radius: 5px;
+}
+
+.scope-option.active {
+  border-color: #6e9d83;
+}
+
+.scope-full.active {
+  background: rgba(110, 157, 131, 0.12);
+}
+
+.scope-preview.active {
+  border-style: dashed;
+  background: rgba(201, 162, 75, 0.1);
+}
+
+.verify-recipe-strip .recipe-badge {
+  margin-left: 8px;
+}
+
+/* Results page */
+.run-group-block .run-group-header {
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+}
+
+.run-group-header strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.run-row.indented {
+  padding-left: 28px;
+}

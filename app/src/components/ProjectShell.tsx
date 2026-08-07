@@ -5,11 +5,9 @@ import type { ProjectRoute, ProjectState } from "../project/types";
 import { countById } from "../project/normalize";
 import { ProjectNavigator } from "./ProjectNavigator";
 import { OverviewPage } from "../pages/OverviewPage";
-import {
-  ResultsPage,
-  SettingsPage,
-  VerifyPage,
-} from "../pages/BlockedPages";
+import { SettingsPage } from "../pages/BlockedPages";
+import { ResultsPage } from "../pages/ResultsPage";
+import { VerifyPage } from "../pages/VerifyPage";
 import { AnalyzePage } from "../pages/AnalyzePage";
 import { DiagnosticsPage } from "../pages/DiagnosticsPage";
 import { MediaPage } from "../pages/MediaPage";
@@ -125,6 +123,7 @@ export function ProjectShell({
                   state={state}
                   analyzeAvailable={analyzeAvailable}
                   onNavigate={onNavigate}
+                  onProjectChange={onProjectChange}
                 />
               )}
               {route === "media" && (
@@ -146,10 +145,19 @@ export function ProjectShell({
                   analyzeAvailable={analyzeAvailable}
                   onOpenDiagnostics={() => onNavigate("diagnostics")}
                   onOpenSamples={() => onNavigate("samples")}
+                  onProjectChange={onProjectChange}
                 />
               )}
-              {route === "verify" && <VerifyPage t={t} />}
-              {route === "results" && <ResultsPage t={t} />}
+              {route === "verify" && (
+                <VerifyPage
+                  t={t}
+                  state={state}
+                  capabilities={capabilities}
+                  analyzeAvailable={analyzeAvailable}
+                  onNavigate={onNavigate}
+                />
+              )}
+              {route === "results" && <ResultsPage t={t} state={state} />}
               {route === "settings" && (
                 <SettingsPage t={t} language={language} onLanguageChange={onLanguageChange} />
               )}

@@ -1,3 +1,10 @@
+import type {
+  GeometrySnapshot,
+  KernelRef,
+  MathMode,
+  MetricSpec,
+} from "../engine/protocol";
+
 export type SourceKind = "still" | "video" | "animated";
 export type SourceState =
   | "added"
@@ -65,11 +72,34 @@ export type Sample = {
   tags: string[];
 };
 
+/**
+ * Recipe lifecycle per DESIGN.md: a draft is mutable; locking makes it immutable;
+ * locking a derived draft supersedes its locked parent. Only locked (never draft
+ * or superseded) Recipes may be newly activated, and activation is explicit.
+ */
+export type RecipeStatus = "draft" | "locked" | "superseded";
+
+/**
+ * Analysis Recipe (分析方案). A locked Recipe owns every semantic value that
+ * changes the metric: geometry, kernel, metric crop, pixel exclusion threshold,
+ * p-norm, compatibility profile, and math mode. Payload fields may be partial
+ * while drafting; locking requires all of them.
+ */
 export type Recipe = {
   id: string;
   name: string;
+  status: RecipeStatus;
+  /** Derived view kept for the schema-1 manifest `locked` flag: status !== "draft". */
   locked: boolean;
   revision: number;
+  parentRecipeId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  geometry: GeometrySnapshot | null;
+  kernel: KernelRef | null;
+  metric: MetricSpec | null;
+  profileId: string | null;
+  mathMode: MathMode | null;
 };
 
 /** UI-level group of independent engine Runs created by one user command. */
@@ -190,8 +220,18 @@ export type ProjectManifestDto = {
   recipes: Array<{
     id: string;
     name: string;
+    /** Legacy schema-1 flag: true for both locked and superseded Recipes. */
     locked?: boolean;
+    status?: RecipeStatus;
     revision?: number;
+    parent_recipe_id?: string | null;
+    created_at?: string;
+    updated_at?: string;
+    geometry?: GeometrySnapshot | null;
+    kernel?: KernelRef | null;
+    metric?: MetricSpec | null;
+    profile_id?: string | null;
+    math_mode?: MathMode | null;
   }>;
   run_groups: Array<{
     id: string;

@@ -114,10 +114,33 @@ pub struct SampleRecord {
 pub struct RecipeRecord {
     pub id: String,
     pub name: String,
+    /// Schema-1 flag: true for both locked and superseded Recipes.
     #[serde(default)]
     pub locked: bool,
+    /// Lifecycle: draft | locked | superseded. Owned by the UI domain layer;
+    /// the manifest only round-trips it. When absent it derives from `locked`.
+    #[serde(default)]
+    pub status: Option<String>,
     #[serde(default)]
     pub revision: u32,
+    #[serde(default)]
+    pub parent_recipe_id: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    /// Semantic payload (geometry/kernel/metric/profile/math mode). Required by
+    /// the UI before locking; stored as structured JSON, language-neutral.
+    #[serde(default)]
+    pub geometry: Option<Value>,
+    #[serde(default)]
+    pub kernel: Option<Value>,
+    #[serde(default)]
+    pub metric: Option<Value>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub math_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -640,7 +663,16 @@ mod tests {
             id: "recipe_1".to_owned(),
             name: "Candidate".to_owned(),
             locked: false,
+            status: None,
             revision: 1,
+            parent_recipe_id: None,
+            created_at: None,
+            updated_at: None,
+            geometry: None,
+            kernel: None,
+            metric: None,
+            profile_id: None,
+            math_mode: None,
         });
         manifest.active_recipe_id = Some("recipe_1".to_owned());
         let error = validate_manifest(&manifest).unwrap_err();

@@ -110,12 +110,28 @@ export function openedToProjectState(opened: OpenedProjectDto): ProjectState {
     tags: sample.tags ?? [],
   }));
 
-  const recipes: Recipe[] = manifest.recipes.map((recipe) => ({
-    id: recipe.id,
-    name: recipe.name,
-    locked: recipe.locked ?? false,
-    revision: recipe.revision ?? 1,
-  }));
+  const recipes: Recipe[] = manifest.recipes.map((recipe) => {
+    // Schema-1 compatibility: `locked` predates `status`; a missing status
+    // derives from it, and an explicit status always wins. Both locked and
+    // superseded Recipes are immutable and serialize locked=true.
+    const status =
+      recipe.status ?? (recipe.locked ? "locked" : "draft");
+    return {
+      id: recipe.id,
+      name: recipe.name,
+      status,
+      locked: status !== "draft",
+      revision: recipe.revision ?? 1,
+      parentRecipeId: recipe.parent_recipe_id ?? null,
+      createdAt: recipe.created_at ?? "",
+      updatedAt: recipe.updated_at ?? "",
+      geometry: recipe.geometry ?? null,
+      kernel: recipe.kernel ?? null,
+      metric: recipe.metric ?? null,
+      profileId: recipe.profile_id ?? null,
+      mathMode: recipe.math_mode ?? null,
+    };
+  });
 
   const runGroups: RunGroup[] = manifest.run_groups.map((group) => ({
     id: group.id,
@@ -233,8 +249,17 @@ export function projectStateToManifest(state: ProjectState): ProjectManifestDto 
     recipes: Object.values(state.recipesById).map((recipe) => ({
       id: recipe.id,
       name: recipe.name,
-      locked: recipe.locked,
+      locked: recipe.status !== "draft",
+      status: recipe.status,
       revision: recipe.revision,
+      parent_recipe_id: recipe.parentRecipeId,
+      created_at: recipe.createdAt,
+      updated_at: recipe.updatedAt,
+      geometry: recipe.geometry,
+      kernel: recipe.kernel,
+      metric: recipe.metric,
+      profile_id: recipe.profileId,
+      math_mode: recipe.mathMode,
     })),
     run_groups: Object.values(state.runGroupsById).map((group) => ({
       id: group.id,

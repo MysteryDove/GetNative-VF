@@ -1,17 +1,20 @@
 import type { Translator } from "../i18n";
 import { countById, readiness } from "../project/normalize";
 import type { ProjectRoute, ProjectState } from "../project/types";
+import { RecipeManager } from "../components/RecipeManager";
 
 export function OverviewPage({
   t,
   state,
   analyzeAvailable,
   onNavigate,
+  onProjectChange,
 }: {
   t: Translator;
   state: ProjectState;
   analyzeAvailable: boolean;
   onNavigate: (route: ProjectRoute) => void;
+  onProjectChange: (updater: (state: ProjectState) => ProjectState) => void;
 }) {
   const flags = readiness(state, analyzeAvailable);
   const steps = [
@@ -43,7 +46,6 @@ export function OverviewPage({
     blockers.push({ message: t("overview.blocker.verifyUnavailable"), route: "verify" });
   }
 
-  const recipes = Object.values(state.recipesById);
   const runs = Object.values(state.runsById);
 
   return (
@@ -97,23 +99,7 @@ export function OverviewPage({
 
       <section className="page-section">
         <h3>{t("overview.recipes")}</h3>
-        {recipes.length === 0 ? (
-          <p className="empty-copy">{t("overview.recipesEmpty")}</p>
-        ) : (
-          <div className="dense-table">
-            {recipes.map((recipe) => {
-              const parts = [t("recipe.revision", { revision: recipe.revision })];
-              if (recipe.locked) parts.push(t("recipe.locked"));
-              if (state.project.activeRecipeId === recipe.id) parts.push(t("recipe.active"));
-              return (
-                <div className="dense-row" key={recipe.id}>
-                  <strong>{recipe.name}</strong>
-                  <span>{parts.join(" · ")}</span>
-                </div>
-              );
-            })}
-          </div>
-        )}
+        <RecipeManager t={t} state={state} onProjectChange={onProjectChange} />
       </section>
 
       <section className="page-section">

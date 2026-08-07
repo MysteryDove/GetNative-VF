@@ -71,6 +71,8 @@ export type PlanSource = {
   path: string;
   fingerprint?: string | null;
   state: string;
+  width?: number | null;
+  height?: number | null;
 };
 
 export function planHeightRunGroup(input: {
