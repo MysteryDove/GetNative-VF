@@ -32,6 +32,13 @@
 #include <utility>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 namespace getnative::cli {
 namespace {
 
@@ -97,6 +104,15 @@ std::int32_t require_int(const JsonValue &object, std::string_view key) {
     return static_cast<std::int32_t>(value);
 }
 
+std::int64_t require_int64(const JsonValue &object, std::string_view key) {
+    const double value = require_number(object, key);
+    if (std::trunc(value) != value
+        || value < -9007199254740992.0 || value > 9007199254740992.0) {
+        throw WorkerError("bad_request", "field must be an exact integer: " + std::string{key});
+    }
+    return static_cast<std::int64_t>(value);
+}
+
 std::int32_t optional_int(const JsonValue &object, std::string_view key, std::int32_t fallback) {
     const JsonValue *value = object.find(key);
     if (!value || value->is_null()) return fallback;
@@ -126,6 +142,30 @@ struct AnalyzeJobSpec {
     std::vector<std::string> candidates;
     MetricSpec metric{};
     std::size_t worker_count = 0;
+};
+
+// Verification (protocol v1.1): one locked recipe, many streamed frames.
+struct VerifyJobSpec {
+    std::string request_id;
+    std::string job_id;
+    std::int32_t width = 0;
+    std::int32_t height = 0;
+    AxisMode axis_mode = AxisMode::height_only;
+    Filter filter{};
+    std::string candidate;
+    MetricSpec metric{};
+    std::size_t worker_count = 0;
+    std::int64_t expected_frames = -1;
+};
+
+struct VerifyFrameItem {
+    std::uint64_t seq = 0;
+    FrameAsset asset;
+};
+
+struct VerifyFrameResult {
+    std::uint64_t seq = 0;
+    std::optional<double> error;
 };
 
 AxisMode parse_axis_mode(const std::string &value) {
@@ -265,10 +305,97 @@ AnalyzeJobSpec parse_analyze(const JsonValue &command, std::string job_id) {
 }
 
 // ---------------------------------------------------------------------------
+// Verify request model (protocol v1.1)
+// ---------------------------------------------------------------------------
+
+constexpr std::size_t kVerifyDefaultWorkers = 16U;
+constexpr std::size_t kVerifyResultBatchSize = 64U;
+constexpr std::int64_t kVerifyMaxFrames = 1000000;
+
+VerifyJobSpec parse_verify_begin(const JsonValue &command, std::string job_id) {
+    VerifyJobSpec spec;
+    spec.request_id = require_string(command, "request_id");
+    spec.job_id = std::move(job_id);
+
+    const JsonValue &geometry = require_member(command, "geometry");
+    spec.width = require_int(geometry, "width");
+    spec.height = require_int(geometry, "height");
+    if (spec.width < 2 || spec.height < 2
+        || spec.width > 32768 || spec.height > 32768) {
+        throw WorkerError("bad_request", "verify geometry must be within 2..32768");
+    }
+
+    const std::string backend = require_string(command, "backend");
+    if (backend == "cpu" || backend == "auto") {
+        // CPU is the deterministic oracle and the only verification backend
+        // in protocol v1.1; CUDA frame streaming is a documented follow-up.
+    } else if (backend == "cuda") {
+        throw WorkerError(
+            "unsupported",
+            "verify mode is CPU-only in protocol v1.1 (CUDA verification is an E2 follow-up)");
+    } else {
+        throw WorkerError("unsupported", "unknown backend: " + backend);
+    }
+
+    spec.axis_mode = parse_axis_mode(require_string(command, "axis_mode"));
+    spec.filter = parse_filter(require_member(command, "kernel"));
+    spec.metric = parse_metric(require_member(command, "metric"));
+
+    const JsonValue &candidate = require_member(command, "candidate");
+    std::string decimal;
+    if (candidate.type == JsonValue::Type::string) {
+        decimal = candidate.string_value;
+    } else if (candidate.type == JsonValue::Type::number) {
+        decimal = candidate.raw_number;
+    } else {
+        throw WorkerError("bad_request", "candidate must be a decimal string or number");
+    }
+    double value = 0.0;
+    try {
+        const JsonValue parsed = parse_json(decimal);
+        if (parsed.type != JsonValue::Type::number) throw std::runtime_error("not a number");
+        value = parsed.number_value;
+    } catch (const std::exception &) {
+        throw WorkerError("bad_request", "invalid candidate decimal: " + decimal);
+    }
+    if (!std::isfinite(value) || value < 2.0) {
+        throw WorkerError("bad_request", "candidate must be finite and >= 2");
+    }
+    const std::int32_t primary =
+        spec.axis_mode == AxisMode::width_only ? spec.width : spec.height;
+    if (value >= static_cast<double>(primary)) {
+        throw WorkerError("bad_request", "candidate must be below the source axis length");
+    }
+    spec.candidate = std::move(decimal);
+
+    if (command.find("worker_count")) {
+        const double workers = require_number(command, "worker_count");
+        if (workers < 0.0 || std::trunc(workers) != workers) {
+            throw WorkerError("bad_request", "worker_count must be a non-negative integer");
+        }
+        spec.worker_count = static_cast<std::size_t>(workers);
+    }
+    if (command.find("expected_frames")) {
+        spec.expected_frames = require_int64(command, "expected_frames");
+        if (spec.expected_frames < 1 || spec.expected_frames > kVerifyMaxFrames) {
+            throw WorkerError("bad_request", "expected_frames must be within 1..1000000");
+        }
+    }
+    return spec;
+}
+
+std::size_t effective_verify_workers(const VerifyJobSpec &spec) {
+    if (spec.worker_count != 0U) return spec.worker_count;
+    const std::size_t hardware =
+        static_cast<std::size_t>(std::max(1U, std::thread::hardware_concurrency()));
+    return std::min(kVerifyDefaultWorkers, hardware);
+}
+
+// ---------------------------------------------------------------------------
 // Frame asset loading
 // ---------------------------------------------------------------------------
 
-std::vector<float> load_frame_asset(const FrameAsset &asset) {
+void load_frame_into(const FrameAsset &asset, float *destination) {
     const std::uint64_t elements =
         static_cast<std::uint64_t>(asset.width) * static_cast<std::uint64_t>(asset.height);
     const std::uint64_t bytes = elements * sizeof(float);
@@ -284,11 +411,69 @@ std::vector<float> load_frame_asset(const FrameAsset &asset) {
                 + " bytes, found " + std::to_string(static_cast<long long>(size)));
     }
     input.seekg(0);
-    std::vector<float> frame(static_cast<std::size_t>(elements));
-    input.read(reinterpret_cast<char *>(frame.data()), static_cast<std::streamsize>(bytes));
+    input.read(reinterpret_cast<char *>(destination), static_cast<std::streamsize>(bytes));
     if (!input) {
         throw WorkerError("frame_asset_error", "failed while reading frame asset: " + asset.path, true);
     }
+}
+
+// Single-use frame access for verify workers. Verification is DRAM-bound
+// (docs/performance/e2-verification-pipeline-*): the read(2) path copies
+// every frame page-cache → user buffer, adding ~16.6 MB of traffic per
+// 1080p frame on top of analysis. Mapping the asset read-only lets analysis
+// consume the page cache directly. Producers publish assets atomically
+// (tmp+rename), so an open mapping can never observe a partially written
+// frame. Windows keeps the read() path until a MapViewOfFile branch lands.
+#if !defined(_WIN32)
+class MappedFrame {
+public:
+    explicit MappedFrame(const FrameAsset &asset) {
+        const std::uint64_t elements =
+            static_cast<std::uint64_t>(asset.width) * static_cast<std::uint64_t>(asset.height);
+        bytes_ = elements * sizeof(float);
+        const int fd = ::open(asset.path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            throw WorkerError("frame_asset_error", "cannot open frame asset: " + asset.path, true);
+        }
+        struct stat info {};
+        if (::fstat(fd, &info) != 0 || static_cast<std::uint64_t>(info.st_size) != bytes_) {
+            ::close(fd);
+            throw WorkerError(
+                "frame_asset_error",
+                "frame asset size mismatch: expected " + std::to_string(bytes_)
+                    + " bytes, found "
+                    + (info.st_size >= 0 ? std::to_string(static_cast<long long>(info.st_size))
+                                         : std::string{"<stat failed>"}));
+        }
+        void *mapped = ::mmap(nullptr, bytes_, PROT_READ,
+                              MAP_PRIVATE | MAP_POPULATE, fd, 0);
+        ::close(fd);
+        if (mapped == MAP_FAILED) {
+            throw WorkerError("frame_asset_error", "cannot map frame asset: " + asset.path, true);
+        }
+        data_ = static_cast<const float *>(mapped);
+    }
+    MappedFrame(const MappedFrame &) = delete;
+    MappedFrame &operator=(const MappedFrame &) = delete;
+    ~MappedFrame() {
+        if (data_ != nullptr) {
+            ::munmap(const_cast<float *>(data_), bytes_);
+        }
+    }
+
+    [[nodiscard]] const float *data() const noexcept { return data_; }
+
+private:
+    const float *data_ = nullptr;
+    std::uint64_t bytes_ = 0;
+};
+#endif
+
+std::vector<float> load_frame_asset(const FrameAsset &asset) {
+    const std::uint64_t elements =
+        static_cast<std::uint64_t>(asset.width) * static_cast<std::uint64_t>(asset.height);
+    std::vector<float> frame(static_cast<std::size_t>(elements));
+    load_frame_into(asset, frame.data());
     return frame;
 }
 
@@ -296,13 +481,51 @@ std::vector<float> load_frame_asset(const FrameAsset &asset) {
 // Worker session
 // ---------------------------------------------------------------------------
 
-struct Job {
-    explicit Job(AnalyzeJobSpec job_spec) : spec(std::move(job_spec)) {}
+enum class JobKind : std::uint8_t { analyze, verify };
 
+struct Job {
+    explicit Job(AnalyzeJobSpec job_spec)
+        : kind(JobKind::analyze), spec(std::move(job_spec)) {}
+    explicit Job(VerifyJobSpec verify_spec)
+        : kind(JobKind::verify), verify(std::move(verify_spec)) {}
+
+    [[nodiscard]] const std::string &id() const {
+        return kind == JobKind::analyze ? spec.job_id : verify.job_id;
+    }
+    [[nodiscard]] const std::string &request_id() const {
+        return kind == JobKind::analyze ? spec.request_id : verify.request_id;
+    }
+    [[nodiscard]] const char *mode() const {
+        return kind == JobKind::analyze ? "height" : "verify";
+    }
+    void request_cancel() {
+        cancel_requested.store(true);
+        stop_source.request_stop();
+        verify_condition.notify_all();
+    }
+
+    JobKind kind;
     AnalyzeJobSpec spec;
+    VerifyJobSpec verify;
     std::atomic<bool> cancel_requested{false};
     std::stop_source stop_source;
     bool started = false;
+
+    // Verify frame stream. The reader thread appends inbox items and the
+    // end marker; the executor's analysis workers consume them. One mutex
+    // guards every field below; one condition variable wakes both the
+    // analysis workers (inbox growth / end / cancel) and the executor's
+    // result drain (outbox growth / completion / cancel).
+    std::mutex verify_mutex;
+    std::condition_variable verify_condition;
+    std::deque<VerifyFrameItem> verify_inbox;
+    std::vector<VerifyFrameResult> verify_outbox;
+    std::uint64_t verify_received = 0;
+    std::uint64_t verify_completed = 0;
+    std::uint64_t verify_failed = 0;
+    bool verify_stream_ended = false;
+    std::uint64_t verify_declared_total = 0;
+    std::string verify_cancel_detail;
 };
 
 // Session frame cache. Frame vectors are never resized after load, so the
@@ -375,11 +598,11 @@ public:
                 dropped = std::move(queue_);
                 queue_.clear();
             }
-            if (running_) running_->cancel_requested.store(true);
+            if (running_) running_->request_cancel();
         }
         condition_.notify_all();
         for (const auto &job : dropped) {
-            emit_cancelled(job->spec, false, "shutdown");
+            emit_cancelled(*job, false, "shutdown");
         }
     }
 
@@ -398,6 +621,9 @@ public:
             {"commands", JsonValue::object({
                 {"analyze", JsonValue::boolean(true)},
                 {"cancel", JsonValue::boolean(true)},
+                {"verify_begin", JsonValue::boolean(true)},
+                {"verify_frame", JsonValue::boolean(true)},
+                {"verify_end", JsonValue::boolean(true)},
             })},
         }));
     }
@@ -437,6 +663,95 @@ public:
         }));
     }
 
+    void verify_begin(const JsonValue &command) {
+        require_greeting();
+        const std::string job_id = "job-" + std::to_string(next_job_++);
+        VerifyJobSpec spec = parse_verify_begin(command, job_id);
+        const std::size_t workers = effective_verify_workers(spec);
+        auto job = std::make_shared<Job>(std::move(spec));
+        {
+            const std::scoped_lock lock(mutex_);
+            queue_.push_back(job);
+        }
+        condition_.notify_one();
+        emit(JsonValue::object({
+            {"protocol_version", JsonValue::integer(kProtocolVersion)},
+            {"type", JsonValue::string("accepted")},
+            {"request_id", JsonValue::string(job->verify.request_id)},
+            {"job_id", JsonValue::string(job_id)},
+            {"timestamp_ms", JsonValue::integer(timestamp_ms())},
+            {"mode", JsonValue::string("verify")},
+            {"worker_count", JsonValue::integer(static_cast<std::int64_t>(workers))},
+            {"suggested_in_flight", JsonValue::integer(
+                static_cast<std::int64_t>(workers * 2U))},
+        }));
+    }
+
+    void verify_frame(const JsonValue &command) {
+        require_greeting();
+        const std::string request_id = require_string(command, "request_id");
+        const std::string job_id = require_string(command, "job_id");
+        const std::int64_t seq_value = require_int64(command, "seq");
+        if (seq_value < 0) {
+            throw WorkerError("bad_request", "verify_frame seq must be non-negative");
+        }
+        FrameAsset asset = parse_frame_asset(require_member(command, "frame_asset"));
+        const std::shared_ptr<Job> job = find_verify_job(job_id);
+        {
+            const std::scoped_lock stream_lock(job->verify_mutex);
+            if (job->verify_stream_ended) {
+                throw WorkerError("bad_request", "verify stream already ended");
+            }
+            if (static_cast<std::uint64_t>(seq_value) != job->verify_received) {
+                throw WorkerError(
+                    "bad_request",
+                    "verify_frame seq must be contiguous: expected "
+                        + std::to_string(job->verify_received)
+                        + ", got " + std::to_string(seq_value));
+            }
+            if (asset.width != job->verify.width || asset.height != job->verify.height) {
+                throw WorkerError(
+                    "bad_request",
+                    "verify frame asset geometry does not match the recipe");
+            }
+            job->verify_inbox.push_back({static_cast<std::uint64_t>(seq_value),
+                                         std::move(asset)});
+            ++job->verify_received;
+        }
+        job->verify_condition.notify_all();
+    }
+
+    void verify_end(const JsonValue &command) {
+        require_greeting();
+        require_string(command, "request_id");
+        const std::string job_id = require_string(command, "job_id");
+        const std::int64_t total = require_int64(command, "total");
+        if (total < 0) {
+            throw WorkerError("bad_request", "verify_end total must be non-negative");
+        }
+        const std::shared_ptr<Job> job = find_verify_job(job_id);
+        bool mismatch = false;
+        {
+            const std::scoped_lock stream_lock(job->verify_mutex);
+            if (job->verify_stream_ended) {
+                throw WorkerError("bad_request", "verify stream already ended");
+            }
+            job->verify_stream_ended = true;
+            job->verify_declared_total = static_cast<std::uint64_t>(total);
+            mismatch = job->verify_declared_total != job->verify_received;
+            if (mismatch) {
+                job->verify_cancel_detail = "verify_total_mismatch";
+            }
+        }
+        job->verify_condition.notify_all();
+        if (mismatch) {
+            job->request_cancel();
+            throw WorkerError(
+                "bad_request",
+                "verify_end total does not match the streamed frame count");
+        }
+    }
+
     void cancel(const JsonValue &command) {
         require_greeting();
         const std::string request_id = require_string(command, "request_id");
@@ -445,13 +760,12 @@ public:
         std::shared_ptr<Job> queued;
         {
             const std::scoped_lock lock(mutex_);
-            if (running_ && running_->spec.job_id == job_id) {
-                running_->cancel_requested.store(true);
-                running_->stop_source.request_stop();
+            if (running_ && running_->id() == job_id) {
+                running_->request_cancel();
                 found = true;
             } else {
                 for (auto iterator = queue_.begin(); iterator != queue_.end(); ++iterator) {
-                    if ((*iterator)->spec.job_id == job_id) {
+                    if ((*iterator)->id() == job_id) {
                         queued = std::move(*iterator);
                         queue_.erase(iterator);
                         found = true;
@@ -461,7 +775,7 @@ public:
             }
         }
         if (queued) {
-            emit_cancelled(queued->spec, false, "cancelled_before_start");
+            emit_cancelled(*queued, false, "cancelled_before_start");
         }
         if (!found) {
             emit(JsonValue::object({
@@ -484,11 +798,11 @@ public:
             stopping_ = true;
             dropped = std::move(queue_);
             queue_.clear();
-            if (running_) running_->cancel_requested.store(true);
+            if (running_) running_->request_cancel();
         }
         condition_.notify_all();
         for (const auto &job : dropped) {
-            emit_cancelled(job->spec, false, "shutdown");
+            emit_cancelled(*job, false, "shutdown");
         }
         if (executor_.joinable()) executor_.join();
         emit(JsonValue::object({
@@ -563,26 +877,49 @@ private:
 
     void emit_progress(const AnalyzeJobSpec &spec, std::string_view phase,
                        std::size_t completed, std::size_t total) {
-        emit(JsonValue::object({
+        emit_progress(spec.request_id, spec.job_id, "height", phase,
+                      completed, total, JsonValue::array());
+    }
+
+    void emit_progress(const std::string &request_id, const std::string &job_id,
+                       const char *mode, std::string_view phase,
+                       std::uint64_t completed, std::uint64_t total,
+                       JsonValue results) {
+        std::vector<std::pair<std::string, JsonValue>> members = {
             {"protocol_version", JsonValue::integer(kProtocolVersion)},
             {"type", JsonValue::string("progress")},
-            {"request_id", JsonValue::string(spec.request_id)},
-            {"job_id", JsonValue::string(spec.job_id)},
+            {"request_id", JsonValue::string(request_id)},
+            {"job_id", JsonValue::string(job_id)},
             {"timestamp_ms", JsonValue::integer(timestamp_ms())},
+            {"mode", JsonValue::string(mode)},
             {"phase", JsonValue::string(std::string{phase})},
             {"completed", JsonValue::integer(static_cast<std::int64_t>(completed))},
             {"total", JsonValue::integer(static_cast<std::int64_t>(total))},
-        }));
+        };
+        if (results.type == JsonValue::Type::array && !results.items.empty()) {
+            members.emplace_back("results", std::move(results));
+        }
+        emit(JsonValue::object(std::move(members)));
     }
 
     void emit_cancelled(const AnalyzeJobSpec &spec, bool partial,
                         std::string_view detail) {
+        emit_cancelled(spec.request_id, spec.job_id, "height", partial, detail);
+    }
+
+    void emit_cancelled(const Job &job, bool partial, std::string_view detail) {
+        emit_cancelled(job.request_id(), job.id(), job.mode(), partial, detail);
+    }
+
+    void emit_cancelled(const std::string &request_id, const std::string &job_id,
+                        const char *mode, bool partial, std::string_view detail) {
         emit(JsonValue::object({
             {"protocol_version", JsonValue::integer(kProtocolVersion)},
             {"type", JsonValue::string("cancelled")},
-            {"request_id", JsonValue::string(spec.request_id)},
-            {"job_id", JsonValue::string(spec.job_id)},
+            {"request_id", JsonValue::string(request_id)},
+            {"job_id", JsonValue::string(job_id)},
             {"timestamp_ms", JsonValue::integer(timestamp_ms())},
+            {"mode", JsonValue::string(mode)},
             {"partial", JsonValue::boolean(partial)},
             {"detail", JsonValue::string(std::string{detail})},
         }));
@@ -592,6 +929,19 @@ private:
         if (job.cancel_requested.load(std::memory_order_relaxed)) {
             throw WorkerError("cancelled", "job was cancelled");
         }
+    }
+
+    std::shared_ptr<Job> find_verify_job(const std::string &job_id) {
+        const std::scoped_lock lock(mutex_);
+        if (running_ && running_->id() == job_id && running_->kind == JobKind::verify) {
+            return running_;
+        }
+        for (const auto &job : queue_) {
+            if (job->id() == job_id && job->kind == JobKind::verify) {
+                return job;
+            }
+        }
+        throw WorkerError("bad_request", "no active verify job with id: " + job_id);
     }
 
     void execute_loop() {
@@ -614,15 +964,15 @@ private:
                         // Candidate-phase cancellation returns normally with
                         // partial results; a thrown cancellation means the job
                         // stopped before any results were produced.
-                        emit_cancelled(job->spec, false, "cancelled");
+                        emit_cancelled(*job, false, "cancelled");
                     } else {
-                        emit_error(job->spec.request_id, error);
+                        emit_error(job->request_id(), error);
                     }
                 } catch (...) {
                 }
             } catch (const std::exception &error) {
                 try {
-                    emit_error(job->spec.request_id,
+                    emit_error(job->request_id(),
                                WorkerError("internal", error.what()));
                 } catch (...) {
                 }
@@ -637,6 +987,14 @@ private:
     // -----------------------------------------------------------------------
 
     void run_job(Job &job) {
+        if (job.kind == JobKind::verify) {
+            run_verify_job(job);
+            return;
+        }
+        run_analyze_job(job);
+    }
+
+    void run_analyze_job(Job &job) {
         const AnalyzeJobSpec &spec = job.spec;
         const auto job_start = std::chrono::steady_clock::now();
 
@@ -843,6 +1201,274 @@ private:
         }));
     }
 
+    // -----------------------------------------------------------------------
+    // Verify job execution (protocol v1.1)
+    // -----------------------------------------------------------------------
+
+    // One locked recipe, many streamed frames. Analysis workers consume the
+    // inbox as the reader thread appends verify_frame items, so decode on the
+    // producer side overlaps analysis naturally; the app bounds its asset
+    // production with the accepted event's suggested_in_flight hint.
+    void run_verify_job(Job &job) {
+        const VerifyJobSpec &spec = job.verify;
+        const auto job_start = std::chrono::steady_clock::now();
+
+        const std::int32_t primary_size =
+            spec.axis_mode == AxisMode::width_only ? spec.width : spec.height;
+        const std::int32_t secondary_size =
+            spec.axis_mode == AxisMode::width_only ? spec.height : spec.width;
+        const double value = parse_json(spec.candidate).number_value;
+
+        std::vector<AxisPlanRequest> requests;
+        requests.push_back(make_axis_request(primary_size, value, spec.filter));
+        if (spec.axis_mode == AxisMode::height_plus_width) {
+            const double derived = static_cast<double>(secondary_size) * value
+                / static_cast<double>(primary_size);
+            if (derived < 2.0) {
+                throw WorkerError("bad_request", "derived secondary axis length is too small");
+            }
+            requests.push_back(make_axis_request(secondary_size, derived, spec.filter));
+        }
+
+        const auto plan_start = std::chrono::steady_clock::now();
+        AxisPlanCacheBatchResult batch = plan_cache_.get_or_build_batch(
+            std::span<const AxisPlanRequest>{requests.data(), requests.size()});
+        const double plan_ms = elapsed_ms(plan_start);
+        emit_progress(spec.request_id, spec.job_id, "verify", "plan",
+                      requests.size(), requests.size(), JsonValue::array());
+        check_cancelled(job);
+
+        std::shared_ptr<const AxisPlan> horizontal;
+        std::shared_ptr<const AxisPlan> vertical;
+        AnalysisAxes axes = AnalysisAxes::vertical;
+        if (spec.axis_mode == AxisMode::width_only) {
+            horizontal = batch.plans.front();
+            axes = AnalysisAxes::horizontal;
+        } else if (spec.axis_mode == AxisMode::height_only) {
+            vertical = batch.plans.front();
+            axes = AnalysisAxes::vertical;
+        } else {
+            vertical = batch.plans.front();
+            horizontal = batch.plans.back();
+            axes = AnalysisAxes::both;
+        }
+
+        const std::size_t worker_count = effective_verify_workers(spec);
+#if defined(_WIN32)
+        const std::uint64_t elements =
+            static_cast<std::uint64_t>(spec.width) * static_cast<std::uint64_t>(spec.height);
+#endif
+        std::atomic<double> frame_load_ms{0.0};
+        std::atomic<double> frame_analyze_ms{0.0};
+
+        const auto worker_body = [&] {
+#if defined(_WIN32)
+            std::vector<float> buffer(static_cast<std::size_t>(elements));
+#endif
+            CpuWorkspace workspace;
+            while (true) {
+                VerifyFrameItem item;
+                {
+                    std::unique_lock lock(job.verify_mutex);
+                    job.verify_condition.wait(lock, [&] {
+                        return !job.verify_inbox.empty() || job.verify_stream_ended
+                            || job.cancel_requested.load(std::memory_order_relaxed);
+                    });
+                    if (job.cancel_requested.load(std::memory_order_relaxed)) return;
+                    if (job.verify_inbox.empty()) {
+                        if (job.verify_stream_ended) return;
+                        continue;
+                    }
+                    item = std::move(job.verify_inbox.front());
+                    job.verify_inbox.pop_front();
+                }
+
+                std::optional<double> error;
+                try {
+                    const auto load_start = std::chrono::steady_clock::now();
+#if !defined(_WIN32)
+                    MappedFrame mapped(item.asset);
+                    ConstImageView view{mapped.data(), spec.width, spec.height, spec.width};
+#else
+                    load_frame_into(item.asset, buffer.data());
+                    ConstImageView view{buffer.data(), spec.width, spec.height, spec.width};
+#endif
+                    frame_load_ms.fetch_add(elapsed_ms(load_start),
+                                            std::memory_order_relaxed);
+                    const auto analyze_start = std::chrono::steady_clock::now();
+                    double frame_error = 0.0;
+                    if (axes == AnalysisAxes::both) {
+                        frame_error = analyze_candidate_f32(
+                            view, *horizontal, *vertical, spec.metric, workspace);
+                    } else {
+                        frame_error = analyze_axis_candidate_f32(
+                            view, axes == AnalysisAxes::vertical ? *vertical : *horizontal,
+                            axes, spec.metric, workspace);
+                    }
+                    frame_analyze_ms.fetch_add(elapsed_ms(analyze_start),
+                                               std::memory_order_relaxed);
+                    error = frame_error;
+                } catch (const std::exception &failure) {
+                    {
+                        const std::scoped_lock lock(job.verify_mutex);
+                        ++job.verify_failed;
+                    }
+                    emit(JsonValue::object({
+                        {"protocol_version", JsonValue::integer(kProtocolVersion)},
+                        {"type", JsonValue::string("warning")},
+                        {"request_id", JsonValue::string(spec.request_id)},
+                        {"job_id", JsonValue::string(spec.job_id)},
+                        {"timestamp_ms", JsonValue::integer(timestamp_ms())},
+                        {"code", JsonValue::string("frame_asset_error")},
+                        {"message", JsonValue::string(failure.what())},
+                        {"seq", JsonValue::integer(static_cast<std::int64_t>(item.seq))},
+                    }));
+                }
+                {
+                    const std::scoped_lock lock(job.verify_mutex);
+                    job.verify_outbox.push_back({item.seq, error});
+                    if (error) ++job.verify_completed;
+                }
+                job.verify_condition.notify_all();
+            }
+        };
+
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+        for (std::size_t index = 0; index < worker_count; ++index) {
+            workers.emplace_back(worker_body);
+        }
+
+        // Drain loop: batch results into progress events until the stream
+        // completes or cancellation lands. A declared-total mismatch never
+        // completes normally; verify_end cancels the job in that case.
+        const auto drain_outbox = [&] {
+            std::vector<VerifyFrameResult> pending;
+            std::uint64_t processed = 0;
+            std::uint64_t total = 0;
+            {
+                const std::scoped_lock lock(job.verify_mutex);
+                pending = std::move(job.verify_outbox);
+                job.verify_outbox.clear();
+                processed = job.verify_completed + job.verify_failed;
+                if (spec.expected_frames > 0) {
+                    total = static_cast<std::uint64_t>(spec.expected_frames);
+                } else {
+                    total = job.verify_stream_ended ? job.verify_declared_total
+                                                    : job.verify_received;
+                }
+            }
+            if (pending.empty()) return;
+            std::vector<JsonValue> results;
+            results.reserve(pending.size());
+            for (const VerifyFrameResult &entry : pending) {
+                results.push_back(JsonValue::object({
+                    {"seq", JsonValue::integer(static_cast<std::int64_t>(entry.seq))},
+                    {"error", entry.error ? JsonValue::number(*entry.error)
+                                          : JsonValue{}},
+                }));
+            }
+            emit_progress(spec.request_id, spec.job_id, "verify", "verify",
+                          processed, total, JsonValue::array(std::move(results)));
+        };
+
+        while (true) {
+            bool finished = false;
+            {
+                std::unique_lock lock(job.verify_mutex);
+                job.verify_condition.wait(lock, [&] {
+                    return job.verify_outbox.size() >= kVerifyResultBatchSize
+                        || job.cancel_requested.load(std::memory_order_relaxed)
+                        || (job.verify_stream_ended
+                            && job.verify_completed + job.verify_failed >= job.verify_received
+                            && job.verify_inbox.empty());
+                });
+                finished = job.cancel_requested.load(std::memory_order_relaxed)
+                    || (job.verify_stream_ended
+                        && job.verify_completed + job.verify_failed >= job.verify_received
+                        && job.verify_inbox.empty()
+                        && job.verify_declared_total == job.verify_received);
+            }
+            drain_outbox();
+            if (finished) break;
+        }
+        for (std::thread &worker : workers) {
+            if (worker.joinable()) worker.join();
+        }
+
+        std::uint64_t completed = 0;
+        std::uint64_t failed = 0;
+        std::string cancel_detail;
+        {
+            const std::scoped_lock lock(job.verify_mutex);
+            completed = job.verify_completed;
+            failed = job.verify_failed;
+            cancel_detail = job.verify_cancel_detail;
+        }
+
+        if (job.cancel_requested.load(std::memory_order_relaxed)) {
+            drain_outbox();
+            emit_verify_cancelled(spec, completed, failed,
+                                  cancel_detail.empty() ? "cancelled" : cancel_detail);
+            return;
+        }
+
+        const double stream_ms = elapsed_ms(job_start);
+        const double fps = stream_ms > 0.0
+            ? static_cast<double>(completed) * 1000.0 / stream_ms
+            : 0.0;
+        emit(JsonValue::object({
+            {"protocol_version", JsonValue::integer(kProtocolVersion)},
+            {"type", JsonValue::string("result")},
+            {"request_id", JsonValue::string(spec.request_id)},
+            {"job_id", JsonValue::string(spec.job_id)},
+            {"timestamp_ms", JsonValue::integer(timestamp_ms())},
+            {"mode", JsonValue::string("verify")},
+            {"payload", JsonValue::object({
+                {"mode", JsonValue::string("verify")},
+                {"frames_completed", JsonValue::integer(static_cast<std::int64_t>(completed))},
+                {"frames_failed", JsonValue::integer(static_cast<std::int64_t>(failed))},
+                {"telemetry", JsonValue::object({
+                    {"plan_build_count", JsonValue::integer(
+                        static_cast<std::int64_t>(batch.physical_build_count))},
+                    {"plan_cache_hits", JsonValue::integer(
+                        static_cast<std::int64_t>(batch.ready_hit_count))},
+                    {"plan_resident_entries", JsonValue::integer(
+                        static_cast<std::int64_t>(plan_cache_.size()))},
+                    {"plan_ms", JsonValue::number(plan_ms)},
+                    {"frame_load_ms", JsonValue::number(frame_load_ms.load())},
+                    {"frame_analyze_ms", JsonValue::number(frame_analyze_ms.load())},
+                    {"stream_ms", JsonValue::number(stream_ms)},
+                    {"fps", JsonValue::number(fps)},
+                    {"worker_count", JsonValue::integer(
+                        static_cast<std::int64_t>(worker_count))},
+                    {"backend", JsonValue::string("cpu")},
+                    {"isa", JsonValue::string(std::string{
+                        cpu_isa_name(cpu_dispatch_info().selected)})},
+                })},
+            })},
+        }));
+    }
+
+    void emit_verify_cancelled(const VerifyJobSpec &spec, std::uint64_t completed,
+                               std::uint64_t failed, const std::string &detail) {
+        emit(JsonValue::object({
+            {"protocol_version", JsonValue::integer(kProtocolVersion)},
+            {"type", JsonValue::string("cancelled")},
+            {"request_id", JsonValue::string(spec.request_id)},
+            {"job_id", JsonValue::string(spec.job_id)},
+            {"timestamp_ms", JsonValue::integer(timestamp_ms())},
+            {"mode", JsonValue::string("verify")},
+            {"partial", JsonValue::boolean(completed + failed > 0)},
+            {"detail", JsonValue::string(detail)},
+            {"payload", JsonValue::object({
+                {"mode", JsonValue::string("verify")},
+                {"frames_completed", JsonValue::integer(static_cast<std::int64_t>(completed))},
+                {"frames_failed", JsonValue::integer(static_cast<std::int64_t>(failed))},
+            })},
+        }));
+    }
+
     void emit_partial_cancelled(const AnalyzeJobSpec &spec,
                                 const std::vector<CandidateResult> &results) {
         std::vector<JsonValue> candidate_values;
@@ -926,6 +1552,12 @@ int run_worker(std::istream &input, std::ostream &output, std::ostream &log) {
                 session.capabilities(command);
             } else if (type == "analyze") {
                 session.analyze(command);
+            } else if (type == "verify_begin") {
+                session.verify_begin(command);
+            } else if (type == "verify_frame") {
+                session.verify_frame(command);
+            } else if (type == "verify_end") {
+                session.verify_end(command);
             } else if (type == "cancel") {
                 session.cancel(command);
             } else if (type == "shutdown") {

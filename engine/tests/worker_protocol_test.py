@@ -25,11 +25,11 @@ def check(name, condition, detail=""):
         FAILURES.append(name)
 
 
-def write_frame(path, width, height):
+def write_frame(path, width, height, seed=0):
     with open(path, "wb") as output:
         for y in range(height):
             for x in range(width):
-                value = 0.5 + 0.1 * ((x * 7 + y * 13) % 17) / 16.0
+                value = 0.5 + 0.1 * ((x * 7 + y * 13 + seed) % 17) / 16.0
                 output.write(struct.pack("<f", value))
 
 
@@ -92,6 +92,63 @@ def analyze_command(request_id, frame_path, candidates, width=320, height=240, *
     }
     command.update(overrides)
     return command
+
+
+def verify_begin_command(request_id, candidate, width=320, height=240, **overrides):
+    command = {
+        "protocol_version": 1,
+        "type": "verify_begin",
+        "request_id": request_id,
+        "geometry": {"width": width, "height": height},
+        "axis_mode": "h_only",
+        "kernel": {"id": "bicubic", "b": 0, "c": 0.5},
+        "candidate": candidate,
+        "metric": {"p_norm": 1},
+        "backend": "cpu",
+    }
+    command.update(overrides)
+    return command
+
+
+def verify_frame_command(request_id, job_id, seq, frame_path, width=320, height=240):
+    return {
+        "protocol_version": 1,
+        "type": "verify_frame",
+        "request_id": request_id,
+        "job_id": job_id,
+        "seq": seq,
+        "frame_asset": {
+            "path": frame_path,
+            "format": "f32le",
+            "width": width,
+            "height": height,
+        },
+    }
+
+
+def run_analyze(worker, command):
+    worker.send(**command)
+    while True:
+        event = worker.read_event()
+        if event["type"] in ("result", "error", "cancelled"):
+            return event
+
+
+def collect_verify(worker, timeout=60.0):
+    """Collect (terminal, streamed_results, warnings) until a terminal event."""
+    results = {}
+    warnings = []
+    while True:
+        event = worker.read_event(timeout=timeout)
+        if event["type"] == "progress":
+            for entry in event.get("results", []):
+                if entry["seq"] in results:
+                    raise AssertionError(f"duplicate verify seq {entry['seq']}")
+                results[entry["seq"]] = entry["error"]
+        elif event["type"] == "warning":
+            warnings.append(event)
+        elif event["type"] in ("result", "error", "cancelled"):
+            return event, results, warnings
 
 
 def main():
@@ -298,6 +355,186 @@ def main():
         while worker.read_event()["type"] != "shutdown":
             pass
         worker.wait_exit()
+
+        # --- Session 4: verify streaming (protocol v1.1) --------------------
+        worker = Worker()
+        worker.send(**{"protocol_version": 1, "type": "hello", "request_id": "v0"})
+        event = worker.read_event()
+        check("verify-advertised", event["type"] == "hello_ok"
+              and event["commands"].get("verify_begin") is True
+              and event["commands"].get("verify_frame") is True
+              and event["commands"].get("verify_end") is True,
+              json.dumps(event.get("commands", {})))
+
+        frame2 = os.path.join(scratch, "frame2.f32")
+        write_frame(frame2, 320, 240, seed=5)
+
+        # Height-mode baselines for parity checks (same session warms the
+        # session plan cache that the verify job must then hit).
+        base1 = run_analyze(worker, analyze_command("v1", frame, ["200"]))
+        base2 = run_analyze(worker, analyze_command("v2", frame2, ["200"]))
+        err_frame = base1["payload"]["candidates"][0]["error"]
+        err_frame2 = base2["payload"]["candidates"][0]["error"]
+
+        worker.send(**verify_begin_command("v3", "200", expected_frames=6))
+        accepted = worker.read_event()
+        check("verify-accepted", accepted["type"] == "accepted"
+              and accepted["mode"] == "verify"
+              and accepted["suggested_in_flight"] > 0,
+              json.dumps(accepted))
+        job = accepted["job_id"]
+        ring = [frame, frame2, frame, frame2, frame, frame2]
+        for seq, path in enumerate(ring):
+            worker.send(**verify_frame_command(f"v3f{seq}", job, seq, path))
+        worker.send(**{"protocol_version": 1, "type": "verify_end",
+                       "request_id": "v3e", "job_id": job, "total": 6})
+        terminal, results, warnings = collect_verify(worker)
+        telemetry = terminal.get("payload", {}).get("telemetry", {})
+        check("verify-flow", terminal["type"] == "result"
+              and terminal["payload"]["frames_completed"] == 6
+              and terminal["payload"]["frames_failed"] == 0
+              and len(results) == 6 and not warnings
+              and telemetry.get("fps", 0) > 0,
+              json.dumps({"terminal": terminal["type"],
+                          "results": len(results), "warnings": warnings}))
+        check("verify-parity", terminal["type"] == "result"
+              and all(abs(results[seq] - (err_frame if seq % 2 == 0 else err_frame2))
+                      <= 1e-12 for seq in range(6)),
+              json.dumps({"results": results, "even": err_frame, "odd": err_frame2}))
+        # The earlier height jobs built the 240->200 plan; verify must reuse it.
+        check("verify-plan-cache-hit",
+              telemetry.get("plan_cache_hits") == 1
+              and telemetry.get("plan_build_count") == 0,
+              json.dumps(telemetry))
+
+        # h_plus_w verify parity against the height-mode two-axis path.
+        base2d = run_analyze(worker, analyze_command("v4", frame, ["200"],
+                                                     axis_mode="h_plus_w"))
+        err_2d = base2d["payload"]["candidates"][0]["error"]
+        worker.send(**verify_begin_command("v5", "200", axis_mode="h_plus_w"))
+        job = worker.read_event()["job_id"]
+        for seq in range(2):
+            worker.send(**verify_frame_command(f"v5f{seq}", job, seq, frame))
+        worker.send(**{"protocol_version": 1, "type": "verify_end",
+                       "request_id": "v5e", "job_id": job, "total": 2})
+        terminal, results, _ = collect_verify(worker)
+        check("verify-h-plus-w", terminal["type"] == "result"
+              and abs(results.get(0, -1) - err_2d) <= 1e-12
+              and abs(results.get(1, -1) - err_2d) <= 1e-12,
+              json.dumps({"results": results, "expected": err_2d}))
+
+        # Mixed success: one missing asset must warn, null its result, and
+        # let the job complete.
+        worker.send(**verify_begin_command("v6", "200"))
+        job = worker.read_event()["job_id"]
+        missing = os.path.join(scratch, "missing-verify.f32")
+        for seq, path in enumerate([frame, missing, frame2]):
+            worker.send(**verify_frame_command(f"v6f{seq}", job, seq, path))
+        worker.send(**{"protocol_version": 1, "type": "verify_end",
+                       "request_id": "v6e", "job_id": job, "total": 3})
+        terminal, results, warnings = collect_verify(worker)
+        check("verify-mixed-success", terminal["type"] == "result"
+              and terminal["payload"]["frames_completed"] == 2
+              and terminal["payload"]["frames_failed"] == 1
+              and results.get(1) is None
+              and any(w.get("seq") == 1 and w.get("code") == "frame_asset_error"
+                      for w in warnings),
+              json.dumps({"terminal": terminal.get("payload", {}),
+                          "results": results, "warnings": warnings}))
+
+        # Stream integrity: seq gaps, unknown jobs, geometry mismatch, and a
+        # declared-total mismatch all surface errors without killing the worker.
+        worker.send(**verify_begin_command("v7", "200"))
+        job = worker.read_event()["job_id"]
+
+        def next_error():
+            # Command errors come from the reader thread; asynchronous job
+            # progress events may interleave and are skipped here.
+            for _ in range(20):
+                event = worker.read_event(timeout=60.0)
+                if event["type"] == "error":
+                    return event
+            raise AssertionError("no error event arrived")
+
+        worker.send(**verify_frame_command("v7f1", job, 1, frame))
+        event = next_error()
+        check("verify-frame-gap", event["code"] == "bad_request", json.dumps(event))
+        worker.send(**verify_frame_command("v7fx", "job-99", 0, frame))
+        event = next_error()
+        check("verify-frame-unknown-job", event["code"] == "bad_request", json.dumps(event))
+        frame_small = os.path.join(scratch, "frame-small.f32")
+        write_frame(frame_small, 160, 120)
+        worker.send(**verify_frame_command("v7fg", job, 0, frame_small,
+                                           width=160, height=120))
+        event = next_error()
+        check("verify-geometry-mismatch", event["code"] == "bad_request", json.dumps(event))
+        # The stream is still usable after rejected items.
+        worker.send(**verify_frame_command("v7f0", job, 0, frame))
+        worker.send(**{"protocol_version": 1, "type": "verify_end",
+                       "request_id": "v7e", "job_id": job, "total": 5})
+        # The mismatch cancels the job; the verify_end command errors too.
+        # Event order between the error and the cancellation is unspecified.
+        terminal_events = []
+        for _ in range(40):
+            event = worker.read_event(timeout=60.0)
+            if event["type"] == "cancelled" and event.get("job_id") == job:
+                terminal_events.append(event)
+            elif event["type"] == "error" and event.get("request_id") == "v7e":
+                terminal_events.append(event)
+            if len(terminal_events) == 2:
+                break
+        kinds = sorted(event["type"] for event in terminal_events)
+        cancelled = next((event for event in terminal_events
+                          if event["type"] == "cancelled"), {})
+        check("verify-total-mismatch", kinds == ["cancelled", "error"]
+              and cancelled.get("detail") == "verify_total_mismatch",
+              json.dumps(terminal_events))
+        worker.send(**{"protocol_version": 1, "type": "verify_end",
+                       "request_id": "v7e2", "job_id": job, "total": 1})
+        event = worker.read_event()
+        check("verify-end-closed-stream", event["type"] == "error"
+              and event["code"] == "bad_request", json.dumps(event))
+
+        # Cooperative cancel mid-stream: results streamed so far stay
+        # consistent with the cancelled payload's frame counters.
+        worker.send(**verify_begin_command("v8", "200"))
+        job = worker.read_event()["job_id"]
+        for seq in range(70):
+            worker.send(**verify_frame_command(f"v8f{seq}", job, seq,
+                                               ring[seq % 2]))
+        streamed = {}
+        cancelled = None
+        for _ in range(400):
+            event = worker.read_event(timeout=60.0)
+            if event["type"] == "progress":
+                for entry in event.get("results", []):
+                    streamed[entry["seq"]] = entry["error"]
+                if len(streamed) >= 1 and cancelled is None:
+                    worker.send(**{"protocol_version": 1, "type": "cancel",
+                                   "request_id": "v8c", "job_id": job})
+                    cancelled = "sent"
+            elif event["type"] in ("cancelled", "result", "error"):
+                cancelled = event
+                break
+        check("verify-cancel-partial", cancelled is not None
+              and cancelled["type"] == "cancelled"
+              and cancelled.get("partial")
+              == (cancelled.get("payload", {}).get("frames_completed", 0)
+                  + cancelled.get("payload", {}).get("frames_failed", 0) > 0)
+              and len(streamed) == (cancelled.get("payload", {}).get("frames_completed", 0)
+                                    + cancelled.get("payload", {}).get("frames_failed", 0)),
+              json.dumps({"terminal": cancelled, "streamed": len(streamed)}))
+
+        # CUDA verify is a documented v1.1 gap, not a silent fallback.
+        worker.send(**verify_begin_command("v9", "200", backend="cuda"))
+        event = worker.read_event()
+        check("verify-cuda-unsupported", event["type"] == "error"
+              and event["code"] == "unsupported", json.dumps(event))
+
+        worker.send(**{"protocol_version": 1, "type": "shutdown", "request_id": "v10"})
+        while worker.read_event()["type"] != "shutdown":
+            pass
+        check("verify-session-exit", worker.wait_exit() == 0)
 
     if FAILURES:
         print(f"{len(FAILURES)} worker protocol test(s) failed")

@@ -1,8 +1,10 @@
 # Worker Protocol v1
 
-- Status: Implemented (engine side, height mode, CPU backend).
-- Date: 2026-08-07.
-- Roadmap anchor: `docs/dsmvc-port-strategy.md` phase E0.
+- Status: Implemented (engine side, height + verify modes; verify is CPU).
+- Date: 2026-08-07 (v1); 2026-08-08 (v1.1 verify streaming).
+- Roadmap anchor: `docs/dsmvc-port-strategy.md` phases E0 (worker) and
+  E2 (verification pipeline). E2 evidence:
+  `docs/performance/e2-verification-pipeline-20260808.md`.
 - App-side semantics: `app/src/engine/protocol.ts`. Wire field names in this
   document are authoritative for the engine/protocol integration lane.
 
@@ -123,6 +125,113 @@ that still emits `cancelled` with `"partial": false` and
 Emits a final `shutdown` acknowledgement event, then the process exits
 with status 0. Running jobs are cancelled cooperatively first.
 
+### 2.6 `verify_begin` / `verify_frame` / `verify_end` (v1.1)
+
+Verification is the inverse workload of `analyze`: **one locked recipe,
+many frames**. Frames stream in as the producer (decode) makes them
+available, so analysis overlaps decode; per-frame results stream back in
+`progress` events.
+
+`verify_begin` submits the recipe and queues the job (jobs still execute
+one at a time on the executor thread):
+
+```json
+{
+  "protocol_version": 1,
+  "type": "verify_begin",
+  "request_id": "req-10",
+  "geometry": {"width": 1920, "height": 1080},
+  "axis_mode": "h_only",
+  "kernel": {"id": "bicubic", "b": 0.0, "c": 0.5},
+  "candidate": "810",
+  "metric": {"crop_left": 10, "crop_right": 10, "crop_top": 10,
+             "crop_bottom": 10, "threshold": 0.015, "p_norm": 1},
+  "backend": "cpu",
+  "worker_count": 0,
+  "expected_frames": 34500
+}
+```
+
+Field rules:
+
+- `geometry` gives the frame dimensions every streamed asset must match.
+- `candidate` is a single decimal with the same plan semantics as one
+  `analyze` candidate (primary axis from `axis_mode`; the secondary axis
+  in `h_plus_w` mode is aspect-derived exactly like height mode).
+- `backend`: verify is **CPU-only** in v1.1 (`cpu`/`auto`); `cuda` fails
+  with `unsupported` (CUDA frame streaming is a documented E2 follow-up).
+- `worker_count`: 0 selects the default, `min(16, hardware)`.
+- `expected_frames` (optional, 1..1,000,000) is the progress total; the
+  integrity total is the `verify_end` declaration instead.
+
+The `accepted` event carries `mode: "verify"`, `worker_count`, and
+`suggested_in_flight` (2× workers). The engine does not hard-cap the
+inbound frame queue — queue items are small paths and frame files are
+loaded just-in-time by the analysis workers. The producer should bound
+its *asset creation* to `suggested_in_flight` unacknowledged frames so
+on-disk assets stay bounded.
+
+```json
+{"protocol_version": 1, "type": "verify_frame", "request_id": "req-11",
+ "job_id": "job-7", "seq": 0,
+ "frame_asset": {"path": "/absolute/path/f0.f32", "format": "f32le",
+                 "width": 1920, "height": 1080}}
+```
+
+- `seq` must be contiguous from 0 (a gap fails `bad_request`; the stream
+  stays usable and the correct `seq` can be sent next).
+- The asset geometry must match the recipe.
+- Frames may repeat paths (a ring of decoded buffers is a valid stream).
+- Analysis workers map each asset read-only (`mmap`, POSIX) for its
+  single use; producers must publish assets atomically (tmp+rename), as
+  the Tauri media layer already does. Windows currently reads into a
+  per-worker buffer (documented tradeoff in the E2 evidence).
+
+```json
+{"protocol_version": 1, "type": "verify_end", "request_id": "req-12",
+ "job_id": "job-7", "total": 34500}
+```
+
+`total` declares the stream length. If it differs from the received
+frame count, the command fails `bad_request` **and** the job is
+cancelled with `detail: "verify_total_mismatch"` (event order between
+the two is unspecified). `verify_frame`/`verify_end` for an unknown,
+mismatched-type, or finished job fail `bad_request`.
+
+Per-frame failures (missing/corrupt asset) do not fail the job: the
+engine emits a `warning` event with `code: "frame_asset_error"` and the
+offending `seq`, records a `null` error for that seq, and continues —
+this is the mixed-success-batch semantics GUI-5 needs.
+
+Per-frame results stream in `progress` events with `phase: "verify"`,
+batched (64 results per batch, plus a final drain), each entry
+`{"seq": N, "error": <number|null>}`. Entries may arrive out of order;
+consumers key on `seq`. Resume is app-side: the app keeps streamed
+results and re-issues only missing seqs on a later job.
+
+The terminal `result` payload:
+
+```json
+{
+  "mode": "verify",
+  "frames_completed": 34498,
+  "frames_failed": 2,
+  "telemetry": {
+    "plan_build_count": 0, "plan_cache_hits": 1,
+    "plan_resident_entries": 37, "plan_ms": 0.31,
+    "frame_load_ms": 4389.0, "frame_analyze_ms": 5586.0,
+    "stream_ms": 31350.0, "fps": 1100.5,
+    "worker_count": 16, "backend": "cpu", "isa": "avx2"
+  }
+}
+```
+
+`frame_load_ms`/`frame_analyze_ms` accumulate across workers (divide by
+frames for per-frame cost). Cancellation mid-stream preserves streamed
+results and ends with `cancelled` carrying `partial`, `frames_completed`,
+`frames_failed`; the last result batch drains before the `cancelled`
+event, so streamed results always equal the payload counters.
+
 ## 3. Events
 
 Every event carries `protocol_version`, `request_id` (of the triggering
@@ -133,9 +242,9 @@ milliseconds).
 | --- | --- | --- |
 | `hello_ok` | Protocol negotiated | `engine_version`, `commands` |
 | `capabilities` | Capability envelope | `payload` (same schema as one-shot CLI) |
-| `accepted` | Job queued | `mode`, `job_id` |
-| `progress` | Job progress | `completed`, `total`, `phase` (`plan` or `candidates`) |
-| `warning` | Non-fatal issue (e.g. backend fallback) | `code`, `message` |
+| `accepted` | Job queued | `mode`, `job_id`; verify adds `worker_count`, `suggested_in_flight` |
+| `progress` | Job progress | `completed`, `total`, `phase` (`plan`, `candidates`, or `verify`); verify adds `results` batches of `{seq, error\|null}` |
+| `warning` | Non-fatal issue (e.g. backend fallback, verify frame failure) | `code`, `message`; verify frame failures add `seq` |
 | `result` | Job finished successfully | `mode`, `payload` (§4) |
 | `cancelled` | Job cancelled | `partial`, `payload` (partial results when `partial=true`) |
 | `error` | Command/job failed | `code`, `message`, `retryable` |
@@ -174,7 +283,9 @@ build). Raw zero stays zero; log display transforms are a UI concern.
 The worker owns one `AxisPlanCache` (default limits: 1024 entries /
 256 MiB) for the whole session. Successive `analyze` jobs that share plan
 keys (same sample at new heights, RunGroup members, verification frames)
-hit warm plans without rebuilding. Cache residency is reported in
+hit warm plans without rebuilding; verify jobs reuse the same cache for
+their locked recipe (a recipe already scanned in the session starts with
+`plan_cache_hits=1`). Cache residency is reported in
 `telemetry`. There is no cross-process persistence in v1.
 
 Frame assets are held in an 8-entry session frame cache (LRU); buffers

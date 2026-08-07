@@ -1,6 +1,11 @@
 # dsmvc Port Strategy and Scheduling-First Optimization Directions
 
 - Status: Planning baseline for the next engine lane.
+- Landed: E0 (worker protocol v1, `docs/worker-protocol-v1.md`), E1 (CUDA
+  session path + source residency,
+  `docs/performance/e1-cuda-batch-scheduling-20260808.md` — see its §7 for
+  the corrected same-session delta), E2 (verify streaming v1.1,
+  `docs/performance/e2-verification-pipeline-20260808.md`).
 - Date: 2026-08-07.
 - Audience: future engine/UI lane owners.
 - Sources: `/home/owen/dev/Descale-MVC` (`dsmvc`, VapourSynth API4 descale
