@@ -237,14 +237,16 @@ repeated same-resolution workloads reuse 100% of plans across images and
 process restarts. The win is not throughput (a 1,000-plan batch builds in
 15.81 ms) but removing the measured fixed-admission cliff: 1,000-plan
 Lanczos-6/7/8 scans currently force 7-30% rebuilds. Design: L1 memory
-single-flight LRU (adopt dsmvc SingleFlightLru semantics) + L2 disk store,
-one zstd1-compressed pack per candidate grid with a lossless structural
-pre-transform (uniform forward offsets dropped, forward indices reduced
-to per-row anchors, CSR arrays delta-varint). Measured on real corpora:
-4.74x/4.26x/4.13x (bicubic/lanczos3/spline64) at ~1.5 GB/s compress and
-~3 GB/s decompress; a 30,000-candidate grid is ~630 MiB on disk and
-preheats in ~0.2-0.3 s. Build fingerprints gate cross-build loading;
-corrupt packs always degrade to rebuild.
+single-flight LRU (adopt dsmvc SingleFlightLru semantics) + L2 chunked
+packs — one file per candidate grid, plans grouped 64-per-chunk as
+independent zstd1 frames behind a sorted key-hash index, with a lossless
+structural pre-transform (uniform forward offsets dropped, forward
+indices reduced to per-row anchors, CSR arrays delta-varint). Measured on
+real corpora: 4.63x/4.07x (bicubic/spline64) at ~3 GB/s decompress;
+sparse single-plan reads cost ~0.4 ms (one ~0.6 MiB chunk), a
+30,000-candidate grid is ~640 MiB on disk and preheats in ~0.25 s. Build
+fingerprints gate cross-build loading; corrupt packs always degrade to
+rebuild.
 
 ### D5 — Explicitly not now
 

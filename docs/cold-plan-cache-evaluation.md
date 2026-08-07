@@ -63,14 +63,51 @@ Lookup: L1 hit → return; L1 miss → L2 file `<cache>/plans/v1/<key_hash>.gnpl
 → validate → publish into L1 → return; L2 miss → build (batch workers) →
 publish L1 → write-behind to L2 (atomic tmp+rename, no-replace publish).
 
-File format (little-endian, self-validating). The payload is the cooked
-structural encoding (§3.1), compressed with zstd1, one pack per candidate
-grid:
+### 3.2 Chunked pack layout (sparse reads without 30,000 files)
+
+A 30,000-candidate grid as individual files is a filesystem anti-pattern
+(inode pressure, directory scans, sync/backup pain); a single monolithic
+zstd stream forces whole-pack reads for sparse access. The resolution is
+the standard **chunked pack with a sparse index** (same family of layout
+as zstd-seekable and git packfiles): one file per grid, plans grouped in
+grid order into independent zstd frames of K plans each; an in-header
+index maps `key_hash → chunk + offset`, so reading one plan decompresses
+only its chunk (~0.6 MiB compressed, sub-millisecond), while full preheat
+is a sequential stream of chunk frames.
+
+Chunk size measured on the cooked corpora (ratio vs raw payload):
+
+| K (plans/chunk) | bicubic | spline64 | Chunk compressed size |
+| --- | --- | --- | --- |
+| 16 | 4.56x | 4.02x | ~0.3 MiB |
+| **64** | **4.63x** | **4.07x** | **~0.6 MiB** |
+| 256 | 4.64x | 4.04x | ~2.4 MiB |
+| whole-pack (§3.1) | 4.74x | 4.13x | all |
+
+K=64 loses only ~2% ratio against the monolithic pack while keeping
+sparse reads at ~0.6 MiB / ~0.2 ms — chosen. (K=16 is also fine; the flat
+curve says within-plan redundancy dominates and cross-plan redundancy is
+a small bonus, consistent with the modest dictionary gain in §3.1.)
+
+For a 30,000-candidate grid: 469 chunks, in-header index 30,000 × 20 B =
+~600 KiB (loaded once per pack open, binary search), file ~650 MiB,
+single-plan sparse read ~0.4 ms, full preheat ~0.25 s.
+
+Alternatives considered and rejected: SQLite (extra dependency, per-blob
+compression loses the within-chunk redundancy unless a dictionary is
+bolted on); zstd-seekable contrib (reusable frame table, but we need the
+key-hash index anyway and libzstd alone suffices).
+
+File format v2 (little-endian, self-validating):
 
 ```
 magic "GNPK" | format_version u32 | grid_hash u64 | build_fingerprint u64
-plan_count u32 | index[plan_count] {key_hash u64, offset u32, length u32}
-payload_len u32 | zstd1(cooked plans concatenated) | checksum u64
+plan_count u32 | chunk_size u32 | chunk_count u32
+plan index[plan_count]: {key_hash u64, chunk_ordinal u32,
+                         cooked_offset u32, cooked_len u32}  (sorted)
+chunk directory[chunk_count]: {file_offset u64, compressed_len u32}
+chunk data: zstd1 frames, one per chunk, plans in grid order
+checksum u64
 ```
 
 - `key_hash` / `grid_hash`: FNV-1a over the canonical PlanKey / the ordered
@@ -136,12 +173,12 @@ recorded fallback for sparse access patterns.
 Projected footprint for a 30,000-candidate stress grid (bicubic,
 100.7 KiB logical/plan):
 
-| Store | Size | Preheat read+decode (3 GB/s class) |
+| Store | Size | Access |
 | --- | --- | --- |
 | raw | 2.95 GiB | — |
-| **grid pack, cooked+zstd1** | **~630 MiB** | **~0.2-0.3 s** |
-| grid pack, cooked+zstd3 | ~510 MiB | ~0.3-0.4 s |
-| per-plan + dictionary | ~770 MiB | ~0.3 s |
+| **chunked pack (K=64), cooked+zstd1** | **~640 MiB** | **sparse plan ~0.4 ms; full preheat ~0.25 s** |
+| monolithic pack, cooked+zstd1 | ~630 MiB | preheat only (~0.2-0.3 s); sparse = full read |
+| per-plan files + dictionary | ~770 MiB | sparse fast; 30,000 inodes |
 
 zstd1 is the default: within ~20% of the zstd9 ratio at 4-5x the
 compression speed and full decompress speed. lz4 remains the "fastest
