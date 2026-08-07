@@ -500,7 +500,11 @@ if(TARGET getnative_metal)
     getnative_enable_strict_fp(getnative_metal)
 endif()
 
-add_executable(getnative-engine src/cli/main.cpp)
+add_executable(getnative-engine
+    src/cli/capabilities.cpp
+    src/cli/json.cpp
+    src/cli/main.cpp
+    src/cli/worker.cpp)
 target_link_libraries(getnative-engine PRIVATE getnative_core)
 if(GETNATIVE_ENABLE_METAL)
     target_link_libraries(getnative-engine PRIVATE getnative_metal)
@@ -557,6 +561,20 @@ if(BUILD_TESTING)
     getnative_enable_warnings(getnative_axis_planner_tests)
     getnative_enable_strict_fp(getnative_axis_planner_tests)
     add_test(NAME getnative_axis_planner_tests COMMAND getnative_axis_planner_tests)
+
+    add_executable(getnative_json_tests tests/json_test.cpp src/cli/json.cpp)
+    target_include_directories(getnative_json_tests PRIVATE src/cli)
+    target_compile_features(getnative_json_tests PRIVATE cxx_std_23)
+    getnative_enable_warnings(getnative_json_tests)
+    add_test(NAME getnative_json_tests COMMAND getnative_json_tests)
+
+    find_program(GETNATIVE_PYTHON3 NAMES python3 python)
+    if(GETNATIVE_PYTHON3)
+        add_test(NAME getnative_worker_protocol_tests
+            COMMAND "${GETNATIVE_PYTHON3}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_protocol_test.py"
+                $<TARGET_FILE:getnative-engine>)
+    endif()
 
     if(GETNATIVE_ENABLE_CUDA)
         add_test(NAME getnative_cuda_artifact_inventory
@@ -687,6 +705,25 @@ target_compile_features(getnative_core_benchmark PRIVATE cxx_std_23)
 getnative_enable_warnings(getnative_core_benchmark)
 getnative_enable_strict_fp(getnative_core_benchmark)
 getnative_configure_benchmark_metadata(getnative_core_benchmark)
+
+find_library(GETNATIVE_ZSTD_LIBRARY NAMES zstd libzstd.so.1)
+find_library(GETNATIVE_LZ4_LIBRARY NAMES lz4 liblz4.so.1)
+find_path(GETNATIVE_COMPRESSION_INCLUDE_DIR NAMES zstd.h lz4.h
+    HINTS "${GETNATIVE_COMPRESSION_INCLUDE_DIR}" /tmp/compression-headers)
+if(GETNATIVE_ZSTD_LIBRARY AND GETNATIVE_LZ4_LIBRARY
+   AND GETNATIVE_COMPRESSION_INCLUDE_DIR)
+    add_executable(getnative_plan_compression_probe
+        bench/plan_compression_probe.cpp)
+    target_link_libraries(getnative_plan_compression_probe PRIVATE
+        getnative_core
+        "${GETNATIVE_ZSTD_LIBRARY}"
+        "${GETNATIVE_LZ4_LIBRARY}")
+    target_include_directories(getnative_plan_compression_probe PRIVATE
+        "${GETNATIVE_COMPRESSION_INCLUDE_DIR}")
+    target_compile_features(getnative_plan_compression_probe PRIVATE cxx_std_23)
+    getnative_enable_warnings(getnative_plan_compression_probe)
+    getnative_enable_strict_fp(getnative_plan_compression_probe)
+endif()
 
 add_executable(getnative_cpu_backend_benchmark
     bench/cpu_backend_benchmark.cpp)

@@ -84,6 +84,8 @@ struct CudaRuntimeTelemetry {
     std::size_t buffer_allocation_count = 0;
     std::size_t plan_cache_hits = 0;
     std::size_t plan_cache_misses = 0;
+    std::size_t source_cache_hits = 0;
+    std::size_t source_cache_misses = 0;
     std::size_t source_upload_bytes = 0;
     std::size_t plan_upload_bytes = 0;
     std::size_t result_readback_bytes = 0;
