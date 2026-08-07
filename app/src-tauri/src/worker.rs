@@ -434,9 +434,9 @@ fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), String> {
     {
         return Err("bad_request: threshold must be finite and non-negative".to_owned());
     }
-    if request.backend != "cpu" {
+    if !matches!(request.backend.as_str(), "cpu" | "cuda" | "auto") {
         return Err(format!(
-            "unsupported: only the cpu backend serves analyze in worker protocol v1, got {}",
+            "unsupported: backend must be one of cpu/cuda/auto in worker protocol v1, got {}",
             request.backend
         ));
     }
@@ -606,6 +606,14 @@ mod tests {
 
         let mut request = analyze_request();
         request.backend = "cuda".to_owned();
+        assert!(validate_analyze(&request).is_ok());
+
+        let mut request = analyze_request();
+        request.backend = "auto".to_owned();
+        assert!(validate_analyze(&request).is_ok());
+
+        let mut request = analyze_request();
+        request.backend = "metal".to_owned();
         assert!(validate_analyze(&request).is_err());
 
         let mut request = analyze_request();
