@@ -14,6 +14,7 @@ import { MediaPage } from "../pages/MediaPage";
 import { SamplesPage } from "../pages/SamplesPage";
 import { ErrorNotice, type UiError } from "./ErrorNotice";
 import { recentJobs, type ExecutionState } from "../engine/runReducer";
+import type { ExecutionBridge } from "../engine/executeRunGroup";
 
 export function ProjectShell({
   t,
@@ -34,6 +35,7 @@ export function ProjectShell({
   onGeometrySuccess,
   busy,
   execution,
+  executionBridge,
 }: {
   t: Translator;
   state: ProjectState;
@@ -53,6 +55,7 @@ export function ProjectShell({
   onGeometrySuccess: () => void;
   busy: boolean;
   execution: ExecutionState;
+  executionBridge: ExecutionBridge;
 }) {
   const analyzeAvailable = capabilities?.payload.commands.analyze ?? false;
   const counts = {
@@ -146,6 +149,7 @@ export function ProjectShell({
                   onOpenDiagnostics={() => onNavigate("diagnostics")}
                   onOpenSamples={() => onNavigate("samples")}
                   onProjectChange={onProjectChange}
+                  executionBridge={executionBridge}
                 />
               )}
               {route === "verify" && (
@@ -189,6 +193,16 @@ export function ProjectShell({
                       <span className="job-progress">
                         {job.completed}/{job.total}
                       </span>
+                    ) : null}
+                    {job.phase === "queued" || job.phase === "running" ? (
+                      <button
+                        className="link-button job-cancel"
+                        type="button"
+                        disabled={job.cancelRequested}
+                        onClick={() => executionBridge.cancel(job.id)}
+                      >
+                        {job.cancelRequested ? t("jobs.cancelling") : t("jobs.cancel")}
+                      </button>
                     ) : null}
                   </li>
                 ))}

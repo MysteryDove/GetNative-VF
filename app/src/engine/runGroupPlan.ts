@@ -294,6 +294,22 @@ export type HeightSeriesPoint = {
 export function extractHeightSeries(result: unknown): HeightSeriesPoint[] | null {
   if (!result || typeof result !== "object") return null;
   const record = result as Record<string, unknown>;
+  // Worker protocol v1 height payload: {candidates: [{id, error}], telemetry}.
+  const wireCandidates = record.candidates;
+  if (Array.isArray(wireCandidates)) {
+    const points: HeightSeriesPoint[] = [];
+    for (const item of wireCandidates) {
+      if (!item || typeof item !== "object") continue;
+      const row = item as Record<string, unknown>;
+      const id = row.id;
+      const rawError = row.error;
+      if (id == null || rawError == null) continue;
+      const metric = typeof rawError === "number" ? rawError : Number(rawError);
+      if (!Number.isFinite(metric)) continue;
+      points.push({ height: String(id), metric });
+    }
+    return points.length ? points : null;
+  }
   const series = record.series ?? record.points ?? record.metrics;
   if (!Array.isArray(series)) return null;
   const points: HeightSeriesPoint[] = [];

@@ -77,7 +77,7 @@ export function VerifyPage({
         ? t("verify.blocked.noSources")
         : !plan
           ? t("verify.blocked.invalidPlan")
-          : t("analyze.runBlocked.noWorker");
+          : t("verify.modeUnsupported");
 
   return (
     <div className="page-panel">

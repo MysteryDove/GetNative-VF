@@ -201,8 +201,6 @@
   "analyze.blockedTitle": "Analysis command unavailable",
   "analyze.blockedBody": "The engine does not currently expose an analyze command. Existing real results would remain visible; runnable fake analysis controls are not shown.",
   "analyze.geometryHint": "Use Diagnostics for the existing geometry preview.",
-  "analyze.waitingWorkerTitle": "Waiting for analysis worker",
-  "analyze.waitingWorkerBody": "The engine reports an analyze command, but the persistent worker and streamed events are not wired yet. Fabricated curves are not shown.",
   "analyze.samplesTitle": "Samples",
   "analyze.noSamples": "Include at least one valid Sample on the Samples page first.",
   "analyze.paramsTitle": "Parameters",
@@ -267,7 +265,6 @@
   "analyze.runBlocked.noCommand": "The engine does not expose analyze; the run control stays disabled.",
   "analyze.runBlocked.noSamples": "At least one included Sample is required.",
   "analyze.runBlocked.invalidGrid": "Candidate grid is invalid; cannot run.",
-  "analyze.runBlocked.noWorker": "The analysis worker is not wired yet; no fabricated job will start.",
   "analyze.seriesVisible": "Show series",
   "analyze.runGroupPlan": "RunGroup plan",
   "analyze.runGroupType": "type {type}",
@@ -445,5 +442,15 @@
   "results.col.run": "Run",
   "results.col.points": "Points",
   "results.col.best": "Best point",
-  "results.col.bestMetric": "Best metric"
+  "results.col.bestMetric": "Best metric",
+  "jobs.cancel": "Cancel",
+  "jobs.cancelling": "Cancelling…",
+  "analyze.runReady": "Ready: {count} member Runs will be created.",
+  "analyze.runSubmitted": "Submitted {submitted} member Runs{failedNote}.",
+  "analyze.submitFailed": "Submission failed: {detail}",
+  "analyze.k.modeUnsupported": "Engine worker v1 supports Resolution Test only; Algorithm Test unlocks in a later engine version.",
+  "verify.modeUnsupported": "Engine worker v1 supports Resolution Test only; Full Video Check unlocks in a later engine version.",
+  "analyze.noRealRunsTitle": "No real results yet",
+  "analyze.noRealRunsBody": "Run a Resolution Test and real engine curves appear here; no fabricated curves.",
+  "analyze.k.modeUnsupportedTitle": "Algorithm Test awaits engine support"
 }

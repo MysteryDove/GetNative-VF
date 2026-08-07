@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   createTranslator,
@@ -14,9 +14,13 @@ import type { EngineEnvelope, EngineState } from "./engine/types";
 import { engineWorker } from "./engine/workerClient";
 import {
   emptyExecutionState,
+  queueJob,
   reduceWorkerEvent,
+  requestCancel,
   type ExecutionState,
+  type QueueJobInput,
 } from "./engine/runReducer";
+import { applyTerminalEventToRun, type ExecutionBridge } from "./engine/executeRunGroup";
 import { applyOpenResult, createTauriProjectStorage } from "./project/storage";
 import { restoredProjectRoute } from "./project/normalize";
 import type {
@@ -55,6 +59,8 @@ function App() {
   const [engineError, setEngineError] = useState("");
   const [capabilities, setCapabilities] = useState<EngineEnvelope | null>(null);
   const [execution, setExecution] = useState<ExecutionState>(() => emptyExecutionState());
+  /** Live job runId → persistent Project Run id, bound at queue time. */
+  const projectRunBindings = useRef(new Map<string, string>());
 
   const t = useMemo(() => createTranslator(locale), [locale]);
 
@@ -87,9 +93,33 @@ function App() {
   // Worker session lifecycle: stream engine events into the Job Tray state,
   // and prefer the resident worker's capability envelope (analyze=true per the
   // backend contract) over the one-shot CLI, which stays analyze=false.
+  // Terminal events are also bridged onto the persistent Project Run records
+  // (append-only); progress never touches ProjectState, so autosave stays calm.
   useEffect(() => {
     const unsubscribe = engineWorker.subscribe((event) => {
       setExecution((state) => reduceWorkerEvent(state, event));
+      if (event.type === "result" || event.type === "cancelled" || event.type === "error") {
+        const projectRunId = projectRunBindings.current.get(event.runId);
+        if (projectRunId) {
+          const nowIso = new Date().toISOString();
+          handleProjectChange((current) =>
+            applyTerminalEventToRun(
+              current,
+              projectRunId,
+              {
+                type: event.type,
+                ...(event.type === "result" ? { payload: event.payload } : {}),
+                ...(event.type === "cancelled" ? { partial: event.partial } : {}),
+                ...(event.type === "error"
+                  ? { code: event.code, message: event.message }
+                  : {}),
+              },
+              nowIso,
+            ),
+          );
+          projectRunBindings.current.delete(event.runId);
+        }
+      }
     });
     const unsubscribeExit = engineWorker.onExit(() => {
       // The resident worker died: fall back to the one-shot envelope so
@@ -370,6 +400,23 @@ function App() {
     });
   }
 
+  const queueExecutionJob = useCallback((input: QueueJobInput) => {
+    if (input.projectRunId) {
+      projectRunBindings.current.set(input.runId, input.projectRunId);
+    }
+    setExecution((state) => queueJob(state, input));
+  }, []);
+
+  const cancelExecutionJob = useCallback((jobId: string) => {
+    void engineWorker.cancel(jobId).catch(() => undefined);
+    setExecution((state) => requestCancel(state, { jobId, nowMs: Date.now() }));
+  }, []);
+
+  const executionBridge: ExecutionBridge = useMemo(
+    () => ({ queue: queueExecutionJob, cancel: cancelExecutionJob }),
+    [queueExecutionJob, cancelExecutionJob],
+  );
+
   if (!prefsReady) {
     return <div className="boot-screen" />;
   }
@@ -425,6 +472,7 @@ function App() {
       }}
       busy={busy}
       execution={execution}
+      executionBridge={executionBridge}
     />
   );
 }

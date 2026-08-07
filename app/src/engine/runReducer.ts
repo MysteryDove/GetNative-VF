@@ -19,6 +19,8 @@ export type JobRecord = {
   requestId: RequestId;
   runId: RunId;
   runGroupId?: string | null;
+  /** Persistent Project Run id this job reports into, when bound. */
+  projectRunId?: string | null;
   mode: ComputationMode;
   phase: JobPhase;
   label: string;
@@ -68,6 +70,7 @@ export type QueueJobInput = {
   requestId: RequestId;
   runId: RunId;
   runGroupId?: string | null;
+  projectRunId?: string | null;
   mode: ComputationMode;
   label: string;
   total: number;
@@ -81,6 +84,7 @@ export function queueJob(state: ExecutionState, input: QueueJobInput): Execution
     requestId: input.requestId,
     runId: input.runId,
     runGroupId: input.runGroupId ?? null,
+    projectRunId: input.projectRunId ?? null,
     mode: input.mode,
     phase: "queued",
     label: input.label,

@@ -63,7 +63,9 @@ export function defaultHeightDraft(capabilities: EngineEnvelope | null): HeightD
       cropTop: 0,
       cropBottom: 0,
       pixelExclusionThreshold: 0,
-      pNorm: 2,
+      // getnative's default metric is the mean absolute retained error (p = 1),
+      // which is also what the worker protocol v1 CPU backend supports.
+      pNorm: 1,
     },
     baseHeight: "",
     baseWidth: "",

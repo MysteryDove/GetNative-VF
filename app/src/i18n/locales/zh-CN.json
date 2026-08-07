@@ -201,8 +201,6 @@
   "analyze.blockedTitle": "分析命令不可用",
   "analyze.blockedBody": "引擎当前未提供 analyze 命令。已有真实结果会保留显示；不会提供可运行的假分析控件。",
   "analyze.geometryHint": "可在诊断中使用现有几何预览。",
-  "analyze.waitingWorkerTitle": "等待分析 worker",
-  "analyze.waitingWorkerBody": "引擎已声明 analyze 命令，但应用侧持久 worker 与流式事件尚未接入。不会显示伪造曲线。",
   "analyze.samplesTitle": "样本",
   "analyze.noSamples": "请先在样本页纳入至少一个有效样本。",
   "analyze.paramsTitle": "参数",
@@ -267,7 +265,6 @@
   "analyze.runBlocked.noCommand": "引擎未提供 analyze 命令，运行控件保持禁用。",
   "analyze.runBlocked.noSamples": "需要至少一个纳入的样本。",
   "analyze.runBlocked.invalidGrid": "候选网格无效，无法运行。",
-  "analyze.runBlocked.noWorker": "分析 worker 尚未接入；不会启动伪造任务。",
   "analyze.seriesVisible": "显示曲线",
   "analyze.runGroupPlan": "RunGroup 计划",
   "analyze.runGroupType": "类型 {type}",
@@ -445,5 +442,15 @@
   "results.col.run": "Run",
   "results.col.points": "点数",
   "results.col.best": "最优点",
-  "results.col.bestMetric": "最优误差"
+  "results.col.bestMetric": "最优误差",
+  "jobs.cancel": "取消",
+  "jobs.cancelling": "取消中…",
+  "analyze.runReady": "就绪：将创建 {count} 个成员 Run。",
+  "analyze.runSubmitted": "已提交 {submitted} 个成员 Run{failedNote}。",
+  "analyze.submitFailed": "提交失败：{detail}",
+  "analyze.k.modeUnsupported": "引擎 worker v1 暂仅支持分辨率测试；算法测试将在后续引擎版本解锁。",
+  "verify.modeUnsupported": "引擎 worker v1 暂仅支持分辨率测试；全视频检查将在后续引擎版本解锁。",
+  "analyze.noRealRunsTitle": "还没有真实结果",
+  "analyze.noRealRunsBody": "运行分辨率测试后，真实引擎曲线会显示在这里；不会显示伪造曲线。",
+  "analyze.k.modeUnsupportedTitle": "算法测试待引擎支持"
 }

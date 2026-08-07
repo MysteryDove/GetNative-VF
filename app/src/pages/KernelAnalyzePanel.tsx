@@ -231,7 +231,7 @@ export function KernelAnalyzePanel({
             ? t("analyze.k.geometryUnresolved")
             : !plan
               ? t("analyze.k.planInvalid")
-              : t("analyze.runBlocked.noWorker");
+              : t("analyze.k.modeUnsupported");
 
   return (
     <div className="analyze-layout">
@@ -394,11 +394,11 @@ export function KernelAnalyzePanel({
           ) : (
             <BlockedState
               title={
-                analyzeAvailable ? t("analyze.waitingWorkerTitle") : t("analyze.blockedTitle")
+                analyzeAvailable ? t("analyze.k.modeUnsupportedTitle") : t("analyze.blockedTitle")
               }
               body={
                 analyzeAvailable
-                  ? t("analyze.waitingWorkerBody")
+                  ? t("analyze.k.modeUnsupported")
                   : t("analyze.blockedBody")
               }
               action={

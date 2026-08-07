@@ -371,7 +371,7 @@ describe("GUI-3 analysis foundation", () => {
     );
     assert(
       metricCompatibilityKey(draft.metric) !==
-        metricCompatibilityKey({ ...draft.metric, pNorm: 1 }),
+        metricCompatibilityKey({ ...draft.metric, pNorm: 2 }),
       "metric key changes with p-norm",
     );
   });

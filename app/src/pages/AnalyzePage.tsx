@@ -5,6 +5,7 @@ import type { EngineEnvelope } from "../engine/types";
 import { kernelDisplayName, profileDisplayName } from "../engine/displayNames";
 import { resolveGeometrySnapshot } from "../engine/geometryResolve";
 import { applyPayloadToRecipeDraft } from "../project/recipeApply";
+import { startHeightRunGroup, type ExecutionBridge } from "../engine/executeRunGroup";
 import { KernelAnalyzePanel } from "./KernelAnalyzePanel";
 import {
   applyPreset,
@@ -33,6 +34,7 @@ export function AnalyzePage({
   onOpenDiagnostics,
   onOpenSamples,
   onProjectChange,
+  executionBridge,
 }: {
   t: Translator;
   state: ProjectState;
@@ -41,6 +43,7 @@ export function AnalyzePage({
   onOpenDiagnostics: () => void;
   onOpenSamples: () => void;
   onProjectChange: (updater: (state: ProjectState) => ProjectState) => void;
+  executionBridge: ExecutionBridge;
 }) {
   const [draft, setDraft] = useState<HeightDraft>(() => defaultHeightDraft(capabilities));
   const [draftSeeded, setDraftSeeded] = useState(Boolean(capabilities));
@@ -49,6 +52,7 @@ export function AnalyzePage({
   const [logDisplay, setLogDisplay] = useState(false);
   const [applyBusy, setApplyBusy] = useState(false);
   const [applyNotice, setApplyNotice] = useState("");
+  const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     if (draftSeeded || !capabilities) return;
@@ -109,10 +113,38 @@ export function AnalyzePage({
       ? t("analyze.runBlocked.noSamples")
       : !work.ok || !plan
         ? t("analyze.runBlocked.invalidGrid")
-        : t("analyze.runBlocked.noWorker");
+        : null;
 
   const canEdit = true;
-  const canRun = false;
+  const canRun = analyzeAvailable && plan !== null && !submitting;
+
+  async function startRun() {
+    if (!plan || submitting) return;
+    setSubmitting(true);
+    setApplyNotice("");
+    try {
+      const result = await startHeightRunGroup({
+        plan,
+        state,
+        onProjectChange,
+        bridge: executionBridge,
+      });
+      if (!result.ok) {
+        setApplyNotice(t("analyze.submitFailed", { detail: result.reason }));
+        return;
+      }
+      setApplyNotice(
+        t("analyze.runSubmitted", {
+          submitted: String(result.submitted),
+          failedNote: result.failed > 0 ? `, ${result.failed} failed` : "",
+        }),
+      );
+    } catch (error) {
+      setApplyNotice(t("analyze.submitFailed", { detail: String(error) }));
+    } finally {
+      setSubmitting(false);
+    }
+  }
 
   function patch(partial: Partial<HeightDraft>) {
     setDraft((current) => ({ ...current, ...partial }));
@@ -325,11 +357,11 @@ export function AnalyzePage({
               ) : (
                 <BlockedState
                   title={
-                    analyzeAvailable ? t("analyze.waitingWorkerTitle") : t("analyze.blockedTitle")
+                    analyzeAvailable ? t("analyze.noRealRunsTitle") : t("analyze.blockedTitle")
                   }
                   body={
                     analyzeAvailable
-                      ? t("analyze.waitingWorkerBody")
+                      ? t("analyze.noRealRunsBody")
                       : `${t("analyze.blockedBody")} ${t("analyze.geometryHint")}`
                   }
                   action={
@@ -694,11 +726,16 @@ export function AnalyzePage({
             </fieldset>
 
             <div className="analyze-run-block">
-              <button className="primary-button" type="button" disabled={!canRun}>
+              <button
+                className="primary-button"
+                type="button"
+                disabled={!canRun}
+                onClick={startRun}
+              >
                 <Play size={15} />
-                {t("analyze.runHeight")}
+                {submitting ? t("diagnostics.working") : t("analyze.runHeight")}
               </button>
-              <p className="help-copy">{runBlockedReason}</p>
+              {runBlockedReason ? <p className="help-copy">{runBlockedReason}</p> : null}
             </div>
           </aside>
         </div>
