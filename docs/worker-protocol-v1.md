@@ -47,8 +47,12 @@ Inside a worker session, `commands.analyze` and the CPU backend's
 
 ### 2.3 `analyze`
 
-Submits one analysis job. v1 implements `mode: "height"` on the CPU
-backend; other modes/backends fail with `unsupported`.
+Submits one analysis job. v1 implements `mode: "height"` on the CPU and
+CUDA backends (`backend: "cpu" | "cuda" | "auto"`; `auto` selects CPU,
+the deterministic oracle). Other modes/backends fail with `unsupported`.
+Inside a worker session, the capability envelope reports
+`analysis_command_available=true` for CPU always and for CUDA when a
+compatible device is usable.
 
 ```json
 {
@@ -172,6 +176,16 @@ The worker owns one `AxisPlanCache` (default limits: 1024 entries /
 keys (same sample at new heights, RunGroup members, verification frames)
 hit warm plans without rebuilding. Cache residency is reported in
 `telemetry`. There is no cross-process persistence in v1.
+
+Frame assets are held in an 8-entry session frame cache (LRU); buffers
+are never resized after load, so backend-visible frame pointers are
+stable across jobs. The CUDA backend additionally keeps the uploaded
+device frame resident per execution slot (`SourceIdentity`: pointer +
+geometry + content probe) and skips re-upload/re-transpose on hits; CUDA
+telemetry fields (`cuda_source_upload_bytes`, `cuda_plan_upload_bytes`,
+`cuda_source_cache_hits`, `cuda_kernel_ms`, `cuda_gpu_total_ms`,
+`cuda_device`, …) are merged into the job result telemetry when
+`backend: "cuda"` is used.
 
 ## 6. Relationship to the one-shot CLI
 

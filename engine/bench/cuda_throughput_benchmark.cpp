@@ -388,6 +388,8 @@ int main(int argc, char **argv) {
                   << telemetry.buffer_allocation_count
                   << ",\"plan_cache_hits\":" << telemetry.plan_cache_hits
                   << ",\"plan_cache_misses\":" << telemetry.plan_cache_misses
+                  << ",\"source_cache_hits\":" << telemetry.source_cache_hits
+                  << ",\"source_cache_misses\":" << telemetry.source_cache_misses
                   << ",\"execution_slot_wait_ms\":"
                   << telemetry.execution_slot_wait_ms
                   << ",\"host_pack_ms\":" << telemetry.host_pack_ms

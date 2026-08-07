@@ -7,6 +7,9 @@
 #include "getnative/cpu_analysis.hpp"
 #include "getnative/cpu_features.hpp"
 #include "getnative/crop_geometry.hpp"
+#if defined(GETNATIVE_HAS_CUDA)
+#include "getnative/cuda_analysis.hpp"
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -15,13 +18,17 @@
 #include <cstdint>
 #include <deque>
 #include <fstream>
+#include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -101,6 +108,7 @@ std::int32_t optional_int(const JsonValue &object, std::string_view key, std::in
 // ---------------------------------------------------------------------------
 
 enum class AxisMode : std::uint8_t { height_only, width_only, height_plus_width };
+enum class BackendChoice : std::uint8_t { cpu, cuda };
 
 struct FrameAsset {
     std::string path;
@@ -113,6 +121,7 @@ struct AnalyzeJobSpec {
     std::string job_id;
     FrameAsset frame;
     AxisMode axis_mode = AxisMode::height_only;
+    BackendChoice backend = BackendChoice::cpu;
     Filter filter{};
     std::vector<std::string> candidates;
     MetricSpec metric{};
@@ -205,8 +214,13 @@ AnalyzeJobSpec parse_analyze(const JsonValue &command, std::string job_id) {
         throw WorkerError("unsupported", "only mode=height is available in protocol v1");
     }
     const std::string backend = require_string(command, "backend");
-    if (backend != "cpu" && backend != "auto") {
-        throw WorkerError("unsupported", "backend must be cpu or auto in protocol v1");
+    if (backend == "cpu" || backend == "auto") {
+        // auto keeps the current contract: CPU is the deterministic oracle.
+        spec.backend = BackendChoice::cpu;
+    } else if (backend == "cuda") {
+        spec.backend = BackendChoice::cuda;
+    } else {
+        throw WorkerError("unsupported", "unknown backend: " + backend);
     }
     spec.frame = parse_frame_asset(require_member(command, "frame_asset"));
     spec.axis_mode = parse_axis_mode(require_string(command, "axis_mode"));
@@ -287,7 +301,55 @@ struct Job {
 
     AnalyzeJobSpec spec;
     std::atomic<bool> cancel_requested{false};
+    std::stop_source stop_source;
     bool started = false;
+};
+
+// Session frame cache. Frame vectors are never resized after load, so the
+// ConstImageView pointer handed to backends is stable across jobs — the
+// CUDA backend's source-residency cache keys on that pointer.
+class FrameCache {
+public:
+    struct Entry {
+        std::vector<float> pixels;
+        std::int32_t width = 0;
+        std::int32_t height = 0;
+    };
+
+    const Entry &get(const FrameAsset &asset) {
+        const std::string key = frame_key(asset);
+        if (auto found = entries_.find(key); found != entries_.end()) {
+            touch(key);
+            return found->second;
+        }
+        Entry entry;
+        entry.pixels = load_frame_asset(asset);
+        entry.width = asset.width;
+        entry.height = asset.height;
+        entries_.emplace(key, std::move(entry));
+        lru_.push_front(key);
+        while (lru_.size() > kMaximumEntries) {
+            entries_.erase(lru_.back());
+            lru_.pop_back();
+        }
+        return entries_.at(key);
+    }
+
+private:
+    static constexpr std::size_t kMaximumEntries = 8U;
+
+    static std::string frame_key(const FrameAsset &asset) {
+        return asset.path + "#" + std::to_string(asset.width) + "x"
+            + std::to_string(asset.height);
+    }
+
+    void touch(const std::string &key) {
+        lru_.remove(key);
+        lru_.push_front(key);
+    }
+
+    std::unordered_map<std::string, Entry> entries_;
+    std::list<std::string> lru_;
 };
 
 class WorkerSession {
@@ -385,6 +447,7 @@ public:
             const std::scoped_lock lock(mutex_);
             if (running_ && running_->spec.job_id == job_id) {
                 running_->cancel_requested.store(true);
+                running_->stop_source.request_stop();
                 found = true;
             } else {
                 for (auto iterator = queue_.begin(); iterator != queue_.end(); ++iterator) {
@@ -459,6 +522,10 @@ private:
     std::ostream &output_;
     std::ostream &log_;
     AxisPlanCache plan_cache_;
+    FrameCache frame_cache_;
+#if defined(GETNATIVE_HAS_CUDA)
+    std::optional<CudaAnalysisEngine> cuda_engine_;
+#endif
     std::mutex mutex_;
     std::condition_variable condition_;
     std::deque<std::shared_ptr<Job>> queue_;
@@ -573,9 +640,10 @@ private:
         const AnalyzeJobSpec &spec = job.spec;
         const auto job_start = std::chrono::steady_clock::now();
 
-        std::vector<float> frame = load_frame_asset(spec.frame);
+        const FrameCache::Entry &frame_entry = frame_cache_.get(spec.frame);
         ConstImageView source{
-            frame.data(), spec.frame.width, spec.frame.height, spec.frame.width};
+            frame_entry.pixels.data(), frame_entry.width, frame_entry.height,
+            frame_entry.width};
 
         const std::int32_t primary_size =
             spec.axis_mode == AxisMode::width_only ? source.width : source.height;
@@ -639,6 +707,30 @@ private:
         const auto candidates_start = std::chrono::steady_clock::now();
         std::vector<CandidateResult> results;
         results.reserve(spec.candidates.size());
+
+#if defined(GETNATIVE_HAS_CUDA)
+        CudaRuntimeTelemetry cuda_start_telemetry;
+        if (spec.backend == BackendChoice::cuda) {
+            if (!cuda_engine_) {
+                try {
+                    log_ << "worker: initializing CUDA analysis engine...\n";
+                    cuda_engine_.emplace();
+                } catch (const std::exception &error) {
+                    throw WorkerError(
+                        "unsupported",
+                        std::string{"CUDA backend is not available: "} + error.what());
+                }
+                log_ << "worker: CUDA analysis engine initialized on "
+                     << cuda_engine_->device_info().name << '\n';
+            }
+            cuda_engine_->reset_analysis_telemetry();
+        }
+#else
+        if (spec.backend == BackendChoice::cuda) {
+            throw WorkerError("unsupported", "CUDA backend was not compiled");
+        }
+#endif
+
         for (std::size_t begin = 0; begin < spec.candidates.size();
              begin += kCandidateChunkSize) {
             const std::size_t end =
@@ -663,8 +755,16 @@ private:
             }
             std::vector<CandidateResult> chunk_results;
             try {
-                chunk_results = analyze_batch_f32(
-                    source, chunk, spec.metric, spec.worker_count);
+                if (spec.backend == BackendChoice::cpu) {
+                    chunk_results = analyze_batch_f32(
+                        source, chunk, spec.metric, spec.worker_count);
+                }
+#if defined(GETNATIVE_HAS_CUDA)
+                else {
+                    chunk_results = cuda_engine_->analyze_axis_batch_f32(
+                        source, chunk, spec.metric, job.stop_source.get_token());
+                }
+#endif
             } catch (...) {
                 check_cancelled(job);
                 throw;
@@ -679,6 +779,46 @@ private:
             emit_progress(spec, "candidates", results.size(), spec.candidates.size());
         }
         const double candidates_ms = elapsed_ms(candidates_start);
+
+        const char *backend_name = spec.backend == BackendChoice::cuda ? "cuda" : "cpu";
+        std::vector<std::pair<std::string, JsonValue>> telemetry_members = {
+            {"plan_build_count", JsonValue::integer(static_cast<std::int64_t>(builds))},
+            {"plan_cache_hits", JsonValue::integer(static_cast<std::int64_t>(cache_hits))},
+            {"plan_resident_entries", JsonValue::integer(
+                static_cast<std::int64_t>(plan_cache_.size()))},
+            {"plan_ms", JsonValue::number(plan_ms)},
+            {"candidates_ms", JsonValue::number(candidates_ms)},
+            {"total_ms", JsonValue::number(elapsed_ms(job_start))},
+            {"backend", JsonValue::string(backend_name)},
+            {"isa", JsonValue::string(std::string{
+                cpu_isa_name(cpu_dispatch_info().selected)})},
+        };
+#if defined(GETNATIVE_HAS_CUDA)
+        if (spec.backend == BackendChoice::cuda) {
+            const CudaRuntimeTelemetry cuda = cuda_engine_->runtime_telemetry();
+            telemetry_members.emplace_back(
+                "cuda_source_upload_bytes",
+                JsonValue::integer(static_cast<std::int64_t>(cuda.source_upload_bytes)));
+            telemetry_members.emplace_back(
+                "cuda_plan_upload_bytes",
+                JsonValue::integer(static_cast<std::int64_t>(cuda.plan_upload_bytes)));
+            telemetry_members.emplace_back(
+                "cuda_source_cache_hits",
+                JsonValue::integer(static_cast<std::int64_t>(cuda.source_cache_hits)));
+            telemetry_members.emplace_back(
+                "cuda_source_cache_misses",
+                JsonValue::integer(static_cast<std::int64_t>(cuda.source_cache_misses)));
+            telemetry_members.emplace_back(
+                "cuda_plan_cache_hits",
+                JsonValue::integer(static_cast<std::int64_t>(cuda.plan_cache_hits)));
+            telemetry_members.emplace_back(
+                "cuda_kernel_ms", JsonValue::number(cuda.kernel_ms));
+            telemetry_members.emplace_back(
+                "cuda_gpu_total_ms", JsonValue::number(cuda.gpu_total_ms));
+            telemetry_members.emplace_back(
+                "cuda_device", JsonValue::string(cuda_engine_->device_info().name));
+        }
+#endif
 
         std::vector<JsonValue> candidate_values;
         candidate_values.reserve(results.size());
@@ -698,18 +838,7 @@ private:
             {"payload", JsonValue::object({
                 {"mode", JsonValue::string("height")},
                 {"candidates", JsonValue::array(std::move(candidate_values))},
-                {"telemetry", JsonValue::object({
-                    {"plan_build_count", JsonValue::integer(static_cast<std::int64_t>(builds))},
-                    {"plan_cache_hits", JsonValue::integer(static_cast<std::int64_t>(cache_hits))},
-                    {"plan_resident_entries", JsonValue::integer(
-                        static_cast<std::int64_t>(plan_cache_.size()))},
-                    {"plan_ms", JsonValue::number(plan_ms)},
-                    {"candidates_ms", JsonValue::number(candidates_ms)},
-                    {"total_ms", JsonValue::number(elapsed_ms(job_start))},
-                    {"backend", JsonValue::string("cpu")},
-                    {"isa", JsonValue::string(std::string{
-                        cpu_isa_name(cpu_dispatch_info().selected)})},
-                })},
+                {"telemetry", JsonValue::object(std::move(telemetry_members))},
             })},
         }));
     }

@@ -130,8 +130,9 @@ void write_capabilities(std::ostream &output, bool analysis_available) {
         const auto &device = cuda.device_info();
         const std::int32_t minimum_cuda = getnative::cuda_minimum_compute_capability();
         output << ",{\"id\":\"cuda\",\"compiled\":true,\"device_available\":true,"
-                  "\"analysis_command_available\":false,"
-                  "\"axes\":[\"horizontal\",\"vertical\",\"both\"],"
+                  "\"analysis_command_available\":"
+               << available
+               << ",\"axes\":[\"horizontal\",\"vertical\",\"both\"],"
                   "\"p_norms\":{\"minimum\":1,\"maximum\":1},"
                   "\"max_half_bandwidth\":15,\"max_forward_width\":16,\"device\":"
                << json_string(device.name)

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -773,6 +774,52 @@ struct BatchIdentity {
     }
 };
 
+// Identity of a resident device source frame. The pointer and geometry are
+// checked along with a 16-sample content probe so a recycled host address
+// with different content cannot produce a stale hit. Callers that pin a
+// frame for the session (the worker's frame cache) get cross-call uploads
+// and transposes for free.
+struct SourceIdentity {
+    const float *data = nullptr;
+    std::int32_t width = 0;
+    std::int32_t height = 0;
+    std::ptrdiff_t stride = 0;
+    std::uint64_t probe = 0;
+
+    [[nodiscard]] bool matches(ConstImageView source, std::uint64_t value) const noexcept {
+        return data == source.data && width == source.width
+            && height == source.height && stride == source.stride
+            && probe == value;
+    }
+
+    void assign(ConstImageView source, std::uint64_t value) noexcept {
+        data = source.data;
+        width = source.width;
+        height = source.height;
+        stride = source.stride;
+        probe = value;
+    }
+};
+
+[[nodiscard]] std::uint64_t source_probe(ConstImageView source) noexcept {
+    std::uint64_t hash = 1469598103934665603ULL;
+    constexpr std::size_t sample_count = 16U;
+    for (std::size_t index = 0U; index < sample_count; ++index) {
+        const std::int32_t row = static_cast<std::int32_t>(
+            (index * static_cast<std::size_t>(source.height)) / sample_count);
+        const std::int32_t column = static_cast<std::int32_t>(
+            (index * static_cast<std::size_t>(source.width)) / sample_count);
+        const float value =
+            source.data[static_cast<std::ptrdiff_t>(row) * source.stride + column];
+        const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
+        for (unsigned shift = 0U; shift < 32U; shift += 8U) {
+            hash ^= static_cast<std::uint8_t>(bits >> shift);
+            hash *= 1099511628211ULL;
+        }
+    }
+    return hash;
+}
+
 struct ExecutionSlot {
     explicit ExecutionSlot(const DriverApi &api) : api(&api) {
         cuda_detail::cuda_check(
@@ -813,6 +860,7 @@ struct ExecutionSlot {
         device_partials.reset();
         device_results.reset();
         plan_ready = false;
+        source_ready = false;
     }
 
     const DriverApi *api = nullptr;
@@ -838,6 +886,8 @@ struct ExecutionSlot {
     BatchIdentity identity;
     std::unique_ptr<PackedBatch> packed;
     bool plan_ready = false;
+    SourceIdentity source_identity;
+    bool source_ready = false;
 };
 
 [[nodiscard]] double elapsed_ms(
@@ -865,6 +915,8 @@ void merge_telemetry(CudaRuntimeTelemetry &destination,
     destination.buffer_allocation_count += source.buffer_allocation_count;
     destination.plan_cache_hits += source.plan_cache_hits;
     destination.plan_cache_misses += source.plan_cache_misses;
+    destination.source_cache_hits += source.source_cache_hits;
+    destination.source_cache_misses += source.source_cache_misses;
     destination.source_upload_bytes += source.source_upload_bytes;
     destination.plan_upload_bytes += source.plan_upload_bytes;
     destination.result_readback_bytes += source.result_readback_bytes;
@@ -1443,31 +1495,46 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
         packed.inverse_diagonal, allocation_count);
     delta.buffer_allocation_count = allocation_count;
 
-    const auto staging_start = std::chrono::steady_clock::now();
-    auto *staged_source = static_cast<float *>(slot.pinned_source.data());
-    if (source.stride == source.width) {
-        std::memcpy(staged_source, source.data, source_bytes);
+    const std::uint64_t probe = source_probe(source);
+    const bool source_cache_hit =
+        slot.source_ready && slot.source_identity.matches(source, probe);
+    if (source_cache_hit) {
+        delta.source_cache_hits = 1U;
     } else {
-        const std::size_t row_bytes = checked_product(
-            static_cast<std::size_t>(source.width), sizeof(float),
-            "CUDA source row");
-        for (std::int32_t row = 0; row < source.height; ++row) {
-            std::memcpy(
-                staged_source + static_cast<std::ptrdiff_t>(row) * source.width,
-                source.data + static_cast<std::ptrdiff_t>(row) * source.stride,
-                row_bytes);
+        delta.source_cache_misses = 1U;
+    }
+
+    const auto staging_start = std::chrono::steady_clock::now();
+    if (!source_cache_hit) {
+        auto *staged_source = static_cast<float *>(slot.pinned_source.data());
+        if (source.stride == source.width) {
+            std::memcpy(staged_source, source.data, source_bytes);
+        } else {
+            const std::size_t row_bytes = checked_product(
+                static_cast<std::size_t>(source.width), sizeof(float),
+                "CUDA source row");
+            for (std::int32_t row = 0; row < source.height; ++row) {
+                std::memcpy(
+                    staged_source + static_cast<std::ptrdiff_t>(row) * source.width,
+                    source.data + static_cast<std::ptrdiff_t>(row) * source.stride,
+                    row_bytes);
+            }
         }
     }
     delta.source_staging_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - staging_start).count();
 
     slot.events[0].record(slot.stream);
-    cuda_detail::cuda_check(
-        *impl_->api,
-        impl_->api->memcpy_htod_async(
-            slot.device_source.pointer(), slot.pinned_source.data(),
-            source_bytes, slot.stream),
-        "cuMemcpyHtoDAsync_v2(source)");
+    if (!source_cache_hit) {
+        cuda_detail::cuda_check(
+            *impl_->api,
+            impl_->api->memcpy_htod_async(
+                slot.device_source.pointer(), slot.pinned_source.data(),
+                source_bytes, slot.stream),
+            "cuMemcpyHtoDAsync_v2(source)");
+        slot.source_identity.assign(source, probe);
+        slot.source_ready = true;
+    }
     slot.events[1].record(slot.stream);
     if (!plan_cache_hit) {
         auto *plan_staging = static_cast<std::byte *>(slot.pinned_plan.data());
@@ -1510,7 +1577,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
         checked_add(source_bytes, device_result_bytes, "CUDA pinned staging"),
         packed.upload_bytes, "CUDA pinned staging");
     delta.peak_workspace_elements = packed.workspace_elements;
-    delta.source_upload_bytes = source_bytes;
+    delta.source_upload_bytes = source_cache_hit ? 0U : source_bytes;
     delta.result_readback_bytes = total_result_bytes;
 
     CUdeviceptr source_pointer = slot.device_source.pointer();
@@ -1559,7 +1626,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
         ++delta.kernel_launch_count;
     };
 
-    if (packed.has_horizontal) {
+    if (packed.has_horizontal && !source_cache_hit) {
         void *parameters[] = {
             &source_pointer, &width, &height, &transposed_source_pointer,
         };

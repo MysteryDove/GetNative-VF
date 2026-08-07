@@ -19,9 +19,9 @@ FAILURES = []
 
 def check(name, condition, detail=""):
     if condition:
-        print(f"PASS {name}")
+        print(f"PASS {name}", flush=True)
     else:
-        print(f"FAIL {name} {detail}")
+        print(f"FAIL {name} {detail}", flush=True)
         FAILURES.append(name)
 
 
@@ -35,33 +35,37 @@ def write_frame(path, width, height):
 
 class Worker:
     def __init__(self):
+        # stdout stays binary: events are framed with an internal byte buffer
+        # (select + buffered readline loses events that arrive in one chunk).
         self.process = subprocess.Popen(
             [ENGINE, "worker"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
+            stderr=subprocess.DEVNULL,
         )
+        self._stdout_buffer = b""
 
     def send(self, **command):
-        self.process.stdin.write(json.dumps(command) + "\n")
+        self.process.stdin.write(json.dumps(command).encode() + b"\n")
         self.process.stdin.flush()
 
     def send_raw(self, line):
-        self.process.stdin.write(line + "\n")
+        self.process.stdin.write(line.encode() + b"\n")
         self.process.stdin.flush()
 
     def read_event(self, timeout=30.0):
         import selectors
 
-        selector = selectors.DefaultSelector()
-        selector.register(self.process.stdout, selectors.EVENT_READ)
-        if not selector.select(timeout):
-            raise TimeoutError("worker did not emit an event in time")
-        line = self.process.stdout.readline()
-        if not line:
-            raise EOFError("worker stdout closed unexpectedly")
+        while b"\n" not in self._stdout_buffer:
+            selector = selectors.DefaultSelector()
+            selector.register(self.process.stdout, selectors.EVENT_READ)
+            if not selector.select(timeout):
+                raise TimeoutError("worker did not emit an event in time")
+            chunk = os.read(self.process.stdout.fileno(), 65536)
+            if not chunk:
+                raise EOFError("worker stdout closed unexpectedly")
+            self._stdout_buffer += chunk
+        line, self._stdout_buffer = self._stdout_buffer.split(b"\n", 1)
         return json.loads(line)
 
     def wait_exit(self, timeout=10.0):
@@ -240,6 +244,60 @@ def main():
         worker.read_event()
         worker.process.stdin.close()
         check("eof-exit", worker.wait_exit() == 0)
+
+        # --- Session 3: CUDA backend parity and source residency ------------
+        worker = Worker()
+        worker.send(**{"protocol_version": 1, "type": "hello", "request_id": "c1"})
+        worker.read_event()
+        worker.send(**{"protocol_version": 1, "type": "capabilities", "request_id": "c2"})
+        event = worker.read_event()
+        cuda_backend = next(
+            (b for b in event["payload"]["backends"] if b.get("id") == "cuda"), {})
+        cuda_usable = (cuda_backend.get("compiled") and cuda_backend.get("device_available"))
+
+        if not cuda_usable:
+            print("SKIP cuda-parity (CUDA backend not available)")
+            print("SKIP cuda-source-residency (CUDA backend not available)")
+        else:
+            candidates = ["200", "201", "202"]
+
+            def run_job(request_id, backend):
+                worker.send(**analyze_command(request_id, frame, candidates,
+                                              backend=backend))
+                while True:
+                    event = worker.read_event()
+                    if event["type"] in ("result", "error", "cancelled"):
+                        return event
+
+            cpu_result = run_job("c3", "cpu")
+            cuda_result = run_job("c4", "cuda")
+            if cpu_result["type"] != "result" or cuda_result["type"] != "result":
+                check("cuda-parity", False,
+                      f"cpu={cpu_result['type']} cuda={cuda_result['type']}: "
+                      + json.dumps(cuda_result)[:400])
+            else:
+                cpu_errors = [c["error"] for c in cpu_result["payload"]["candidates"]]
+                cuda_errors = [c["error"] for c in cuda_result["payload"]["candidates"]]
+                close = all(
+                    abs(c - g) <= max(1e-6, abs(c) * 1e-6)
+                    for c, g in zip(cpu_errors, cuda_errors))
+                check("cuda-parity", close,
+                      f"cpu={cpu_errors} cuda={cuda_errors}")
+
+            first_telemetry = cuda_result["payload"]["telemetry"]
+            second = run_job("c5", "cuda")
+            second_telemetry = second["payload"]["telemetry"]
+            check("cuda-source-residency",
+                  first_telemetry.get("cuda_source_upload_bytes", 0) > 0
+                  and second_telemetry.get("cuda_source_upload_bytes", -1) == 0
+                  and second_telemetry.get("cuda_source_cache_hits", 0) >= 1,
+                  json.dumps({"first": first_telemetry.get("cuda_source_upload_bytes"),
+                              "second": second_telemetry.get("cuda_source_upload_bytes")}))
+
+        worker.send(**{"protocol_version": 1, "type": "shutdown", "request_id": "c9"})
+        while worker.read_event()["type"] != "shutdown":
+            pass
+        worker.wait_exit()
 
     if FAILURES:
         print(f"{len(FAILURES)} worker protocol test(s) failed")
