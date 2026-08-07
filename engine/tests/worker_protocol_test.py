@@ -34,14 +34,25 @@ def write_frame(path, width, height, seed=0):
 
 
 class Worker:
-    def __init__(self):
+    def __init__(self, store_dir=None):
         # stdout stays binary: events are framed with an internal byte buffer
         # (select + buffered readline loses events that arrive in one chunk).
+        # Each worker gets an isolated plan-store dir: the persistent cache
+        # would otherwise leak plans across sessions and break telemetry
+        # expectations (and the user's real cache must never be touched).
+        env = None
+        if store_dir is not None:
+            env = dict(os.environ)
+            env["GETNATIVE_PLAN_CACHE_DIR"] = store_dir
+        else:
+            env = dict(os.environ)
+            env["GETNATIVE_PLAN_CACHE"] = "off"
         self.process = subprocess.Popen(
             [ENGINE, "worker"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            env=env,
         )
         self._stdout_buffer = b""
 
@@ -535,6 +546,47 @@ def main():
         while worker.read_event()["type"] != "shutdown":
             pass
         check("verify-session-exit", worker.wait_exit() == 0)
+
+        # --- Session 5: cross-process plan store reuse (E4) -----------------
+        store_dir = os.path.join(scratch, "plan-store")
+        grid_candidates = [str(200 + i) for i in range(21)]
+
+        worker_a = Worker(store_dir=store_dir)
+        worker_a.send(**{"protocol_version": 1, "type": "hello", "request_id": "s5a"})
+        worker_a.read_event()
+        result_a = run_analyze(worker_a, analyze_command("s5b", frame, grid_candidates))
+        telemetry_a = result_a["payload"]["telemetry"]
+        check("store-cold-build", result_a["type"] == "result"
+              and telemetry_a["plan_build_count"] == 21
+              and telemetry_a["plan_store_hits"] == 0,
+              json.dumps(telemetry_a))
+        worker_a.send(**{"protocol_version": 1, "type": "shutdown", "request_id": "s5z"})
+        while worker_a.read_event()["type"] != "shutdown":
+            pass
+        worker_a.wait_exit()
+
+        import glob
+        packs = glob.glob(os.path.join(store_dir, "*.gnpk"))
+        check("store-pack-written", len(packs) == 1, json.dumps(packs))
+
+        worker_b = Worker(store_dir=store_dir)
+        worker_b.send(**{"protocol_version": 1, "type": "hello", "request_id": "s5c"})
+        worker_b.read_event()
+        result_b = run_analyze(worker_b, analyze_command("s5d", frame, grid_candidates))
+        telemetry_b = result_b["payload"]["telemetry"]
+        errors_a = [c["error"] for c in result_a["payload"]["candidates"]]
+        errors_b = [c["error"] for c in result_b["payload"]["candidates"]]
+        check("store-cross-process-hit", result_b["type"] == "result"
+              and telemetry_b["plan_build_count"] == 0
+              and telemetry_b["plan_store_hits"] == 21
+              and telemetry_b["plan_cache_hits"] == 21,
+              json.dumps(telemetry_b))
+        check("store-cross-process-parity", errors_a == errors_b,
+              json.dumps({"a": errors_a[:3], "b": errors_b[:3]}))
+        worker_b.send(**{"protocol_version": 1, "type": "shutdown", "request_id": "s5y"})
+        while worker_b.read_event()["type"] != "shutdown":
+            pass
+        worker_b.wait_exit()
 
     if FAILURES:
         print(f"{len(FAILURES)} worker protocol test(s) failed")

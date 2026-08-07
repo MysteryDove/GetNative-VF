@@ -1,6 +1,12 @@
 # Cold (Persistent) Plan Cache Evaluation
 
-- Status: Evaluation for a future planner lane.
+- Status: **Implemented** (E4, 2026-08-08) — L1 single-flight LRU
+  default-on; L2 pack store opt-in (`GETNATIVE_PLAN_CACHE=on` /
+  `GETNATIVE_PLAN_CACHE_DIR`). Outcome, final numbers, and the
+  keep/reject split: `docs/performance/e4-cold-plan-store-20260808.md`.
+  The format implemented is GNPK **v3** (adds codec field, LZ4 default,
+  XXH64 content checksums); the v2 sketch in §3.2 was superseded during
+  bring-up.
 - Date: 2026-08-08.
 - Question: can plans survive process restarts so repeated getfnative-style
   workloads across different images preheat from disk instead of rebuilding?

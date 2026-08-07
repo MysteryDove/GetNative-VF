@@ -7,6 +7,7 @@
 #include "getnative/cpu_analysis.hpp"
 #include "getnative/cpu_features.hpp"
 #include "getnative/crop_geometry.hpp"
+#include "getnative/plan_store.hpp"
 #if defined(GETNATIVE_HAS_CUDA)
 #include "getnative/cuda_analysis.hpp"
 #endif
@@ -16,7 +17,9 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <list>
 #include <memory>
@@ -395,6 +398,40 @@ std::size_t effective_verify_workers(const VerifyJobSpec &spec) {
 // Frame asset loading
 // ---------------------------------------------------------------------------
 
+// Plan store directory resolution (E4). The store is OPT-IN: on hosts with
+// fast NVMe and many cores the parallel batch build beats pack fetch latency
+// at every measured shape (docs/performance/e4-cold-plan-store-20260808.md),
+// so it serves low-parallelism hosts and future sparse patterns rather than
+// the default path. GETNATIVE_PLAN_CACHE=on enables the platform cache root;
+// GETNATIVE_PLAN_CACHE_DIR enables an explicit directory; "off" disables.
+std::optional<std::filesystem::path> resolve_plan_store_dir() {
+    const char *toggle = std::getenv("GETNATIVE_PLAN_CACHE");
+    const bool enabled = toggle != nullptr && std::string_view{toggle} == "on";
+    if (toggle != nullptr && std::string_view{toggle} == "off") return std::nullopt;
+    if (!enabled && std::getenv("GETNATIVE_PLAN_CACHE_DIR") == nullptr) {
+        return std::nullopt;
+    }
+    if (const char *explicit_dir = std::getenv("GETNATIVE_PLAN_CACHE_DIR")) {
+        if (*explicit_dir != '\0') return std::filesystem::path{explicit_dir};
+    }
+#if defined(_WIN32)
+    if (const char *local = std::getenv("LOCALAPPDATA")) {
+        if (*local != '\0') return std::filesystem::path{local} / "getnative" / "plans";
+    }
+    return std::nullopt;
+#else
+    if (const char *xdg = std::getenv("XDG_CACHE_HOME")) {
+        if (*xdg != '\0') return std::filesystem::path{xdg} / "getnative" / "plans";
+    }
+    if (const char *home = std::getenv("HOME")) {
+        if (*home != '\0') {
+            return std::filesystem::path{home} / ".cache" / "getnative" / "plans";
+        }
+    }
+    return std::nullopt;
+#endif
+}
+
 void load_frame_into(const FrameAsset &asset, float *destination) {
     const std::uint64_t elements =
         static_cast<std::uint64_t>(asset.width) * static_cast<std::uint64_t>(asset.height);
@@ -580,11 +617,18 @@ public:
     WorkerSession(std::ostream &output, std::ostream &log)
         : output_(output), log_(log), plan_cache_{} {
         executor_ = std::thread([this] { execute_loop(); });
+        store_writer_ = std::thread([this] { store_write_loop(); });
     }
 
     ~WorkerSession() {
         request_stop();
         if (executor_.joinable()) executor_.join();
+        {
+            const std::scoped_lock lock(store_mutex_);
+            store_stop_ = true;
+        }
+        store_condition_.notify_all();
+        if (store_writer_.joinable()) store_writer_.join();
     }
 
     void request_stop() {
@@ -840,6 +884,21 @@ private:
 #if defined(GETNATIVE_HAS_CUDA)
     std::optional<CudaAnalysisEngine> cuda_engine_;
 #endif
+    // L2 cold plan store (E4): lazily opened on the first plan-bearing job;
+    // failures disable it for the session (cache degradation, never a job
+    // failure). Publishing is write-behind on store_writer_.
+    std::optional<PlanStore> plan_store_;
+    bool plan_store_attempted_ = false;
+    struct PendingGridPublish {
+        std::uint64_t grid_hash = 0;
+        std::vector<AxisPlanRequest> requests;
+        std::vector<std::shared_ptr<const AxisPlan>> plans;
+    };
+    std::mutex store_mutex_;
+    std::condition_variable store_condition_;
+    std::deque<PendingGridPublish> store_queue_;
+    bool store_stop_ = false;
+    std::thread store_writer_;
     std::mutex mutex_;
     std::condition_variable condition_;
     std::deque<std::shared_ptr<Job>> queue_;
@@ -944,6 +1003,144 @@ private:
         throw WorkerError("bad_request", "no active verify job with id: " + job_id);
     }
 
+    // -----------------------------------------------------------------------
+    // Cold plan store (E4)
+    // -----------------------------------------------------------------------
+
+    PlanStore *plan_store_or_null() {
+        if (plan_store_attempted_) {
+            return plan_store_ ? &*plan_store_ : nullptr;
+        }
+        plan_store_attempted_ = true;
+        const std::optional<std::filesystem::path> directory = resolve_plan_store_dir();
+        if (!directory) return nullptr;
+        try {
+            plan_store_.emplace(*directory);
+            log_ << "worker: plan store at " << directory->string() << '\n';
+        } catch (const std::exception &error) {
+            log_ << "worker: plan store disabled: " << error.what() << '\n';
+        }
+        return plan_store_ ? &*plan_store_ : nullptr;
+    }
+
+    // Sparse store reads (E4): resolve one job plan-chunk through the pack's
+    // key-hash index, decompressing only the touched zstd chunks. Per-chunk
+    // reads keep the L1 working set at chunk size, so over-capacity grids
+    // cannot thrash the byte cap the way whole-pack preheat would.
+    std::size_t fetch_from_store(std::uint64_t grid_hash,
+                                 std::span<const AxisPlanRequest> chunk_requests,
+                                 double *fetch_ms_out) {
+        PlanStore *store = plan_store_or_null();
+        if (store == nullptr || chunk_requests.empty()) return 0U;
+        const auto start = std::chrono::steady_clock::now();
+        std::optional<std::vector<std::shared_ptr<const AxisPlan>>> stored;
+        try {
+            stored = store->read_plans(grid_hash, chunk_requests);
+        } catch (const std::exception &error) {
+            log_ << "worker: plan store read failed: " << error.what() << '\n';
+        }
+        const double read_ms = elapsed_ms(start);
+        *fetch_ms_out += read_ms;
+        if (!stored) return 0U;
+        const auto publish_start = std::chrono::steady_clock::now();
+        for (std::size_t index = 0; index < chunk_requests.size(); ++index) {
+            plan_cache_.publish(chunk_requests[index], (*stored)[index]);
+        }
+        if (std::getenv("GETNATIVE_STORE_TRACE") != nullptr) {
+            log_ << "worker: store fetch read=" << read_ms << "ms publish="
+                 << elapsed_ms(publish_start) << "ms plans=" << chunk_requests.size()
+                 << '\n';
+        }
+        return chunk_requests.size();
+    }
+
+    // Write-behind publish: the store writer thread owns the actual encode +
+    // compress + rename, so job latency never waits on zstd.
+    void queue_store_publish(std::span<const AxisPlanRequest> requests,
+                             std::span<const std::shared_ptr<const AxisPlan>> plans,
+                             std::size_t physical_build_count) {
+        if (plan_store_or_null() == nullptr || requests.empty()
+            || physical_build_count == 0) {
+            return;
+        }
+        {
+            const std::scoped_lock lock(store_mutex_);
+            store_queue_.push_back({
+                PlanStore::grid_hash(requests),
+                {requests.begin(), requests.end()},
+                {plans.begin(), plans.end()},
+            });
+        }
+        store_condition_.notify_one();
+    }
+
+    // Deduplicate parallel request/plan vectors for grid publishing (the
+    // pack index rejects duplicate keys). Field-wise identity is exact here:
+    // duplicates within one job arise from identical candidate strings.
+    static std::pair<std::vector<AxisPlanRequest>,
+                     std::vector<std::shared_ptr<const AxisPlan>>>
+    dedupe_requests(const std::vector<AxisPlanRequest> &requests,
+                    const std::vector<std::shared_ptr<const AxisPlan>> &plans) {
+        const auto less = [&](std::size_t lhs, std::size_t rhs) {
+            const AxisPlanRequest &a = requests[lhs];
+            const AxisPlanRequest &b = requests[rhs];
+            const auto tuple_a = std::tie(
+                a.source_size, a.destination_size, a.active_length, a.shift,
+                a.filter.type, a.filter.b, a.filter.c, a.filter.taps, a.border);
+            const auto tuple_b = std::tie(
+                b.source_size, b.destination_size, b.active_length, b.shift,
+                b.filter.type, b.filter.b, b.filter.c, b.filter.taps, b.border);
+            return tuple_a < tuple_b;
+        };
+        std::vector<std::size_t> order(requests.size());
+        for (std::size_t index = 0; index < order.size(); ++index) order[index] = index;
+        std::sort(order.begin(), order.end(), less);
+        std::vector<AxisPlanRequest> unique_requests;
+        std::vector<std::shared_ptr<const AxisPlan>> unique_plans;
+        for (const std::size_t index : order) {
+            if (!unique_requests.empty()
+                && equal_requests(unique_requests.back(), requests[index])) {
+                continue;
+            }
+            unique_requests.push_back(requests[index]);
+            unique_plans.push_back(plans[index]);
+        }
+        return {std::move(unique_requests), std::move(unique_plans)};
+    }
+
+    static bool equal_requests(const AxisPlanRequest &a, const AxisPlanRequest &b) {
+        return a.source_size == b.source_size
+            && a.destination_size == b.destination_size
+            && a.active_length == b.active_length && a.shift == b.shift
+            && a.filter.type == b.filter.type && a.filter.b == b.filter.b
+            && a.filter.c == b.filter.c && a.filter.taps == b.filter.taps
+            && a.border == b.border;
+    }
+
+    void store_write_loop() {
+        while (true) {
+            PendingGridPublish pending;
+            {
+                std::unique_lock lock(store_mutex_);
+                store_condition_.wait(lock, [&] {
+                    return store_stop_ || !store_queue_.empty();
+                });
+                if (store_stop_) return;
+                pending = std::move(store_queue_.front());
+                store_queue_.pop_front();
+            }
+            try {
+                PlanStore *store = plan_store_or_null();
+                if (store != nullptr) {
+                    store->publish_grid(pending.grid_hash, pending.requests,
+                                        pending.plans);
+                }
+            } catch (const std::exception &error) {
+                log_ << "worker: plan store publish failed: " << error.what() << '\n';
+            }
+        }
+    }
+
     void execute_loop() {
         while (true) {
             std::shared_ptr<Job> job;
@@ -1041,8 +1238,24 @@ private:
             }
         }
 
-        // Plan phase with chunked progress + cancellation checkpoints.
+        // Plan phase: one parallel prefetch of the whole grid from the cold
+        // store, then per-chunk top-up reads for any entries the L1 byte cap
+        // evicted (the sparse path that keeps over-capacity grids from
+        // thrashing), then the L1 batch (which builds whatever remains).
         const auto plan_start = std::chrono::steady_clock::now();
+        double store_fetch_ms = 0.0;
+        std::size_t store_hits = 0;
+        const std::uint64_t grid_hash =
+            plan_store_or_null() != nullptr ? PlanStore::grid_hash(requests) : 0U;
+        if (grid_hash != 0U) {
+            // Publish in reverse so the earliest-consumed plans are the
+            // newest LRU entries; over-capacity grids then evict the
+            // latest-consumed plans instead of the not-yet-used ones.
+            const std::vector<AxisPlanRequest> reversed(requests.rbegin(),
+                                                        requests.rend());
+            store_hits += fetch_from_store(
+                grid_hash, {reversed.data(), reversed.size()}, &store_fetch_ms);
+        }
         std::vector<std::shared_ptr<const AxisPlan>> plans;
         plans.reserve(requests.size());
         std::size_t cache_hits = 0;
@@ -1050,8 +1263,19 @@ private:
         for (std::size_t begin = 0; begin < requests.size(); begin += kPlanChunkSize) {
             check_cancelled(job);
             const std::size_t end = std::min(begin + kPlanChunkSize, requests.size());
-            AxisPlanCacheBatchResult batch = plan_cache_.get_or_build_batch(
-                std::span<const AxisPlanRequest>{requests.data() + begin, end - begin});
+            const std::span<const AxisPlanRequest> chunk{requests.data() + begin,
+                                                         end - begin};
+            if (grid_hash != 0U) {
+                const auto found = plan_cache_.lookup_batch(chunk);
+                std::vector<AxisPlanRequest> evicted;
+                for (std::size_t index = 0; index < chunk.size(); ++index) {
+                    if (!found[index]) evicted.push_back(chunk[index]);
+                }
+                if (!evicted.empty()) {
+                    store_hits += fetch_from_store(grid_hash, evicted, &store_fetch_ms);
+                }
+            }
+            AxisPlanCacheBatchResult batch = plan_cache_.get_or_build_batch(chunk);
             cache_hits += batch.ready_hit_count;
             builds += batch.physical_build_count;
             plans.insert(plans.end(),
@@ -1060,6 +1284,10 @@ private:
             emit_progress(spec, "plan", plans.size(), requests.size());
         }
         const double plan_ms = elapsed_ms(plan_start);
+        if (builds > 0) {
+            const auto [unique_requests, unique_plans] = dedupe_requests(requests, plans);
+            queue_store_publish(unique_requests, unique_plans, builds);
+        }
 
         // Candidate phase.
         const auto candidates_start = std::chrono::steady_clock::now();
@@ -1142,6 +1370,8 @@ private:
         std::vector<std::pair<std::string, JsonValue>> telemetry_members = {
             {"plan_build_count", JsonValue::integer(static_cast<std::int64_t>(builds))},
             {"plan_cache_hits", JsonValue::integer(static_cast<std::int64_t>(cache_hits))},
+            {"plan_store_hits", JsonValue::integer(static_cast<std::int64_t>(store_hits))},
+            {"plan_store_fetch_ms", JsonValue::number(store_fetch_ms)},
             {"plan_resident_entries", JsonValue::integer(
                 static_cast<std::int64_t>(plan_cache_.size()))},
             {"plan_ms", JsonValue::number(plan_ms)},
@@ -1231,9 +1461,20 @@ private:
         }
 
         const auto plan_start = std::chrono::steady_clock::now();
+        double store_fetch_ms = 0.0;
+        std::size_t store_hits = 0;
+        const std::uint64_t grid_hash =
+            plan_store_or_null() != nullptr ? PlanStore::grid_hash(requests) : 0U;
+        if (grid_hash != 0U) {
+            store_hits += fetch_from_store(
+                grid_hash, {requests.data(), requests.size()}, &store_fetch_ms);
+        }
         AxisPlanCacheBatchResult batch = plan_cache_.get_or_build_batch(
             std::span<const AxisPlanRequest>{requests.data(), requests.size()});
         const double plan_ms = elapsed_ms(plan_start);
+        if (batch.physical_build_count > 0) {
+            queue_store_publish(requests, batch.plans, batch.physical_build_count);
+        }
         emit_progress(spec.request_id, spec.job_id, "verify", "plan",
                       requests.size(), requests.size(), JsonValue::array());
         check_cancelled(job);
@@ -1433,6 +1674,9 @@ private:
                         static_cast<std::int64_t>(batch.physical_build_count))},
                     {"plan_cache_hits", JsonValue::integer(
                         static_cast<std::int64_t>(batch.ready_hit_count))},
+                    {"plan_store_hits", JsonValue::integer(
+                        static_cast<std::int64_t>(store_hits))},
+                    {"plan_store_fetch_ms", JsonValue::number(store_fetch_ms)},
                     {"plan_resident_entries", JsonValue::integer(
                         static_cast<std::int64_t>(plan_cache_.size()))},
                     {"plan_ms", JsonValue::number(plan_ms)},

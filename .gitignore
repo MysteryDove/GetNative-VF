@@ -82,3 +82,4 @@ Thumbs.db
 *.suo
 *.user
 *.sw?
+__pycache__/

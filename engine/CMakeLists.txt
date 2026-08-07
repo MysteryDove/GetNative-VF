@@ -208,6 +208,8 @@ set(GETNATIVE_CORE_SOURCES
     src/planner/axis_plan.cpp
     src/planner/axis_planner.cpp
     src/planner/filter.cpp
+    src/planner/plan_serialize.cpp
+    src/planner/plan_store.cpp
 )
 if(NOT GETNATIVE_PLANNER_FP_MODE STREQUAL "strict")
     # Keep the target strict and relax only the translation units that construct
@@ -263,10 +265,24 @@ if(GETNATIVE_ENABLE_X86_SIMD)
     endif()
 endif()
 
+add_library(getnative_zstd STATIC third_party/zstd/zstd.c)
+target_include_directories(getnative_zstd PUBLIC third_party/zstd)
+set_target_properties(getnative_zstd PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(NOT MSVC)
+    target_compile_options(getnative_zstd PRIVATE -w)
+endif()
+
+add_library(getnative_lz4 STATIC third_party/lz4/lz4.c third_party/lz4/xxhash.c)
+target_include_directories(getnative_lz4 PUBLIC third_party/lz4)
+set_target_properties(getnative_lz4 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(NOT MSVC)
+    target_compile_options(getnative_lz4 PRIVATE -w)
+endif()
+
 add_library(getnative_core STATIC ${GETNATIVE_CORE_SOURCES})
 target_compile_features(getnative_core PUBLIC cxx_std_23)
 target_include_directories(getnative_core PUBLIC include)
-target_link_libraries(getnative_core PUBLIC Threads::Threads)
+target_link_libraries(getnative_core PUBLIC Threads::Threads getnative_zstd getnative_lz4)
 target_compile_definitions(getnative_core PUBLIC
     GETNATIVE_PLANNER_REUSE_TAPS=${GETNATIVE_PLANNER_REUSE_TAPS}
     GETNATIVE_PLANNER_FAST_INTERIOR=${GETNATIVE_PLANNER_FAST_INTERIOR}
@@ -274,6 +290,13 @@ target_compile_definitions(getnative_core PUBLIC
     GETNATIVE_PLANNER_DIRECT_TRANSPOSE=${GETNATIVE_PLANNER_DIRECT_TRANSPOSE}
     GETNATIVE_PLANNER_PERSISTENT_WORKERS=${GETNATIVE_PLANNER_PERSISTENT_WORKERS}
 )
+if(GETNATIVE_PLANNER_FP_MODE STREQUAL "strict")
+    target_compile_definitions(getnative_core PUBLIC GETNATIVE_PLANNER_FP_MODE_VALUE=0)
+elseif(GETNATIVE_PLANNER_FP_MODE STREQUAL "fast")
+    target_compile_definitions(getnative_core PUBLIC GETNATIVE_PLANNER_FP_MODE_VALUE=1)
+else()
+    target_compile_definitions(getnative_core PUBLIC GETNATIVE_PLANNER_FP_MODE_VALUE=2)
+endif()
 if(GETNATIVE_ENABLE_X86_SIMD)
     target_compile_definitions(getnative_core PRIVATE
         GETNATIVE_X86_SSE2_COMPILED=1
@@ -561,6 +584,14 @@ if(BUILD_TESTING)
     getnative_enable_warnings(getnative_axis_planner_tests)
     getnative_enable_strict_fp(getnative_axis_planner_tests)
     add_test(NAME getnative_axis_planner_tests COMMAND getnative_axis_planner_tests)
+
+    add_executable(getnative_plan_store_tests tests/plan_store_test.cpp)
+    target_include_directories(getnative_plan_store_tests PRIVATE src/planner)
+    target_link_libraries(getnative_plan_store_tests PRIVATE getnative_core)
+    target_compile_features(getnative_plan_store_tests PRIVATE cxx_std_23)
+    getnative_enable_warnings(getnative_plan_store_tests)
+    getnative_enable_strict_fp(getnative_plan_store_tests)
+    add_test(NAME getnative_plan_store_tests COMMAND getnative_plan_store_tests)
 
     add_executable(getnative_json_tests tests/json_test.cpp src/cli/json.cpp)
     target_include_directories(getnative_json_tests PRIVATE src/cli)

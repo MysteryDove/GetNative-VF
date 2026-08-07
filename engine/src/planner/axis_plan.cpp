@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -1024,18 +1025,51 @@ struct AxisPlanCache::Impl {
     struct Entry {
         std::shared_ptr<const AxisPlan> plan;
         std::size_t bytes = 0U;
+        std::list<detail::PlanKey>::iterator lru_position;
     };
 
     explicit Impl(AxisPlanCacheLimits limits) : limits(limits) {}
 
-    [[nodiscard]] bool can_admit(std::size_t bytes) const noexcept {
-        return plans.size() < limits.maximum_entries
-            && bytes <= limits.maximum_resident_bytes - resident_bytes;
+    // All three require `mutex` held.
+    void touch(const std::unordered_map<detail::PlanKey, Entry, detail::PlanKeyHash>::iterator &found) {
+        lru.splice(lru.begin(), lru, found->second.lru_position);
+    }
+
+    void evict_lru() {
+        const detail::PlanKey &oldest = lru.back();
+        const auto found = plans.find(oldest);
+        resident_bytes -= found->second.bytes;
+        lru.erase(found->second.lru_position);
+        plans.erase(found);
+    }
+
+    bool admit(detail::PlanKey key, std::shared_ptr<const AxisPlan> plan,
+               std::size_t bytes) {
+        if (bytes > limits.maximum_resident_bytes) {
+            return false; // a single plan larger than the cap is never retained
+        }
+        while (!lru.empty()
+               && (plans.size() >= limits.maximum_entries
+                   || resident_bytes + bytes > limits.maximum_resident_bytes)) {
+            evict_lru();
+        }
+        if (plans.size() >= limits.maximum_entries
+            || resident_bytes + bytes > limits.maximum_resident_bytes) {
+            return false;
+        }
+        lru.push_front(key);
+        plans.emplace(key, Entry{std::move(plan), bytes, lru.begin()});
+        resident_bytes += bytes;
+        return true;
     }
 
     mutable std::mutex mutex;
+    // Serializes miss paths across calls: a concurrent caller waits, then
+    // re-checks before building — single-flight at call granularity.
+    std::mutex build_mutex;
     AxisPlanCacheLimits limits;
     std::unordered_map<detail::PlanKey, Entry, detail::PlanKeyHash> plans;
+    std::list<detail::PlanKey> lru; // front = most recently used
     std::size_t resident_bytes = 0U;
 };
 
@@ -1048,20 +1082,52 @@ std::shared_ptr<const AxisPlan> AxisPlanCache::get_or_build(const AxisPlanReques
     {
         const std::scoped_lock lock(impl_->mutex);
         if (const auto found = impl_->plans.find(key); found != impl_->plans.end()) {
+            impl_->touch(found);
+            return found->second.plan;
+        }
+    }
+    const std::scoped_lock build_lock(impl_->build_mutex);
+    {
+        const std::scoped_lock lock(impl_->mutex);
+        if (const auto found = impl_->plans.find(key); found != impl_->plans.end()) {
+            impl_->touch(found);
             return found->second.plan;
         }
     }
     auto candidate = std::make_shared<const AxisPlan>(build_axis_plan(request));
     const std::size_t candidate_bytes = axis_plan_storage_bytes(*candidate);
     const std::scoped_lock lock(impl_->mutex);
-    if (const auto found = impl_->plans.find(key); found != impl_->plans.end()) {
-        return found->second.plan;
-    }
-    if (impl_->can_admit(candidate_bytes)) {
-        impl_->plans.emplace(key, Impl::Entry{candidate, candidate_bytes});
-        impl_->resident_bytes += candidate_bytes;
-    }
+    impl_->admit(key, candidate, candidate_bytes);
     return candidate;
+}
+
+void AxisPlanCache::publish(const AxisPlanRequest &request,
+                            std::shared_ptr<const AxisPlan> plan) {
+    if (plan == nullptr || !plan->valid()) {
+        throw std::invalid_argument("cannot publish an invalid plan");
+    }
+    const detail::PlanKey key = detail::plan_key(request);
+    const std::size_t bytes = axis_plan_storage_bytes(*plan);
+    const std::scoped_lock lock(impl_->mutex);
+    if (const auto found = impl_->plans.find(key); found != impl_->plans.end()) {
+        impl_->touch(found);
+        return;
+    }
+    impl_->admit(key, std::move(plan), bytes);
+}
+
+std::vector<std::shared_ptr<const AxisPlan>> AxisPlanCache::lookup_batch(
+    std::span<const AxisPlanRequest> requests) {
+    std::vector<std::shared_ptr<const AxisPlan>> result(requests.size());
+    const std::scoped_lock lock(impl_->mutex);
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+        if (const auto found = impl_->plans.find(detail::plan_key(requests[index]));
+            found != impl_->plans.end()) {
+            impl_->touch(found);
+            result[index] = found->second.plan;
+        }
+    }
+    return result;
 }
 
 AxisPlanCacheBatchResult AxisPlanCache::get_or_build_batch(
@@ -1101,6 +1167,7 @@ AxisPlanCacheBatchResult AxisPlanCache::get_or_build_batch(
         for (std::size_t index = 0; index < unique_keys.size(); ++index) {
             if (const auto found = impl_->plans.find(unique_keys[index]);
                 found != impl_->plans.end()) {
+                impl_->touch(found);
                 unique_plans[index] = found->second.plan;
                 ready[index] = true;
             }
@@ -1108,6 +1175,22 @@ AxisPlanCacheBatchResult AxisPlanCache::get_or_build_batch(
     }
     for (const std::size_t unique_index : request_to_unique) {
         if (ready[unique_index]) ++result.ready_hit_count;
+    }
+
+    // Single-flight: concurrent miss paths serialize on build_mutex, then
+    // re-check — a caller that raced a publisher builds nothing twice.
+    const std::scoped_lock build_lock(impl_->build_mutex);
+    {
+        const std::scoped_lock lock(impl_->mutex);
+        for (std::size_t index = 0; index < unique_keys.size(); ++index) {
+            if (ready[index]) continue;
+            if (const auto found = impl_->plans.find(unique_keys[index]);
+                found != impl_->plans.end()) {
+                impl_->touch(found);
+                unique_plans[index] = found->second.plan;
+                ready[index] = true;
+            }
+        }
     }
 
     std::vector<AxisPlanRequest> missing_requests;
@@ -1132,16 +1215,14 @@ AxisPlanCacheBatchResult AxisPlanCache::get_or_build_batch(
             const std::size_t unique_index = missing_to_unique[index];
             if (const auto found = impl_->plans.find(unique_keys[unique_index]);
                 found != impl_->plans.end()) {
+                impl_->touch(found);
                 unique_plans[unique_index] = found->second.plan;
                 continue;
             }
             const auto &candidate = built.plans[index];
             const std::size_t candidate_bytes = axis_plan_storage_bytes(*candidate);
             unique_plans[unique_index] = candidate;
-            if (impl_->can_admit(candidate_bytes)) {
-                impl_->plans.emplace(
-                    unique_keys[unique_index], Impl::Entry{candidate, candidate_bytes});
-                impl_->resident_bytes += candidate_bytes;
+            if (impl_->admit(unique_keys[unique_index], candidate, candidate_bytes)) {
                 ++result.published_plan_count;
             }
         }
@@ -1173,6 +1254,7 @@ std::size_t AxisPlanCache::resident_bytes() const {
 void AxisPlanCache::clear() {
     const std::scoped_lock lock(impl_->mutex);
     impl_->plans.clear();
+    impl_->lru.clear();
     impl_->resident_bytes = 0U;
 }
 
