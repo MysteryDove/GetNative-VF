@@ -1,0 +1,124 @@
+# Cold (Persistent) Plan Cache Evaluation
+
+- Status: Evaluation for a future planner lane.
+- Date: 2026-08-08.
+- Question: can plans survive process restarts so repeated getfnative-style
+  workloads across different images preheat from disk instead of rebuilding?
+
+## 1. Why reuse across images is sound
+
+`PlanKey` (`engine/src/planner/axis_plan_key.hpp`) is a bit-exact function of
+**geometry and kernel only**: `{source_size, destination_size, active_length,
+shift, kernel type, b, c, taps, border}`. Image content never enters the key.
+A plan for `1080 → 810, bicubic(0, 0.5)` is identical for every 1080p frame
+ever fed to the engine. The typical getfnative workload — one show, many
+episodes, same resolution, same candidate grid — therefore reuses **100%**
+of its plans across images, samples, and app restarts. Different resolutions
+or grids produce different keys and miss cleanly.
+
+`AxisPlan` is immutable and pointer-free (seven flat arrays +
+scalars, ~94.4 KiB average, `axis_plan_storage_bytes`), so serialization is a
+mechanical layout exercise. dsmvc has no disk format to borrow (confirmed
+during the port survey); we design our own, using the CUDA `PackedBatch`
+single-blob idea only as a layout reference.
+
+## 2. What it buys — honest numbers
+
+Measured facts (`docs/performance/pre-gpu-planner-results.md`):
+
+- Parallel batch build: 1,000 unique plans in **15.81 ms** (6.65x over the
+  105.62 ms serial baseline). A disk read of the same 92.2 MiB is ~50-100 ms
+  on NVMe — **slower than rebuilding for bicubic-class plans**.
+- Warm in-session hit: 16.97 → 0.059 ms (291.78x) — already solved by the
+  worker session cache (E0).
+- **Fixed-admission cliff**: the current cache retains at most
+  1024 entries / 256 MiB with fixed admission (overflow plans are returned
+  but *not retained*, and it is not single-flight). For 1,000-plan
+  Lanczos-6/7/8 scans, measured hit rates drop to **92.7 / 79.7 / 69.8%** —
+  i.e. up to 302 plans are rebuilt *within one repeated scan*. Large-taps
+  plans are also the biggest (~2-4x average size) and slowest to build.
+
+Conclusion on value:
+
+| Scenario | Cold cache win |
+| --- | --- |
+| Integer coarse scan, bicubic, 301 candidates | ~None (build ≈ 5 ms) |
+| Large-taps 1,000-point scans (Lanczos 6-8) | **Real**: eliminates the 7-30% forced rebuilds; effective hit rate → ~100% for repeated grids |
+| App restart, same series (810p episode checks) | First-scan latency removed via preheat; UX, not throughput |
+| Cross-machine cache sharing | Possible only with identical build fingerprints (see §4) |
+
+So the cold cache is a **robustness and latency feature, not a throughput
+feature** — and it only makes sense bundled with the in-memory policy
+upgrade the strategy doc already lists (single-flight LRU, D3).
+
+## 3. Proposed design (two-level cache)
+
+```
+L1  AxisPlanCache (memory): fixed-admission → single-flight LRU
+    (adopt dsmvc SingleFlightLru semantics; byte+entry dual cap)
+L2  PlanStore (disk): content-addressed, read-through, write-behind
+```
+
+Lookup: L1 hit → return; L1 miss → L2 file `<cache>/plans/v1/<key_hash>.gnpl`
+→ validate → publish into L1 → return; L2 miss → build (batch workers) →
+publish L1 → write-behind to L2 (atomic tmp+rename, no-replace publish).
+
+File format (little-endian, self-validating):
+
+```
+magic "GNPL" | format_version u32 | key_hash u64 | build_fingerprint u64
+payload_len u32 | payload (counts + arrays) | checksum u64 (fnv1a64)
+```
+
+- `key_hash`: FNV-1a over the canonical PlanKey (already implemented).
+- `build_fingerprint`: compiler id+version, FP mode (`planner_fp`
+  strict/fast), build type, planner source identity. Mismatch → treat as
+  miss and rebuild; **never** load plans whose provenance differs, because
+  last-bit Float64 assembly order is part of the upstream-conformance
+  contract.
+- Validation on load: magic/version/hash, size bounds
+  (destination ≤ 65536, half-bandwidth ≤ 29), all values finite,
+  `AxisPlan::valid()`, checksum match. Any failure → delete file, rebuild.
+  Corrupt cache can never fail a job.
+- Eviction: bounded directory (default 1 GiB), mtime-LRU sweep at session
+  start; atomic publish makes concurrent workers safe.
+
+## 4. Risks and mitigations
+
+| Risk | Mitigation |
+| --- | --- |
+| Cross-build FP non-determinism (fast-math planner, compiler differences) | build fingerprint in key; miss-and-rebuild |
+| Format drift as AxisPlan evolves | format_version + fail-closed reader |
+| Corrupt/poisoned cache files | checksum + full structural validation + rebuild fallback |
+| Multi-process writers | atomic no-replace publish (pattern already in `benchmark_support.hpp`) |
+| Disk growth | bounded LRU sweep; opt-out env var |
+| Write-behind stalls the job | writer on a background thread, best-effort |
+
+## 5. Preheat paths (protocol v1.1, optional)
+
+- On `hello`: background sweep of the L2 directory index (sizes/mtimes
+  only, no payload reads).
+- On `analyze`: read-through is automatic; a future `preheat` command
+  (source dims + grid) can bulk-load matching plans while the user is
+  still picking frames. This is the "load once, read all" shape the
+  question asks about — it falls out of L2 for free.
+
+## 6. Recommendation
+
+Feasible and worth doing, in this order, as one planner-lane change:
+
+1. L1: replace fixed admission with single-flight LRU (correctness of
+   retention under pressure; dsmvc-proven semantics).
+2. L2 disk store with the format/validation above; targets the measured
+   Lanczos 7-30% rebuild cliff.
+3. Evidence: repeated 1,000-plan Lanczos-6/8 scans, effective hit rate
+   79.7/69.8% → ~100%; first-scan latency after process restart, preheated
+   vs cold. Keep/reject per the usual discipline.
+
+Explicitly not now: cross-machine sharing (fingerprint-gated), CUDA packed
+batch persistence (device layouts are internal and version-sensitive),
+compression (plans are small and mostly incompressible float data).
+
+Priority: below the Tauri transport merge and E2 verification; above any
+further kernel micro-optimization, because it removes a measured
+correctness-of-retention cliff rather than chasing marginal wall time.
