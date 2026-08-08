@@ -97,8 +97,12 @@ overlap granularity, worse tail).
 
 ## 5. Follow-ups (recorded)
 
-- Plan-build phase-reuse quantization (ulp-exact or fast-FP gated) —
-  largest remaining host lever for cold wide-taps scans.
+- ~~Plan-build phase-reuse quantization~~ — **LANDED** (`77a9042`):
+  integer active_length geometries replay row weights across the position
+  lattice period (rows/gcd rows). lanczos8 h_plus_w plan phase
+  118 → 98 ms on the uniform 700..1000 grid (median period 270 caps the
+  average at ~4x on weight evals); gcd-friendly native heights get
+  10-270x per plan. Fractional active lengths fall back.
 - Shallow-tier inverse ring (exact hbw=1, or 7-deep) once GPU is the
   wall after plan build improves.
 - Per-plan packed-blob persistence (plan store v4) — the pinned layout
