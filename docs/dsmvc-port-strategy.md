@@ -14,7 +14,10 @@
   met; store loses to the parallel build on 16-core NVMe hosts, hence
   opt-in), D1.2 (register-ring inverse +77-95% wide taps, 2-deep
   candidate pipeline, steady-state CUDA scan 4-10x CPU;
-  `docs/performance/d12-cuda-wide-taps-and-pipeline-20260808.md`).
+  `docs/performance/d12-cuda-wide-taps-and-pipeline-20260808.md`), D1.3
+  (pack-into-pinned scan host path, pipeline depth 3; lanczos8 h_plus_w
+  candidate phase 222→162 ms;
+  `docs/performance/d13-cuda-scan-host-path-20260808.md`).
 - Date: 2026-08-07.
 - Audience: future engine/UI lane owners.
 - Sources: `/home/owen/dev/Descale-MVC` (`dsmvc`, VapourSynth API4 descale
