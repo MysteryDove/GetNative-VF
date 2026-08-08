@@ -492,6 +492,65 @@ struct PackedBatch {
     std::size_t maximum_tile_candidate_count = 0U;
     std::size_t upload_bytes = 0U;
     bool has_horizontal = false;
+
+    // Keeps vector capacity across batches: chunk-sized batches recur with
+    // near-identical sizes, so clearing instead of rebuilding avoids the
+    // reallocation cascade and fresh-page faults on every batch.
+    void clear_for_reuse() {
+        candidates.clear();
+        tiles.clear();
+        forward_left.clear();
+        forward_weights.clear();
+        transpose_offsets.clear();
+        transpose_indices.clear();
+        transpose_weights.clear();
+        lower_ld.clear();
+        upper_l.clear();
+        inverse_diagonal.clear();
+        workspace_elements = 0U;
+        maximum_tile_candidate_count = 0U;
+        upload_bytes = 0U;
+        has_horizontal = false;
+    }
+
+    // Exact-sizing pre-pass: every appended range is a whole plan array, so
+    // the final sizes are known before any packing happens.
+    void reserve_for(std::span<const CandidateAnalysis> batch) {
+        std::size_t forward_rows = 0U;
+        std::size_t forward_weight_elements = 0U;
+        std::size_t transpose_offset_elements = 0U;
+        std::size_t transpose_elements = 0U;
+        std::size_t factor_elements = 0U;
+        std::size_t diagonal_elements = 0U;
+        for (const CandidateAnalysis &candidate : batch) {
+            const AxisPlan *axes[2] = {nullptr, nullptr};
+            std::size_t axis_count = 0U;
+            if (candidate.axes != AnalysisAxes::vertical && candidate.horizontal) {
+                axes[axis_count++] = candidate.horizontal.get();
+            }
+            if (candidate.axes != AnalysisAxes::horizontal && candidate.vertical) {
+                axes[axis_count++] = candidate.vertical.get();
+            }
+            for (std::size_t index = 0U; index < axis_count; ++index) {
+                const AxisPlan &plan = *axes[index];
+                forward_rows += static_cast<std::size_t>(plan.source_size);
+                forward_weight_elements += plan.forward_weights.size();
+                transpose_offset_elements += plan.transpose_offsets.size();
+                transpose_elements += plan.transpose_indices.size();
+                factor_elements += plan.lower_ld.size();
+                diagonal_elements += plan.inverse_diagonal.size();
+            }
+        }
+        candidates.reserve(batch.size());
+        forward_left.reserve(forward_rows);
+        forward_weights.reserve(forward_weight_elements);
+        transpose_offsets.reserve(transpose_offset_elements);
+        transpose_indices.reserve(transpose_elements);
+        transpose_weights.reserve(transpose_elements);
+        lower_ld.reserve(factor_elements);
+        upper_l.reserve(factor_elements);
+        inverse_diagonal.reserve(diagonal_elements);
+    }
 };
 
 [[nodiscard]] AxisPlanDescriptor pack_axis(
@@ -545,10 +604,11 @@ struct PackedBatch {
     throw std::invalid_argument("CUDA candidate has an invalid axes value");
 }
 
-[[nodiscard]] PackedBatch pack_batch(
-    ConstImageView source, std::span<const CandidateAnalysis> candidates,
+void pack_batch(
+    PackedBatch &packed, ConstImageView source,
+    std::span<const CandidateAnalysis> candidates,
     std::size_t workspace_limit_elements, std::size_t pixel_threads) {
-    PackedBatch packed;
+    packed.reserve_for(candidates);
     packed.upload_bytes = checked_product(
         candidates.size(), sizeof(CandidateDescriptor), "CUDA candidate upload");
     if (packed.upload_bytes > maximum_explicit_bytes) {
@@ -685,7 +745,6 @@ struct PackedBatch {
             packed.maximum_tile_candidate_count, tile.candidate_count);
         packed.tiles.push_back(tile);
     }
-    return packed;
 }
 
 template <class Value>
@@ -885,7 +944,7 @@ struct ExecutionSlot {
     DeviceBuffer device_partials;
     DeviceBuffer device_results;
     BatchIdentity identity;
-    std::unique_ptr<PackedBatch> packed;
+    PackedBatch packed;
     bool plan_ready = false;
     SourceIdentity source_identity;
     bool source_ready = false;
@@ -1331,14 +1390,14 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
     }};
 
     const auto pack_start = std::chrono::steady_clock::now();
-    bool plan_cache_hit = slot.plan_ready && slot.packed
-        && slot.identity.matches(
-            source, candidates, impl_->effective_workspace_limit_elements);
+    bool plan_cache_hit = slot.plan_ready && slot.identity.matches(
+        source, candidates, impl_->effective_workspace_limit_elements);
     if (!plan_cache_hit) {
         slot.plan_ready = false;
-        slot.packed = std::make_unique<PackedBatch>(pack_batch(
-            source, candidates, impl_->effective_workspace_limit_elements,
-            pixel_threads));
+        slot.packed.clear_for_reuse();
+        pack_batch(
+            slot.packed, source, candidates,
+            impl_->effective_workspace_limit_elements, pixel_threads);
         slot.identity.assign(
             source, candidates, impl_->effective_workspace_limit_elements);
         delta.plan_cache_misses = 1U;
@@ -1347,7 +1406,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
     }
     delta.host_pack_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - pack_start).count();
-    PackedBatch &packed = *slot.packed;
+    PackedBatch &packed = slot.packed;
 
     const std::size_t source_elements = checked_product(
         static_cast<std::size_t>(source.width),
