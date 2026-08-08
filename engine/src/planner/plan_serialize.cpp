@@ -32,14 +32,6 @@ void put_i32(std::vector<std::byte> &out, std::int32_t value) {
 void put_f64(std::vector<std::byte> &out, double value) {
     put_u64(out, std::bit_cast<std::uint64_t>(value));
 }
-void put_varint(std::vector<std::byte> &out, std::uint64_t value) {
-    while (value >= 0x80U) {
-        out.push_back(static_cast<std::byte>((value & 0x7FU) | 0x80U));
-        value >>= 7U;
-    }
-    out.push_back(static_cast<std::byte>(value));
-}
-
 template <typename T>
 void put_span_raw(std::vector<std::byte> &out, const std::vector<T> &values) {
     const auto *bytes = reinterpret_cast<const std::byte *>(values.data());
@@ -73,16 +65,6 @@ public:
     std::int32_t i32() { return static_cast<std::int32_t>(u32()); }
     float f32() { return std::bit_cast<float>(u32()); }
     double f64() { return std::bit_cast<double>(u64()); }
-    std::uint64_t varint() {
-        std::uint64_t value = 0;
-        for (unsigned shift = 0; shift < 64; shift += 7) {
-            const std::uint8_t byte = u8();
-            value |= static_cast<std::uint64_t>(byte & 0x7FU) << shift;
-            if ((byte & 0x80U) == 0) return value;
-        }
-        throw PlanStoreError("cooked plan varint overruns 64 bits");
-    }
-
     template <typename T>
     void raw_into(std::vector<T> &out, std::size_t count) {
         require(count * sizeof(T));
@@ -183,17 +165,12 @@ std::vector<std::byte> serialize_plan_cooked(
 
     put_span_raw(out, plan.forward_weights);
 
-    std::uint32_t previous_offset = 0;
-    for (const std::uint32_t offset : plan.transpose_offsets) {
-        put_varint(out, offset - previous_offset);
-        previous_offset = offset;
-    }
-    std::int32_t previous_index = 0;
-    for (const std::int32_t index : plan.transpose_indices) {
-        put_varint(out, static_cast<std::uint64_t>(
-            static_cast<std::int64_t>(index) - previous_index + (1LL << 31)));
-        previous_index = index;
-    }
+    // v4: transpose offsets/indices are stored raw. The v3 varint/delta
+    // cooking made them smaller but the decode loops dominated fetch
+    // latency (~60% of a 200 ms/1000-plan fetch; io+codec+hash is the
+    // rest), and LZ4 recovers most of the size delta on its own.
+    put_span_raw(out, plan.transpose_offsets);
+    put_span_raw(out, plan.transpose_indices);
     put_span_raw(out, plan.transpose_weights);
     put_span_raw(out, plan.lower_ld);
     put_span_raw(out, plan.upper_l);
@@ -268,27 +245,29 @@ AxisPlan deserialize_plan_cooked(
     }
     reader.raw_into(plan.forward_weights, src * forward_width);
 
+    // v4: raw transpose offsets/indices with one checked pass (monotone
+    // offsets, in-range indices) instead of per-element varint decoding.
     plan.transpose_offsets.resize(dst + 1U);
-    std::uint64_t offset = 0;
-    for (std::size_t row = 0; row <= dst; ++row) {
-        offset += reader.varint();
-        if (offset > static_cast<std::uint64_t>(kMaxAxisLength) * kMaxForwardWidth) {
-            throw PlanStoreError("cooked transpose offsets are out of bounds");
-        }
-        plan.transpose_offsets[row] = static_cast<std::uint32_t>(offset);
+    reader.raw_into(plan.transpose_offsets, dst + 1U);
+    if (plan.transpose_offsets.front() != 0U) {
+        throw PlanStoreError("cooked transpose offsets do not start at zero");
     }
-    const std::size_t nnz = static_cast<std::size_t>(offset);
+    for (std::size_t row = 1U; row <= dst; ++row) {
+        if (plan.transpose_offsets[row] < plan.transpose_offsets[row - 1U]) {
+            throw PlanStoreError("cooked transpose offsets are not monotone");
+        }
+    }
+    const std::size_t nnz = plan.transpose_offsets.back();
+    if (nnz > static_cast<std::size_t>(kMaxAxisLength) * kMaxForwardWidth) {
+        throw PlanStoreError("cooked transpose offsets are out of bounds");
+    }
     plan.transpose_indices.resize(nnz);
-    std::int64_t previous_index = 0;
-    for (std::size_t position = 0; position < nnz; ++position) {
-        const std::int64_t delta = static_cast<std::int64_t>(reader.varint()) - (1LL << 31);
-        previous_index += delta;
+    reader.raw_into(plan.transpose_indices, nnz);
+    for (const std::int32_t index : plan.transpose_indices) {
         // Transpose indices address source observations (inverse pass input).
-        if (previous_index < 0
-            || previous_index >= static_cast<std::int64_t>(plan.source_size)) {
+        if (index < 0 || index >= plan.source_size) {
             throw PlanStoreError("cooked transpose index is out of range");
         }
-        plan.transpose_indices[position] = static_cast<std::int32_t>(previous_index);
     }
     reader.raw_into(plan.transpose_weights, nnz);
 

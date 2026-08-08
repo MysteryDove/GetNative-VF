@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,10 +24,10 @@ namespace getnative {
 namespace {
 
 // ---------------------------------------------------------------------------
-// GNPK v2 layout (little-endian throughout)
+// GNPK v4 layout (little-endian throughout)
 // ---------------------------------------------------------------------------
 //
-//   magic "GNPK" u32 | format_version u32 (=3)
+//   magic "GNPK" u32 | format_version u32 (=4)
 //   grid_hash u64 | build_fingerprint u64
 //   plan_count u32 | chunk_size u32 | chunk_count u32 | codec u32
 //   plan index[plan_count]: {key_hash u64, chunk_ordinal u32,
@@ -43,9 +44,14 @@ namespace {
 // dominated by decompression, and LZ4's ~13 GB/s decode beats zstd-1's
 // ~3 GB/s at a ~40% size cost (docs/cold-plan-cache-evaluation.md §3.1
 // named exactly this escape hatch).
+//
+// v4 (2026-08-08): per-plan transpose offsets/indices are raw arrays
+// instead of varint/delta cooking — the byte-at-a-time decode loops
+// dominated fetch latency, and LZ4 recovers most of the size delta.
+// v3 packs are rejected and rebuilt (same policy as v2 -> v3).
 
 constexpr std::uint32_t kMagic = 0x4B504E47U; // "GNPK" little-endian
-constexpr std::uint32_t kFormatVersion = 3;
+constexpr std::uint32_t kFormatVersion = 4;
 constexpr std::uint32_t kCodecZstd = 0;
 constexpr std::uint32_t kCodecLz4 = 1;
 constexpr std::uint32_t kDefaultCodec = kCodecLz4;
@@ -448,8 +454,20 @@ std::optional<StoredGrid> PlanStore::read_grid(std::uint64_t grid_hash) {
         std::filesystem::remove(path, error);
         return std::nullopt;
     };
+    // Stage timing for fetch-latency work; enabled per process via
+    // GETNATIVE_STORE_DEBUG_TIMING=1 and printed on each read_grid call.
+    const bool debug_timing = std::getenv("GETNATIVE_STORE_DEBUG_TIMING") != nullptr;
+    const auto now = [] { return std::chrono::steady_clock::now(); };
+    const auto ms_between = [](auto begin, auto end) {
+        return std::chrono::duration<double, std::milli>(end - begin).count();
+    };
+    double header_ms = 0.0;
+    double decode_ms = 0.0;
+    double entry_ms = 0.0;
     try {
+        const auto header_start = now();
         std::optional<PackFile> pack = load_pack_header(path, grid_hash);
+        header_ms = ms_between(header_start, now());
         if (!pack) return std::nullopt; // plain miss: never existed
         // Index entries are hash-sorted (not grid-ordered), so each entry is
         // located within its chunk via the stored offsets.
@@ -462,13 +480,25 @@ std::optional<StoredGrid> PlanStore::read_grid(std::uint64_t grid_hash) {
             auto &cooked = decoded_chunks[entry.chunk_ordinal];
             if (!cooked.has_value()) {
                 cooked.emplace();
+                const auto decode_start = now();
                 decode_chunk(path, pack->chunks[entry.chunk_ordinal],
                              pack->codec, *cooked);
+                decode_ms += ms_between(decode_start, now());
             }
+            const auto entry_start = now();
             AxisPlanRequest request;
             auto plan = decode_plan_entry(entry, *cooked, request);
+            entry_ms += ms_between(entry_start, now());
             grid.requests.push_back(request);
             grid.plans.push_back(std::move(plan));
+        }
+        if (debug_timing) {
+            std::fprintf(
+                stderr,
+                "plan_store read_grid: header=%.2fms decode=%.2fms "
+                "entries=%.2fms plans=%zu chunks=%zu\n",
+                header_ms, decode_ms, entry_ms, grid.plans.size(),
+                pack->chunks.size());
         }
         return grid;
     } catch (const detail::PlanStoreError &) {
