@@ -1477,12 +1477,16 @@ private:
 
 #if defined(GETNATIVE_HAS_CUDA)
         if (spec.backend == BackendChoice::cuda && chunk_total > 1U) {
-            // Pipeline depth: worker_count when given (1..8), else 2 —
-            // measured sweet spot (p2 vs p1: -24%/-32% candidate phase on
-            // lanczos3/8; p4+ shows no further gain).
+            // Pipeline depth: worker_count when given (1..8), else 3.
+            // After the pack-path rework the knee moved: with host pack
+            // cheap, depth 3 covers the remaining pack/upload latency
+            // (301 candidates, 1080p h_plus_w, median: lanczos8 273/166/152
+            // ms at p1/p2/p3, p4 163 — deeper regresses on contention;
+            // bicubic 59/42/41/41). Chunk size stays 32: 64 coarsens
+            // overlap granularity and regresses both depths.
             const std::size_t requested = spec.worker_count != 0U
                 ? std::max<std::size_t>(1U, std::min<std::size_t>(8U, spec.worker_count))
-                : 2U;
+                : 3U;
             const std::size_t thread_count = std::min(requested, chunk_total);
             std::atomic_size_t cursor{0U};
             std::atomic_size_t done_candidates{0U};
