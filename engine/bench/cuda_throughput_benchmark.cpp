@@ -35,7 +35,19 @@ struct Configuration {
     std::size_t concurrency = 1U;
     std::size_t workspace_mib = 0U;
     getnative::AnalysisAxes axes = getnative::AnalysisAxes::vertical;
+    getnative::Filter filter = getnative::Filter::lanczos(3);
+    std::string filter_id = "lanczos3";
 };
+
+[[nodiscard]] getnative::Filter parse_filter(std::string_view text) {
+    if (text == "bilinear") return getnative::Filter::bilinear();
+    if (text == "bicubic") return getnative::Filter::bicubic();
+    if (text == "lanczos3") return getnative::Filter::lanczos(3);
+    if (text == "spline64") return getnative::Filter::spline64();
+    if (text == "lanczos8") return getnative::Filter::lanczos(8);
+    throw std::invalid_argument(
+        "--filter requires bilinear, bicubic, lanczos3, spline64, or lanczos8");
+}
 
 [[nodiscard]] getnative::AnalysisAxes parse_axes(std::string_view text) {
     if (text == "horizontal") return getnative::AnalysisAxes::horizontal;
@@ -121,6 +133,10 @@ struct Configuration {
             result.workspace_mib = parse_size(next(argument), argument);
         } else if (argument == "--axes") {
             result.axes = parse_axes(next(argument));
+        } else if (argument == "--filter") {
+            const std::string_view id = next(argument);
+            result.filter = parse_filter(id);
+            result.filter_id = std::string{id};
         } else if (argument == "--help") {
             std::cout
                 << "usage: getnative_cuda_throughput_benchmark [--full|--profile] "
@@ -185,7 +201,7 @@ struct Fixture {
                     config.native_width,
                     horizontal_active,
                     horizontal_shift,
-                    getnative::Filter::lanczos(3),
+                    config.filter,
                     getnative::BorderMode::mirror,
                 }));
         }
@@ -196,7 +212,7 @@ struct Fixture {
                 config.native_height,
                 vertical_active,
                 vertical_shift,
-                getnative::Filter::lanczos(3),
+                config.filter,
                 getnative::BorderMode::mirror,
             }));
         }
@@ -339,6 +355,8 @@ int main(int argc, char **argv) {
                   << ",\"native_height\":" << config.native_height
                   << ",\"axes\":"
                   << getnative::benchmark::json_string(axes_name(config.axes))
+                  << ",\"filter\":"
+                  << getnative::benchmark::json_string(config.filter_id)
                   << ",\"candidates\":" << config.candidates
                   << ",\"warmups\":" << config.warmups
                   << ",\"samples\":" << config.samples

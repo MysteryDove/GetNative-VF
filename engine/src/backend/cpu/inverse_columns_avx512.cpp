@@ -71,6 +71,29 @@ void absolute_difference_avx512_f32(
     _mm512_storeu_ps(differences, absolute);
 }
 
+// Bit-exact with the scalar raster-order accumulator (masked lanes add an
+// exact +0.0; survivors keep their order in one double chain).
+double absolute_difference_norm1_avx512_f32(
+    const float *source, const float *reconstruction,
+    std::int32_t x_begin, std::int32_t x_end, float threshold,
+    double sum) noexcept {
+    const __m512i sign = _mm512_set1_epi32(static_cast<int>(0x80000000U));
+    const __m512 threshold_values = _mm512_set1_ps(threshold);
+    for (std::int32_t x = x_begin; x < x_end; x += Avx512Operations::lanes) {
+        const __m512 difference = _mm512_castsi512_ps(_mm512_andnot_si512(
+            sign, _mm512_castps_si512(
+                _mm512_sub_ps(_mm512_loadu_ps(source + x),
+                              _mm512_loadu_ps(reconstruction + x)))));
+        const __m512 filtered = _mm512_maskz_mov_ps(
+            _mm512_cmp_ps_mask(difference, threshold_values, _CMP_GT_OQ), difference);
+        sum = add_norm1_lanes(_mm512_castps512_ps128(filtered), sum);
+        sum = add_norm1_lanes(_mm512_extractf32x4_ps(filtered, 1), sum);
+        sum = add_norm1_lanes(_mm512_extractf32x4_ps(filtered, 2), sum);
+        sum = add_norm1_lanes(_mm512_extractf32x4_ps(filtered, 3), sum);
+    }
+    return sum;
+}
+
 void vertical_reconstruction_avx512_f32(
     const AxisPlan &plan, std::uint32_t begin, std::int32_t left,
     const float *source, const float *native, std::ptrdiff_t native_stride,

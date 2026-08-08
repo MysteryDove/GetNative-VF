@@ -91,6 +91,26 @@ void absolute_difference_avx2_f32(
         differences, _mm256_andnot_ps(_mm256_set1_ps(-0.0F), difference));
 }
 
+// Bit-exact with the scalar raster-order accumulator: masked lanes add an
+// exact +0.0, and surviving lanes are summed in order into one double chain.
+double absolute_difference_norm1_avx2_f32(
+    const float *source, const float *reconstruction,
+    std::int32_t x_begin, std::int32_t x_end, float threshold,
+    double sum) noexcept {
+    const __m256 sign = _mm256_set1_ps(-0.0F);
+    const __m256 threshold_values = _mm256_set1_ps(threshold);
+    for (std::int32_t x = x_begin; x < x_end; x += Avx2Operations::lanes) {
+        __m256 difference = _mm256_andnot_ps(
+            sign, _mm256_sub_ps(_mm256_loadu_ps(source + x),
+                                _mm256_loadu_ps(reconstruction + x)));
+        difference = _mm256_and_ps(
+            difference, _mm256_cmp_ps(difference, threshold_values, _CMP_GT_OQ));
+        sum = add_norm1_lanes(_mm256_castps256_ps128(difference), sum);
+        sum = add_norm1_lanes(_mm256_extractf128_ps(difference, 1), sum);
+    }
+    return sum;
+}
+
 void vertical_reconstruction_avx2_f32(
     const AxisPlan &plan, std::uint32_t begin, std::int32_t left,
     const float *source, const float *native, std::ptrdiff_t native_stride,

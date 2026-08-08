@@ -71,6 +71,23 @@ void absolute_difference_sse2_f32(
         differences, _mm_andnot_ps(_mm_set1_ps(-0.0F), difference));
 }
 
+// Bit-exact with the scalar raster-order accumulator (masked lanes add an
+// exact +0.0; survivors keep their order in one double chain).
+double absolute_difference_norm1_sse2_f32(
+    const float *source, const float *reconstruction,
+    std::int32_t x_begin, std::int32_t x_end, float threshold,
+    double sum) noexcept {
+    const __m128 sign = _mm_set1_ps(-0.0F);
+    const __m128 threshold_values = _mm_set1_ps(threshold);
+    for (std::int32_t x = x_begin; x < x_end; x += Sse2Operations::lanes) {
+        const __m128 difference = _mm_andnot_ps(
+            sign, _mm_sub_ps(_mm_loadu_ps(source + x),
+                             _mm_loadu_ps(reconstruction + x)));
+        sum = add_norm1_lanes(difference, threshold_values, sum);
+    }
+    return sum;
+}
+
 void vertical_reconstruction_sse2_f32(
     const AxisPlan &plan, std::uint32_t begin, std::int32_t left,
     const float *source, const float *native, std::ptrdiff_t native_stride,

@@ -5,7 +5,10 @@
   session path + source residency,
   `docs/performance/e1-cuda-batch-scheduling-20260808.md` — see its §7 for
   the corrected same-session delta), E2 (verify streaming v1.1,
-  `docs/performance/e2-verification-pipeline-20260808.md`), E4 (L1
+  `docs/performance/e2-verification-pipeline-20260808.md`), E3 (metric
+  fusion adopted; large-taps CUDA per-kernel rewrite rejected — headroom
+  is candidate-batched merged solves, D1.2;
+  `docs/performance/e3-kernel-increments-20260808.md`), E4 (L1
   single-flight LRU default + L2 pack store opt-in,
   `docs/performance/e4-cold-plan-store-20260808.md` — hit-rate criterion
   met; store loses to the parallel build on 16-core NVMe hosts, hence

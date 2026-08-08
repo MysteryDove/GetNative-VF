@@ -19,6 +19,10 @@ enum class ColumnDispatchPolicy : std::uint8_t {
 
 using AbsoluteDifferenceBlockFunction = void (*)(
     const float *source, const float *reconstruction, float *differences) noexcept;
+using AbsoluteDifferenceNorm1RowFunction = double (*)(
+    const float *source, const float *reconstruction,
+    std::int32_t x_begin, std::int32_t x_end, float threshold,
+    double sum) noexcept;
 using VerticalReconstructionBlockFunction = void (*)(
     const AxisPlan &plan, std::uint32_t begin, std::int32_t left,
     const float *source, const float *native, std::ptrdiff_t native_stride,
@@ -32,6 +36,7 @@ using VerticalReconstructionNorm1RowFunction = double (*)(
 struct AnalysisRowDispatch {
     std::int32_t lanes = 1;
     AbsoluteDifferenceBlockFunction absolute_difference = nullptr;
+    AbsoluteDifferenceNorm1RowFunction absolute_difference_norm1 = nullptr;
     VerticalReconstructionBlockFunction vertical_reconstruction = nullptr;
     VerticalReconstructionNorm1RowFunction vertical_reconstruction_norm1 = nullptr;
 };

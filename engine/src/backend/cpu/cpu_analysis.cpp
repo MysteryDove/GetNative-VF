@@ -159,7 +159,17 @@ void add_absolute_difference_row(
         }
     }
 #endif
-    if (dispatch.absolute_difference != nullptr) {
+    if (accumulator.is_norm1()
+        && dispatch.absolute_difference_norm1 != nullptr) {
+        const std::int32_t vector_end = x
+            + (x_end - x) / dispatch.lanes * dispatch.lanes;
+        if (x < vector_end) {
+            accumulator.set_norm1_sum(dispatch.absolute_difference_norm1(
+                source, reconstruction, x, vector_end, accumulator.threshold(),
+                accumulator.norm1_sum()));
+            x = vector_end;
+        }
+    } else if (dispatch.absolute_difference != nullptr) {
         alignas(64) float differences[16];
         for (; x <= x_end - dispatch.lanes; x += dispatch.lanes) {
             dispatch.absolute_difference(source + x, reconstruction + x, differences);
