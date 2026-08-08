@@ -68,6 +68,51 @@ void expect_plan_equal(
                               "inverse diagonal");
 }
 
+#if GETNATIVE_PLANNER_FP_MODE_VALUE == 1
+// Fast-math builds reassociate the reuse and recompute tap-evaluation paths
+// differently: measured deltas are <= 6e-8 absolute (1-2 float ulps) on GCC
+// 15.2 -O3. Assert structural equality with a bound far above that noise and
+// far below the 2e-6 upstream-conformance budget; integer data and scalars
+// stay bit-exact. Strict-FP builds keep the exact expectation above.
+void expect_plan_equal_within_fp_noise(
+    const getnative::AxisPlan &actual, const getnative::AxisPlan &expected) {
+    expect(actual.source_size == expected.source_size, "source size differs");
+    expect(actual.destination_size == expected.destination_size, "destination size differs");
+    expect(actual.support == expected.support, "support differs");
+    expect(actual.half_bandwidth == expected.half_bandwidth, "half bandwidth differs");
+    expect(actual.forward_width == expected.forward_width, "forward width differs");
+    expect_vector_bytes_equal(actual.forward_offsets, expected.forward_offsets,
+                              "forward offsets");
+    expect_vector_bytes_equal(actual.forward_indices, expected.forward_indices,
+                              "forward indices");
+    expect_vector_bytes_equal(actual.transpose_offsets, expected.transpose_offsets,
+                              "transpose offsets");
+    expect_vector_bytes_equal(actual.transpose_indices, expected.transpose_indices,
+                              "transpose indices");
+    const auto expect_weights_close = [](const std::vector<float> &lhs,
+                                         const std::vector<float> &rhs,
+                                         std::string_view name) {
+        expect(lhs.size() == rhs.size(), std::string{name} + " size differs");
+        for (std::size_t index = 0; index < lhs.size(); ++index) {
+            if (std::abs(static_cast<double>(lhs[index])
+                         - static_cast<double>(rhs[index])) > 1e-6) {
+                throw std::runtime_error(
+                    std::string{name} + " differs beyond fp noise at "
+                    + std::to_string(index));
+            }
+        }
+    };
+    expect_weights_close(actual.forward_weights, expected.forward_weights,
+                         "forward weights");
+    expect_weights_close(actual.transpose_weights, expected.transpose_weights,
+                         "transpose weights");
+    expect_weights_close(actual.lower_ld, expected.lower_ld, "lower LDLT");
+    expect_weights_close(actual.upper_l, expected.upper_l, "upper L");
+    expect_weights_close(actual.inverse_diagonal, expected.inverse_diagonal,
+                         "inverse diagonal");
+}
+#endif
+
 [[nodiscard]] std::vector<getnative::AxisPlanRequest> fixture_requests() {
     return {
         {37, 23, 23.4, -0.375, getnative::Filter::bilinear(),
@@ -87,6 +132,18 @@ void expect_plan_equal(
         {128, 85, 85.5, -0.25, getnative::Filter::lanczos(8),
          getnative::BorderMode::mirror},
     };
+}
+
+// Cross-mode comparisons (reuse vs recompute, family-reuse vs independent)
+// differ by fast-math reassociation noise; same-mode serial/batch
+// comparisons stay bit-exact and keep using expect_plan_equal.
+void expect_plan_equal_cross_mode(
+    const getnative::AxisPlan &actual, const getnative::AxisPlan &expected) {
+#if GETNATIVE_PLANNER_FP_MODE_VALUE == 1
+    expect_plan_equal_within_fp_noise(actual, expected);
+#else
+    expect_plan_equal(actual, expected);
+#endif
 }
 
 void test_empty_and_stable_deduplication() {
@@ -170,8 +227,8 @@ void test_tap_reuse_is_byte_identical() {
             request, getnative::detail::TapEvaluationMode::recompute);
         const auto reused = getnative::detail::build_axis_plan_with_tap_evaluation(
             request, getnative::detail::TapEvaluationMode::reuse);
-        expect_plan_equal(reused, recomputed);
-        expect_plan_equal(getnative::build_axis_plan(request), reused);
+        expect_plan_equal_cross_mode(reused, recomputed);
+        expect_plan_equal_cross_mode(getnative::build_axis_plan(request), reused);
     }
 
     getnative::detail::AxisPlanBatchOptions recompute_options;
@@ -188,7 +245,7 @@ void test_tap_reuse_is_byte_identical() {
     expect(recomputed_batch.plans.size() == reused_batch.plans.size(),
            "tap evaluation batches differ in size");
     for (std::size_t index = 0; index < reused_batch.plans.size(); ++index) {
-        expect_plan_equal(*reused_batch.plans[index], *recomputed_batch.plans[index]);
+        expect_plan_equal_cross_mode(*reused_batch.plans[index], *recomputed_batch.plans[index]);
     }
 }
 
@@ -229,7 +286,7 @@ void test_bicubic_geometry_reuse_is_byte_identical() {
     expect(independent.plans.size() == reused.plans.size(),
            "bicubic geometry batches differ in size");
     for (std::size_t index = 0; index < reused.plans.size(); ++index) {
-        expect_plan_equal(*reused.plans[index], *independent.plans[index]);
+        expect_plan_equal_cross_mode(*reused.plans[index], *independent.plans[index]);
     }
     expect(independent.bicubic_geometry_family_count == 0U
                && independent.bicubic_geometry_plan_count == 0U
@@ -361,36 +418,53 @@ void test_session_cache_batch_publish_and_ready_reuse() {
            "externally held plans survive session-cache clear");
 }
 
-void test_session_cache_enforces_fixed_admission_limits() {
+void test_session_cache_enforces_lru_eviction() {
     const auto requests = fixture_requests();
+    // Entry bound 2 with three unique plans: all three publish; the third
+    // admission evicts the first (least recently used).
     getnative::AxisPlanCache entry_bounded({
         2U, 64U * 1024U * 1024U,
     });
     const auto cold = entry_bounded.get_or_build_batch(
         std::span<const getnative::AxisPlanRequest>{requests}.first(3U), 4U);
-    expect(cold.physical_build_count == 3U && cold.published_plan_count == 2U
+    expect(cold.physical_build_count == 3U && cold.published_plan_count == 3U
                && cold.resident_entry_count == 2U,
-           "entry bound admits only the stable first two unique plans");
+           "entry bound publishes all plans and retains the two most recent");
     const auto repeated = entry_bounded.get_or_build_batch(
         std::span<const getnative::AxisPlanRequest>{requests}.first(3U), 4U);
     expect(repeated.ready_hit_count == 2U && repeated.physical_build_count == 1U
-               && repeated.published_plan_count == 0U,
-           "non-admitted plans rebuild without evicting retained session plans");
-    expect(repeated.plans[0].get() == cold.plans[0].get()
+               && repeated.published_plan_count == 1U,
+           "the evicted oldest plan rebuilds exactly once and re-admits");
+    expect(repeated.plans[0].get() != cold.plans[0].get()
                && repeated.plans[1].get() == cold.plans[1].get()
-               && repeated.plans[2].get() != cold.plans[2].get(),
-           "fixed admission preserves retained pointers and leaves overflow transient");
+               && repeated.plans[2].get() == cold.plans[2].get(),
+           "LRU keeps the recent pointers and rebuilds the evicted one");
 
+    // Byte bound of the larger plan: admitting the second plan evicts the
+    // first. (A plan larger than the cap itself is never retained.)
     const auto first_plan = getnative::build_axis_plan(requests.front());
-    const std::size_t first_bytes = getnative::axis_plan_storage_bytes(first_plan);
-    getnative::AxisPlanCache byte_bounded({8U, first_bytes});
+    const auto second_plan = getnative::build_axis_plan(requests[1]);
+    const std::size_t byte_cap = std::max(getnative::axis_plan_storage_bytes(first_plan),
+                                          getnative::axis_plan_storage_bytes(second_plan));
+    getnative::AxisPlanCache byte_bounded({8U, byte_cap});
     const auto byte_result = byte_bounded.get_or_build_batch(
         std::span<const getnative::AxisPlanRequest>{requests}.first(2U), 2U);
     expect(byte_result.physical_build_count == 2U
-               && byte_result.published_plan_count == 1U,
-           "byte bound admits the first fitting plan only");
-    expect(byte_bounded.size() == 1U && byte_bounded.resident_bytes() == first_bytes,
+               && byte_result.published_plan_count == 2U
+               && byte_result.resident_entry_count == 1U,
+           "byte bound admits each plan and evicts the previous one");
+    expect(byte_bounded.size() == 1U
+               && byte_bounded.resident_bytes()
+                   == getnative::axis_plan_storage_bytes(*byte_result.plans[1]),
            "session-cache logical bytes never exceed the configured ceiling");
+
+    getnative::AxisPlanCache oversized({8U, 1U});
+    const auto oversized_result = oversized.get_or_build_batch(
+        std::span<const getnative::AxisPlanRequest>{requests}.first(1U), 1U);
+    expect(oversized_result.physical_build_count == 1U
+               && oversized_result.published_plan_count == 0U
+               && oversized.size() == 0U,
+           "a plan larger than the byte cap is returned but never retained");
 
     getnative::AxisPlanCache no_residency({0U, 0U});
     const auto transient_first = no_residency.get_or_build(requests.front());
@@ -533,7 +607,7 @@ int main() {
         test_bicubic_geometry_reuse_is_byte_identical();
         test_exact_bit_key_distinctions_and_call_isolation();
         test_session_cache_batch_publish_and_ready_reuse();
-        test_session_cache_enforces_fixed_admission_limits();
+        test_session_cache_enforces_lru_eviction();
         test_session_cache_failed_batch_publishes_nothing();
         test_worker_bounds_and_peak_concurrency();
         test_lowest_stable_failure_is_rethrown_after_join();
