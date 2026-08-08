@@ -692,11 +692,9 @@ public:
         const std::string job_id = "job-" + std::to_string(next_job_++);
         AnalyzeJobSpec spec = parse_analyze(command, job_id);
         auto job = std::make_shared<Job>(std::move(spec));
-        {
-            const std::scoped_lock lock(mutex_);
-            queue_.push_back(job);
-        }
-        condition_.notify_one();
+        // Emit accepted BEFORE the job becomes visible to the executor:
+        // event order on the wire must place accepted ahead of any job
+        // event (a warm plan cache makes plan progress otherwise racy).
         emit(JsonValue::object({
             {"protocol_version", JsonValue::integer(kProtocolVersion)},
             {"type", JsonValue::string("accepted")},
@@ -705,6 +703,11 @@ public:
             {"timestamp_ms", JsonValue::integer(timestamp_ms())},
             {"mode", JsonValue::string("height")},
         }));
+        {
+            const std::scoped_lock lock(mutex_);
+            queue_.push_back(job);
+        }
+        condition_.notify_one();
     }
 
     void verify_begin(const JsonValue &command) {
@@ -713,11 +716,6 @@ public:
         VerifyJobSpec spec = parse_verify_begin(command, job_id);
         const std::size_t workers = effective_verify_workers(spec);
         auto job = std::make_shared<Job>(std::move(spec));
-        {
-            const std::scoped_lock lock(mutex_);
-            queue_.push_back(job);
-        }
-        condition_.notify_one();
         emit(JsonValue::object({
             {"protocol_version", JsonValue::integer(kProtocolVersion)},
             {"type", JsonValue::string("accepted")},
@@ -729,6 +727,11 @@ public:
             {"suggested_in_flight", JsonValue::integer(
                 static_cast<std::int64_t>(workers * 2U))},
         }));
+        {
+            const std::scoped_lock lock(mutex_);
+            queue_.push_back(job);
+        }
+        condition_.notify_one();
     }
 
     void verify_frame(const JsonValue &command) {
