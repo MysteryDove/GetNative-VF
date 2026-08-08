@@ -844,9 +844,11 @@ struct ExecutionSlot {
     ExecutionSlot(const ExecutionSlot &) = delete;
     ExecutionSlot &operator=(const ExecutionSlot &) = delete;
 
-    void reset_device_buffers() noexcept {
-        device_source.reset();
-        device_transposed_source.reset();
+    // Drops the large per-batch buffers (plan arrays, workspace, partials)
+    // while keeping source residency: the source and its transpose are small
+    // (2 x source bytes), generic across batches, and expensive to rebuild
+    // (H2D + transpose kernel) when a budget reset evicts them.
+    void reset_plan_buffers() noexcept {
         device_candidates.reset();
         device_forward_left.reset();
         device_forward_weights.reset();
@@ -860,7 +862,6 @@ struct ExecutionSlot {
         device_partials.reset();
         device_results.reset();
         plan_ready = false;
-        source_ready = false;
     }
 
     const DriverApi *api = nullptr;
@@ -1444,7 +1445,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
     const std::size_t retained_capacity_limit = std::min(
         maximum_explicit_bytes, impl_->memory_budget.per_slot_budget_bytes);
     if (projected_device_bytes > retained_capacity_limit) {
-        slot.reset_device_buffers();
+        slot.reset_plan_buffers();
         if (plan_cache_hit) {
             plan_cache_hit = false;
             delta.plan_cache_hits = 0U;

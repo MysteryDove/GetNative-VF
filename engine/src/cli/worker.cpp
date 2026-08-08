@@ -1635,6 +1635,36 @@ private:
             telemetry_members.emplace_back(
                 "cuda_gpu_total_ms", JsonValue::number(cuda.gpu_total_ms));
             telemetry_members.emplace_back(
+                "cuda_host_pack_ms", JsonValue::number(cuda.host_pack_ms));
+            telemetry_members.emplace_back(
+                "cuda_source_staging_ms",
+                JsonValue::number(cuda.source_staging_ms));
+            telemetry_members.emplace_back(
+                "cuda_source_upload_ms",
+                JsonValue::number(cuda.source_upload_ms));
+            telemetry_members.emplace_back(
+                "cuda_plan_upload_ms", JsonValue::number(cuda.plan_upload_ms));
+            telemetry_members.emplace_back(
+                "cuda_source_transpose_ms",
+                JsonValue::number(cuda.source_transpose_ms));
+            telemetry_members.emplace_back(
+                "cuda_inverse_horizontal_ms",
+                JsonValue::number(cuda.inverse_horizontal_ms));
+            telemetry_members.emplace_back(
+                "cuda_inverse_vertical_ms",
+                JsonValue::number(cuda.inverse_vertical_ms));
+            telemetry_members.emplace_back(
+                "cuda_forward_intermediate_ms",
+                JsonValue::number(cuda.forward_intermediate_ms));
+            telemetry_members.emplace_back(
+                "cuda_metric_ms", JsonValue::number(cuda.metric_ms));
+            telemetry_members.emplace_back(
+                "cuda_result_readback_ms",
+                JsonValue::number(cuda.result_readback_ms));
+            telemetry_members.emplace_back(
+                "cuda_execution_slot_wait_ms",
+                JsonValue::number(cuda.execution_slot_wait_ms));
+            telemetry_members.emplace_back(
                 "cuda_device", JsonValue::string(cuda_engine_->device_info().name));
         }
 #endif
