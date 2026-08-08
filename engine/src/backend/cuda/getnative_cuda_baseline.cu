@@ -227,6 +227,208 @@ __device__ __forceinline__ void inverse_axis_ring_pair(
     }
 }
 
+// Register-ring inverse for runtime half-bandwidths (up to 15). Identical
+// operation order to the generic output-array recurrence in inverse_axis
+// below, but the recurrence state lives in registers instead of re-reading
+// output[] from global memory at every step — the wide-taps stall measured
+// in docs/performance/e3-kernel-increments-20260808.md (inverse_horizontal
+// at 9.1% SM, 0.32 waves/SM on lanczos8). The fixed 15-deep unrolled loops
+// with runtime guards keep the window in registers for any band <= 15;
+// half-bandwidths 3 and 5 keep their tighter specializations above.
+constexpr std::uint32_t kRegisterRingMaxBandwidth = 15U;
+
+__device__ __forceinline__ void inverse_axis_ring_dynamic(
+    const baseline::AxisPlanDescriptor &plan,
+    const std::uint32_t *__restrict__ transpose_offsets,
+    const std::int32_t *__restrict__ transpose_indices,
+    const float *__restrict__ transpose_weights,
+    const float *__restrict__ lower_ld,
+    const float *__restrict__ upper_l,
+    const float *__restrict__ inverse_diagonal,
+    const float *__restrict__ input,
+    std::uint32_t input_stride,
+    float *__restrict__ output,
+    std::uint32_t output_stride) {
+    const std::uint32_t size = plan.destination_size;
+    const std::uint32_t band = plan.half_bandwidth;
+    float recent[kRegisterRingMaxBandwidth]{};
+    for (std::uint32_t index = 0U; index < size; ++index) {
+        float sum = 0.0F;
+        const std::uint32_t begin = transpose_offsets[
+            plan.transpose_offsets_base + index];
+        const std::uint32_t end = transpose_offsets[
+            plan.transpose_offsets_base + index + 1U];
+        for (std::uint32_t position = begin; position < end; ++position) {
+            const std::uint32_t input_index = static_cast<std::uint32_t>(
+                transpose_indices[plan.transpose_indices_base + position]);
+            sum = fmaf(
+                transpose_weights[plan.transpose_weights_base + position],
+                input[input_index * input_stride], sum);
+        }
+        const std::uint32_t available = minimum(band, index);
+#pragma unroll
+        for (std::uint32_t reverse = kRegisterRingMaxBandwidth;
+             reverse > 0U; --reverse) {
+            if (reverse <= available) {
+                const std::uint32_t factor = plan.lower_ld_base
+                    + (reverse - 1U) * size + index;
+                sum = fmaf(-lower_ld[factor], recent[reverse - 1U], sum);
+            }
+        }
+        const float current =
+            sum * inverse_diagonal[plan.inverse_diagonal_base + index];
+        output[index * output_stride] = current;
+#pragma unroll
+        for (std::uint32_t distance = kRegisterRingMaxBandwidth - 1U;
+             distance > 0U; --distance) {
+            recent[distance] = recent[distance - 1U];
+        }
+        recent[0] = current;
+    }
+
+    if (size < 2U) return;
+    recent[0] = output[(size - 1U) * output_stride];
+#pragma unroll
+    for (std::uint32_t distance = 1U; distance < kRegisterRingMaxBandwidth;
+         ++distance) {
+        recent[distance] = 0.0F;
+    }
+    for (std::uint32_t reverse_index = size - 1U;
+         reverse_index > 0U; --reverse_index) {
+        const std::uint32_t index = reverse_index - 1U;
+        const std::uint32_t available = minimum(band, size - index - 1U);
+        float sum = 0.0F;
+#pragma unroll
+        for (std::uint32_t distance = kRegisterRingMaxBandwidth;
+             distance > 0U; --distance) {
+            if (distance <= available) {
+                const std::uint32_t factor = plan.upper_l_base
+                    + (distance - 1U) * size + index;
+                sum = fmaf(upper_l[factor], recent[distance - 1U], sum);
+            }
+        }
+        const float current = output[index * output_stride] - sum;
+        output[index * output_stride] = current;
+#pragma unroll
+        for (std::uint32_t distance = kRegisterRingMaxBandwidth - 1U;
+             distance > 0U; --distance) {
+            recent[distance] = recent[distance - 1U];
+        }
+        recent[0] = current;
+    }
+}
+
+__device__ __forceinline__ void inverse_axis_ring_pair_dynamic(
+    const baseline::AxisPlanDescriptor &plan,
+    const std::uint32_t *__restrict__ transpose_offsets,
+    const std::int32_t *__restrict__ transpose_indices,
+    const float *__restrict__ transpose_weights,
+    const float *__restrict__ lower_ld,
+    const float *__restrict__ upper_l,
+    const float *__restrict__ inverse_diagonal,
+    const float *__restrict__ input0,
+    const float *__restrict__ input1,
+    std::uint32_t input_stride,
+    float *__restrict__ output0,
+    float *__restrict__ output1,
+    std::uint32_t output_stride,
+    bool second_active) {
+    const std::uint32_t size = plan.destination_size;
+    const std::uint32_t band = plan.half_bandwidth;
+    float recent0[kRegisterRingMaxBandwidth]{};
+    float recent1[kRegisterRingMaxBandwidth]{};
+    for (std::uint32_t index = 0U; index < size; ++index) {
+        float sum0 = 0.0F;
+        float sum1 = 0.0F;
+        const std::uint32_t begin = transpose_offsets[
+            plan.transpose_offsets_base + index];
+        const std::uint32_t end = transpose_offsets[
+            plan.transpose_offsets_base + index + 1U];
+        for (std::uint32_t position = begin; position < end; ++position) {
+            const std::uint32_t input_index = static_cast<std::uint32_t>(
+                transpose_indices[plan.transpose_indices_base + position]);
+            const float weight =
+                transpose_weights[plan.transpose_weights_base + position];
+            sum0 = fmaf(weight, input0[input_index * input_stride], sum0);
+            if (second_active) {
+                sum1 = fmaf(weight, input1[input_index * input_stride], sum1);
+            }
+        }
+        const std::uint32_t available = minimum(band, index);
+#pragma unroll
+        for (std::uint32_t reverse = kRegisterRingMaxBandwidth;
+             reverse > 0U; --reverse) {
+            if (reverse <= available) {
+                const std::uint32_t factor_index = plan.lower_ld_base
+                    + (reverse - 1U) * size + index;
+                const float factor = lower_ld[factor_index];
+                sum0 = fmaf(-factor, recent0[reverse - 1U], sum0);
+                if (second_active) {
+                    sum1 = fmaf(-factor, recent1[reverse - 1U], sum1);
+                }
+            }
+        }
+        const float diagonal =
+            inverse_diagonal[plan.inverse_diagonal_base + index];
+        const float current0 = sum0 * diagonal;
+        const float current1 = second_active ? sum1 * diagonal : 0.0F;
+        output0[index * output_stride] = current0;
+        if (second_active) output1[index * output_stride] = current1;
+#pragma unroll
+        for (std::uint32_t distance = kRegisterRingMaxBandwidth - 1U;
+             distance > 0U; --distance) {
+            recent0[distance] = recent0[distance - 1U];
+            recent1[distance] = recent1[distance - 1U];
+        }
+        recent0[0] = current0;
+        recent1[0] = current1;
+    }
+
+    if (size < 2U) return;
+    recent0[0] = output0[(size - 1U) * output_stride];
+    recent1[0] = second_active
+        ? output1[(size - 1U) * output_stride] : 0.0F;
+#pragma unroll
+    for (std::uint32_t distance = 1U; distance < kRegisterRingMaxBandwidth;
+         ++distance) {
+        recent0[distance] = 0.0F;
+        recent1[distance] = 0.0F;
+    }
+    for (std::uint32_t reverse_index = size - 1U;
+         reverse_index > 0U; --reverse_index) {
+        const std::uint32_t index = reverse_index - 1U;
+        const std::uint32_t available = minimum(band, size - index - 1U);
+        float sum0 = 0.0F;
+        float sum1 = 0.0F;
+#pragma unroll
+        for (std::uint32_t distance = kRegisterRingMaxBandwidth;
+             distance > 0U; --distance) {
+            if (distance <= available) {
+                const std::uint32_t factor_index = plan.upper_l_base
+                    + (distance - 1U) * size + index;
+                const float factor = upper_l[factor_index];
+                sum0 = fmaf(factor, recent0[distance - 1U], sum0);
+                if (second_active) {
+                    sum1 = fmaf(factor, recent1[distance - 1U], sum1);
+                }
+            }
+        }
+        const float current0 = output0[index * output_stride] - sum0;
+        const float current1 = second_active
+            ? output1[index * output_stride] - sum1 : 0.0F;
+        output0[index * output_stride] = current0;
+        if (second_active) output1[index * output_stride] = current1;
+#pragma unroll
+        for (std::uint32_t distance = kRegisterRingMaxBandwidth - 1U;
+             distance > 0U; --distance) {
+            recent0[distance] = recent0[distance - 1U];
+            recent1[distance] = recent1[distance - 1U];
+        }
+        recent0[0] = current0;
+        recent1[0] = current1;
+    }
+}
+
 template <std::uint32_t Bandwidth, bool UpperAscending>
 __device__ __forceinline__ void inverse_axis_ring_row_major_tiled(
     const baseline::AxisPlanDescriptor &plan,
@@ -415,6 +617,13 @@ __device__ __forceinline__ void inverse_axis(
             input, input_stride, output, output_stride);
         return;
     }
+    if (plan.half_bandwidth <= kRegisterRingMaxBandwidth) {
+        inverse_axis_ring_dynamic(
+            plan, transpose_offsets, transpose_indices, transpose_weights,
+            lower_ld, upper_l, inverse_diagonal,
+            input, input_stride, output, output_stride);
+        return;
+    }
     const std::uint32_t size = plan.destination_size;
     for (std::uint32_t index = 0U; index < size; ++index) {
         float sum = 0.0F;
@@ -490,6 +699,14 @@ __device__ __forceinline__ void inverse_axis_pair(
     }
     if (plan.half_bandwidth == 3U) {
         inverse_axis_ring_pair<3U, true>(
+            plan, transpose_offsets, transpose_indices, transpose_weights,
+            lower_ld, upper_l, inverse_diagonal,
+            input0, input1, input_stride,
+            output0, output1, output_stride, second_active);
+        return;
+    }
+    if (plan.half_bandwidth <= kRegisterRingMaxBandwidth) {
+        inverse_axis_ring_pair_dynamic(
             plan, transpose_offsets, transpose_indices, transpose_weights,
             lower_ld, upper_l, inverse_diagonal,
             input0, input1, input_stride,

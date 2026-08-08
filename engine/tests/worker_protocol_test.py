@@ -327,7 +327,9 @@ def main():
             print("SKIP cuda-parity (CUDA backend not available)")
             print("SKIP cuda-source-residency (CUDA backend not available)")
         else:
-            candidates = ["200", "201", "202"]
+            # 40 candidates span two 32-wide chunks, exercising the CUDA
+            # candidate pipeline (parallel chunk execution, ordered results).
+            candidates = [str(190 + i) for i in range(40)]
 
             def run_job(request_id, backend):
                 worker.send(**analyze_command(request_id, frame, candidates,

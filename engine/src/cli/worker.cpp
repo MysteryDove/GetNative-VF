@@ -1292,13 +1292,15 @@ private:
             queue_store_publish(unique_requests, unique_plans, builds);
         }
 
-        // Candidate phase.
+        // Candidate phase. Results are indexed by candidate position so the
+        // CUDA path can run chunks through a pipeline of threads: the
+        // engine's slot pool overlaps chunk N's device execution with chunk
+        // N+1's host pack + upload (the unique-candidate-scan wall measured
+        // in docs/performance/e3-kernel-increments-20260808.md §2).
         const auto candidates_start = std::chrono::steady_clock::now();
-        std::vector<CandidateResult> results;
-        results.reserve(spec.candidates.size());
+        std::vector<CandidateResult> results(spec.candidates.size());
 
 #if defined(GETNATIVE_HAS_CUDA)
-        CudaRuntimeTelemetry cuda_start_telemetry;
         if (spec.backend == BackendChoice::cuda) {
             if (!cuda_engine_) {
                 try {
@@ -1320,11 +1322,12 @@ private:
         }
 #endif
 
-        for (std::size_t begin = 0; begin < spec.candidates.size();
-             begin += kCandidateChunkSize) {
+        const auto build_chunk = [&](std::size_t chunk_index,
+                                     std::vector<CandidateAnalysis> &chunk) {
+            const std::size_t begin = chunk_index * kCandidateChunkSize;
             const std::size_t end =
                 std::min(begin + kCandidateChunkSize, spec.candidates.size());
-            std::vector<CandidateAnalysis> chunk;
+            chunk.clear();
             chunk.reserve(end - begin);
             for (std::size_t index = begin; index < end; ++index) {
                 CandidateAnalysis candidate;
@@ -1342,31 +1345,132 @@ private:
                 }
                 chunk.push_back(std::move(candidate));
             }
-            std::vector<CandidateResult> chunk_results;
-            try {
-                if (spec.backend == BackendChoice::cpu) {
-                    chunk_results = analyze_batch_f32(
-                        source, chunk, spec.metric, spec.worker_count);
-                }
+        };
+
+        const std::size_t chunk_total =
+            (spec.candidates.size() + kCandidateChunkSize - 1U) / kCandidateChunkSize;
+        std::size_t completed = 0U;
+
 #if defined(GETNATIVE_HAS_CUDA)
-                else {
-                    chunk_results = cuda_engine_->analyze_axis_batch_f32(
-                        source, chunk, spec.metric, job.stop_source.get_token());
+        if (spec.backend == BackendChoice::cuda && chunk_total > 1U) {
+            // Pipeline depth: worker_count when given (1..8), else 2 —
+            // measured sweet spot (p2 vs p1: -24%/-32% candidate phase on
+            // lanczos3/8; p4+ shows no further gain).
+            const std::size_t requested = spec.worker_count != 0U
+                ? std::max<std::size_t>(1U, std::min<std::size_t>(8U, spec.worker_count))
+                : 2U;
+            const std::size_t thread_count = std::min(requested, chunk_total);
+            std::atomic_size_t cursor{0U};
+            std::atomic_size_t done_candidates{0U};
+            std::vector<std::atomic<bool>> chunk_done(chunk_total);
+            for (auto &flag : chunk_done) flag.store(false, std::memory_order_relaxed);
+            std::exception_ptr failure;
+            std::mutex failure_mutex;
+            {
+                std::vector<std::thread> pipeline;
+                pipeline.reserve(thread_count);
+                for (std::size_t worker = 0; worker < thread_count; ++worker) {
+                    pipeline.emplace_back([&] {
+                        while (true) {
+                            const std::size_t chunk_index =
+                                cursor.fetch_add(1U, std::memory_order_relaxed);
+                            if (chunk_index >= chunk_total) return;
+                            if (job.cancel_requested.load(std::memory_order_relaxed)) {
+                                return;
+                            }
+                            try {
+                                std::vector<CandidateAnalysis> chunk;
+                                build_chunk(chunk_index, chunk);
+                                const std::size_t begin =
+                                    chunk_index * kCandidateChunkSize;
+                                std::vector<CandidateResult> chunk_results =
+                                    cuda_engine_->analyze_axis_batch_f32(
+                                        source, chunk, spec.metric,
+                                        job.stop_source.get_token());
+                                for (std::size_t offset = 0;
+                                     offset < chunk_results.size(); ++offset) {
+                                    results[begin + offset] =
+                                        std::move(chunk_results[offset]);
+                                }
+                                chunk_done[chunk_index].store(
+                                    true, std::memory_order_release);
+                                const std::size_t done = done_candidates.fetch_add(
+                                    chunk_results.size(), std::memory_order_relaxed)
+                                    + chunk_results.size();
+                                emit_progress(spec, "candidates", done,
+                                              spec.candidates.size());
+                            } catch (...) {
+                                if (job.cancel_requested.load(
+                                        std::memory_order_relaxed)) {
+                                    return; // cooperative cancellation, not a failure
+                                }
+                                const std::scoped_lock lock(failure_mutex);
+                                if (!failure) failure = std::current_exception();
+                                cursor.store(chunk_total, std::memory_order_relaxed);
+                                return;
+                            }
+                        }
+                    });
                 }
-#endif
-            } catch (...) {
-                check_cancelled(job);
-                throw;
+                for (std::thread &thread : pipeline) thread.join();
             }
-            results.insert(results.end(),
-                           std::make_move_iterator(chunk_results.begin()),
-                           std::make_move_iterator(chunk_results.end()));
+            if (failure) std::rethrow_exception(failure);
             if (job.cancel_requested.load(std::memory_order_relaxed)) {
-                emit_partial_cancelled(spec, results);
+                // Contiguous-prefix partial results in candidate order.
+                std::vector<CandidateResult> partial;
+                for (std::size_t chunk_index = 0; chunk_index < chunk_total;
+                     ++chunk_index) {
+                    if (!chunk_done[chunk_index].load(std::memory_order_acquire)) {
+                        break;
+                    }
+                    const std::size_t begin = chunk_index * kCandidateChunkSize;
+                    const std::size_t end = std::min(
+                        begin + kCandidateChunkSize, spec.candidates.size());
+                    for (std::size_t index = begin; index < end; ++index) {
+                        partial.push_back(std::move(results[index]));
+                    }
+                }
+                emit_partial_cancelled(spec, partial);
                 return;
             }
-            emit_progress(spec, "candidates", results.size(), spec.candidates.size());
+            completed = spec.candidates.size();
+        } else
+#endif
+        {
+            for (std::size_t chunk_index = 0; chunk_index < chunk_total;
+                 ++chunk_index) {
+                std::vector<CandidateAnalysis> chunk;
+                build_chunk(chunk_index, chunk);
+                std::vector<CandidateResult> chunk_results;
+                try {
+#if defined(GETNATIVE_HAS_CUDA)
+                    if (spec.backend == BackendChoice::cuda) {
+                        chunk_results = cuda_engine_->analyze_axis_batch_f32(
+                            source, chunk, spec.metric, job.stop_source.get_token());
+                    } else
+#endif
+                    {
+                        chunk_results = analyze_batch_f32(
+                            source, chunk, spec.metric, spec.worker_count);
+                    }
+                } catch (...) {
+                    check_cancelled(job);
+                    throw;
+                }
+                const std::size_t begin = chunk_index * kCandidateChunkSize;
+                for (std::size_t offset = 0; offset < chunk_results.size(); ++offset) {
+                    results[begin + offset] = std::move(chunk_results[offset]);
+                }
+                completed += chunk_results.size();
+                if (job.cancel_requested.load(std::memory_order_relaxed)) {
+                    results.resize(completed);
+                    emit_partial_cancelled(spec, results);
+                    return;
+                }
+                emit_progress(spec, "candidates", completed, spec.candidates.size());
+            }
         }
+        results.resize(completed);
         const double candidates_ms = elapsed_ms(candidates_start);
 
         const char *backend_name = spec.backend == BackendChoice::cuda ? "cuda" : "cpu";

@@ -12,7 +12,9 @@
   single-flight LRU default + L2 pack store opt-in,
   `docs/performance/e4-cold-plan-store-20260808.md` — hit-rate criterion
   met; store loses to the parallel build on 16-core NVMe hosts, hence
-  opt-in).
+  opt-in), D1.2 (register-ring inverse +77-95% wide taps, 2-deep
+  candidate pipeline, steady-state CUDA scan 4-10x CPU;
+  `docs/performance/d12-cuda-wide-taps-and-pipeline-20260808.md`).
 - Date: 2026-08-07.
 - Audience: future engine/UI lane owners.
 - Sources: `/home/owen/dev/Descale-MVC` (`dsmvc`, VapourSynth API4 descale
