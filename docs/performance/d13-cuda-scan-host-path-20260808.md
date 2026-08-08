@@ -103,8 +103,12 @@ overlap granularity, worse tail).
   118 → 98 ms on the uniform 700..1000 grid (median period 270 caps the
   average at ~4x on weight evals); gcd-friendly native heights get
   10-270x per plan. Fractional active lengths fall back.
-- Shallow-tier inverse ring (exact hbw=1, or 7-deep) once GPU is the
-  wall after plan build improves.
+- ~~Shallow-tier inverse ring (exact hbw=1, or 7-deep)~~ — **LANDED**
+  (`83eba57`): exact-fit rings for bands 1 and 7. Worker-shape kernel
+  time bilinear −20%, spline64 −32%. Nuance: the frozen-shape benchmark
+  shows only −5% for bilinear inv_h — at band 1 the short recurrence is
+  gather/occupancy-bound, not issue-bound; the guard waste bound band 7
+  much harder. lanczos 5-7 (bands 9/11/13) stay on the dynamic 15-ring.
 - Per-plan packed-blob persistence (plan store v4) — the pinned layout
   work makes the packed form cheap to produce; storing it would skip
   build + pack on repeat sessions (revisits the E4 latency verdict).
