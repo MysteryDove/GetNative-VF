@@ -377,29 +377,6 @@ private:
     Function function_;
 };
 
-template <class Value>
-[[nodiscard]] std::uint32_t append_values(
-    std::vector<Value> &destination, const std::vector<Value> &source,
-    std::size_t &aggregate_upload_bytes) {
-    const std::size_t appended_bytes = checked_product(
-        source.size(), sizeof(Value), "CUDA plan upload");
-    const std::size_t next_upload_bytes = checked_add(
-        aggregate_upload_bytes, appended_bytes, "CUDA plan upload");
-    if (next_upload_bytes > maximum_explicit_bytes) {
-        throw std::length_error("CUDA plan upload exceeds 2 GiB");
-    }
-    const std::size_t next_size = checked_add(
-        destination.size(), source.size(), "CUDA packed plan");
-    if (next_size > destination.max_size()) {
-        throw std::length_error("CUDA packed plan exceeds host vector capacity");
-    }
-    const std::uint32_t base = checked_u32(
-        destination.size(), "CUDA packed plan offset");
-    destination.insert(destination.end(), source.begin(), source.end());
-    aggregate_upload_bytes = next_upload_bytes;
-    return base;
-}
-
 void validate_axis_plan(const AxisPlan &plan) {
     if (!plan.valid() || plan.half_bandwidth < 0 || plan.half_bandwidth > 15
         || plan.forward_width > 16) {
@@ -478,44 +455,57 @@ struct PackedBatch {
         bool fused_both = true;
     };
 
-    std::vector<CandidateDescriptor> candidates;
+    // Byte sizes of the pinned staging image, in upload order. Every packed
+    // range is a whole plan array, so the exact sizes are known from a cheap
+    // pre-pass over the candidate plans before anything is written.
+    struct Layout {
+        std::size_t candidates_bytes = 0U;
+        std::size_t forward_left_bytes = 0U;
+        std::size_t forward_weights_bytes = 0U;
+        std::size_t transpose_offsets_bytes = 0U;
+        std::size_t transpose_indices_bytes = 0U;
+        std::size_t transpose_weights_bytes = 0U;
+        std::size_t lower_ld_bytes = 0U;
+        std::size_t upper_l_bytes = 0U;
+        std::size_t inverse_diagonal_bytes = 0U;
+        std::size_t total_bytes = 0U;
+
+        // {offset, bytes} per array, in the fixed upload order used for the
+        // H2D copies (candidates first).
+        [[nodiscard]] std::array<std::pair<std::size_t, std::size_t>, 9U>
+        regions() const {
+            const std::array<std::size_t, 9U> bytes = {
+                candidates_bytes, forward_left_bytes, forward_weights_bytes,
+                transpose_offsets_bytes, transpose_indices_bytes,
+                transpose_weights_bytes, lower_ld_bytes, upper_l_bytes,
+                inverse_diagonal_bytes};
+            std::array<std::pair<std::size_t, std::size_t>, 9U> result{};
+            std::size_t offset = 0U;
+            for (std::size_t index = 0U; index < bytes.size(); ++index) {
+                result[index] = {offset, bytes[index]};
+                offset += bytes[index];
+            }
+            return result;
+        }
+    };
+
     std::vector<Tile> tiles;
-    std::vector<std::int32_t> forward_left;
-    std::vector<float> forward_weights;
-    std::vector<std::uint32_t> transpose_offsets;
-    std::vector<std::int32_t> transpose_indices;
-    std::vector<float> transpose_weights;
-    std::vector<float> lower_ld;
-    std::vector<float> upper_l;
-    std::vector<float> inverse_diagonal;
+    Layout layout;
     std::size_t workspace_elements = 0U;
     std::size_t maximum_tile_candidate_count = 0U;
-    std::size_t upload_bytes = 0U;
     bool has_horizontal = false;
 
-    // Keeps vector capacity across batches: chunk-sized batches recur with
-    // near-identical sizes, so clearing instead of rebuilding avoids the
-    // reallocation cascade and fresh-page faults on every batch.
     void clear_for_reuse() {
-        candidates.clear();
         tiles.clear();
-        forward_left.clear();
-        forward_weights.clear();
-        transpose_offsets.clear();
-        transpose_indices.clear();
-        transpose_weights.clear();
-        lower_ld.clear();
-        upper_l.clear();
-        inverse_diagonal.clear();
+        layout = {};
         workspace_elements = 0U;
         maximum_tile_candidate_count = 0U;
-        upload_bytes = 0U;
         has_horizontal = false;
     }
 
-    // Exact-sizing pre-pass: every appended range is a whole plan array, so
-    // the final sizes are known before any packing happens.
-    void reserve_for(std::span<const CandidateAnalysis> batch) {
+    [[nodiscard]] static Layout compute_layout(
+        std::span<const CandidateAnalysis> batch) {
+        Layout layout;
         std::size_t forward_rows = 0U;
         std::size_t forward_weight_elements = 0U;
         std::size_t transpose_offset_elements = 0U;
@@ -533,57 +523,92 @@ struct PackedBatch {
             }
             for (std::size_t index = 0U; index < axis_count; ++index) {
                 const AxisPlan &plan = *axes[index];
-                forward_rows += static_cast<std::size_t>(plan.source_size);
-                forward_weight_elements += plan.forward_weights.size();
-                transpose_offset_elements += plan.transpose_offsets.size();
-                transpose_elements += plan.transpose_indices.size();
-                factor_elements += plan.lower_ld.size();
-                diagonal_elements += plan.inverse_diagonal.size();
+                forward_rows = checked_add(
+                    forward_rows, static_cast<std::size_t>(plan.source_size),
+                    "CUDA packed plan");
+                forward_weight_elements = checked_add(
+                    forward_weight_elements, plan.forward_weights.size(),
+                    "CUDA packed plan");
+                transpose_offset_elements = checked_add(
+                    transpose_offset_elements, plan.transpose_offsets.size(),
+                    "CUDA packed plan");
+                transpose_elements = checked_add(
+                    transpose_elements, plan.transpose_indices.size(),
+                    "CUDA packed plan");
+                factor_elements = checked_add(
+                    factor_elements, plan.lower_ld.size(), "CUDA packed plan");
+                diagonal_elements = checked_add(
+                    diagonal_elements, plan.inverse_diagonal.size(),
+                    "CUDA packed plan");
             }
         }
-        candidates.reserve(batch.size());
-        forward_left.reserve(forward_rows);
-        forward_weights.reserve(forward_weight_elements);
-        transpose_offsets.reserve(transpose_offset_elements);
-        transpose_indices.reserve(transpose_elements);
-        transpose_weights.reserve(transpose_elements);
-        lower_ld.reserve(factor_elements);
-        upper_l.reserve(factor_elements);
-        inverse_diagonal.reserve(diagonal_elements);
+        layout.candidates_bytes = checked_product(
+            batch.size(), sizeof(CandidateDescriptor), "CUDA candidate upload");
+        layout.forward_left_bytes = checked_product(
+            forward_rows, sizeof(std::int32_t), "CUDA plan upload");
+        layout.forward_weights_bytes = checked_product(
+            forward_weight_elements, sizeof(float), "CUDA plan upload");
+        layout.transpose_offsets_bytes = checked_product(
+            transpose_offset_elements, sizeof(std::uint32_t), "CUDA plan upload");
+        layout.transpose_indices_bytes = checked_product(
+            transpose_elements, sizeof(std::int32_t), "CUDA plan upload");
+        layout.transpose_weights_bytes = checked_product(
+            transpose_elements, sizeof(float), "CUDA plan upload");
+        layout.lower_ld_bytes = checked_product(
+            factor_elements, sizeof(float), "CUDA plan upload");
+        layout.upper_l_bytes = checked_product(
+            factor_elements, sizeof(float), "CUDA plan upload");
+        layout.inverse_diagonal_bytes = checked_product(
+            diagonal_elements, sizeof(float), "CUDA plan upload");
+        std::size_t total = 0U;
+        for (const auto &[offset, bytes] : layout.regions()) {
+            total = checked_add(total, bytes, "CUDA plan upload");
+        }
+        if (total > maximum_explicit_bytes) {
+            throw std::length_error("CUDA plan upload exceeds 2 GiB");
+        }
+        layout.total_bytes = total;
+        return layout;
     }
 };
 
-// Reserves `elements` more room in `destination`, accounting the bytes into
-// `aggregate_upload_bytes`, and returns {base element offset, write pointer}.
-// The caller fills the region in place — no temporary vector + copy.
-// (resize value-initializes the region; the forward arrays are ~1/4 of the
-// upload payload, so the wasted pass is ~2 ms per 301-candidate scan — not
-// worth a default-init allocator. resize_and_overwrite would be ideal but
-// this libstdc++ lacks it.)
+// Element cursors into the pinned staging arrays; descriptor bases are these
+// per-array element offsets, exactly as the old append-to-vector pack
+// produced.
+struct PackCursors {
+    std::size_t forward_left = 0U;
+    std::size_t forward_weights = 0U;
+    std::size_t transpose_offsets = 0U;
+    std::size_t transpose_indices = 0U;
+    std::size_t transpose_weights = 0U;
+    std::size_t lower_ld = 0U;
+    std::size_t upper_l = 0U;
+    std::size_t inverse_diagonal = 0U;
+};
+
+// Writes `elements` values from `source` into the pinned region at the
+// cursor and advances it; returns the base element offset.
 template <class Value>
-[[nodiscard]] std::pair<std::uint32_t, Value *> append_region(
-    std::vector<Value> &destination, std::size_t elements,
-    std::size_t &aggregate_upload_bytes) {
-    const std::size_t appended_bytes = checked_product(
-        elements, sizeof(Value), "CUDA plan upload");
-    const std::size_t next_upload_bytes = checked_add(
-        aggregate_upload_bytes, appended_bytes, "CUDA plan upload");
-    if (next_upload_bytes > maximum_explicit_bytes) {
-        throw std::length_error("CUDA plan upload exceeds 2 GiB");
+[[nodiscard]] std::uint32_t pack_array_into(
+    std::byte *pinned, std::pair<std::size_t, std::size_t> region,
+    std::size_t &cursor, const std::vector<Value> &source) {
+    const std::size_t bytes = checked_product(
+        source.size(), sizeof(Value), "CUDA plan upload");
+    if (cursor > region.second / sizeof(Value)
+        || source.size() > region.second / sizeof(Value) - cursor) {
+        throw std::length_error("CUDA packed plan exceeds the staged region");
     }
-    const std::size_t base_elements = destination.size();
-    if (elements > destination.max_size() - base_elements) {
-        throw std::length_error("CUDA packed plan exceeds host vector capacity");
-    }
-    const std::uint32_t base = checked_u32(
-        base_elements, "CUDA packed plan offset");
-    destination.resize(base_elements + elements);
-    aggregate_upload_bytes = next_upload_bytes;
-    return {base, destination.data() + base_elements};
+    const std::uint32_t base = checked_u32(cursor, "CUDA packed plan offset");
+    std::memcpy(
+        pinned + region.first + cursor * sizeof(Value), source.data(), bytes);
+    cursor += source.size();
+    return base;
 }
 
 [[nodiscard]] AxisPlanDescriptor pack_axis(
-    const AxisPlan &plan, PackedBatch &packed) {
+    const AxisPlan &plan, std::byte *pinned,
+    const std::array<std::pair<std::size_t, std::size_t>, 9U> &regions,
+    PackCursors &cursors) {
     validate_axis_plan(plan);
     AxisPlanDescriptor result;
     result.source_size = static_cast<std::uint32_t>(plan.source_size);
@@ -592,21 +617,24 @@ template <class Value>
     result.forward_width = static_cast<std::uint32_t>(plan.forward_width);
     const std::size_t rows = static_cast<std::size_t>(plan.source_size);
     const std::size_t width = static_cast<std::size_t>(plan.forward_width);
-
-    const auto forward_left_region = append_region(
-        packed.forward_left, rows, packed.upload_bytes);
-    result.forward_left_base = forward_left_region.first;
-    const auto forward_weights_region = append_region(
-        packed.forward_weights, plan.forward_weights.size(),
-        packed.upload_bytes);
-    result.forward_weights_base = forward_weights_region.first;
+    if (rows > regions[1].second / sizeof(std::int32_t) - cursors.forward_left
+        || plan.forward_weights.size()
+            > regions[2].second / sizeof(float) - cursors.forward_weights) {
+        throw std::length_error("CUDA packed plan exceeds the staged region");
+    }
+    result.forward_left_base = checked_u32(
+        cursors.forward_left, "CUDA packed plan offset");
+    result.forward_weights_base = checked_u32(
+        cursors.forward_weights, "CUDA packed plan offset");
     // One pass produces both the per-row left edge and the tap-major weight
     // layout: row-outer iteration reads the row-major source once (the old
     // tap-outer loop re-read every cache line forward_width times) while the
     // scattered writes land in forward_width <= 16 concurrently-hot output
     // lines, which fit L1 (16 x 64 B = 1 KiB).
-    std::int32_t *const left_out = forward_left_region.second;
-    float *const weights_out = forward_weights_region.second;
+    auto *const left_out = reinterpret_cast<std::int32_t *>(
+        pinned + regions[1].first) + cursors.forward_left;
+    auto *const weights_out = reinterpret_cast<float *>(
+        pinned + regions[2].first) + cursors.forward_weights;
     for (std::size_t row = 0U; row < rows; ++row) {
         left_out[row] = plan.forward_indices[row * width];
         const float *const row_weights =
@@ -615,19 +643,21 @@ template <class Value>
             weights_out[tap * rows + row] = row_weights[tap];
         }
     }
+    cursors.forward_left += rows;
+    cursors.forward_weights += plan.forward_weights.size();
 
-    result.transpose_offsets_base = append_values(
-        packed.transpose_offsets, plan.transpose_offsets, packed.upload_bytes);
-    result.transpose_indices_base = append_values(
-        packed.transpose_indices, plan.transpose_indices, packed.upload_bytes);
-    result.transpose_weights_base = append_values(
-        packed.transpose_weights, plan.transpose_weights, packed.upload_bytes);
-    result.lower_ld_base = append_values(
-        packed.lower_ld, plan.lower_ld, packed.upload_bytes);
-    result.upper_l_base = append_values(
-        packed.upper_l, plan.upper_l, packed.upload_bytes);
-    result.inverse_diagonal_base = append_values(
-        packed.inverse_diagonal, plan.inverse_diagonal, packed.upload_bytes);
+    result.transpose_offsets_base = pack_array_into(
+        pinned, regions[3], cursors.transpose_offsets, plan.transpose_offsets);
+    result.transpose_indices_base = pack_array_into(
+        pinned, regions[4], cursors.transpose_indices, plan.transpose_indices);
+    result.transpose_weights_base = pack_array_into(
+        pinned, regions[5], cursors.transpose_weights, plan.transpose_weights);
+    result.lower_ld_base = pack_array_into(
+        pinned, regions[6], cursors.lower_ld, plan.lower_ld);
+    result.upper_l_base = pack_array_into(
+        pinned, regions[7], cursors.upper_l, plan.upper_l);
+    result.inverse_diagonal_base = pack_array_into(
+        pinned, regions[8], cursors.inverse_diagonal, plan.inverse_diagonal);
     return result;
 }
 
@@ -640,17 +670,17 @@ template <class Value>
     throw std::invalid_argument("CUDA candidate has an invalid axes value");
 }
 
+// Fills the pinned staging image; `pinned` must already hold
+// packed.layout.total_bytes (the caller reserves it between the layout
+// pre-pass and this call).
 void pack_batch(
-    PackedBatch &packed, ConstImageView source,
+    PackedBatch &packed, std::byte *pinned, ConstImageView source,
     std::span<const CandidateAnalysis> candidates,
     std::size_t workspace_limit_elements, std::size_t pixel_threads) {
-    packed.reserve_for(candidates);
-    packed.upload_bytes = checked_product(
-        candidates.size(), sizeof(CandidateDescriptor), "CUDA candidate upload");
-    if (packed.upload_bytes > maximum_explicit_bytes) {
-        throw std::length_error("CUDA candidate upload exceeds 2 GiB");
-    }
-    packed.candidates.reserve(candidates.size());
+    const auto regions = packed.layout.regions();
+    PackCursors cursors;
+    auto *const pinned_candidates =
+        reinterpret_cast<CandidateDescriptor *>(pinned);
     const std::size_t hard_limit = maximum_explicit_bytes / sizeof(float);
     const std::size_t default_limit =
         cuda_detail::cuda_default_workspace_bytes / sizeof(float);
@@ -674,7 +704,8 @@ void pack_batch(
             if (!candidate.horizontal || candidate.horizontal->source_size != source.width) {
                 throw std::invalid_argument("CUDA candidate has no matching horizontal plan");
             }
-            descriptor.horizontal = pack_axis(*candidate.horizontal, packed);
+            descriptor.horizontal = pack_axis(
+                *candidate.horizontal, pinned, regions, cursors);
             intermediate = checked_product(
                 static_cast<std::size_t>(source.height),
                 static_cast<std::size_t>(candidate.horizontal->destination_size),
@@ -685,7 +716,8 @@ void pack_batch(
             if (!candidate.vertical || candidate.vertical->source_size != source.height) {
                 throw std::invalid_argument("CUDA candidate has no matching vertical plan");
             }
-            descriptor.vertical = pack_axis(*candidate.vertical, packed);
+            descriptor.vertical = pack_axis(
+                *candidate.vertical, pinned, regions, cursors);
             native = checked_product(
                 static_cast<std::size_t>(candidate.vertical->destination_size),
                 candidate.axes == AnalysisAxes::both
@@ -771,7 +803,7 @@ void pack_batch(
             tile.maximum_forward_elements = std::max(
                 tile.maximum_forward_elements, forward_elements);
         }
-        packed.candidates.push_back(descriptor);
+        pinned_candidates[candidate_index] = descriptor;
     }
 
     if (tile.candidate_count != 0U) {
@@ -781,18 +813,24 @@ void pack_batch(
             packed.maximum_tile_candidate_count, tile.candidate_count);
         packed.tiles.push_back(tile);
     }
-}
 
-template <class Value>
-[[nodiscard]] std::size_t value_bytes(const std::vector<Value> &values) {
-    return checked_product(values.size(), sizeof(Value), "CUDA upload");
-}
-
-template <class Value>
-void reserve_values(const DriverApi &api, DeviceBuffer &buffer,
-                    const std::vector<Value> &values,
-                    std::size_t &allocation_count) {
-    buffer.reserve(api, value_bytes(values), allocation_count);
+    // The pre-pass is exact: cursors must land precisely on region ends.
+    if (cursors.forward_left * sizeof(std::int32_t)
+                != packed.layout.forward_left_bytes
+            || cursors.forward_weights * sizeof(float)
+                != packed.layout.forward_weights_bytes
+            || cursors.transpose_offsets * sizeof(std::uint32_t)
+                != packed.layout.transpose_offsets_bytes
+            || cursors.transpose_indices * sizeof(std::int32_t)
+                != packed.layout.transpose_indices_bytes
+            || cursors.transpose_weights * sizeof(float)
+                != packed.layout.transpose_weights_bytes
+            || cursors.lower_ld * sizeof(float) != packed.layout.lower_ld_bytes
+            || cursors.upper_l * sizeof(float) != packed.layout.upper_l_bytes
+            || cursors.inverse_diagonal * sizeof(float)
+                != packed.layout.inverse_diagonal_bytes) {
+        throw std::runtime_error("CUDA staged plan byte accounting mismatch");
+    }
 }
 
 void validate_source_and_metric(ConstImageView source, const MetricSpec &metric) {
@@ -1426,14 +1464,21 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
     }};
 
     const auto pack_start = std::chrono::steady_clock::now();
+    std::size_t allocation_count = 0U;
     bool plan_cache_hit = slot.plan_ready && slot.identity.matches(
         source, candidates, impl_->effective_workspace_limit_elements);
     if (!plan_cache_hit) {
         slot.plan_ready = false;
         slot.packed.clear_for_reuse();
+        slot.packed.layout = PackedBatch::compute_layout(candidates);
+        // The pack writes straight into pinned staging, so the pinned buffer
+        // must be sized before pack_batch runs.
+        slot.pinned_plan.reserve(
+            *impl_->api, slot.packed.layout.total_bytes, allocation_count);
         pack_batch(
-            slot.packed, source, candidates,
-            impl_->effective_workspace_limit_elements, pixel_threads);
+            slot.packed, static_cast<std::byte *>(slot.pinned_plan.data()),
+            source, candidates, impl_->effective_workspace_limit_elements,
+            pixel_threads);
         slot.identity.assign(
             source, candidates, impl_->effective_workspace_limit_elements);
         delta.plan_cache_misses = 1U;
@@ -1498,7 +1543,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
     const std::size_t working_set = checked_add(
         checked_add(source_working_bytes, workspace_bytes, "CUDA working set"),
         checked_add(
-            packed.upload_bytes,
+            packed.layout.total_bytes,
             checked_add(partial_bytes, device_result_bytes, "CUDA working set"),
             "CUDA working set"),
         "CUDA working set");
@@ -1523,20 +1568,21 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
     include_capacity(slot.device_workspace, workspace_bytes);
     include_capacity(slot.device_partials, partial_bytes);
     include_capacity(slot.device_results, device_result_bytes);
-    include_capacity(slot.device_candidates, value_bytes(packed.candidates));
-    include_capacity(slot.device_forward_left, value_bytes(packed.forward_left));
+    include_capacity(slot.device_candidates, packed.layout.candidates_bytes);
     include_capacity(
-        slot.device_forward_weights, value_bytes(packed.forward_weights));
+        slot.device_forward_left, packed.layout.forward_left_bytes);
     include_capacity(
-        slot.device_transpose_offsets, value_bytes(packed.transpose_offsets));
+        slot.device_forward_weights, packed.layout.forward_weights_bytes);
     include_capacity(
-        slot.device_transpose_indices, value_bytes(packed.transpose_indices));
+        slot.device_transpose_offsets, packed.layout.transpose_offsets_bytes);
     include_capacity(
-        slot.device_transpose_weights, value_bytes(packed.transpose_weights));
-    include_capacity(slot.device_lower_ld, value_bytes(packed.lower_ld));
-    include_capacity(slot.device_upper_l, value_bytes(packed.upper_l));
+        slot.device_transpose_indices, packed.layout.transpose_indices_bytes);
     include_capacity(
-        slot.device_inverse_diagonal, value_bytes(packed.inverse_diagonal));
+        slot.device_transpose_weights, packed.layout.transpose_weights_bytes);
+    include_capacity(slot.device_lower_ld, packed.layout.lower_ld_bytes);
+    include_capacity(slot.device_upper_l, packed.layout.upper_l_bytes);
+    include_capacity(
+        slot.device_inverse_diagonal, packed.layout.inverse_diagonal_bytes);
     const std::size_t retained_capacity_limit = std::min(
         maximum_explicit_bytes, impl_->memory_budget.per_slot_budget_bytes);
     if (projected_device_bytes > retained_capacity_limit) {
@@ -1548,47 +1594,54 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
         }
     }
 
-    std::size_t allocation_count = 0U;
-    slot.pinned_source.reserve(*impl_->api, source_bytes, allocation_count);
+    slot.pinned_source.reserve(
+        *impl_->api, source_bytes, allocation_count);
     slot.pinned_results.reserve(
         *impl_->api, device_result_bytes, allocation_count);
     if (!plan_cache_hit) {
+        // No-op on the miss path (already reserved before pack_batch); this
+        // covers the budget-reset path that flips a hit to a miss below the
+        // pack phase, where the retained pinned image is re-uploaded.
         slot.pinned_plan.reserve(
-            *impl_->api, packed.upload_bytes, allocation_count);
+            *impl_->api, packed.layout.total_bytes, allocation_count);
     }
-    slot.device_source.reserve(*impl_->api, source_bytes, allocation_count);
+    slot.device_source.reserve(
+        *impl_->api, source_bytes, allocation_count);
     if (packed.has_horizontal) {
         slot.device_transposed_source.reserve(
             *impl_->api, source_bytes, allocation_count);
     }
-    slot.device_workspace.reserve(*impl_->api, workspace_bytes, allocation_count);
-    slot.device_partials.reserve(*impl_->api, partial_bytes, allocation_count);
+    slot.device_workspace.reserve(
+        *impl_->api, workspace_bytes, allocation_count);
+    slot.device_partials.reserve(
+        *impl_->api, partial_bytes, allocation_count);
     slot.device_results.reserve(
         *impl_->api, device_result_bytes, allocation_count);
-    reserve_values(
-        *impl_->api, slot.device_candidates, packed.candidates, allocation_count);
-    reserve_values(
-        *impl_->api, slot.device_forward_left,
-        packed.forward_left, allocation_count);
-    reserve_values(
-        *impl_->api, slot.device_forward_weights,
-        packed.forward_weights, allocation_count);
-    reserve_values(
-        *impl_->api, slot.device_transpose_offsets,
-        packed.transpose_offsets, allocation_count);
-    reserve_values(
-        *impl_->api, slot.device_transpose_indices,
-        packed.transpose_indices, allocation_count);
-    reserve_values(
-        *impl_->api, slot.device_transpose_weights,
-        packed.transpose_weights, allocation_count);
-    reserve_values(
-        *impl_->api, slot.device_lower_ld, packed.lower_ld, allocation_count);
-    reserve_values(
-        *impl_->api, slot.device_upper_l, packed.upper_l, allocation_count);
-    reserve_values(
-        *impl_->api, slot.device_inverse_diagonal,
-        packed.inverse_diagonal, allocation_count);
+    slot.device_candidates.reserve(
+        *impl_->api, packed.layout.candidates_bytes,
+        allocation_count);
+    slot.device_forward_left.reserve(
+        *impl_->api, packed.layout.forward_left_bytes,
+        allocation_count);
+    slot.device_forward_weights.reserve(
+        *impl_->api, packed.layout.forward_weights_bytes,
+        allocation_count);
+    slot.device_transpose_offsets.reserve(
+        *impl_->api, packed.layout.transpose_offsets_bytes,
+        allocation_count);
+    slot.device_transpose_indices.reserve(
+        *impl_->api, packed.layout.transpose_indices_bytes,
+        allocation_count);
+    slot.device_transpose_weights.reserve(
+        *impl_->api, packed.layout.transpose_weights_bytes,
+        allocation_count);
+    slot.device_lower_ld.reserve(
+        *impl_->api, packed.layout.lower_ld_bytes, allocation_count);
+    slot.device_upper_l.reserve(
+        *impl_->api, packed.layout.upper_l_bytes, allocation_count);
+    slot.device_inverse_diagonal.reserve(
+        *impl_->api, packed.layout.inverse_diagonal_bytes,
+        allocation_count);
     delta.buffer_allocation_count = allocation_count;
 
     const std::uint64_t probe = source_probe(source);
@@ -1633,36 +1686,29 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
     }
     slot.events[1].record(slot.stream);
     if (!plan_cache_hit) {
-        auto *plan_staging = static_cast<std::byte *>(slot.pinned_plan.data());
-        std::size_t plan_offset = 0U;
-        const auto upload = [&](DeviceBuffer &buffer, const auto &values) {
-            using Value = typename std::remove_cvref_t<decltype(values)>::value_type;
-            const std::size_t bytes = checked_product(
-                values.size(), sizeof(Value), "CUDA staged plan upload");
-            if (bytes == 0U) return;
-            std::memcpy(plan_staging + plan_offset, values.data(), bytes);
+        // The pack wrote the staging image directly into pinned memory, so
+        // the upload is nine straight H2D copies out of the layout regions —
+        // no host-side staging copy.
+        const auto *plan_staging =
+            static_cast<const std::byte *>(slot.pinned_plan.data());
+        const auto regions = packed.layout.regions();
+        DeviceBuffer *const targets[9] = {
+            &slot.device_candidates, &slot.device_forward_left,
+            &slot.device_forward_weights, &slot.device_transpose_offsets,
+            &slot.device_transpose_indices, &slot.device_transpose_weights,
+            &slot.device_lower_ld, &slot.device_upper_l,
+            &slot.device_inverse_diagonal};
+        for (std::size_t index = 0U; index < 9U; ++index) {
+            const auto [offset, bytes] = regions[index];
+            if (bytes == 0U) continue;
             cuda_detail::cuda_check(
                 *impl_->api,
                 impl_->api->memcpy_htod_async(
-                    buffer.pointer(), plan_staging + plan_offset,
+                    targets[index]->pointer(), plan_staging + offset,
                     bytes, slot.stream),
                 "cuMemcpyHtoDAsync_v2(plan)");
-            plan_offset = checked_add(
-                plan_offset, bytes, "CUDA staged plan upload");
-        };
-        upload(slot.device_candidates, packed.candidates);
-        upload(slot.device_forward_left, packed.forward_left);
-        upload(slot.device_forward_weights, packed.forward_weights);
-        upload(slot.device_transpose_offsets, packed.transpose_offsets);
-        upload(slot.device_transpose_indices, packed.transpose_indices);
-        upload(slot.device_transpose_weights, packed.transpose_weights);
-        upload(slot.device_lower_ld, packed.lower_ld);
-        upload(slot.device_upper_l, packed.upper_l);
-        upload(slot.device_inverse_diagonal, packed.inverse_diagonal);
-        if (plan_offset != packed.upload_bytes) {
-            throw std::runtime_error("CUDA staged plan byte accounting mismatch");
         }
-        delta.plan_upload_bytes = packed.upload_bytes;
+        delta.plan_upload_bytes = packed.layout.total_bytes;
     }
     slot.events[2].record(slot.stream);
 
@@ -1671,7 +1717,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
     delta.workspace_bytes = workspace_bytes;
     delta.pinned_staging_bytes = checked_add(
         checked_add(source_bytes, device_result_bytes, "CUDA pinned staging"),
-        packed.upload_bytes, "CUDA pinned staging");
+        packed.layout.total_bytes, "CUDA pinned staging");
     delta.peak_workspace_elements = packed.workspace_elements;
     delta.source_upload_bytes = source_cache_hit ? 0U : source_bytes;
     delta.result_readback_bytes = total_result_bytes;
