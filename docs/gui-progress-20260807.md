@@ -130,6 +130,24 @@ GUI click-through on video Samples still needs the staged-FFmpeg host
   gaps: verify review loop (timeline/threshold/Top-N/add-to-Samples) awaits
   the engine verify mode; kernel mode likewise.
 
+## Update 3 — GUI-4/GUI-5 execution wired (2026-08-08, commits 32f820e, d525350)
+
+Engine lane landed kernel mode (5666005) and verify streaming v1.1 (1548784);
+both GUI slices are now fully wired:
+
+- GUI-4: `submitKernel` + `startKernelRunGroup`; ordered kernel lists with
+  index-id results and kernel echoes; CUDA backend preference honored
+  (cpu/cuda/auto; metal degrades to auto). Real-engine kernel smoke passed.
+- GUI-5: `verify_stream.rs` producer (one FFmpeg pass per member, bounded
+  in-flight assets, ack-driven eviction) + `executeVerify` orchestrator +
+  VerifyPage review loop (live coverage, log timeline, threshold/Top-N
+  filters without re-run, anomaly → Sample with `originRunId`).
+- Sample manifest gains optional `origin_run_id` (schema-1 compatible).
+
+Boundaries still open: staged-FFmpeg media smoke on a host with sidecars;
+GUI click-through acceptance; fractional shift/parity engine semantics
+(v1.1+); dual-locale screenshot capture.
+
 ## Suggested next step
 
 GUI-3's remaining acceptance item is a manual click-through smoke (still
