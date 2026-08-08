@@ -212,3 +212,33 @@ describe("planKernelRunGroup", () => {
     if (!result.ok) expect(result.reason).toBe("kernel_list_too_small");
   });
 });
+
+describe("extractKernelResultRows (worker v1.1 payload)", () => {
+  it("reads the candidates array with kernel echoes in request order", () => {
+    const { extractKernelResultRows } = await_import();
+    const payload = {
+      mode: "kernel",
+      candidate: "720",
+      candidates: [
+        { id: "0", error: 5.1, kernel: { id: "bilinear" } },
+        { id: "1", error: 0.4, kernel: { id: "bicubic", b: 0, c: 0.5 } },
+        { id: "2", error: 0.4, kernel: { id: "bicubic", b: 0, c: 1 } },
+      ],
+      telemetry: { plan_cache_hits: 2 },
+    };
+    const rows = extractKernelResultRows(payload);
+    expect(rows).toEqual([
+      { kernelId: "bilinear", parameters: {}, metric: 5.1 },
+      { kernelId: "bicubic", parameters: { b: 0, c: 0.5 }, metric: 0.4 },
+      { kernelId: "bicubic", parameters: { b: 0, c: 1 }, metric: 0.4 },
+    ]);
+    expect(extractKernelResultRows(null)).toBeNull();
+    expect(extractKernelResultRows({ candidates: "bogus" })).toBeNull();
+  });
+});
+
+// Hoisted import helper keeps the appended block self-contained.
+import { extractKernelResultRows as _extractKernelResultRows } from "./kernelRunGroup";
+function await_import() {
+  return { extractKernelResultRows: _extractKernelResultRows };
+}

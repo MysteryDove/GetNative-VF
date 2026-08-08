@@ -275,3 +275,77 @@ describe("applyTerminalEventToRun", () => {
     expect(partial.runsById[run2]?.status).toBe("partial");
   });
 });
+
+describe("startKernelRunGroup", () => {
+  it("submits fixed-geometry ordered kernel lists and binds runs", async () => {
+    const { startKernelRunGroup } = await import("./executeRunGroup");
+    const { planKernelRunGroup } = await import("./kernelRunGroup");
+    const { defaultKernelDraft } = await import("./kernelDraft");
+
+    const draft = defaultKernelDraft(null, {
+      cropLeft: 0, cropRight: 0, cropTop: 0, cropBottom: 0,
+      pixelExclusionThreshold: 0, pNorm: 1,
+    }, "muf-d278cd3", "raw", "auto");
+    draft.families = {
+      bilinear: true, bicubic: true, spline16: false,
+      spline36: false, spline64: false, lanczos: false,
+    };
+    const geometry = {
+      mode: "standard" as const,
+      activeWidth: 1920, activeHeight: 1080,
+      canvasWidth: 1280, canvasHeight: 720,
+      srcLeft: 0, srcTop: 0, srcWidth: 1920, srcHeight: 1080,
+      baseWidth: null, baseHeight: 720, parity: null,
+    };
+    const key = geometryGroupKeyForTest(draft);
+    const planned = planKernelRunGroup({
+      draft,
+      samples: [samples[0]!],
+      sourcesById: sources,
+      geometries: { [key]: geometry },
+      capabilities: null,
+      nowMs: 1,
+      requestIdPrefix: "t",
+    });
+    expect(planned.ok).toBe(true);
+    if (!planned.ok) return;
+
+    let state: ProjectState = emptyProjectState({ id: "p1" });
+    const { bridge, queued } = makeBridge();
+    const submissions: Array<Record<string, unknown>> = [];
+    const result = await startKernelRunGroup({
+      plan: planned.plan,
+      state,
+      onProjectChange: (updater) => { state = updater(state); },
+      bridge,
+      exportAsset: async () => ({
+        path: "/cache/f.f32", format: "f32le", width: 1920, height: 1080, from_cache: false,
+      }),
+      worker: {
+        submitKernel: async (params) => {
+          submissions.push(params as unknown as Record<string, unknown>);
+          return { requestId: "r1", jobId: "j1", runId: "g1" };
+        },
+      },
+      nowMs: () => 1000,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(submissions).toHaveLength(1);
+    expect(submissions[0]?.candidate).toBe("720");
+    expect(submissions[0]?.kernels).toEqual([
+      { id: "bilinear" },
+      { id: "bicubic", b: 0, c: 0.5 },
+    ]);
+    expect(queued[0]?.mode).toBe("kernel");
+    expect(queued[0]?.total).toBe(2);
+    const run = Object.values(state.runsById)[0];
+    expect(run?.runType).toBe("kernel");
+    expect(run?.status).toBe("queued");
+  });
+});
+
+function geometryGroupKeyForTest(draft: { baseHeight: string; baseWidth: string; profileId: string }) {
+  // Same derivation the panel uses for the 1920x1080 fixture source.
+  return ["1920", "1080", draft.baseHeight || "auto", draft.baseWidth || "auto", draft.profileId].join("@");
+}

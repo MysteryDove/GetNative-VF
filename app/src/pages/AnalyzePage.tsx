@@ -287,6 +287,7 @@ export function AnalyzePage({
           inheritedBackend={draft.backendPreference}
           onOpenDiagnostics={onOpenDiagnostics}
           onProjectChange={onProjectChange}
+          executionBridge={executionBridge}
         />
       ) : (
         <div className="analyze-layout">

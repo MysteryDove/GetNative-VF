@@ -20,7 +20,7 @@ export type EndpointRule = "inclusive" | "exclusive_stop";
 
 export type MathMode = "raw" | "log_display";
 
-export type BackendPreference = "cpu" | "metal" | "auto";
+export type BackendPreference = "cpu" | "cuda" | "metal" | "auto";
 
 /** Decimal grid; candidates are resolved as exact decimal strings, not binary floats. */
 export type CandidateGridSpec = {

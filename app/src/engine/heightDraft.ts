@@ -171,8 +171,9 @@ export function selectableBackends(capabilities: EngineEnvelope | null): Backend
   const options: BackendPreference[] = ["auto"];
   const cpu = backends.find((backend) => backend.id === "cpu");
   if (cpu?.compiled && cpu.device_available) options.push("cpu");
-  const metal = backends.find((backend) => backend.id === "metal");
-  if (metal?.compiled && metal.device_available) options.push("metal");
-  // CUDA/Vulkan remain reserved capability slots; never offered as runnable preferences here.
+  const cuda = backends.find((backend) => backend.id === "cuda");
+  if (cuda?.compiled && cuda.device_available) options.push("cuda");
+  // Metal is not offered as a runnable preference: the worker protocol accepts
+  // cpu/cuda/auto only. Vulkan remains a reserved capability slot.
   return options;
 }

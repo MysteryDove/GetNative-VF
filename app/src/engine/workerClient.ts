@@ -45,6 +45,19 @@ export type HeightJobParams = {
     threshold?: number;
     pNorm?: number;
   };
+  backend?: "cpu" | "cuda" | "auto";
+  workerCount?: number;
+};
+
+export type KernelJobParams = {
+  frameAsset: FrameAssetRef;
+  axisMode: AxisMode;
+  /** Fixed primary-axis value (decimal string); wire candidates = [candidate]. */
+  candidate: string;
+  /** Ordered kernel list; result rows key on the decimal index into this list. */
+  kernels: Array<{ id: string; b?: number; c?: number; taps?: number }>;
+  metric: HeightJobParams["metric"];
+  backend?: "cpu" | "cuda" | "auto";
   workerCount?: number;
 };
 
@@ -156,6 +169,34 @@ export class EngineWorkerClient {
 
   /** Submit one height-mode analyze job. Events stream to subscribers. */
   async submitHeight(params: HeightJobParams): Promise<SubmittedJob> {
+    return this.submitAnalyze("height", {
+      kernel: params.kernel,
+      candidates: params.candidates,
+      frameAsset: params.frameAsset,
+      axisMode: params.axisMode,
+      metric: params.metric,
+      backend: params.backend ?? "cpu",
+      workerCount: params.workerCount,
+    });
+  }
+
+  /** Submit one kernel-mode analyze job (protocol v1.1): fixed geometry, ordered kernels. */
+  async submitKernel(params: KernelJobParams): Promise<SubmittedJob> {
+    return this.submitAnalyze("kernel", {
+      kernels: params.kernels,
+      candidates: [params.candidate],
+      frameAsset: params.frameAsset,
+      axisMode: params.axisMode,
+      metric: params.metric,
+      backend: params.backend ?? "cpu",
+      workerCount: params.workerCount,
+    });
+  }
+
+  private async submitAnalyze(
+    mode: "height" | "kernel",
+    body: Record<string, unknown>,
+  ): Promise<SubmittedJob> {
     this.sequence += 1;
     const submitted: SubmittedJob = {
       requestId: `gui-req-${this.sequence}`,
@@ -172,14 +213,8 @@ export class EngineWorkerClient {
       await invoke("engine_worker_analyze", {
         request: {
           requestId: submitted.requestId,
-          mode: "height",
-          frameAsset: params.frameAsset,
-          axisMode: params.axisMode,
-          kernel: params.kernel,
-          candidates: params.candidates,
-          metric: params.metric,
-          backend: "cpu",
-          workerCount: params.workerCount,
+          mode,
+          ...body,
         },
       });
     } catch (error) {

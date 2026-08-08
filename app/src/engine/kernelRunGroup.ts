@@ -162,21 +162,27 @@ export type KernelResultEntry = {
 export function extractKernelResultRows(result: unknown): KernelResultEntry[] | null {
   if (!result || typeof result !== "object") return null;
   const record = result as Record<string, unknown>;
-  const rows = record.rows ?? record.results ?? record.metrics;
+  // Worker protocol v1.1 kernel payload: {candidates: [{id: "<index>", error,
+  // kernel: {...echo...}}], candidate, telemetry}; tolerate row/result shapes.
+  const rows = record.candidates ?? record.rows ?? record.results ?? record.metrics;
   if (!Array.isArray(rows)) return null;
   const extracted: KernelResultEntry[] = [];
   for (const item of rows) {
     if (!item || typeof item !== "object") continue;
     const row = item as Record<string, unknown>;
     const kernel = row.kernel as Record<string, unknown> | undefined;
-    const kernelId = (kernel?.id ?? row.kernelId ?? row.id) as string | undefined;
-    const rawMetric = row.metric ?? row.value ?? row.error;
+    const kernelId = (kernel?.id ?? row.kernelId) as string | undefined;
+    const rawMetric = row.error ?? row.metric ?? row.value;
     if (!kernelId || rawMetric == null) continue;
     const metric = typeof rawMetric === "number" ? rawMetric : Number(rawMetric);
     if (!Number.isFinite(metric)) continue;
+    const { id: _echoId, ...echoParams } = kernel ?? {};
     extracted.push({
       kernelId,
-      parameters: (kernel?.parameters ?? row.parameters ?? {}) as Record<string, unknown>,
+      parameters:
+        kernel != null
+          ? echoParams
+          : ((row.parameters ?? {}) as Record<string, unknown>),
       metric,
     });
   }

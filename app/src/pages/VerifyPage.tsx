@@ -5,6 +5,7 @@ import type { EngineEnvelope } from "../engine/types";
 import { kernelDisplayName, profileDisplayName } from "../engine/displayNames";
 import type { BackendPreference } from "../engine/protocol";
 import { activeRecipe } from "../project/recipe";
+import { selectableBackends } from "../engine/heightDraft";
 import {
   defaultVerifyDraft,
   extractVerifyFrames,
@@ -32,7 +33,6 @@ export function VerifyPage({
   analyzeAvailable: boolean;
   onNavigate: (route: ProjectRoute) => void;
 }) {
-  void capabilities;
   const [draft, setDraft] = useState<VerifyDraft>(() => defaultVerifyDraft());
 
   const recipe = activeRecipe(state);
@@ -296,9 +296,13 @@ export function VerifyPage({
                 patch({ backendPreference: event.target.value as BackendPreference })
               }
             >
-              <option value="auto">{t("analyze.backend.auto")}</option>
-              <option value="cpu">{t("backend.cpu")}</option>
-              <option value="metal">{t("backend.metal")}</option>
+              {selectableBackends(capabilities).map((backend) => (
+                <option key={backend} value={backend}>
+                  {backend === "auto"
+                    ? t("analyze.backend.auto")
+                    : t(`backend.${backend}` as "backend.cpu")}
+                </option>
+              ))}
             </select>
           </label>
 

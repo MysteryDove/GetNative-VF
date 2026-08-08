@@ -22,6 +22,8 @@ import {
 } from "../engine/kernelDraft";
 import { extractKernelResultRows, planKernelRunGroup } from "../engine/kernelRunGroup";
 import { metricCompatibilityKey } from "../engine/runGroupPlan";
+import { selectableBackends } from "../engine/heightDraft";
+import { startKernelRunGroup, type ExecutionBridge } from "../engine/executeRunGroup";
 import { applyPayloadToRecipeDraft } from "../project/recipeApply";
 import type { ProjectState, Run } from "../project/types";
 import { BlockedState } from "../components/BlockedState";
@@ -39,6 +41,7 @@ export function KernelAnalyzePanel({
   inheritedBackend,
   onOpenDiagnostics,
   onProjectChange,
+  executionBridge,
 }: {
   t: Translator;
   state: ProjectState;
@@ -50,6 +53,7 @@ export function KernelAnalyzePanel({
   inheritedBackend: BackendPreference;
   onOpenDiagnostics: () => void;
   onProjectChange: (updater: (state: ProjectState) => ProjectState) => void;
+  executionBridge: ExecutionBridge;
 }) {
   const [draft, setDraft] = useState<KernelDraft>(() =>
     defaultKernelDraft(
@@ -66,6 +70,7 @@ export function KernelAnalyzePanel({
   const [geometryError, setGeometryError] = useState("");
   const [selectedCandidate, setSelectedCandidate] = useState<number | null>(null);
   const [applyNotice, setApplyNotice] = useState("");
+  const [submitting, setSubmitting] = useState(false);
 
   // MetricSpec inherits from Height by default; an explicit unlink is visible.
   useEffect(() => {
@@ -231,7 +236,37 @@ export function KernelAnalyzePanel({
             ? t("analyze.k.geometryUnresolved")
             : !plan
               ? t("analyze.k.planInvalid")
-              : t("analyze.k.modeUnsupported");
+              : null;
+
+  const canRun = analyzeAvailable && plan !== null && !submitting;
+
+  async function startRun() {
+    if (!plan || submitting) return;
+    setSubmitting(true);
+    setApplyNotice("");
+    try {
+      const result = await startKernelRunGroup({
+        plan,
+        state,
+        onProjectChange,
+        bridge: executionBridge,
+      });
+      if (!result.ok) {
+        setApplyNotice(t("analyze.submitFailed", { detail: result.reason }));
+        return;
+      }
+      setApplyNotice(
+        t("analyze.runSubmitted", {
+          submitted: String(result.submitted),
+          failedNote: result.failed > 0 ? `, ${result.failed} failed` : "",
+        }),
+      );
+    } catch (error) {
+      setApplyNotice(t("analyze.submitFailed", { detail: String(error) }));
+    } finally {
+      setSubmitting(false);
+    }
+  }
 
   return (
     <div className="analyze-layout">
@@ -394,11 +429,11 @@ export function KernelAnalyzePanel({
           ) : (
             <BlockedState
               title={
-                analyzeAvailable ? t("analyze.k.modeUnsupportedTitle") : t("analyze.blockedTitle")
+                analyzeAvailable ? t("analyze.noRealRunsTitle") : t("analyze.blockedTitle")
               }
               body={
                 analyzeAvailable
-                  ? t("analyze.k.modeUnsupported")
+                  ? t("analyze.k.noRealRunsBody")
                   : t("analyze.blockedBody")
               }
               action={
@@ -550,9 +585,13 @@ export function KernelAnalyzePanel({
                 patch({ backendPreference: event.target.value as BackendPreference })
               }
             >
-              <option value="auto">{t("analyze.backend.auto")}</option>
-              <option value="cpu">{t("backend.cpu")}</option>
-              <option value="metal">{t("backend.metal")}</option>
+              {selectableBackends(capabilities).map((backend) => (
+                <option key={backend} value={backend}>
+                  {backend === "auto"
+                    ? t("analyze.backend.auto")
+                    : t(`backend.${backend}` as "backend.cpu")}
+                </option>
+              ))}
             </select>
           </label>
         </fieldset>
@@ -582,11 +621,16 @@ export function KernelAnalyzePanel({
         </fieldset>
 
         <div className="analyze-run-block">
-          <button className="primary-button" type="button" disabled>
+          <button
+            className="primary-button"
+            type="button"
+            disabled={!canRun}
+            onClick={startRun}
+          >
             <Play size={15} />
-            {t("analyze.k.runKernel")}
+            {submitting ? t("diagnostics.working") : t("analyze.k.runKernel")}
           </button>
-          <p className="help-copy">{runBlockedReason}</p>
+          {runBlockedReason ? <p className="help-copy">{runBlockedReason}</p> : null}
         </div>
       </aside>
     </div>
