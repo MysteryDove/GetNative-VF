@@ -113,3 +113,27 @@ a throughput feature** — measured here down to the keep/reject split.
   were measured).
 - Revisit default-on if builds move to low-core targets or if packs
   learn cross-grid plan dedup (content-addressed plan store).
+
+## 6. v4 addendum (2026-08-08, P3-7 revisit)
+
+A follow-up attempt to flip the latency verdict measured the fetch
+pipeline stage by stage (`GETNATIVE_STORE_DEBUG_TIMING=1` on
+`read_grid`; a cancel-isolated perf profile of the plan phase). Every
+suspect was individually small: v3 varint/delta decode ~4%, the
+`require_finite` validation passes ~2% (env-gated A/B), allocator
+first-touch ~2% (worse with `mmap_threshold` raised via GLIBC_TUNABLES),
+publish ~0.3%. The floor is the payload: ~255 MB per 1000 lanczos8
+plans moves through memory 4-5 times (read ~25 ms, LZ4 ~30 ms, XXH64
+~8 ms, AxisPlan materialization ~25-50 ms, fault overhead), landing
+within ~1.3x of the 16-core parallel build regardless of encoding. The
+period-replay planner speedup (`77a9042`, integer grids 148 → 98 ms per
+1000 plans) moved the bar further against the store.
+
+Landed anyway: GNPK **v4** stores transpose offsets/indices raw (one
+bounds-checked pass replaces per-element varint/delta decode), fetch
+−4%, pack +5-7%, −30 lines (`9a5dda4`). A zero-copy/span-backed AxisPlan
+consuming blobs in place could reach ~1.3-1.6x over build for sinc
+kernels only — below the bar for that refactor. **Verdict unchanged:
+opt-in, not a throughput feature on this host class.** Poly-kernel grids
+(bicubic/bilinear/spline) build in ~1 ms per 1000 plans, so no encoding
+can ever win there; any future flip should also be filter-gated.
