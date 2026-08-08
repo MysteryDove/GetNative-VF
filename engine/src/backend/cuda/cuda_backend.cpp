@@ -553,6 +553,35 @@ struct PackedBatch {
     }
 };
 
+// Reserves `elements` more room in `destination`, accounting the bytes into
+// `aggregate_upload_bytes`, and returns {base element offset, write pointer}.
+// The caller fills the region in place — no temporary vector + copy.
+// (resize value-initializes the region; the forward arrays are ~1/4 of the
+// upload payload, so the wasted pass is ~2 ms per 301-candidate scan — not
+// worth a default-init allocator. resize_and_overwrite would be ideal but
+// this libstdc++ lacks it.)
+template <class Value>
+[[nodiscard]] std::pair<std::uint32_t, Value *> append_region(
+    std::vector<Value> &destination, std::size_t elements,
+    std::size_t &aggregate_upload_bytes) {
+    const std::size_t appended_bytes = checked_product(
+        elements, sizeof(Value), "CUDA plan upload");
+    const std::size_t next_upload_bytes = checked_add(
+        aggregate_upload_bytes, appended_bytes, "CUDA plan upload");
+    if (next_upload_bytes > maximum_explicit_bytes) {
+        throw std::length_error("CUDA plan upload exceeds 2 GiB");
+    }
+    const std::size_t base_elements = destination.size();
+    if (elements > destination.max_size() - base_elements) {
+        throw std::length_error("CUDA packed plan exceeds host vector capacity");
+    }
+    const std::uint32_t base = checked_u32(
+        base_elements, "CUDA packed plan offset");
+    destination.resize(base_elements + elements);
+    aggregate_upload_bytes = next_upload_bytes;
+    return {base, destination.data() + base_elements};
+}
+
 [[nodiscard]] AxisPlanDescriptor pack_axis(
     const AxisPlan &plan, PackedBatch &packed) {
     validate_axis_plan(plan);
@@ -561,25 +590,32 @@ struct PackedBatch {
     result.destination_size = static_cast<std::uint32_t>(plan.destination_size);
     result.half_bandwidth = static_cast<std::uint32_t>(plan.half_bandwidth);
     result.forward_width = static_cast<std::uint32_t>(plan.forward_width);
-    std::vector<std::int32_t> forward_left(
-        static_cast<std::size_t>(plan.source_size));
-    for (std::size_t row = 0U; row < forward_left.size(); ++row) {
-        forward_left[row] = plan.forward_indices[
-            row * static_cast<std::size_t>(plan.forward_width)];
-    }
-    result.forward_left_base = append_values(
-        packed.forward_left, forward_left, packed.upload_bytes);
-    std::vector<float> forward_weights_tap_major(plan.forward_weights.size());
-    for (std::size_t tap = 0U;
-         tap < static_cast<std::size_t>(plan.forward_width); ++tap) {
-        for (std::size_t row = 0U; row < forward_left.size(); ++row) {
-            forward_weights_tap_major[
-                tap * forward_left.size() + row] = plan.forward_weights[
-                    row * static_cast<std::size_t>(plan.forward_width) + tap];
+    const std::size_t rows = static_cast<std::size_t>(plan.source_size);
+    const std::size_t width = static_cast<std::size_t>(plan.forward_width);
+
+    const auto forward_left_region = append_region(
+        packed.forward_left, rows, packed.upload_bytes);
+    result.forward_left_base = forward_left_region.first;
+    const auto forward_weights_region = append_region(
+        packed.forward_weights, plan.forward_weights.size(),
+        packed.upload_bytes);
+    result.forward_weights_base = forward_weights_region.first;
+    // One pass produces both the per-row left edge and the tap-major weight
+    // layout: row-outer iteration reads the row-major source once (the old
+    // tap-outer loop re-read every cache line forward_width times) while the
+    // scattered writes land in forward_width <= 16 concurrently-hot output
+    // lines, which fit L1 (16 x 64 B = 1 KiB).
+    std::int32_t *const left_out = forward_left_region.second;
+    float *const weights_out = forward_weights_region.second;
+    for (std::size_t row = 0U; row < rows; ++row) {
+        left_out[row] = plan.forward_indices[row * width];
+        const float *const row_weights =
+            plan.forward_weights.data() + row * width;
+        for (std::size_t tap = 0U; tap < width; ++tap) {
+            weights_out[tap * rows + row] = row_weights[tap];
         }
     }
-    result.forward_weights_base = append_values(
-        packed.forward_weights, forward_weights_tap_major, packed.upload_bytes);
+
     result.transpose_offsets_base = append_values(
         packed.transpose_offsets, plan.transpose_offsets, packed.upload_bytes);
     result.transpose_indices_base = append_values(
