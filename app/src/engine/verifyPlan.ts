@@ -168,6 +168,73 @@ export function planVerifyRunGroup(input: {
   };
 }
 
+/** Materialize a verification plan into immutable Project Run/RunGroup records. */
+export function materializeVerifyRunGroup(input: {
+  plan: VerifyRunGroupPlan;
+  idFactory?: () => string;
+  nowIso?: string;
+}): {
+  runGroup: {
+    id: string;
+    groupType: string;
+    label: string;
+    memberRunIds: string[];
+    createdAt: string;
+    intentSnapshot: unknown;
+  };
+  runs: Array<{
+    id: string;
+    runType: string;
+    status: string;
+    runGroupId: string;
+    sampleId: string | null;
+    sourceId: string | null;
+    createdAt: string;
+    updatedAt: string;
+    inputSnapshot: unknown;
+    result: null;
+    errorCode: null;
+    errorMessage: null;
+    completed: number;
+    total: number;
+  }>;
+} {
+  const makeId = input.idFactory ?? (() => crypto.randomUUID());
+  const nowIso = input.nowIso ?? new Date().toISOString();
+  const groupId = `rgrp_${makeId()}`;
+  const runs = input.plan.members.map((member) => ({
+    id: `run_${makeId()}`,
+    runType: "verification",
+    status: "queued",
+    runGroupId: groupId,
+    sampleId: null,
+    sourceId: member.sourceId,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+    inputSnapshot: {
+      planKey: member.planKey,
+      request: member.request,
+      scanScope: member.scanScope,
+    },
+    result: null,
+    errorCode: null,
+    errorMessage: null,
+    completed: 0,
+    total: 0,
+  }));
+  return {
+    runGroup: {
+      id: groupId,
+      groupType: input.plan.groupType,
+      label: input.plan.label,
+      memberRunIds: runs.map((run) => run.id),
+      createdAt: nowIso,
+      intentSnapshot: input.plan.intentSnapshot,
+    },
+    runs,
+  };
+}
+
 export type VerifyFrameRow = {
   frameIndex: number;
   metric: number;

@@ -147,8 +147,8 @@ pub struct MediaProbeResult {
 }
 
 #[derive(Debug, Clone)]
-struct MediaTool {
-    path: PathBuf,
+pub(crate) struct MediaTool {
+    pub(crate) path: PathBuf,
     source: &'static str,
 }
 
@@ -304,7 +304,7 @@ fn frame_asset_cache_path(
     cache_dir.join(format!("{:x}.f32le", hasher.finalize()))
 }
 
-fn frame_asset_expected_bytes(width: u32, height: u32) -> Result<u64, String> {
+pub(crate) fn frame_asset_expected_bytes(width: u32, height: u32) -> Result<u64, String> {
     if width < 2 || height < 2 {
         return Err("frame_asset_invalid: frame dimensions must be at least 2x2".to_owned());
     }
@@ -495,7 +495,7 @@ fn prune_frame_asset_cache(cache_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn validated_media_path(raw: &str) -> Result<PathBuf, String> {
+pub(crate) fn validated_media_path(raw: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(raw);
     if raw.trim().is_empty() || !path.is_file() {
         return Err(format!("media_missing: media file does not exist: {raw}"));
@@ -504,7 +504,7 @@ fn validated_media_path(raw: &str) -> Result<PathBuf, String> {
         .map_err(|error| format!("media_path_error: failed to resolve media path: {error}"))
 }
 
-fn validate_expected_fingerprint(path: &Path, expected: Option<&str>) -> Result<(), String> {
+pub(crate) fn validate_expected_fingerprint(path: &Path, expected: Option<&str>) -> Result<(), String> {
     let Some(expected) = expected else {
         return Ok(());
     };
@@ -907,7 +907,7 @@ fn prune_frame_preview_cache(cache_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn frame_index_cache_path(
+pub(crate) fn frame_index_cache_path(
     app: &AppHandle,
     fingerprint: &str,
     stream_index: u32,
@@ -924,7 +924,7 @@ fn frame_index_cache_path(
         .map_err(|error| format!("frame_index_cache_error: {error}"))
 }
 
-fn build_frame_index(
+pub(crate) fn build_frame_index(
     ffprobe: &Path,
     media_path: &Path,
     stream_index: u32,
@@ -1172,7 +1172,7 @@ fn frame_cache_reader(
         }))
 }
 
-fn quick_fingerprint(path: &Path, size: u64) -> Result<String, String> {
+pub(crate) fn quick_fingerprint(path: &Path, size: u64) -> Result<String, String> {
     let mut file = File::open(path)
         .map_err(|error| format!("media_fingerprint_error: failed to open media: {error}"))?;
     let mut hasher = Sha256::new();
@@ -1248,7 +1248,7 @@ fn looks_like_video(path: &Path) -> bool {
     )
 }
 
-fn resolve_media_tool(app: &AppHandle, name: &str, environment: &str) -> Option<MediaTool> {
+pub(crate) fn resolve_media_tool(app: &AppHandle, name: &str, environment: &str) -> Option<MediaTool> {
     if let Some(path) = env::var_os(environment)
         .map(PathBuf::from)
         .filter(|path| path.is_file())

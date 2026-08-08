@@ -163,6 +163,16 @@ export type WorkerEventBase = {
 export type WorkerAcceptedEvent = WorkerEventBase & {
   type: "accepted";
   mode: ComputationMode;
+  /** Verify mode (v1.1): engine-advised producer pacing hint. */
+  suggestedInFlight?: number;
+  workerCount?: number;
+};
+
+/** One streamed verify frame result (v1.1 progress batches). */
+export type VerifyFrameResult = {
+  seq: number;
+  /** Null marks a frame the engine failed to load; the job continues. */
+  error: number | null;
 };
 
 export type WorkerProgressEvent = WorkerEventBase & {
@@ -170,6 +180,8 @@ export type WorkerProgressEvent = WorkerEventBase & {
   completed: number;
   total: number;
   detail?: string | null;
+  /** Verify mode: batched per-frame results, possibly out of order. */
+  results?: VerifyFrameResult[];
 };
 
 export type WorkerWarningEvent = WorkerEventBase & {

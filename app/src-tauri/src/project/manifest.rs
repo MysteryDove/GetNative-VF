@@ -108,6 +108,8 @@ pub struct SampleRecord {
     pub timestamp_seconds: Option<f64>,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub origin_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -697,6 +699,7 @@ mod tests {
             time_base_den: None,
             timestamp_seconds: None,
             tags: Vec::new(),
+            origin_run_id: None,
         });
         assert!(validate_manifest(&manifest)
             .unwrap_err()

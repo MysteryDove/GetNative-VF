@@ -90,6 +90,9 @@ type WireEvent = {
   retryable?: boolean;
   partial?: boolean;
   payload?: unknown;
+  worker_count?: number;
+  suggested_in_flight?: number;
+  results?: Array<{ seq?: number; error?: number | null }>;
 };
 
 type TrackedJob = {
@@ -235,6 +238,97 @@ export class EngineWorkerClient {
     // Otherwise the cancel is sent as soon as `accepted` arrives.
   }
 
+  /**
+   * Verify mode (protocol v1.1): submit the locked recipe, then stream frames
+   * with verifyFrame and close with verifyEnd. The engine job id arrives in
+   * the `accepted` event — await waitAccepted before streaming.
+   */
+  async verifyBegin(params: {
+    width: number;
+    height: number;
+    axisMode: AxisMode;
+    kernel: { id: string; b?: number; c?: number; taps?: number };
+    candidate: string;
+    metric: HeightJobParams["metric"];
+    backend?: "cpu" | "auto";
+    workerCount?: number;
+    expectedFrames?: number;
+  }): Promise<SubmittedJob> {
+    this.sequence += 1;
+    const submitted: SubmittedJob = {
+      requestId: `gui-req-${this.sequence}`,
+      jobId: `gui-job-${this.sequence}`,
+      runId: `gui-run-${this.sequence}`,
+    };
+    this.jobsByRequest.set(submitted.requestId, {
+      ...submitted,
+      engineJobId: null,
+      finished: false,
+      cancelRequested: false,
+    });
+    try {
+      await invoke("engine_worker_verify_begin", {
+        request: {
+          requestId: submitted.requestId,
+          width: params.width,
+          height: params.height,
+          axisMode: params.axisMode,
+          kernel: params.kernel,
+          candidate: params.candidate,
+          metric: params.metric,
+          backend: params.backend ?? "auto",
+          workerCount: params.workerCount,
+          expectedFrames: params.expectedFrames,
+        },
+      });
+    } catch (error) {
+      this.jobsByRequest.delete(submitted.requestId);
+      throw error;
+    }
+    return submitted;
+  }
+
+  /** Resolves with the engine-assigned job id once the job is accepted. */
+  waitAccepted(requestId: RequestId): Promise<string> {
+    const tracked = this.jobsByRequest.get(requestId);
+    if (tracked?.engineJobId) return Promise.resolve(tracked.engineJobId);
+    return new Promise((resolve, reject) => {
+      this.acceptedWaiters.set(requestId, { resolve, reject });
+    });
+  }
+
+  async verifyFrame(input: {
+    jobId: string;
+    seq: number;
+    frameAsset: FrameAssetRef;
+  }): Promise<void> {
+    this.sequence += 1;
+    await invoke("engine_worker_verify_frame", {
+      request: {
+        requestId: `gui-req-${this.sequence}`,
+        jobId: input.jobId,
+        seq: input.seq,
+        frameAsset: input.frameAsset,
+      },
+    });
+  }
+
+  async verifyEnd(input: { jobId: string; total: number }): Promise<void> {
+    this.sequence += 1;
+    await invoke("engine_worker_verify_end", {
+      request: {
+        requestId: `gui-req-${this.sequence}`,
+        jobId: input.jobId,
+        total: input.total,
+      },
+    });
+  }
+
+  private acceptedWaiters = new Map<
+    RequestId,
+    { resolve: (engineJobId: string) => void; reject: (error: Error) => void }
+  >();
+
   private emit(event: WorkerEvent): void {
     for (const listener of this.eventListeners) {
       listener(event);
@@ -263,6 +357,11 @@ export class EngineWorkerClient {
     if (wire.type === "accepted" && tracked && typeof wire.job_id === "string") {
       tracked.engineJobId = wire.job_id;
       this.jobsByEngineId.set(wire.job_id, tracked);
+      const waiter = this.acceptedWaiters.get(tracked.requestId);
+      if (waiter) {
+        this.acceptedWaiters.delete(tracked.requestId);
+        waiter.resolve(wire.job_id);
+      }
       if (tracked.cancelRequested) {
         void invoke("engine_worker_cancel", { jobId: wire.job_id }).catch(() => undefined);
       }
@@ -272,6 +371,11 @@ export class EngineWorkerClient {
       (wire.type === "result" || wire.type === "cancelled" || wire.type === "error")
     ) {
       tracked.finished = true;
+      const waiter = this.acceptedWaiters.get(tracked.requestId);
+      if (waiter) {
+        this.acceptedWaiters.delete(tracked.requestId);
+        waiter.reject(new Error(wire.message ?? `job ended with ${wire.type}`));
+      }
     }
 
     const base = {
@@ -284,7 +388,13 @@ export class EngineWorkerClient {
 
     switch (wire.type) {
       case "accepted":
-        this.emit({ ...base, type: "accepted", mode: wireMode(wire.mode) });
+        this.emit({
+          ...base,
+          type: "accepted",
+          mode: wireMode(wire.mode),
+          suggestedInFlight: wire.suggested_in_flight,
+          workerCount: wire.worker_count,
+        });
         break;
       case "progress":
         this.emit({
@@ -293,6 +403,19 @@ export class EngineWorkerClient {
           completed: wire.completed ?? 0,
           total: wire.total ?? 0,
           detail: wire.phase ?? null,
+          results: Array.isArray(wire.results)
+            ? wire.results
+                .filter((entry) => typeof entry?.seq === "number")
+                .map((entry) => ({
+                  seq: entry.seq as number,
+                  error:
+                    entry.error === null
+                      ? null
+                      : typeof entry.error === "number" && Number.isFinite(entry.error)
+                        ? entry.error
+                        : null,
+                }))
+            : undefined,
         });
         break;
       case "warning":
@@ -335,6 +458,10 @@ export class EngineWorkerClient {
       stderrTail.length > 0
         ? stderrTail.join("\n")
         : "the engine worker exited before finishing the job";
+    for (const waiter of this.acceptedWaiters.values()) {
+      waiter.reject(new Error(message));
+    }
+    this.acceptedWaiters.clear();
     for (const tracked of this.jobsByRequest.values()) {
       if (tracked.finished) continue;
       tracked.finished = true;

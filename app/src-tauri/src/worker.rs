@@ -369,6 +369,26 @@ pub struct WorkerAnalyzeRequest {
     pub worker_count: Option<u32>,
 }
 
+fn validate_kernel_command(kernel: &KernelCommand) -> Result<(), String> {
+    match kernel.id.as_str() {
+        "bilinear" | "spline16" | "spline36" | "spline64" => {}
+        "bicubic" => {
+            for (label, value) in [("b", kernel.b), ("c", kernel.c)] {
+                if value.is_some_and(|value| !value.is_finite()) {
+                    return Err(format!("bad_request: bicubic {label} must be finite"));
+                }
+            }
+        }
+        "lanczos" => {
+            if kernel.taps.is_some_and(|taps| !(1..=15).contains(&taps)) {
+                return Err("bad_request: lanczos taps must be within 1..=15".to_owned());
+            }
+        }
+        other => return Err(format!("bad_request: unknown kernel id {other}")),
+    }
+    Ok(())
+}
+
 fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), String> {
     if request.request_id.trim().is_empty() {
         return Err("bad_request: requestId must not be empty".to_owned());
@@ -398,23 +418,7 @@ fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), String> {
         return Err(format!("bad_request: unknown axisMode {}", request.axis_mode));
     }
     fn validate_kernel(kernel: &KernelCommand) -> Result<(), String> {
-        match kernel.id.as_str() {
-            "bilinear" | "spline16" | "spline36" | "spline64" => {}
-            "bicubic" => {
-                for (label, value) in [("b", kernel.b), ("c", kernel.c)] {
-                    if value.is_some_and(|value| !value.is_finite()) {
-                        return Err(format!("bad_request: bicubic {label} must be finite"));
-                    }
-                }
-            }
-            "lanczos" => {
-                if kernel.taps.is_some_and(|taps| !(1..=15).contains(&taps)) {
-                    return Err("bad_request: lanczos taps must be within 1..=15".to_owned());
-                }
-            }
-            other => return Err(format!("bad_request: unknown kernel id {other}")),
-        }
-        Ok(())
+        validate_kernel_command(kernel)
     }
     if request.mode == "kernel" {
         if request.kernel.is_some() {
@@ -597,6 +601,192 @@ pub fn engine_worker_shutdown(state: State<'_, WorkerManager>) -> Result<(), Str
         session.terminate();
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Verify streaming (worker protocol v1.1)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyBeginRequest {
+    pub request_id: String,
+    /// Frame dimensions every streamed asset must match.
+    pub width: u32,
+    pub height: u32,
+    pub axis_mode: String,
+    pub kernel: KernelCommand,
+    /// Locked recipe's fixed axis value (decimal string).
+    pub candidate: String,
+    pub metric: MetricCommand,
+    pub backend: String,
+    pub worker_count: Option<u32>,
+    pub expected_frames: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyFrameRequest {
+    pub request_id: String,
+    pub job_id: String,
+    pub seq: u64,
+    pub frame_asset: FrameAssetRef,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyEndRequest {
+    pub request_id: String,
+    pub job_id: String,
+    pub total: u64,
+}
+
+fn validate_frame_asset_ref(asset: &FrameAssetRef) -> Result<(), String> {
+    if asset.path.trim().is_empty() {
+        return Err("bad_request: frameAsset.path must not be empty".to_owned());
+    }
+    if asset.format != "f32le" {
+        return Err(format!(
+            "unsupported: frame asset format must be f32le in worker protocol v1, got {}",
+            asset.format
+        ));
+    }
+    if asset.width < 2 || asset.height < 2 || asset.width > MAX_FRAME_AXIS || asset.height > MAX_FRAME_AXIS {
+        return Err(format!(
+            "bad_request: frame asset dimensions must be within 2..={MAX_FRAME_AXIS}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_verify_begin(request: &VerifyBeginRequest) -> Result<(), String> {
+    if request.request_id.trim().is_empty() {
+        return Err("bad_request: requestId must not be empty".to_owned());
+    }
+    if request.width < 2 || request.height < 2 || request.width > MAX_FRAME_AXIS || request.height > MAX_FRAME_AXIS {
+        return Err(format!(
+            "bad_request: verify geometry must be within 2..={MAX_FRAME_AXIS}"
+        ));
+    }
+    if !matches!(request.axis_mode.as_str(), "h_only" | "w_only" | "h_plus_w") {
+        return Err(format!("bad_request: unknown axisMode {}", request.axis_mode));
+    }
+    validate_kernel_command(&request.kernel)?;
+    let Ok(value) = request.candidate.parse::<f64>() else {
+        return Err(format!(
+            "bad_request: candidate {:?} is not a decimal",
+            request.candidate
+        ));
+    };
+    if !value.is_finite() || value < 2.0 {
+        return Err("bad_request: candidate must be finite and >= 2".to_owned());
+    }
+    if !matches!(request.backend.as_str(), "cpu" | "auto") {
+        return Err(format!(
+            "unsupported: verify is CPU-only in worker protocol v1.1, got {}",
+            request.backend
+        ));
+    }
+    if let Some(expected) = request.expected_frames {
+        if !(1..=1_000_000).contains(&expected) {
+            return Err("bad_request: expectedFrames must be within 1..=1000000".to_owned());
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn engine_worker_verify_begin(
+    state: State<'_, WorkerManager>,
+    request: VerifyBeginRequest,
+) -> Result<Value, String> {
+    validate_verify_begin(&request)?;
+    let mut metric = Map::new();
+    if let Some(value) = request.metric.crop_left {
+        metric.insert("crop_left".to_owned(), json!(value));
+    }
+    if let Some(value) = request.metric.crop_right {
+        metric.insert("crop_right".to_owned(), json!(value));
+    }
+    if let Some(value) = request.metric.crop_top {
+        metric.insert("crop_top".to_owned(), json!(value));
+    }
+    if let Some(value) = request.metric.crop_bottom {
+        metric.insert("crop_bottom".to_owned(), json!(value));
+    }
+    if let Some(value) = request.metric.threshold {
+        metric.insert("threshold".to_owned(), json!(value));
+    }
+    if let Some(value) = request.metric.p_norm {
+        metric.insert("p_norm".to_owned(), json!(value));
+    }
+    let mut command = json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "type": "verify_begin",
+        "request_id": request.request_id,
+        "geometry": { "width": request.width, "height": request.height },
+        "axis_mode": request.axis_mode,
+        "kernel": kernel_json(&request.kernel),
+        "candidate": request.candidate,
+        "metric": Value::Object(metric),
+        "backend": request.backend,
+    });
+    if let Some(worker_count) = request.worker_count {
+        command["worker_count"] = json!(worker_count);
+    }
+    if let Some(expected) = request.expected_frames {
+        command["expected_frames"] = json!(expected);
+    }
+    let request_id = request.request_id.clone();
+    state.with_live_session(|session| session.write_command(&command))?;
+    Ok(json!({ "requestId": request_id, "queued": true }))
+}
+
+#[tauri::command]
+pub fn engine_worker_verify_frame(
+    state: State<'_, WorkerManager>,
+    request: VerifyFrameRequest,
+) -> Result<Value, String> {
+    if request.job_id.trim().is_empty() {
+        return Err("bad_request: jobId must not be empty".to_owned());
+    }
+    validate_frame_asset_ref(&request.frame_asset)?;
+    let command = json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "type": "verify_frame",
+        "request_id": request.request_id,
+        "job_id": request.job_id,
+        "seq": request.seq,
+        "frame_asset": {
+            "path": request.frame_asset.path,
+            "format": request.frame_asset.format,
+            "width": request.frame_asset.width,
+            "height": request.frame_asset.height,
+        },
+    });
+    let request_id = request.request_id.clone();
+    state.with_live_session(|session| session.write_command(&command))?;
+    Ok(json!({ "requestId": request_id, "queued": true }))
+}
+
+#[tauri::command]
+pub fn engine_worker_verify_end(
+    state: State<'_, WorkerManager>,
+    request: VerifyEndRequest,
+) -> Result<Value, String> {
+    if request.job_id.trim().is_empty() {
+        return Err("bad_request: jobId must not be empty".to_owned());
+    }
+    let command = json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "type": "verify_end",
+        "request_id": request.request_id,
+        "job_id": request.job_id,
+        "total": request.total,
+    });
+    let request_id = request.request_id.clone();
+    state.with_live_session(|session| session.write_command(&command))?;
+    Ok(json!({ "requestId": request_id, "queued": true }))
 }
 
 #[cfg(test)]

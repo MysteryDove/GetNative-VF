@@ -131,3 +131,46 @@ export function exportFrameAsset(request: {
 }): Promise<MediaFrameAsset> {
   return invoke("media_frame_asset", { request });
 }
+
+export type VerifyStreamInfo = {
+  ticket: string;
+  total: number;
+  width: number;
+  height: number;
+};
+
+export type VerifyStreamAssetEvent = {
+  ticket: string;
+  seq: number;
+  frameIndex: number;
+  pts?: number | null;
+  timestampSeconds?: number | null;
+  path: string;
+  width: number;
+  height: number;
+};
+
+/** Start the streaming frame producer for one verification member. */
+export function startVerifyStream(request: {
+  path: string;
+  fingerprint?: string | null;
+  streamIndex: number;
+  selection: "all" | "decoded_i_picture" | "every_n";
+  everyN?: number | null;
+  startFrame?: number | null;
+  endFrame?: number | null;
+  width: number;
+  height: number;
+  inFlight?: number;
+}): Promise<VerifyStreamInfo> {
+  return invoke("media_verify_stream_start", { request });
+}
+
+/** Acknowledge one consumed frame asset: deletes the file, frees a producer slot. */
+export function ackVerifyStream(ticket: string, seq: number): Promise<void> {
+  return invoke("media_verify_stream_ack", { ticket, seq });
+}
+
+export function abortVerifyStream(ticket: string): Promise<void> {
+  return invoke("media_verify_stream_abort", { ticket });
+}

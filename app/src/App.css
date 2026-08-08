@@ -3047,3 +3047,49 @@ button {
 .result-table-row.perfect span:first-child {
   color: #7fb598;
 }
+
+/* Verify review */
+.verify-run-block {
+  border-top: 1px solid #2b302e;
+  padding: 10px 0;
+  display: grid;
+  gap: 8px;
+}
+
+.verify-timeline {
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  height: 72px;
+  padding: 4px 6px;
+  border: 1px solid #2b302e;
+  border-radius: 5px;
+  background: #111412;
+}
+
+.verify-timeline-bar {
+  flex: 1;
+  min-width: 1px;
+  background: #4a6a5a;
+  border-radius: 1px 1px 0 0;
+}
+
+.verify-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.verify-filter input {
+  width: 90px;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid #3a423e;
+  border-radius: 4px;
+  color: #e5ebe8;
+  background: #111412;
+}
+
+.samples-drop-notice {
+  margin: 4px 0;
+}

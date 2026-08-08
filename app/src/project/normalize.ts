@@ -108,6 +108,7 @@ export function openedToProjectState(opened: OpenedProjectDto): ProjectState {
     timeBaseDen: sample.time_base_den ?? null,
     timestampSeconds: sample.timestamp_seconds ?? null,
     tags: sample.tags ?? [],
+    originRunId: sample.origin_run_id ?? null,
   }));
 
   const recipes: Recipe[] = manifest.recipes.map((recipe) => {
@@ -245,6 +246,7 @@ export function projectStateToManifest(state: ProjectState): ProjectManifestDto 
         time_base_den: sample.timeBaseDen ?? null,
         timestamp_seconds: sample.timestampSeconds ?? null,
         tags: sample.tags,
+        origin_run_id: sample.originRunId ?? null,
       })),
     recipes: Object.values(state.recipesById).map((recipe) => ({
       id: recipe.id,

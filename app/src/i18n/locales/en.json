@@ -448,7 +448,6 @@
   "analyze.runReady": "Ready: {count} member Runs will be created.",
   "analyze.runSubmitted": "Submitted {submitted} member Runs{failedNote}.",
   "analyze.submitFailed": "Submission failed: {detail}",
-  "verify.modeUnsupported": "Engine worker v1 supports Resolution Test only; Full Video Check unlocks in a later engine version.",
   "analyze.noRealRunsTitle": "No real results yet",
   "analyze.noRealRunsBody": "Run a Resolution Test and real engine curves appear here; no fabricated curves.",
   "samples.dropHint": "Drop images here to create Samples directly; pick frames on the Media page for videos.",
@@ -458,5 +457,18 @@
   "analyze.perfectThreshold": "Error ≤1e-6 counts as perfectly descale",
   "analyze.perfectCount": "{count}/{total} points ≤1e-6",
   "analyze.baseParityHint": "Leave the base canvas empty for automatic even alignment; when a reverse peak appears, retry with an odd base (engine v1.1).",
-  "analyze.k.noRealRunsBody": "Run an Algorithm Test and real engine results appear here."
+  "analyze.k.noRealRunsBody": "Run an Algorithm Test and real engine results appear here.",
+  "verify.reviewThreshold": "Review threshold",
+  "verify.thresholdOff": "off",
+  "verify.topN": "Top N",
+  "verify.reviewFilterHint": "Threshold and Top N filter stored metrics without recomputation.",
+  "verify.timeline": "frame error timeline",
+  "verify.reviewTable": "frame review",
+  "verify.col.frame": "Frame",
+  "verify.col.time": "Time",
+  "verify.col.error": "Error",
+  "verify.addToSamples": "Add to Samples",
+  "verify.sampleAdded": "Frame #{frame} added to Samples.",
+  "verify.sampleExists": "A Sample for that frame already exists.",
+  "verify.noFramesAbove": "No frames above the threshold."
 }

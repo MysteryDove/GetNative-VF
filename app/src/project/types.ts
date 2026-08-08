@@ -70,6 +70,8 @@ export type Sample = {
   timeBaseDen?: number | null;
   timestampSeconds?: number | null;
   tags: string[];
+  /** Set when the Sample was added from a VerificationRun review. */
+  originRunId?: string | null;
 };
 
 /**
@@ -216,6 +218,7 @@ export type ProjectManifestDto = {
     time_base_den?: number | null;
     timestamp_seconds?: number | null;
     tags?: string[];
+    origin_run_id?: string | null;
   }>;
   recipes: Array<{
     id: string;

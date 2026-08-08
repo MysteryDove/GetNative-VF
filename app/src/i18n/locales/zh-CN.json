@@ -448,7 +448,6 @@
   "analyze.runReady": "就绪：将创建 {count} 个成员 Run。",
   "analyze.runSubmitted": "已提交 {submitted} 个成员 Run{failedNote}。",
   "analyze.submitFailed": "提交失败：{detail}",
-  "verify.modeUnsupported": "引擎 worker v1 暂仅支持分辨率测试；全视频检查将在后续引擎版本解锁。",
   "analyze.noRealRunsTitle": "还没有真实结果",
   "analyze.noRealRunsBody": "运行分辨率测试后，真实引擎曲线会显示在这里；不会显示伪造曲线。",
   "samples.dropHint": "可直接拖放图片到此页创建样本；视频请先在媒体页选帧。",
@@ -458,5 +457,18 @@
   "analyze.perfectThreshold": "误差 ≤1e-6 视为 perfectly descale",
   "analyze.perfectCount": "{count}/{total} 个点 ≤1e-6",
   "analyze.baseParityHint": "base 画布留空则自动（偶数对齐）；出现反向峰时改用奇数 base 重测（引擎 v1.1 生效）。",
-  "analyze.k.noRealRunsBody": "运行算法测试后，真实引擎结果会显示在这里。"
+  "analyze.k.noRealRunsBody": "运行算法测试后，真实引擎结果会显示在这里。",
+  "verify.reviewThreshold": "评审阈值",
+  "verify.thresholdOff": "关闭",
+  "verify.topN": "Top N",
+  "verify.reviewFilterHint": "阈值与 Top N 只过滤已存储指标，不重跑计算。",
+  "verify.timeline": "帧误差时间线",
+  "verify.reviewTable": "帧评审表",
+  "verify.col.frame": "Frame",
+  "verify.col.time": "Time",
+  "verify.col.error": "Error",
+  "verify.addToSamples": "Add to Samples",
+  "verify.sampleAdded": "Frame #{frame} added to Samples.",
+  "verify.sampleExists": "A Sample for that frame already exists.",
+  "verify.noFramesAbove": "No frames above the threshold."
 }

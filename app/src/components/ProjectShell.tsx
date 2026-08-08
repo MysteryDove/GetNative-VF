@@ -159,6 +159,8 @@ export function ProjectShell({
                   capabilities={capabilities}
                   analyzeAvailable={analyzeAvailable}
                   onNavigate={onNavigate}
+                  onProjectChange={onProjectChange}
+                  executionBridge={executionBridge}
                 />
               )}
               {route === "results" && <ResultsPage t={t} state={state} />}
