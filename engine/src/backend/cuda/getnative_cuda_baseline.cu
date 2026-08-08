@@ -234,7 +234,7 @@ __device__ __forceinline__ void inverse_axis_ring_pair(
 // in docs/performance/e3-kernel-increments-20260808.md (inverse_horizontal
 // at 9.1% SM, 0.32 waves/SM on lanczos8). The fixed 15-deep unrolled loops
 // with runtime guards keep the window in registers for any band <= 15;
-// half-bandwidths 3 and 5 keep their tighter specializations above.
+// half-bandwidths 1, 3, 5, and 7 keep their tighter specializations above.
 constexpr std::uint32_t kRegisterRingMaxBandwidth = 15U;
 
 __device__ __forceinline__ void inverse_axis_ring_dynamic(
@@ -617,6 +617,26 @@ __device__ __forceinline__ void inverse_axis(
             input, input_stride, output, output_stride);
         return;
     }
+    // Exact-fit tiers for the other common bands: the dynamic 15-deep ring
+    // pays 15-band guards per step, which made bilinear (band 1) measurably
+    // slower per candidate than exact-fit bicubic (band 3) despite less
+    // work. Band 7 covers spline64/lanczos4; band 1 is order-neutral
+    // (single recurrence term). Both use the generic loop's descending
+    // back-substitution order, so results stay bit-identical.
+    if (plan.half_bandwidth == 7U) {
+        inverse_axis_ring<7U, false>(
+            plan, transpose_offsets, transpose_indices, transpose_weights,
+            lower_ld, upper_l, inverse_diagonal,
+            input, input_stride, output, output_stride);
+        return;
+    }
+    if (plan.half_bandwidth == 1U) {
+        inverse_axis_ring<1U, false>(
+            plan, transpose_offsets, transpose_indices, transpose_weights,
+            lower_ld, upper_l, inverse_diagonal,
+            input, input_stride, output, output_stride);
+        return;
+    }
     if (plan.half_bandwidth <= kRegisterRingMaxBandwidth) {
         inverse_axis_ring_dynamic(
             plan, transpose_offsets, transpose_indices, transpose_weights,
@@ -699,6 +719,22 @@ __device__ __forceinline__ void inverse_axis_pair(
     }
     if (plan.half_bandwidth == 3U) {
         inverse_axis_ring_pair<3U, true>(
+            plan, transpose_offsets, transpose_indices, transpose_weights,
+            lower_ld, upper_l, inverse_diagonal,
+            input0, input1, input_stride,
+            output0, output1, output_stride, second_active);
+        return;
+    }
+    if (plan.half_bandwidth == 7U) {
+        inverse_axis_ring_pair<7U, false>(
+            plan, transpose_offsets, transpose_indices, transpose_weights,
+            lower_ld, upper_l, inverse_diagonal,
+            input0, input1, input_stride,
+            output0, output1, output_stride, second_active);
+        return;
+    }
+    if (plan.half_bandwidth == 1U) {
+        inverse_axis_ring_pair<1U, false>(
             plan, transpose_offsets, transpose_indices, transpose_weights,
             lower_ld, upper_l, inverse_diagonal,
             input0, input1, input_stride,
