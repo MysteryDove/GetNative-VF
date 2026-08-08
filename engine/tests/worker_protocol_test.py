@@ -201,7 +201,7 @@ def main():
         check("unknown-command", event["type"] == "error" and event["code"] == "bad_request")
 
         # Unsupported mode and bad frame asset.
-        worker.send(**analyze_command("rB", frame, ["200"], mode="kernel"))
+        worker.send(**analyze_command("rB", frame, ["200"], mode="width"))
         event = worker.read_event()
         check("unsupported-mode", event["type"] == "error" and event["code"] == "unsupported")
         worker.send(**analyze_command("rC", os.path.join(scratch, "missing.f32"), ["200"]))
@@ -589,6 +589,111 @@ def main():
         while worker_b.read_event()["type"] != "shutdown":
             pass
         worker_b.wait_exit()
+
+        # --- Session 6: kernel mode (protocol v1.1) --------------------------
+        worker = Worker()
+        worker.send(**{"protocol_version": 1, "type": "hello", "request_id": "k0"})
+        worker.read_event()
+
+        kernels = [{"id": "bilinear"}, {"id": "bicubic", "b": 0.0, "c": 0.5},
+                   {"id": "bicubic", "b": 0.0, "c": 1.0}, {"id": "lanczos", "taps": 3},
+                   {"id": "spline64"}]
+        kernel_result = run_analyze(worker, {
+            "protocol_version": 1, "type": "analyze", "request_id": "k1",
+            "mode": "kernel", "backend": "cpu",
+            "frame_asset": {"path": frame, "format": "f32le", "width": 320, "height": 240},
+            "axis_mode": "h_only", "candidate": "200", "kernels": kernels,
+            "metric": {"p_norm": 1}})
+        entries = kernel_result.get("payload", {}).get("candidates", [])
+        check("kernel-flow", kernel_result["type"] == "result"
+              and kernel_result["payload"]["mode"] == "kernel"
+              and kernel_result["payload"].get("candidate") == "200"
+              and len(entries) == 5
+              and [entry["id"] for entry in entries] == ["0", "1", "2", "3", "4"]
+              and entries[3]["kernel"] == {"id": "lanczos", "taps": 3}
+              and entries[1]["kernel"] == {"id": "bicubic", "b": 0.0, "c": 0.5},
+              json.dumps(entries)[:300])
+
+        # Cross-mode parity: kernel-mode lanczos(3)@200 equals the same
+        # height-mode candidate bit-for-bit, and the shared plan was a
+        # session-cache hit on whichever job ran second.
+        height_l3 = run_analyze(worker, analyze_command(
+            "k2", frame, ["200"], kernel={"id": "lanczos", "taps": 3}))
+        height_err = height_l3["payload"]["candidates"][0]["error"]
+        kernel_l3 = entries[3]["error"] if entries else None
+        check("kernel-height-parity", kernel_l3 == height_err,
+              f"kernel={kernel_l3} height={height_err}")
+        check("kernel-cross-mode-cache", height_l3["payload"]["telemetry"]["plan_cache_hits"] == 1,
+              json.dumps(height_l3["payload"]["telemetry"]))
+
+        # Duplicate kernel specs get distinct index ids but one shared plan.
+        dup_result = run_analyze(worker, {
+            "protocol_version": 1, "type": "analyze", "request_id": "k3",
+            "mode": "kernel", "backend": "cpu",
+            "frame_asset": {"path": frame, "format": "f32le", "width": 320, "height": 240},
+            "axis_mode": "h_only", "candidate": "200",
+            "kernels": [{"id": "lanczos", "taps": 3}, {"id": "lanczos", "taps": 3}],
+            "metric": {"p_norm": 1}})
+        dup = dup_result.get("payload", {}).get("candidates", [])
+        check("kernel-duplicates", dup_result["type"] == "result"
+              and len(dup) == 2 and dup[0]["id"] == "0" and dup[1]["id"] == "1"
+              and dup[0]["error"] == dup[1]["error"] == height_err
+              and dup_result["payload"]["telemetry"]["plan_build_count"] == 0,
+              json.dumps(dup_result.get("payload", {}))[:300])
+
+        # h_plus_w kernel mode: secondary plans derive per kernel and match
+        # the height-mode two-axis path bit-for-bit.
+        height_2d = run_analyze(worker, analyze_command(
+            "k4", frame, ["200"], axis_mode="h_plus_w",
+            kernel={"id": "bicubic", "b": 0.0, "c": 0.5}))
+        kernel_2d = run_analyze(worker, {
+            "protocol_version": 1, "type": "analyze", "request_id": "k5",
+            "mode": "kernel", "backend": "cpu",
+            "frame_asset": {"path": frame, "format": "f32le", "width": 320, "height": 240},
+            "axis_mode": "h_plus_w", "candidate": "200",
+            "kernels": [{"id": "bicubic", "b": 0.0, "c": 0.5}, {"id": "spline36"}],
+            "metric": {"p_norm": 1}})
+        k2d_entries = kernel_2d.get("payload", {}).get("candidates", [])
+        check("kernel-h-plus-w", kernel_2d["type"] == "result"
+              and len(k2d_entries) == 2
+              and k2d_entries[0]["error"]
+                  == height_2d["payload"]["candidates"][0]["error"],
+              json.dumps(k2d_entries)[:300])
+
+        # Wire-level guards.
+        worker.send(**{"protocol_version": 1, "type": "analyze", "request_id": "k6",
+                       "mode": "kernel", "backend": "cpu",
+                       "frame_asset": {"path": frame, "format": "f32le",
+                                       "width": 320, "height": 240},
+                       "axis_mode": "h_only", "kernels": kernels,
+                       "metric": {"p_norm": 1}})
+        event = worker.read_event()
+        check("kernel-missing-candidate", event["type"] == "error"
+              and event["code"] == "bad_request", json.dumps(event))
+        worker.send(**{"protocol_version": 1, "type": "analyze", "request_id": "k7",
+                       "mode": "kernel", "backend": "cpu",
+                       "frame_asset": {"path": frame, "format": "f32le",
+                                       "width": 320, "height": 240},
+                       "axis_mode": "h_only", "candidate": "200",
+                       "kernel": {"id": "bicubic"}, "kernels": kernels,
+                       "metric": {"p_norm": 1}})
+        event = worker.read_event()
+        check("kernel-both-fields", event["type"] == "error"
+              and event["code"] == "bad_request", json.dumps(event))
+        worker.send(**{"protocol_version": 1, "type": "analyze", "request_id": "k8",
+                       "mode": "kernel", "backend": "cpu",
+                       "frame_asset": {"path": frame, "format": "f32le",
+                                       "width": 320, "height": 240},
+                       "axis_mode": "h_only", "candidate": "200", "kernels": [],
+                       "metric": {"p_norm": 1}})
+        event = worker.read_event()
+        check("kernel-empty-list", event["type"] == "error"
+              and event["code"] == "bad_request", json.dumps(event))
+
+        worker.send(**{"protocol_version": 1, "type": "shutdown", "request_id": "k9"})
+        while worker.read_event()["type"] != "shutdown":
+            pass
+        check("kernel-session-exit", worker.wait_exit() == 0)
 
     if FAILURES:
         print(f"{len(FAILURES)} worker protocol test(s) failed")

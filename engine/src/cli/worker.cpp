@@ -143,6 +143,11 @@ struct AnalyzeJobSpec {
     BackendChoice backend = BackendChoice::cpu;
     Filter filter{};
     std::vector<std::string> candidates;
+    // mode "kernel" (protocol v1.1): one fixed geometry, many kernels.
+    // `candidates` then holds exactly one decimal (the fixed axis value) and
+    // `kernel_filters` carries the ordered kernel list.
+    bool kernel_mode = false;
+    std::vector<Filter> kernel_filters;
     MetricSpec metric{};
     std::size_t worker_count = 0;
 };
@@ -207,6 +212,36 @@ Filter parse_filter(const JsonValue &kernel) {
     throw WorkerError("bad_request", "unknown kernel id: " + id);
 }
 
+// Canonical echo of a parsed kernel spec (defaults filled): bicubic always
+// carries b and c, lanczos always carries taps.
+JsonValue filter_to_json(const Filter &filter) {
+    std::vector<std::pair<std::string, JsonValue>> members;
+    switch (filter.type) {
+    case KernelType::bilinear:
+        members.emplace_back("id", JsonValue::string("bilinear"));
+        break;
+    case KernelType::bicubic:
+        members.emplace_back("id", JsonValue::string("bicubic"));
+        members.emplace_back("b", JsonValue::number(filter.b));
+        members.emplace_back("c", JsonValue::number(filter.c));
+        break;
+    case KernelType::lanczos:
+        members.emplace_back("id", JsonValue::string("lanczos"));
+        members.emplace_back("taps", JsonValue::integer(filter.taps));
+        break;
+    case KernelType::spline16:
+        members.emplace_back("id", JsonValue::string("spline16"));
+        break;
+    case KernelType::spline36:
+        members.emplace_back("id", JsonValue::string("spline36"));
+        break;
+    case KernelType::spline64:
+        members.emplace_back("id", JsonValue::string("spline64"));
+        break;
+    }
+    return JsonValue::object(std::move(members));
+}
+
 MetricSpec parse_metric(const JsonValue &metric) {
     MetricSpec result{};
     result.crop_left = optional_int(metric, "crop_left", result.crop_left);
@@ -253,8 +288,10 @@ AnalyzeJobSpec parse_analyze(const JsonValue &command, std::string job_id) {
     spec.request_id = require_string(command, "request_id");
     spec.job_id = std::move(job_id);
     const std::string mode = require_string(command, "mode");
-    if (mode != "height") {
-        throw WorkerError("unsupported", "only mode=height is available in protocol v1");
+    spec.kernel_mode = mode == "kernel";
+    if (mode != "height" && !spec.kernel_mode) {
+        throw WorkerError("unsupported",
+                          "mode must be height or kernel in protocol v1.1, got: " + mode);
     }
     const std::string backend = require_string(command, "backend");
     if (backend == "cpu" || backend == "auto") {
@@ -267,8 +304,70 @@ AnalyzeJobSpec parse_analyze(const JsonValue &command, std::string job_id) {
     }
     spec.frame = parse_frame_asset(require_member(command, "frame_asset"));
     spec.axis_mode = parse_axis_mode(require_string(command, "axis_mode"));
-    spec.filter = parse_filter(require_member(command, "kernel"));
     spec.metric = parse_metric(require_member(command, "metric"));
+
+    if (spec.kernel_mode) {
+        // Kernel scan: one fixed axis value + an ordered kernel list. The
+        // fixed value travels in the single `candidate` field (same decimal
+        // semantics as verify_begin); `kernel` must not accompany `kernels`.
+        if (command.find("kernel")) {
+            throw WorkerError("bad_request",
+                              "kernel mode takes kernels, not kernel");
+        }
+        const JsonValue *candidate = command.find("candidate");
+        if (candidate == nullptr) {
+            throw WorkerError("bad_request", "kernel mode requires candidate");
+        }
+        std::string decimal;
+        if (candidate->type == JsonValue::Type::string) {
+            decimal = candidate->string_value;
+        } else if (candidate->type == JsonValue::Type::number) {
+            decimal = candidate->raw_number;
+        } else {
+            throw WorkerError("bad_request",
+                              "candidate must be a decimal string or number");
+        }
+        double value = 0.0;
+        try {
+            const JsonValue parsed = parse_json(decimal);
+            if (parsed.type != JsonValue::Type::number) {
+                throw std::runtime_error("not a number");
+            }
+            value = parsed.number_value;
+        } catch (const std::exception &) {
+            throw WorkerError("bad_request", "invalid candidate decimal: " + decimal);
+        }
+        if (!std::isfinite(value) || value < 2.0) {
+            throw WorkerError("bad_request", "candidate must be finite and >= 2");
+        }
+        spec.candidates.push_back(std::move(decimal));
+
+        const JsonValue &kernels = require_member(command, "kernels");
+        if (kernels.type != JsonValue::Type::array || kernels.items.empty()) {
+            throw WorkerError("bad_request", "kernels must be a non-empty array");
+        }
+        if (kernels.items.size() > 4096U) {
+            throw WorkerError("bad_request", "kernels exceeds the 4096-entry cap");
+        }
+        spec.kernel_filters.reserve(kernels.items.size());
+        for (const JsonValue &kernel : kernels.items) {
+            if (kernel.type != JsonValue::Type::object) {
+                throw WorkerError("bad_request", "kernels entries must be objects");
+            }
+            spec.kernel_filters.push_back(parse_filter(kernel));
+        }
+        if (command.find("worker_count")) {
+            const double workers = require_number(command, "worker_count");
+            if (workers < 0.0 || std::trunc(workers) != workers) {
+                throw WorkerError("bad_request",
+                                  "worker_count must be a non-negative integer");
+            }
+            spec.worker_count = static_cast<std::size_t>(workers);
+        }
+        return spec;
+    }
+
+    spec.filter = parse_filter(require_member(command, "kernel"));
 
     const JsonValue &candidates = require_member(command, "candidates");
     if (candidates.type != JsonValue::Type::array || candidates.items.empty()) {
@@ -1210,7 +1309,8 @@ private:
 
         // Candidate axis requests (primary axis follows the candidate grid;
         // the secondary axis in h_plus_w mode is derived from the aspect
-        // ratio, matching the standard integer-width rule).
+        // ratio, matching the standard integer-width rule). Kernel mode maps
+        // each kernel filter onto the single fixed axis value instead.
         std::vector<double> values;
         values.reserve(spec.candidates.size());
         for (const std::string &decimal : spec.candidates) {
@@ -1223,21 +1323,40 @@ private:
             values.push_back(value);
         }
 
+        const std::size_t result_count = spec.kernel_mode
+            ? spec.kernel_filters.size() : values.size();
         std::vector<AxisPlanRequest> requests;
         requests.reserve(spec.axis_mode == AxisMode::height_plus_width
-                             ? values.size() * 2U
-                             : values.size());
-        for (const double value : values) {
-            requests.push_back(make_axis_request(primary_size, value, spec.filter));
+                             ? result_count * 2U
+                             : result_count);
+        if (spec.kernel_mode) {
+            for (const Filter &filter : spec.kernel_filters) {
+                requests.push_back(make_axis_request(primary_size, values.front(), filter));
+            }
+        } else {
+            for (const double value : values) {
+                requests.push_back(make_axis_request(primary_size, value, spec.filter));
+            }
         }
         if (spec.axis_mode == AxisMode::height_plus_width) {
-            for (const double value : values) {
-                const double derived =
-                    static_cast<double>(secondary_size) * value / static_cast<double>(primary_size);
+            if (spec.kernel_mode) {
+                const double derived = static_cast<double>(secondary_size)
+                    * values.front() / static_cast<double>(primary_size);
                 if (derived < 2.0) {
                     throw WorkerError("bad_request", "derived secondary axis length is too small");
                 }
-                requests.push_back(make_axis_request(secondary_size, derived, spec.filter));
+                for (const Filter &filter : spec.kernel_filters) {
+                    requests.push_back(make_axis_request(secondary_size, derived, filter));
+                }
+            } else {
+                for (const double value : values) {
+                    const double derived =
+                        static_cast<double>(secondary_size) * value / static_cast<double>(primary_size);
+                    if (derived < 2.0) {
+                        throw WorkerError("bad_request", "derived secondary axis length is too small");
+                    }
+                    requests.push_back(make_axis_request(secondary_size, derived, spec.filter));
+                }
             }
         }
 
@@ -1298,7 +1417,7 @@ private:
         // N+1's host pack + upload (the unique-candidate-scan wall measured
         // in docs/performance/e3-kernel-increments-20260808.md §2).
         const auto candidates_start = std::chrono::steady_clock::now();
-        std::vector<CandidateResult> results(spec.candidates.size());
+        std::vector<CandidateResult> results(result_count);
 
 #if defined(GETNATIVE_HAS_CUDA)
         if (spec.backend == BackendChoice::cuda) {
@@ -1326,12 +1445,17 @@ private:
                                      std::vector<CandidateAnalysis> &chunk) {
             const std::size_t begin = chunk_index * kCandidateChunkSize;
             const std::size_t end =
-                std::min(begin + kCandidateChunkSize, spec.candidates.size());
+                std::min(begin + kCandidateChunkSize, result_count);
             chunk.clear();
             chunk.reserve(end - begin);
             for (std::size_t index = begin; index < end; ++index) {
                 CandidateAnalysis candidate;
-                candidate.id = spec.candidates[index];
+                // Kernel-mode result ids are the kernel's index into the
+                // request's ordered kernels list; the payload echoes each
+                // parsed kernel spec, so ids stay unambiguous even with a
+                // duplicated (b, c) grid.
+                candidate.id = spec.kernel_mode
+                    ? std::to_string(index) : spec.candidates[index];
                 if (spec.axis_mode == AxisMode::width_only) {
                     candidate.horizontal = plans[index];
                     candidate.axes = AnalysisAxes::horizontal;
@@ -1340,7 +1464,7 @@ private:
                     candidate.axes = AnalysisAxes::vertical;
                 } else {
                     candidate.vertical = plans[index];
-                    candidate.horizontal = plans[values.size() + index];
+                    candidate.horizontal = plans[result_count + index];
                     candidate.axes = AnalysisAxes::both;
                 }
                 chunk.push_back(std::move(candidate));
@@ -1348,7 +1472,7 @@ private:
         };
 
         const std::size_t chunk_total =
-            (spec.candidates.size() + kCandidateChunkSize - 1U) / kCandidateChunkSize;
+            (result_count + kCandidateChunkSize - 1U) / kCandidateChunkSize;
         std::size_t completed = 0U;
 
 #if defined(GETNATIVE_HAS_CUDA)
@@ -1398,7 +1522,7 @@ private:
                                     chunk_results.size(), std::memory_order_relaxed)
                                     + chunk_results.size();
                                 emit_progress(spec, "candidates", done,
-                                              spec.candidates.size());
+                                              result_count);
                             } catch (...) {
                                 if (job.cancel_requested.load(
                                         std::memory_order_relaxed)) {
@@ -1425,7 +1549,7 @@ private:
                     }
                     const std::size_t begin = chunk_index * kCandidateChunkSize;
                     const std::size_t end = std::min(
-                        begin + kCandidateChunkSize, spec.candidates.size());
+                        begin + kCandidateChunkSize, result_count);
                     for (std::size_t index = begin; index < end; ++index) {
                         partial.push_back(std::move(results[index]));
                     }
@@ -1433,7 +1557,7 @@ private:
                 emit_partial_cancelled(spec, partial);
                 return;
             }
-            completed = spec.candidates.size();
+            completed = result_count;
         } else
 #endif
         {
@@ -1467,7 +1591,7 @@ private:
                     emit_partial_cancelled(spec, results);
                     return;
                 }
-                emit_progress(spec, "candidates", completed, spec.candidates.size());
+                emit_progress(spec, "candidates", completed, result_count);
             }
         }
         results.resize(completed);
@@ -1518,10 +1642,27 @@ private:
         std::vector<JsonValue> candidate_values;
         candidate_values.reserve(results.size());
         for (const CandidateResult &result : results) {
-            candidate_values.push_back(JsonValue::object({
+            std::vector<std::pair<std::string, JsonValue>> entry = {
                 {"id", JsonValue::string(result.id)},
                 {"error", JsonValue::number(result.error)},
-            }));
+            };
+            if (spec.kernel_mode) {
+                const std::size_t kernel_index =
+                    static_cast<std::size_t>(std::stoull(result.id));
+                entry.emplace_back(
+                    "kernel", filter_to_json(spec.kernel_filters[kernel_index]));
+            }
+            candidate_values.push_back(JsonValue::object(std::move(entry)));
+        }
+        const char *mode_name = spec.kernel_mode ? "kernel" : "height";
+        std::vector<std::pair<std::string, JsonValue>> payload = {
+            {"mode", JsonValue::string(mode_name)},
+            {"candidates", JsonValue::array(std::move(candidate_values))},
+            {"telemetry", JsonValue::object(std::move(telemetry_members))},
+        };
+        if (spec.kernel_mode) {
+            payload.emplace_back("candidate",
+                                 JsonValue::string(spec.candidates.front()));
         }
         emit(JsonValue::object({
             {"protocol_version", JsonValue::integer(kProtocolVersion)},
@@ -1529,12 +1670,8 @@ private:
             {"request_id", JsonValue::string(spec.request_id)},
             {"job_id", JsonValue::string(spec.job_id)},
             {"timestamp_ms", JsonValue::integer(timestamp_ms())},
-            {"mode", JsonValue::string("height")},
-            {"payload", JsonValue::object({
-                {"mode", JsonValue::string("height")},
-                {"candidates", JsonValue::array(std::move(candidate_values))},
-                {"telemetry", JsonValue::object(std::move(telemetry_members))},
-            })},
+            {"mode", JsonValue::string(mode_name)},
+            {"payload", JsonValue::object(std::move(payload))},
         }));
     }
 
@@ -1839,7 +1976,7 @@ private:
             {"partial", JsonValue::boolean(!results.empty())},
             {"detail", JsonValue::string("cancelled")},
             {"payload", JsonValue::object({
-                {"mode", JsonValue::string("height")},
+                {"mode", JsonValue::string(spec.kernel_mode ? "kernel" : "height")},
                 {"candidates", JsonValue::array(std::move(candidate_values))},
             })},
         }));

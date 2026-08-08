@@ -358,7 +358,11 @@ pub struct WorkerAnalyzeRequest {
     pub mode: String,
     pub frame_asset: FrameAssetRef,
     pub axis_mode: String,
-    pub kernel: KernelCommand,
+    /// Height mode: the single scan kernel. Kernel mode: omit.
+    pub kernel: Option<KernelCommand>,
+    /// Kernel mode: the ordered kernel list (fixed geometry from
+    /// `candidates[0]`). Height mode: omit.
+    pub kernels: Option<Vec<KernelCommand>>,
     pub candidates: Vec<String>,
     pub metric: MetricCommand,
     pub backend: String,
@@ -369,9 +373,9 @@ fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), String> {
     if request.request_id.trim().is_empty() {
         return Err("bad_request: requestId must not be empty".to_owned());
     }
-    if request.mode != "height" {
+    if !matches!(request.mode.as_str(), "height" | "kernel") {
         return Err(format!(
-            "unsupported: only mode=height is available in worker protocol v1, got {}",
+            "unsupported: mode must be height or kernel in worker protocol v1.1, got {}",
             request.mode
         ));
     }
@@ -393,26 +397,60 @@ fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), String> {
     if !matches!(request.axis_mode.as_str(), "h_only" | "w_only" | "h_plus_w") {
         return Err(format!("bad_request: unknown axisMode {}", request.axis_mode));
     }
-    match request.kernel.id.as_str() {
-        "bilinear" | "spline16" | "spline36" | "spline64" => {}
-        "bicubic" => {
-            for (label, value) in [("b", request.kernel.b), ("c", request.kernel.c)] {
-                if value.is_some_and(|value| !value.is_finite()) {
-                    return Err(format!("bad_request: bicubic {label} must be finite"));
+    fn validate_kernel(kernel: &KernelCommand) -> Result<(), String> {
+        match kernel.id.as_str() {
+            "bilinear" | "spline16" | "spline36" | "spline64" => {}
+            "bicubic" => {
+                for (label, value) in [("b", kernel.b), ("c", kernel.c)] {
+                    if value.is_some_and(|value| !value.is_finite()) {
+                        return Err(format!("bad_request: bicubic {label} must be finite"));
+                    }
                 }
             }
-        }
-        "lanczos" => {
-            if request.kernel.taps.is_some_and(|taps| !(1..=15).contains(&taps)) {
-                return Err("bad_request: lanczos taps must be within 1..=15".to_owned());
+            "lanczos" => {
+                if kernel.taps.is_some_and(|taps| !(1..=15).contains(&taps)) {
+                    return Err("bad_request: lanczos taps must be within 1..=15".to_owned());
+                }
             }
+            other => return Err(format!("bad_request: unknown kernel id {other}")),
         }
-        other => return Err(format!("bad_request: unknown kernel id {other}")),
+        Ok(())
     }
-    if request.candidates.is_empty() || request.candidates.len() > MAX_CANDIDATES {
-        return Err(format!(
-            "bad_request: candidates must contain 1..={MAX_CANDIDATES} values"
-        ));
+    if request.mode == "kernel" {
+        if request.kernel.is_some() {
+            return Err("bad_request: kernel mode takes kernels, not kernel".to_owned());
+        }
+        let kernels = request.kernels.as_ref().filter(|list| !list.is_empty());
+        let Some(kernels) = kernels else {
+            return Err("bad_request: kernel mode requires a non-empty kernels list".to_owned());
+        };
+        if kernels.len() > MAX_CANDIDATES {
+            return Err(format!(
+                "bad_request: kernels must contain 1..={MAX_CANDIDATES} entries"
+            ));
+        }
+        for kernel in kernels {
+            validate_kernel(kernel)?;
+        }
+        if request.candidates.len() != 1 {
+            return Err(
+                "bad_request: kernel mode takes exactly one candidate (the fixed axis value)"
+                    .to_owned(),
+            );
+        }
+    } else {
+        if request.kernels.is_some() {
+            return Err("bad_request: height mode takes kernel, not kernels".to_owned());
+        }
+        let Some(kernel) = request.kernel.as_ref() else {
+            return Err("bad_request: height mode requires kernel".to_owned());
+        };
+        validate_kernel(kernel)?;
+        if request.candidates.is_empty() || request.candidates.len() > MAX_CANDIDATES {
+            return Err(format!(
+                "bad_request: candidates must contain 1..={MAX_CANDIDATES} values"
+            ));
+        }
     }
     for candidate in &request.candidates {
         let Ok(value) = candidate.parse::<f64>() else {
@@ -443,22 +481,26 @@ fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), String> {
     Ok(())
 }
 
+fn kernel_json(kernel: &KernelCommand) -> Value {
+    let mut object = Map::new();
+    object.insert("id".to_owned(), json!(kernel.id));
+    if kernel.id == "bicubic" {
+        if let Some(b) = kernel.b {
+            object.insert("b".to_owned(), json!(b));
+        }
+        if let Some(c) = kernel.c {
+            object.insert("c".to_owned(), json!(c));
+        }
+    }
+    if kernel.id == "lanczos" {
+        if let Some(taps) = kernel.taps {
+            object.insert("taps".to_owned(), json!(taps));
+        }
+    }
+    Value::Object(object)
+}
+
 fn analyze_command(request: &WorkerAnalyzeRequest) -> Value {
-    let mut kernel = Map::new();
-    kernel.insert("id".to_owned(), json!(request.kernel.id));
-    if request.kernel.id == "bicubic" {
-        if let Some(b) = request.kernel.b {
-            kernel.insert("b".to_owned(), json!(b));
-        }
-        if let Some(c) = request.kernel.c {
-            kernel.insert("c".to_owned(), json!(c));
-        }
-    }
-    if request.kernel.id == "lanczos" {
-        if let Some(taps) = request.kernel.taps {
-            kernel.insert("taps".to_owned(), json!(taps));
-        }
-    }
     let mut metric = Map::new();
     if let Some(value) = request.metric.crop_left {
         metric.insert("crop_left".to_owned(), json!(value));
@@ -490,11 +532,26 @@ fn analyze_command(request: &WorkerAnalyzeRequest) -> Value {
             "height": request.frame_asset.height,
         },
         "axis_mode": request.axis_mode,
-        "kernel": Value::Object(kernel),
-        "candidates": request.candidates,
         "metric": Value::Object(metric),
         "backend": request.backend,
     });
+    if request.mode == "kernel" {
+        // Kernel mode: the single fixed axis value travels as `candidate`
+        // and the ordered kernel list as `kernels` (engine protocol v1.1).
+        command["candidate"] = json!(request.candidates[0]);
+        command["kernels"] = Value::Array(
+            request
+                .kernels
+                .as_ref()
+                .map(|kernels| kernels.iter().map(kernel_json).collect())
+                .unwrap_or_default(),
+        );
+    } else {
+        command["kernel"] = kernel_json(
+            request.kernel.as_ref().expect("height mode requires kernel"),
+        );
+        command["candidates"] = json!(request.candidates);
+    }
     if let Some(worker_count) = request.worker_count {
         command["worker_count"] = json!(worker_count);
     }
@@ -580,20 +637,92 @@ mod tests {
     #[test]
     fn analyze_command_omits_irrelevant_kernel_parameters() {
         let mut request = analyze_request();
-        request.kernel = KernelCommand {
+        request.kernel = Some(KernelCommand {
             id: "lanczos".to_owned(),
             b: Some(9.0),
             c: Some(9.0),
             taps: Some(3),
-        };
+        });
         let command = analyze_command(&request);
         assert_eq!(command["kernel"], json!({"id": "lanczos", "taps": 3}));
     }
 
     #[test]
+    fn kernel_mode_serializes_candidate_and_kernel_list() {
+        let request: WorkerAnalyzeRequest = serde_json::from_value(json!({
+            "requestId": "req-k1",
+            "mode": "kernel",
+            "frameAsset": {
+                "path": "/tmp/frame.f32",
+                "format": "f32le",
+                "width": 320,
+                "height": 240,
+            },
+            "axisMode": "h_only",
+            "kernels": [
+                {"id": "bicubic", "b": 0.0, "c": 0.5},
+                {"id": "lanczos", "taps": 3},
+            ],
+            "candidates": ["200"],
+            "metric": {"pNorm": 1},
+            "backend": "cpu",
+        }))
+        .unwrap();
+        validate_analyze(&request).unwrap();
+        let command = analyze_command(&request);
+        assert_eq!(command["mode"], json!("kernel"));
+        assert_eq!(command["candidate"], json!("200"));
+        assert_eq!(
+            command["kernels"],
+            json!([{"id": "bicubic", "b": 0.0, "c": 0.5}, {"id": "lanczos", "taps": 3}])
+        );
+        assert!(command.get("kernel").is_none());
+        assert!(command.get("candidates").is_none());
+    }
+
+    #[test]
+    fn kernel_mode_validation_rejects_bad_shapes() {
+        let valid = json!({
+            "requestId": "req-k2",
+            "mode": "kernel",
+            "frameAsset": {
+                "path": "/tmp/frame.f32",
+                "format": "f32le",
+                "width": 320,
+                "height": 240,
+            },
+            "axisMode": "h_only",
+            "kernels": [{"id": "bicubic", "b": 0.0, "c": 0.5}],
+            "candidates": ["200"],
+            "metric": {"pNorm": 1},
+            "backend": "cpu",
+        });
+
+        let mut value = valid.clone();
+        value["candidates"] = json!(["200", "201"]);
+        let request: WorkerAnalyzeRequest = serde_json::from_value(value).unwrap();
+        assert!(validate_analyze(&request).is_err());
+
+        let mut value = valid.clone();
+        value["kernels"] = json!([]);
+        let request: WorkerAnalyzeRequest = serde_json::from_value(value).unwrap();
+        assert!(validate_analyze(&request).is_err());
+
+        let mut value = valid.clone();
+        value["kernel"] = json!({"id": "bicubic"});
+        let request: WorkerAnalyzeRequest = serde_json::from_value(value).unwrap();
+        assert!(validate_analyze(&request).is_err());
+
+        let mut value = valid;
+        value["kernels"] = json!([{"id": "lanczos", "taps": 16}]);
+        let request: WorkerAnalyzeRequest = serde_json::from_value(value).unwrap();
+        assert!(validate_analyze(&request).is_err());
+    }
+
+    #[test]
     fn analyze_validation_rejects_out_of_contract_shapes() {
         let mut request = analyze_request();
-        request.mode = "kernel".to_owned();
+        request.mode = "width".to_owned();
         assert!(validate_analyze(&request).unwrap_err().contains("unsupported"));
 
         let mut request = analyze_request();
@@ -629,8 +758,10 @@ mod tests {
         assert!(validate_analyze(&request).is_err());
 
         let mut request = analyze_request();
-        request.kernel.taps = Some(16);
-        request.kernel.id = "lanczos".to_owned();
+        if let Some(kernel) = request.kernel.as_mut() {
+            kernel.taps = Some(16);
+            kernel.id = "lanczos".to_owned();
+        }
         assert!(validate_analyze(&request).is_err());
     }
 
@@ -724,12 +855,13 @@ mod tests {
                 height: 240,
             },
             axis_mode: "h_only".to_owned(),
-            kernel: KernelCommand {
+            kernel: Some(KernelCommand {
                 id: "bicubic".to_owned(),
                 b: Some(0.0),
                 c: Some(0.5),
                 taps: None,
-            },
+            }),
+            kernels: None,
             candidates: (200..=220).map(|height| height.to_string()).collect(),
             metric: MetricCommand {
                 crop_left: Some(10),
@@ -857,12 +989,13 @@ mod tests {
                 height: asset.height,
             },
             axis_mode: "h_only".to_owned(),
-            kernel: KernelCommand {
+            kernel: Some(KernelCommand {
                 id: "bicubic".to_owned(),
                 b: Some(0.0),
                 c: Some(0.5),
                 taps: None,
-            },
+            }),
+            kernels: None,
             candidates: vec!["220".to_owned(), "221".to_owned(), "222".to_owned()],
             metric: MetricCommand {
                 crop_left: Some(10),

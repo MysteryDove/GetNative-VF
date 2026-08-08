@@ -100,7 +100,56 @@ Field rules:
   axis length.
 - `metric.p_norm`: currently `1` for CPU parity with the validated
   fixtures; other values fail with `unsupported`.
-- `worker_count`: 0 selects the backend default.
+- `worker_count`: 0 selects the backend default. On the CUDA backend it
+  also sets the candidate-pipeline depth (1..8; default 2).
+
+### 2.3.1 `analyze` with `mode: "kernel"` (v1.1)
+
+A kernel scan inverts the height scan: **one fixed geometry, many
+kernels**. The wire shape drops `kernel`/`candidates` for a single
+`candidate` decimal plus an ordered `kernels` array:
+
+```json
+{
+  "protocol_version": 1,
+  "type": "analyze",
+  "request_id": "req-20",
+  "mode": "kernel",
+  "frame_asset": {"path": "/absolute/path/frame.f32", "format": "f32le",
+                  "width": 1920, "height": 1080},
+  "axis_mode": "h_only",
+  "candidate": "810",
+  "kernels": [
+    {"id": "bilinear"},
+    {"id": "bicubic", "b": 0.0, "c": 0.5},
+    {"id": "bicubic", "b": 0.0, "c": 1.0},
+    {"id": "lanczos", "taps": 3}
+  ],
+  "metric": {"p_norm": 1},
+  "backend": "cpu"
+}
+```
+
+Field rules:
+
+- `candidate` is one decimal with the same plan semantics as a height
+  candidate (destination = floor, active_length = value, shift = 0);
+  for `h_plus_w` the secondary axis derives per kernel from the aspect
+  ratio exactly like height mode.
+- `kernels` entries follow the height-mode `kernel` rules (`b`/`c`
+  bicubic-only, `taps` lanczos-only, defaults filled when omitted).
+  Duplicates are legal (a bicubic (b, c) grid needs them). Cap: 4096.
+- Sending both `kernel` and `kernels`, or omitting `candidate`, fails
+  `bad_request`.
+
+Result payload: `mode: "kernel"`, `candidate` echo, and one entry per
+kernel **in request order**: `{"id": "<index>", "error": …, "kernel":
+{…echo with defaults filled…}}`. The `id` is the decimal index into the
+request's `kernels` list, so duplicated specs stay unambiguous. Plans
+share the session cache and store with height mode (same PlanKey space —
+a kernel-mode entry already scanned as a height candidate is a hit).
+Cancel/progress semantics are identical to height mode (partial payload
+carries the completed prefix in request order).
 
 ### 2.4 `cancel`
 
