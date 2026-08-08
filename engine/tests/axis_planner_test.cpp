@@ -597,6 +597,36 @@ void test_failure_stops_claiming_and_joins_started_builds() {
            "no new unique key is claimed after the failure is observed");
 }
 
+void test_period_replay_repeats_interior_rows() {
+    // 1080/800 reduces to 27/20, so the position lattice repeats every 27
+    // source rows. Per-row evaluation jitters the repeat by ~1 ulp (this
+    // geometry showed 1982 unique distance bit patterns); the period cache
+    // replays the class row's raw tap weights instead, making interior
+    // forward-weight rows bit-identical within a class. Edge rows differ:
+    // boundary coalescing near row 0 and window pinning once row_left
+    // reaches destination_size - forward_width.
+    const getnative::AxisPlan plan = getnative::build_axis_plan(
+        {1080, 800, 800.0, 0.0, getnative::Filter::lanczos(8),
+         getnative::BorderMode::mirror});
+    const std::size_t width = static_cast<std::size_t>(plan.forward_width);
+    expect(plan.forward_weights.size()
+               == static_cast<std::size_t>(plan.source_size) * width,
+           "forward weights shape differs");
+    for (std::int32_t row = 100; row < 700; ++row) {
+        const float *current = plan.forward_weights.data()
+            + static_cast<std::size_t>(row) * width;
+        const float *class_row = current - 27 * width;
+        expect(std::memcmp(current, class_row, width * sizeof(float)) == 0,
+               "period replay broke interior row periodicity");
+    }
+    // Fractional active lengths have no small period and still build.
+    const getnative::AxisPlan fractional = getnative::build_axis_plan(
+        {1080, 800, 800.5, 0.0, getnative::Filter::lanczos(8),
+         getnative::BorderMode::mirror});
+    expect(fractional.forward_weights.size() == plan.forward_weights.size(),
+           "fractional active length plan shape differs");
+}
+
 } // namespace
 
 int main() {
@@ -612,6 +642,7 @@ int main() {
         test_worker_bounds_and_peak_concurrency();
         test_lowest_stable_failure_is_rethrown_after_join();
         test_failure_stops_claiming_and_joins_started_builds();
+        test_period_replay_repeats_interior_rows();
         std::cout << "axis planner tests passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception &error) {

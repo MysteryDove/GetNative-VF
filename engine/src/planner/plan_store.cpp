@@ -241,7 +241,9 @@ std::uint64_t PlanStore::build_fingerprint() {
     fnv_mix(hash, 0U);
 #endif
     // Bump when planner output semantics change without a flag change.
-    fnv_mix(hash, 1U);
+    // 1 -> 2: period-replayed row weights (position-lattice reuse) differ
+    // from per-row evaluation by <=1 position ulp on repeat rows.
+    fnv_mix(hash, 2U);
     return hash;
 }
 

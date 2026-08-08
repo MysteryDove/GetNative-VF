@@ -13,6 +13,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -397,6 +398,51 @@ struct DoubleCsrView {
     std::vector<double> &weights;
 };
 
+// Position lattice period: for integer active_length the scale
+// rows/active_length reduces to p/q, so position(row + p) = position(row)
+// + q in exact arithmetic — the per-row tap-weight vector repeats every p
+// rows. Returns p when reuse pays (at least 2x and a bounded cache), else
+// 0. Rows >= p bit-copy row (row mod p)'s raw tap weights and total instead
+// of re-evaluating the filter kernel; this differs from per-row evaluation
+// only by the division-rounding jitter the per-row path itself exhibits
+// across periods (<=1 position ulp, far below the 2e-6 upstream-conformance
+// budget), and every comparison gate is self-consistent or tolerance-based.
+[[nodiscard]] std::int32_t position_lattice_period(
+    std::int32_t source_size, double active_length) noexcept {
+    if (!finite_binary64(active_length)
+        || std::trunc(active_length) != active_length
+        || active_length < 1.0
+        || active_length > 9007199254740992.0) {
+        return 0;
+    }
+    const std::int64_t active = static_cast<std::int64_t>(active_length);
+    const std::int64_t period = static_cast<std::int64_t>(source_size)
+        / std::gcd(static_cast<std::int64_t>(source_size), active);
+    if (period <= 0 || period * 2 > source_size || period > 4096) {
+        return 0;
+    }
+    return static_cast<std::int32_t>(period);
+}
+
+// Per-period-class store of raw tap weights and totals for one builder.
+struct PeriodWeightCache {
+    std::int32_t period = 0;
+    std::size_t width = 0;
+    std::vector<double> raw;     // period x width, filled for row < period
+    std::vector<double> totals;  // period
+
+    void enable(std::int32_t rows, double active_length, std::size_t taps) {
+        period = position_lattice_period(rows, active_length);
+        if (period == 0) return;
+        width = taps;
+        raw.resize(static_cast<std::size_t>(period) * width);
+        totals.resize(static_cast<std::size_t>(period));
+    }
+    [[nodiscard]] bool replay(std::int32_t row) const noexcept {
+        return period != 0 && row >= period;
+    }
+};
+
 template <bool ReuseTapWeights, bool ReuseGeometry = false>
 void make_descale_matrix(DoubleCsrView result,
                          const AxisPlanRequest &request,
@@ -425,6 +471,9 @@ void make_descale_matrix(DoubleCsrView result,
     std::array<double, 30> tap_weights{};
     std::array<double, 30> coalesced_weights{};
     std::array<bool, 30> coalesced_seen{};
+    PeriodWeightCache period_cache;
+    period_cache.enable(rows, request.active_length,
+                        static_cast<std::size_t>(2 * support));
     for (std::int32_t i = 0; i < rows; ++i) {
         double position = 0.0;
         double begin = 0.0;
@@ -435,6 +484,15 @@ void make_descale_matrix(DoubleCsrView result,
         const std::size_t geometry_row_base = static_cast<std::size_t>(i)
             * static_cast<std::size_t>(2 * support);
         double total = 0.0;
+        const bool replaying = period_cache.replay(i);
+        if (replaying) {
+            const std::size_t class_base = static_cast<std::size_t>(
+                i % period_cache.period) * period_cache.width;
+            std::copy_n(period_cache.raw.data() + class_base,
+                        period_cache.width, tap_weights.data());
+            total = period_cache.totals[
+                static_cast<std::size_t>(i % period_cache.period)];
+        } else {
         for (std::int32_t tap = 0; tap < 2 * support; ++tap) {
             double distance = 0.0;
             if constexpr (ReuseGeometry) {
@@ -452,13 +510,37 @@ void make_descale_matrix(DoubleCsrView result,
         if (!finite_binary64(total) || total == 0.0) {
             throw std::runtime_error("filter produced a zero or non-finite weight sum");
         }
+        if (period_cache.period != 0) {
+            // First-period row: record raw taps for replay. The tap-recompute
+            // structure mode does not stash weights in the first loop, so
+            // replay rows fill tap_weights from the cache either way.
+            if constexpr (!ReuseTapWeights) {
+                for (std::int32_t tap = 0; tap < 2 * support; ++tap) {
+                    double distance = 0.0;
+                    if constexpr (ReuseGeometry) {
+                        distance = geometry->descale_distances[
+                            geometry_row_base + static_cast<std::size_t>(tap)];
+                    } else {
+                        distance = begin + static_cast<double>(tap) - position;
+                    }
+                    tap_weights[static_cast<std::size_t>(tap)] =
+                        request.filter.weight(distance);
+                }
+            }
+            const std::size_t class_base =
+                static_cast<std::size_t>(i) * period_cache.width;
+            std::copy_n(tap_weights.data(), period_cache.width,
+                        period_cache.raw.data() + class_base);
+            period_cache.totals[static_cast<std::size_t>(i)] = total;
+        }
+        }
 
         if constexpr (!ReuseGeometry && fast_interior_indices) {
             const double final_center = begin + static_cast<double>(2 * support - 1);
             if (begin >= 0.0 && final_center < static_cast<double>(columns)) {
                 const auto first_index = static_cast<std::int32_t>(std::floor(begin));
                 for (std::int32_t tap = 0; tap < 2 * support; ++tap) {
-                    const double raw_weight = ReuseTapWeights
+                    const double raw_weight = (ReuseTapWeights || replaying)
                         ? tap_weights[static_cast<std::size_t>(tap)]
                         : request.filter.weight(
                             begin + static_cast<double>(tap) - position);
@@ -496,7 +578,9 @@ void make_descale_matrix(DoubleCsrView result,
             if constexpr (ReuseTapWeights) {
                 raw_weight = tap_weights[static_cast<std::size_t>(tap)];
             } else {
-                if constexpr (ReuseGeometry) {
+                if (replaying) {
+                    raw_weight = tap_weights[static_cast<std::size_t>(tap)];
+                } else if constexpr (ReuseGeometry) {
                     raw_weight = request.filter.weight(geometry->descale_distances[
                         geometry_row_base + static_cast<std::size_t>(tap)]);
                 } else {
@@ -592,6 +676,9 @@ void make_zimg_forward(DoubleCsrView result,
     }
     std::vector<double> tap_weights(static_cast<std::size_t>(filter_size));
     std::vector<double> row_weights;
+    PeriodWeightCache period_cache;
+    period_cache.enable(rows, request.active_length,
+                        static_cast<std::size_t>(filter_size));
     for (std::int32_t row = 0; row < rows; ++row) {
         double position = 0.0;
         double begin = 0.0;
@@ -603,6 +690,14 @@ void make_zimg_forward(DoubleCsrView result,
         const std::size_t geometry_row_base = static_cast<std::size_t>(row)
             * static_cast<std::size_t>(filter_size);
         double total = 0.0;
+        const bool replaying = period_cache.replay(row);
+        if (replaying) {
+            const std::size_t class_index = static_cast<std::size_t>(
+                row % period_cache.period);
+            std::copy_n(period_cache.raw.data() + class_index * period_cache.width,
+                        period_cache.width, tap_weights.data());
+            total = period_cache.totals[class_index];
+        } else {
         for (std::int32_t tap = 0; tap < filter_size; ++tap) {
             double distance = 0.0;
             if constexpr (ReuseGeometry) {
@@ -620,13 +715,37 @@ void make_zimg_forward(DoubleCsrView result,
         if (!finite_binary64(total) || total == 0.0) {
             throw std::runtime_error("zimg forward filter produced a zero or non-finite weight sum");
         }
+        if (period_cache.period != 0) {
+            // First-period row: record raw taps for replay (see the descale
+            // builder for the tap-recompute mode note).
+            if constexpr (!ReuseTapWeights) {
+                for (std::int32_t tap = 0; tap < filter_size; ++tap) {
+                    double distance = 0.0;
+                    if constexpr (ReuseGeometry) {
+                        distance = geometry->forward_distances[
+                            geometry_row_base + static_cast<std::size_t>(tap)];
+                    } else {
+                        distance = (begin + static_cast<double>(tap) - position)
+                            * step;
+                    }
+                    tap_weights[static_cast<std::size_t>(tap)] =
+                        kernel.weight(distance);
+                }
+            }
+            const std::size_t class_base =
+                static_cast<std::size_t>(row) * period_cache.width;
+            std::copy_n(tap_weights.data(), period_cache.width,
+                        period_cache.raw.data() + class_base);
+            period_cache.totals[static_cast<std::size_t>(row)] = total;
+        }
+        }
 
         if constexpr (!ReuseGeometry && fast_interior_indices) {
             const double final_center = begin + static_cast<double>(filter_size - 1);
             if (begin >= 0.0 && final_center < static_cast<double>(columns)) {
                 const auto first_index = static_cast<std::int32_t>(std::floor(begin));
                 for (std::int32_t tap = 0; tap < filter_size; ++tap) {
-                    const double raw_weight = ReuseTapWeights
+                    const double raw_weight = (ReuseTapWeights || replaying)
                         ? tap_weights[static_cast<std::size_t>(tap)]
                         : kernel.weight(
                             (begin + static_cast<double>(tap) - position) * step);
@@ -670,7 +789,9 @@ void make_zimg_forward(DoubleCsrView result,
             if constexpr (ReuseTapWeights) {
                 raw_weight = tap_weights[static_cast<std::size_t>(tap)];
             } else {
-                if constexpr (ReuseGeometry) {
+                if (replaying) {
+                    raw_weight = tap_weights[static_cast<std::size_t>(tap)];
+                } else if constexpr (ReuseGeometry) {
                     raw_weight = kernel.weight(geometry->forward_distances[
                         geometry_row_base + static_cast<std::size_t>(tap)]);
                 } else {
