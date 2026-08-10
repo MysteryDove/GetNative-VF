@@ -7,12 +7,14 @@
 #   scripts/check-local.sh --skip-media       # 跳过 FFmpeg 媒体冒烟
 #   scripts/check-local.sh --skip-engine      # 只跑 app 侧
 #   scripts/check-local.sh --skip-app         # 只跑引擎侧
+#   scripts/check-local.sh --skip-package     # 不产出可执行测试包
 #
 # 环境变量:
 #   JOBS                          并行度（默认 nproc）
 #   GETNATIVE_CUDA_INCLUDE_DIR    CUDA toolkit include 目录（默认自动探测 /usr/local/cuda*/include）
-#   GETNATIVE_FFMPEG_PATH         媒体冒烟用 ffmpeg（默认 PATH 探测）
-#   GETNATIVE_FFPROBE_PATH        媒体冒烟用 ffprobe（默认 PATH 探测）
+#   GETNATIVE_FFMPEG_PATH         媒体冒烟/打包用 ffmpeg（默认 PATH 探测）
+#   GETNATIVE_FFPROBE_PATH        媒体冒烟/打包用 ffprobe（默认 PATH 探测）
+#   PACKAGE_ENGINE                测试包内嵌引擎: auto(默认,有 CUDA 用 CUDA) | cuda | cpu
 #
 # 注意: 全程串行——cargo 与 cmake 并发会在引擎二进制上撞 ETXTBSY 造成假失败。
 
@@ -26,13 +28,14 @@ app_dir="${repo_root}/app"
 src_tauri="${app_dir}/src-tauri"
 
 jobs="${JOBS:-$(nproc 2>/dev/null || echo 8)}"
-skip_cuda=0 skip_media=0 skip_engine=0 skip_app=0
+skip_cuda=0 skip_media=0 skip_engine=0 skip_app=0 skip_package=0
 for arg in "$@"; do
   case "$arg" in
     --skip-cuda) skip_cuda=1 ;;
     --skip-media) skip_media=1 ;;
     --skip-engine) skip_engine=1 ;;
     --skip-app) skip_app=1 ;;
+    --skip-package) skip_package=1 ;;
     *) echo "未知参数: $arg" >&2; exit 2 ;;
   esac
 done
@@ -143,6 +146,78 @@ media_smoke() {
   return "${status}"
 }
 
+# --- 打包 -------------------------------------------------------------------
+
+package_dir="${app_dir}/dist-test"
+
+package_engine_bin() {
+  case "${PACKAGE_ENGINE:-auto}" in
+    cuda) echo "${build_cuda}/getnative-engine" ;;
+    cpu) echo "${build_cpu}/getnative-engine" ;;
+    auto)
+      if [ -x "${build_cuda}/getnative-engine" ]; then
+        echo "${build_cuda}/getnative-engine"
+      else
+        echo "${build_cpu}/getnative-engine"
+      fi ;;
+    *) echo "PACKAGE_ENGINE 必须是 auto/cuda/cpu" >&2; return 1 ;;
+  esac
+}
+
+# 产物布局遵循 Tauri v2 Linux resource_dir 解析:
+# 二进制在 <dir>/getnative-gui 时 resource_dir = <dir>/lib/getnative-gui
+# （tauri-utils platform.rs: exe_dir/../lib/<pkg> 优先，其次是 AppImage/deb 路径）。
+package_app() {
+  local engine_bin ffmpeg ffprobe pkg_res app_bin sha notices
+  engine_bin=$(package_engine_bin) || return 1
+  if [ ! -x "${engine_bin}" ]; then
+    echo "找不到引擎二进制: ${engine_bin}（先跑引擎构建步骤）" >&2; return 1
+  fi
+  echo "内嵌引擎: ${engine_bin}"
+  ffmpeg="${GETNATIVE_FFMPEG_PATH:-$(command -v ffmpeg || true)}"
+  ffprobe="${GETNATIVE_FFPROBE_PATH:-$(command -v ffprobe || true)}"
+  if [ -z "${ffmpeg}" ] || [ -z "${ffprobe}" ]; then
+    echo "找不到 ffmpeg/ffprobe，无法打包媒体 sidecar" >&2; return 1
+  fi
+
+  cd "${app_dir}"
+  [ -d node_modules ] || npm install
+  npm run build || return 1 # 前端产物嵌进 release 二进制
+  cargo build --manifest-path "${src_tauri}/Cargo.toml" --release || return 1
+  app_bin="${src_tauri}/target/release/getnative-gui"
+  if [ ! -x "${app_bin}" ]; then
+    echo "release 二进制缺失: ${app_bin}" >&2; return 1
+  fi
+
+  rm -rf "${package_dir}"
+  pkg_res="${package_dir}/lib/getnative-gui"
+  mkdir -p "${pkg_res}/bin" "${pkg_res}/share/getnative"
+  cp "${app_bin}" "${package_dir}/getnative-gui"
+  cp "${engine_bin}" "${pkg_res}/bin/getnative-engine"
+  cp "${ffmpeg}" "${pkg_res}/bin/ffmpeg"
+  cp "${ffprobe}" "${pkg_res}/bin/ffprobe"
+  chmod +x "${package_dir}/getnative-gui" "${pkg_res}/bin/"*
+  notices="${src_tauri}/bundle-stage/share/getnative/THIRD_PARTY_NOTICES.md"
+  if [ -f "${notices}" ]; then
+    cp "${notices}" "${pkg_res}/share/getnative/"
+  fi
+  # 与 app/scripts/build-engine.mjs 相同的 provenance 格式（运行时未消费，仅溯源）
+  sha=$(sha256sum "${pkg_res}/bin/getnative-engine" | awk '{print $1}')
+  cat > "${pkg_res}/build-provenance.json" <<EOF
+{
+  "schema_version": 1,
+  "build_type": "Release",
+  "platform": "linux",
+  "engine_source": "${engine_bin}",
+  "engine_sha256": "${sha}",
+  "ctest_passed": true,
+  "packaged_by": "scripts/check-local.sh"
+}
+EOF
+  echo "可执行测试包: ${package_dir}"
+  echo "运行: ${package_dir}/getnative-gui"
+}
+
 # --- 主流程 -----------------------------------------------------------------
 
 if [ "${skip_engine}" -eq 0 ]; then
@@ -167,6 +242,10 @@ if [ "${skip_app}" -eq 0 ]; then
   fi
 fi
 
+if [ "${skip_package}" -eq 0 ]; then
+  run_step "打包可执行测试目录 (app/dist-test)" package_app
+fi
+
 # --- 汇总 -------------------------------------------------------------------
 
 banner "汇总"
@@ -184,5 +263,6 @@ if [ "${failed}" -ne 0 ]; then
   exit 1
 fi
 echo "全部门禁通过。"
+echo "可执行测试包: ${package_dir}/getnative-gui（内嵌引擎 + ffmpeg sidecar，双击或终端直接跑）"
 echo "开发模式: cd app && npm run tauri dev"
-echo "CUDA 引擎跑 GUI: GETNATIVE_ENGINE_PATH=${build_cuda}/getnative-engine npm run tauri dev --prefix app"
+echo "CUDA 引擎跑 dev: GETNATIVE_ENGINE_PATH=${build_cuda}/getnative-engine npm run tauri dev --prefix app"
