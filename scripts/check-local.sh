@@ -183,7 +183,11 @@ package_app() {
   cd "${app_dir}"
   [ -d node_modules ] || npm install
   npm run build || return 1 # 前端产物嵌进 release 二进制
-  cargo build --manifest-path "${src_tauri}/Cargo.toml" --release || return 1
+  # custom-protocol 是 Tauri v2 生产/开发开关：不启用则 cfg(dev)=true，
+  # 窗口去连 devUrl(localhost:1420) 而非内嵌资源——tauri dev 能跑、
+  # 裸 cargo build 的 release 二进制报 "Could not connect to localhost"。
+  cargo build --manifest-path "${src_tauri}/Cargo.toml" --release \
+    --features tauri/custom-protocol || return 1
   app_bin="${src_tauri}/target/release/getnative-gui"
   if [ ! -x "${app_bin}" ]; then
     echo "release 二进制缺失: ${app_bin}" >&2; return 1
