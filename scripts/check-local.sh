@@ -164,9 +164,10 @@ package_engine_bin() {
   esac
 }
 
-# 产物布局遵循 Tauri v2 Linux resource_dir 解析:
-# 二进制在 <dir>/getnative-gui 时 resource_dir = <dir>/lib/getnative-gui
-# （tauri-utils platform.rs: exe_dir/../lib/<pkg> 优先，其次是 AppImage/deb 路径）。
+# 产物布局遵循 Tauri v2 Linux resource_dir 解析（FHS/deb 风格）:
+# tauri-utils platform.rs 取 exe_dir/../lib/<productName>——二进制必须放在
+# bin/ 下，资源放 lib/<productName>/（本应用带空格: "GetNative VF"），二者
+# 同级。顶层 symlink 只是双击便利，/proc/self/exe 解析到 bin/getnative-gui。
 package_app() {
   local engine_bin ffmpeg ffprobe pkg_res app_bin sha notices
   engine_bin=$(package_engine_bin) || return 1
@@ -194,13 +195,14 @@ package_app() {
   fi
 
   rm -rf "${package_dir}"
-  pkg_res="${package_dir}/lib/getnative-gui"
-  mkdir -p "${pkg_res}/bin" "${pkg_res}/share/getnative"
-  cp "${app_bin}" "${package_dir}/getnative-gui"
+  pkg_res="${package_dir}/lib/GetNative VF"
+  mkdir -p "${package_dir}/bin" "${pkg_res}/bin" "${pkg_res}/share/getnative"
+  cp "${app_bin}" "${package_dir}/bin/getnative-gui"
+  ln -s "bin/getnative-gui" "${package_dir}/getnative-gui"
   cp "${engine_bin}" "${pkg_res}/bin/getnative-engine"
   cp "${ffmpeg}" "${pkg_res}/bin/ffmpeg"
   cp "${ffprobe}" "${pkg_res}/bin/ffprobe"
-  chmod +x "${package_dir}/getnative-gui" "${pkg_res}/bin/"*
+  chmod +x "${package_dir}/bin/getnative-gui" "${pkg_res}/bin/"*
   notices="${src_tauri}/bundle-stage/share/getnative/THIRD_PARTY_NOTICES.md"
   if [ -f "${notices}" ]; then
     cp "${notices}" "${pkg_res}/share/getnative/"
