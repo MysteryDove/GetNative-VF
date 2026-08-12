@@ -237,8 +237,12 @@ let cudaMinimumArchitecture = "not-applicable";
 let cudaPtxArchitectures = "not-applicable";
 if (process.platform === "win32") {
   if (!process.env.VSCMD_VER) environment = visualStudioEnvironment(environment);
-  const visualStudioCMakeRoot =
-    "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake";
+  const visualStudioDirectory = environmentEntry(environment, "VSINSTALLDIR")
+    || "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools";
+  const visualStudioCMakeRoot = join(
+    visualStudioDirectory,
+    "Common7", "IDE", "CommonExtensions", "Microsoft", "CMake",
+  );
   const bundledCmake = join(visualStudioCMakeRoot, "CMake", "bin", "cmake.exe");
   const bundledCtest = join(visualStudioCMakeRoot, "CMake", "bin", "ctest.exe");
   const bundledNinja = join(visualStudioCMakeRoot, "Ninja", "ninja.exe");
