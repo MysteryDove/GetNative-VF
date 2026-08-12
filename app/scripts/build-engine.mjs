@@ -68,6 +68,12 @@ function replaceEnvironmentEntry(environment, name, value) {
   environment[name] = value;
 }
 
+function environmentEntry(environment, name) {
+  const key = Object.keys(environment)
+    .find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+  return key ? environment[key] : undefined;
+}
+
 function enabled(value) {
   return ["1", "on", "true", "yes"].includes((value || "").toLowerCase());
 }
@@ -194,7 +200,7 @@ if (process.env.GETNATIVE_FFMPEG_RUNTIME_DIR) {
     replaceEnvironmentEntry(
       environment,
       "PATH",
-      `${runtimeDirectory}${delimiter}${environment.PATH || ""}`,
+      `${runtimeDirectory}${delimiter}${environmentEntry(environment, "PATH") || ""}`,
     );
   } else {
     const loaderVariable = process.platform === "darwin"
@@ -203,7 +209,7 @@ if (process.env.GETNATIVE_FFMPEG_RUNTIME_DIR) {
     replaceEnvironmentEntry(
       environment,
       loaderVariable,
-      `${runtimeDirectory}${delimiter}${environment[loaderVariable] || ""}`,
+      `${runtimeDirectory}${delimiter}${environmentEntry(environment, loaderVariable) || ""}`,
     );
   }
 }
