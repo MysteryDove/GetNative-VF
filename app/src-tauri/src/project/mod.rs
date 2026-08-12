@@ -213,9 +213,6 @@ pub fn project_save(
             .unwrap_or(&request.manifest.name);
         match pick_save_path(dialog_name) {
             Ok(picked) => path = Some(picked),
-            Err(error) if error.code == ManifestErrorCode::Cancelled => {
-                return Ok(ProjectCommandResult::failure(error));
-            }
             Err(error) => return Ok(ProjectCommandResult::failure(error)),
         }
     }
@@ -279,11 +276,15 @@ pub fn project_remove_recent(
 }
 
 #[tauri::command]
-pub fn project_reveal(request: RevealProjectRequest) -> Result<ProjectCommandResult, String> {
-    match reveal_project_path(Path::new(&request.path)) {
-        Ok(()) => Ok(ProjectCommandResult::success()),
-        Err(error) => Ok(ProjectCommandResult::failure(error)),
-    }
+pub async fn project_reveal(request: RevealProjectRequest) -> Result<ProjectCommandResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        match reveal_project_path(Path::new(&request.path)) {
+            Ok(()) => Ok(ProjectCommandResult::success()),
+            Err(error) => Ok(ProjectCommandResult::failure(error)),
+        }
+    })
+    .await
+    .map_err(|error| format!("project_task_error: {error}"))?
 }
 
 #[tauri::command]

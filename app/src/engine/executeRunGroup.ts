@@ -7,9 +7,9 @@ import {
   type MediaFrameAsset,
   type MediaFrameBatchPrepareRequest,
 } from "../media/service";
-import type { QueueJobInput } from "./runReducer";
+import { isTerminalPhase, type QueueJobInput } from "./runReducer";
 import type { BackendPreference, KernelRef } from "./protocol";
-import type { ProjectState, Run, RunGroup } from "../project/types";
+import type { ProjectState, Run } from "../project/types";
 
 /**
  * RunGroup execution orchestration (GUI-3): materialize the plan into
@@ -181,10 +181,10 @@ export async function startHeightRunGroup(input: {
   const { runGroup, runs } = materializeHeightRunGroup({ plan: input.plan });
   input.onProjectChange((current) => ({
     ...current,
-    runGroupsById: { ...current.runGroupsById, [runGroup.id]: runGroup as RunGroup },
+    runGroupsById: { ...current.runGroupsById, [runGroup.id]: runGroup },
     runsById: {
       ...current.runsById,
-      ...Object.fromEntries(runs.map((run) => [run.id, run as Run])),
+      ...Object.fromEntries(runs.map((run) => [run.id, run])),
     },
   }));
 
@@ -328,10 +328,10 @@ export async function startKernelRunGroup(input: {
   const { runGroup, runs } = materializeKernelRunGroup({ plan: input.plan });
   input.onProjectChange((current) => ({
     ...current,
-    runGroupsById: { ...current.runGroupsById, [runGroup.id]: runGroup as RunGroup },
+    runGroupsById: { ...current.runGroupsById, [runGroup.id]: runGroup },
     runsById: {
       ...current.runsById,
-      ...Object.fromEntries(runs.map((run) => [run.id, run as Run])),
+      ...Object.fromEntries(runs.map((run) => [run.id, run])),
     },
   }));
 
@@ -461,7 +461,7 @@ export function applyTerminalEventToRun(
 ): ProjectState {
   const run = state.runsById[projectRunId];
   if (!run) return state;
-  if (run.status === "completed" || run.status === "failed" || run.status === "cancelled" || run.status === "partial") {
+  if (isTerminalPhase(run.status)) {
     return state;
   }
   const next: Run = { ...run, updatedAt: nowIso };

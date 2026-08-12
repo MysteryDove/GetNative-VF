@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { startVerifyRunGroup, type VerifyFrameEntry } from "./executeVerify";
+import { startVerifyRunGroup, VERIFY_RESULT_FRAMES_CAP, type VerifyFrameEntry } from "./executeVerify";
 import { planVerifyRunGroup, defaultVerifyDraft } from "./verifyPlan";
 import { emptyProjectState } from "../project/normalize";
 import type { ProjectState, Recipe, Source } from "../project/types";
@@ -148,5 +148,47 @@ describe("startVerifyRunGroup", () => {
     expect(queued[0]?.total).toBe(0);
     expect(mediaParams).toMatchObject([{ concurrency: 2 }]);
     expect((run?.inputSnapshot as { concurrency?: number }).concurrency).toBe(2);
+  });
+
+  it("caps retained frames for the terminal write while counting every frame", async () => {
+    const draft = { ...defaultVerifyDraft(), sourceIds: ["src_1"] };
+    const planned = planVerifyRunGroup({
+      draft,
+      recipe,
+      sourcesById: { src_1: video },
+      nowMs: 1,
+      requestIdPrefix: "t",
+    });
+    expect(planned.ok).toBe(true);
+    if (!planned.ok) return;
+
+    const frameCount = VERIFY_RESULT_FRAMES_CAP + 7;
+    const { worker } = makeFakeWorker(
+      Array.from({ length: frameCount }, (_, index) => (index % 2 === 0 ? 0.5 : null)),
+    );
+    let state: ProjectState = emptyProjectState({ id: "p1" });
+    state.sourcesById.src_1 = video;
+
+    const result = await startVerifyRunGroup({
+      plan: planned.plan,
+      recipe,
+      state,
+      onProjectChange: (updater) => {
+        state = updater(state);
+      },
+      bridge: { queue: () => {}, cancel: () => {} },
+      deps: { worker, nowMs: () => 1000 },
+    });
+
+    expect(result.ok).toBe(true);
+    const run = Object.values(state.runsById)[0];
+    expect(run?.status).toBe("completed");
+    // Every streamed frame counts toward progress...
+    expect(run?.completed).toBe(frameCount);
+    // ...but the stored result keeps only the most recent capped entries.
+    const stored = run?.result as { frames?: Array<{ seq: number }> };
+    expect(stored.frames).toHaveLength(VERIFY_RESULT_FRAMES_CAP);
+    expect(stored.frames?.[0]?.seq).toBe(frameCount - VERIFY_RESULT_FRAMES_CAP);
+    expect(stored.frames?.[stored.frames.length - 1]?.seq).toBe(frameCount - 1);
   });
 });

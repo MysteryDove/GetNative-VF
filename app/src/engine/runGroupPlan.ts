@@ -8,6 +8,7 @@ import {
 } from "./heightDraft";
 import { validateHeightShape } from "./shapeGuards";
 import type { HeightAnalyzeRequest } from "./protocol";
+import type { Run, RunGroup } from "../project/types";
 
 export type HeightRunGroupType =
   | "single_height"
@@ -228,32 +229,7 @@ export function materializeHeightRunGroup(input: {
   plan: HeightRunGroupPlan;
   idFactory?: () => string;
   nowIso?: string;
-}): {
-  runGroup: {
-    id: string;
-    groupType: string;
-    label: string;
-    memberRunIds: string[];
-    createdAt: string;
-    intentSnapshot: unknown;
-  };
-  runs: Array<{
-    id: string;
-    runType: string;
-    status: string;
-    runGroupId: string;
-    sampleId: string | null;
-    sourceId: string | null;
-    createdAt: string;
-    updatedAt: string;
-    inputSnapshot: unknown;
-    result: null;
-    errorCode: null;
-    errorMessage: null;
-    completed: number;
-    total: number;
-  }>;
-} {
+}): { runGroup: RunGroup; runs: Run[] } {
   const makeId = input.idFactory ?? (() => crypto.randomUUID());
   const nowIso = input.nowIso ?? new Date().toISOString();
   const groupId = `rgrp_${makeId()}`;

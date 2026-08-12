@@ -126,10 +126,17 @@ function submitMediaTask<T>(
   let cancelRequested = false;
   let settled = false;
   const promise = new Promise<T>((resolve, reject) => {
-    let unlisten: UnlistenFn | null = null;
+    let unlistenEvent: UnlistenFn | null = null;
+    let unlistenExit: UnlistenFn | null = null;
+    const cleanup = () => {
+      unlistenEvent?.();
+      unlistenEvent = null;
+      unlistenExit?.();
+      unlistenExit = null;
+    };
     void (async () => {
       try {
-        unlisten = await listen<WireMediaEvent>("engine-worker-event", (event) => {
+        unlistenEvent = await listen<WireMediaEvent>("engine-worker-event", (event) => {
           const wire = event.payload;
           if (wire.request_id !== requestId || settled) return;
           if (wire.type === "accepted" && typeof wire.job_id === "string") {
@@ -150,20 +157,32 @@ function submitMediaTask<T>(
           if (wire.type === "warning") return;
           if (wire.type === "result") {
             settled = true;
-            unlisten?.();
+            cleanup();
             resolve(wire.payload as T);
             return;
           }
           if (wire.type === "cancelled" || wire.type === "error") {
             settled = true;
-            unlisten?.();
+            cleanup();
             const code = wire.type === "cancelled" ? "cancelled" : wire.code ?? "media_error";
             reject(new Error(`${code}: ${wire.message ?? "media task did not complete"}`));
           }
         });
+        // A dead worker never finishes its jobs: fail this task on worker exit
+        // so pending media promises cannot hang forever (mirrors workerClient.handleExit).
+        unlistenExit = await listen<{ stderr_tail?: string[] }>("engine-worker-exit", (event) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          const tail = event.payload?.stderr_tail ?? [];
+          const message = tail.length > 0
+            ? tail.join("\n")
+            : "the engine worker exited before finishing the job";
+          reject(new Error(`worker_exit: ${message}`));
+        });
         if (cancelRequested) {
           settled = true;
-          unlisten();
+          cleanup();
           reject(new Error("cancelled: media task was cancelled before submission"));
           return;
         }
@@ -173,7 +192,7 @@ function submitMediaTask<T>(
       } catch (error) {
         if (settled) return;
         settled = true;
-        unlisten?.();
+        cleanup();
         reject(error instanceof Error ? error : new Error(String(error)));
       }
     })();

@@ -15,6 +15,23 @@ export type JobPhase =
   | "cancelled"
   | "partial";
 
+/**
+ * Terminal phases: a job/run in one of these has emitted its final state and
+ * must never be rewritten; cancel requests against it are ignored. "partial"
+ * is terminal too — it is set by the worker-confirmed cancelled event.
+ */
+export const TERMINAL_PHASES: ReadonlySet<JobPhase> = new Set<JobPhase>([
+  "completed",
+  "failed",
+  "cancelled",
+  "partial",
+]);
+
+/** Accepts plain strings so Project Run statuses (`string`) can be checked too. */
+export function isTerminalPhase(phase: string): boolean {
+  return (TERMINAL_PHASES as ReadonlySet<string>).has(phase);
+}
+
 export type JobRecord = {
   id: JobId;
   requestId: RequestId;
@@ -140,7 +157,7 @@ export function requestCancel(
   if (!jobId) return state;
   const job = state.jobsById[jobId];
   if (!job) return state;
-  if (job.phase === "completed" || job.phase === "failed" || job.phase === "cancelled") {
+  if (isTerminalPhase(job.phase)) {
     return state;
   }
   return {

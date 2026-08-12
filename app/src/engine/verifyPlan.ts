@@ -1,7 +1,7 @@
 import type { BackendPreference, ScanScope, VerifyRequest } from "./protocol";
 import { validateVerifyShape } from "./shapeGuards";
 import { recipeReadiness } from "../project/recipe";
-import type { ProjectState, Recipe, Source } from "../project/types";
+import type { ProjectState, Recipe, Run, RunGroup, Source } from "../project/types";
 
 /**
  * Whole-video Verification (全视频检查) setup. One member VerificationRun per
@@ -190,32 +190,7 @@ export function materializeVerifyRunGroup(input: {
   plan: VerifyRunGroupPlan;
   idFactory?: () => string;
   nowIso?: string;
-}): {
-  runGroup: {
-    id: string;
-    groupType: string;
-    label: string;
-    memberRunIds: string[];
-    createdAt: string;
-    intentSnapshot: unknown;
-  };
-  runs: Array<{
-    id: string;
-    runType: string;
-    status: string;
-    runGroupId: string;
-    sampleId: string | null;
-    sourceId: string | null;
-    createdAt: string;
-    updatedAt: string;
-    inputSnapshot: unknown;
-    result: null;
-    errorCode: null;
-    errorMessage: null;
-    completed: number;
-    total: number;
-  }>;
-} {
+}): { runGroup: RunGroup; runs: Run[] } {
   const makeId = input.idFactory ?? (() => crypto.randomUUID());
   const nowIso = input.nowIso ?? new Date().toISOString();
   const groupId = `rgrp_${makeId()}`;

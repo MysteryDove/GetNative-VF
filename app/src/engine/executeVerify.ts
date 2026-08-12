@@ -1,7 +1,8 @@
 import { engineWorker, type EngineWorkerClient } from "./workerClient";
 import { materializeVerifyRunGroup, type VerifyRunGroupPlan } from "./verifyPlan";
 import { kernelParamsForWire, type ExecutionBridge } from "./executeRunGroup";
-import type { ProjectState, Recipe, Run, RunGroup } from "../project/types";
+import { isTerminalPhase } from "./runReducer";
+import type { ProjectState, Recipe, Run } from "../project/types";
 import type { WorkerEvent } from "./protocol";
 
 export type VerifyFrameEntry = {
@@ -46,10 +47,10 @@ export async function startVerifyRunGroup(input: {
   const { runGroup, runs } = materializeVerifyRunGroup({ plan: input.plan });
   input.onProjectChange((current) => ({
     ...current,
-    runGroupsById: { ...current.runGroupsById, [runGroup.id]: runGroup as RunGroup },
+    runGroupsById: { ...current.runGroupsById, [runGroup.id]: runGroup },
     runsById: {
       ...current.runsById,
-      ...Object.fromEntries(runs.map((run) => [run.id, run as Run])),
+      ...Object.fromEntries(runs.map((run) => [run.id, run])),
     },
   }));
 
@@ -100,6 +101,14 @@ export async function startVerifyRunGroup(input: {
 type Member = VerifyRunGroupPlan["members"][number];
 type TerminalEvent = Extract<WorkerEvent, { type: "result" | "cancelled" | "error" }>;
 
+/**
+ * Cap on frame entries retained in memory for the terminal result write.
+ * A full-video scan can exceed 100k frames; live batches are already
+ * streamed to the caller via onFrames, so the stored result keeps only the
+ * most recent entries while `framesSeen` still counts every frame.
+ */
+export const VERIFY_RESULT_FRAMES_CAP = 10_000;
+
 async function runEngineMediaVerifyMember(
   member: Member,
   projectRunId: string,
@@ -115,6 +124,7 @@ async function runEngineMediaVerifyMember(
   deps: VerifyOrchestratorDeps,
 ): Promise<void> {
   const frames: VerifyFrameEntry[] = [];
+  let framesSeen = 0;
   let exactTotal = 0;
   let myRunId: string | null = null;
   let resolveTerminal!: (event: TerminalEvent) => void;
@@ -146,7 +156,11 @@ async function runEngineMediaVerifyMember(
           timestampSeconds: entry.timestampSeconds ?? null,
           error: entry.error,
         }));
+        framesSeen += batch.length;
         frames.push(...batch);
+        if (frames.length > VERIFY_RESULT_FRAMES_CAP) {
+          frames.splice(0, frames.length - VERIFY_RESULT_FRAMES_CAP);
+        }
         input.onFrames?.(projectRunId, batch);
       }
       return;
@@ -212,13 +226,13 @@ async function runEngineMediaVerifyMember(
     const nowIso = new Date(deps.nowMs()).toISOString();
     input.onProjectChange((current) => {
       const run = current.runsById[projectRunId];
-      if (!run || ["completed", "failed", "cancelled", "partial"].includes(run.status)) {
+      if (!run || isTerminalPhase(run.status)) {
         return current;
       }
       const next: Run = {
         ...run,
         total: exactTotal || run.total,
-        completed: sorted.length,
+        completed: framesSeen,
         updatedAt: nowIso,
       };
       if (event.type === "result") {

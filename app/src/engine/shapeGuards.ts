@@ -90,6 +90,9 @@ export function validateKernelShape(request: KernelAnalyzeRequest): ShapeGuardRe
   }
   const metric = validateMetricSpec(request.metric);
   if (!metric.ok) return metric;
+  if (!request.profileId) {
+    return fail("kernel_profile_required", "Compatibility profile is required");
+  }
   return { ok: true };
 }
 

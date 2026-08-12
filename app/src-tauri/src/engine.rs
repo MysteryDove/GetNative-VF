@@ -508,19 +508,27 @@ fn checked_geometry_number(value: f64, label: &str) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn engine_capabilities(app: AppHandle) -> Result<Value, String> {
-    let path = find_engine(&app)?;
-    let payload = run_engine(&path, &["capabilities".to_owned()])?;
-    validate_capabilities(&payload)?;
-    Ok(json!({ "path": path, "payload": payload }))
+pub async fn engine_capabilities(app: AppHandle) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = find_engine(&app)?;
+        let payload = run_engine(&path, &["capabilities".to_owned()])?;
+        validate_capabilities(&payload)?;
+        Ok(json!({ "path": path, "payload": payload }))
+    })
+    .await
+    .map_err(|error| format!("engine_task_error: {error}"))?
 }
 
 #[tauri::command]
-pub fn engine_geometry(app: AppHandle, request: GeometryRequest) -> Result<Value, String> {
-    let args = geometry_args(request)?;
-    let path = find_engine(&app)?;
-    let payload = run_engine(&path, &args)?;
-    Ok(json!({ "path": path, "payload": payload }))
+pub async fn engine_geometry(app: AppHandle, request: GeometryRequest) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let args = geometry_args(request)?;
+        let path = find_engine(&app)?;
+        let payload = run_engine(&path, &args)?;
+        Ok(json!({ "path": path, "payload": payload }))
+    })
+    .await
+    .map_err(|error| format!("engine_task_error: {error}"))?
 }
 
 fn geometry_args(request: GeometryRequest) -> Result<Vec<String>, String> {

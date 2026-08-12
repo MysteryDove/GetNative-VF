@@ -10,6 +10,14 @@ mod worker;
 pub fn run() {
     tauri::Builder::default()
         .manage(worker::WorkerManager::default())
+        .setup(|app| {
+            // One-shot cleanup of the retired `media-index` cache; media
+            // commands afterwards only resolve the current cache directory.
+            if let Err(error) = worker::migrate_legacy_media_cache(app.handle()) {
+                eprintln!("legacy media cache migration failed: {error}");
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             engine::engine_capabilities,
             engine::engine_geometry,

@@ -98,27 +98,51 @@ pub fn media_probe(request: MediaProbeRequest) -> Result<MediaProbeResult, Strin
 }
 
 #[tauri::command]
-pub fn media_preview(request: MediaPreviewRequest) -> Result<Response, String> {
-    let path = validated_media_path(&request.path)?;
-    validate_expected_fingerprint(&path, request.fingerprint.as_deref())?;
-    if image_format(&path).is_none() {
-        return Err(
-            "video_engine_required: video previews are decoded by the resident engine".to_owned(),
-        );
-    }
-    let maximum = request.max_dimension.unwrap_or(PREVIEW_MAX_DIMENSION);
-    if !(PREVIEW_MIN_DIMENSION..=PREVIEW_MAX_DIMENSION).contains(&maximum) {
-        return Err(format!(
-            "preview_dimension_invalid: maxDimension must be between {PREVIEW_MIN_DIMENSION} and {PREVIEW_MAX_DIMENSION}"
-        ));
-    }
-    let image = image::open(&path).map_err(|error| format!("image_decode_error: {error}"))?;
-    let preview = image.thumbnail(maximum, maximum);
+pub async fn media_preview(request: MediaPreviewRequest) -> Result<Response, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = validated_media_path(&request.path)?;
+        validate_expected_fingerprint(&path, request.fingerprint.as_deref())?;
+        if image_format(&path).is_none() {
+            return Err(
+                "video_engine_required: video previews are decoded by the resident engine".to_owned(),
+            );
+        }
+        let maximum = request.max_dimension.unwrap_or(PREVIEW_MAX_DIMENSION);
+        if !(PREVIEW_MIN_DIMENSION..=PREVIEW_MAX_DIMENSION).contains(&maximum) {
+            return Err(format!(
+                "preview_dimension_invalid: maxDimension must be between {PREVIEW_MIN_DIMENSION} and {PREVIEW_MAX_DIMENSION}"
+            ));
+        }
+        let bytes = render_preview(&path, maximum)?;
+        Ok(Response::new(bytes))
+    })
+    .await
+    .map_err(|error| format!("preview_task_error: {error}"))?
+}
+
+/// Thumbnail-oriented decode. The pinned `image` 0.25 exposes no
+/// decoder-level scaling, so the cheapest path is: decode via `ImageReader`,
+/// skip resampling entirely when the source already fits the requested box,
+/// otherwise downscale with the fast box-sampling `thumbnail` (imageops)
+/// instead of a full-quality resize.
+fn render_preview(path: &Path, maximum: u32) -> Result<Vec<u8>, String> {
+    let reader = ImageReader::open(path)
+        .map_err(|error| format!("image_decode_error: {error}"))?
+        .with_guessed_format()
+        .map_err(|error| format!("image_decode_error: {error}"))?;
+    let image = reader
+        .decode()
+        .map_err(|error| format!("image_decode_error: {error}"))?;
+    let preview = if image.width() <= maximum && image.height() <= maximum {
+        image
+    } else {
+        image.thumbnail(maximum, maximum)
+    };
     let mut bytes = Vec::new();
     preview
         .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
         .map_err(|error| format!("image_preview_error: {error}"))?;
-    Ok(Response::new(bytes))
+    Ok(bytes)
 }
 
 #[tauri::command]

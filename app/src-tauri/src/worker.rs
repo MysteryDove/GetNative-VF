@@ -38,6 +38,21 @@ fn media_cache_directory(app: &AppHandle) -> Result<PathBuf, String> {
         .path()
         .app_cache_dir()
         .map_err(|error| format!("media_cache_error: {error}"))?;
+    let directory = app_cache.join("media");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("media_cache_error: failed to create cache directory: {error}"))?;
+    directory
+        .canonicalize()
+        .map_err(|error| format!("media_cache_error: failed to resolve cache directory: {error}"))
+}
+
+/// One-shot legacy cleanup: remove the retired `media-index` cache. Runs once
+/// from the app setup hook instead of on every media command.
+pub(crate) fn migrate_legacy_media_cache(app: &AppHandle) -> Result<(), String> {
+    let app_cache = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("media_cache_error: {error}"))?;
     let legacy = app_cache.join("media-index");
     if let Ok(entries) = fs::read_dir(&legacy) {
         for entry in entries.flatten() {
@@ -51,12 +66,7 @@ fn media_cache_directory(app: &AppHandle) -> Result<PathBuf, String> {
         }
         let _ = fs::remove_dir(&legacy);
     }
-    let directory = app_cache.join("media");
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("media_cache_error: failed to create cache directory: {error}"))?;
-    directory
-        .canonicalize()
-        .map_err(|error| format!("media_cache_error: failed to resolve cache directory: {error}"))
+    Ok(())
 }
 
 /// Output of the stdout reader thread. Kept transport-agnostic so the
@@ -283,9 +293,9 @@ fn tauri_sink(app: &AppHandle) -> WorkerSink {
     })
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct WorkerManager {
-    session: Mutex<Option<WorkerSession>>,
+    session: Arc<Mutex<Option<WorkerSession>>>,
 }
 
 impl WorkerManager {
@@ -314,59 +324,73 @@ impl WorkerManager {
 }
 
 #[tauri::command]
-pub fn engine_worker_start(app: AppHandle, state: State<'_, WorkerManager>) -> Result<Value, String> {
-    let mut guard = state
-        .session
-        .lock()
-        .map_err(|_| "worker_internal_error: session lock poisoned".to_owned())?;
-    if let Some(session) = guard.as_mut() {
-        if session.alive() {
-            return Ok(session.hello.clone());
+pub async fn engine_worker_start(
+    app: AppHandle,
+    state: State<'_, WorkerManager>,
+) -> Result<Value, String> {
+    // Clone the Arc-backed manager: `State` lifetimes cannot cross spawn_blocking.
+    let manager = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut guard = manager
+            .session
+            .lock()
+            .map_err(|_| "worker_internal_error: session lock poisoned".to_owned())?;
+        if let Some(session) = guard.as_mut() {
+            if session.alive() {
+                return Ok(session.hello.clone());
+            }
+            // Dead session: drop kills the child and a fresh one is spawned below.
+            guard.take();
         }
-        // Dead session: drop kills the child and a fresh one is spawned below.
-        guard.take();
-    }
 
-    let path: PathBuf = find_engine(&app)?;
-    let configured_cache_dir = crate::prefs::load_preferences(&app)
-        .ok()
-        .and_then(|prefs| prefs.axis_plan_cache_dir.map(PathBuf::from));
-    let mut session = spawn_session(&path, tauri_sink(&app), configured_cache_dir.as_deref())?;
-    let hello = session.roundtrip(json!({
-        "protocol_version": PROTOCOL_VERSION,
-        "type": "hello",
-    }))?;
-    if hello.get("type").and_then(Value::as_str) != Some("hello_ok")
-        || hello.get("protocol_version").and_then(Value::as_u64) != Some(PROTOCOL_VERSION as u64)
-    {
-        return Err("worker_protocol_error: the engine worker rejected the protocol handshake".to_owned());
-    }
-    session.hello = json!({
-        "path": path,
-        "payload": hello,
-    });
-    let result = session.hello.clone();
-    *guard = Some(session);
-    Ok(result)
+        let path: PathBuf = find_engine(&app)?;
+        let configured_cache_dir = crate::prefs::load_preferences(&app)
+            .ok()
+            .and_then(|prefs| prefs.axis_plan_cache_dir.map(PathBuf::from));
+        let mut session = spawn_session(&path, tauri_sink(&app), configured_cache_dir.as_deref())?;
+        let hello = session.roundtrip(json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "type": "hello",
+        }))?;
+        if hello.get("type").and_then(Value::as_str) != Some("hello_ok")
+            || hello.get("protocol_version").and_then(Value::as_u64) != Some(PROTOCOL_VERSION as u64)
+        {
+            return Err("worker_protocol_error: the engine worker rejected the protocol handshake".to_owned());
+        }
+        session.hello = json!({
+            "path": path,
+            "payload": hello,
+        });
+        let result = session.hello.clone();
+        *guard = Some(session);
+        Ok(result)
+    })
+    .await
+    .map_err(|error| format!("worker_task_error: {error}"))?
 }
 
 #[tauri::command]
-pub fn engine_worker_capabilities(state: State<'_, WorkerManager>) -> Result<Value, String> {
-    state.with_live_session(|session| {
-        let response = session.roundtrip(json!({
-            "protocol_version": PROTOCOL_VERSION,
-            "type": "capabilities",
-        }))?;
-        if response.get("type").and_then(Value::as_str) != Some("capabilities") {
-            return Err("worker_protocol_error: unexpected capabilities response".to_owned());
-        }
-        let payload = response
-            .get("payload")
-            .cloned()
-            .ok_or_else(|| "worker_protocol_error: capabilities response has no payload".to_owned())?;
-        validate_capabilities(&payload)?;
-        Ok(json!({ "path": session.engine_path, "payload": payload }))
+pub async fn engine_worker_capabilities(state: State<'_, WorkerManager>) -> Result<Value, String> {
+    let manager = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        manager.with_live_session(|session| {
+            let response = session.roundtrip(json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "type": "capabilities",
+            }))?;
+            if response.get("type").and_then(Value::as_str) != Some("capabilities") {
+                return Err("worker_protocol_error: unexpected capabilities response".to_owned());
+            }
+            let payload = response
+                .get("payload")
+                .cloned()
+                .ok_or_else(|| "worker_protocol_error: capabilities response has no payload".to_owned())?;
+            validate_capabilities(&payload)?;
+            Ok(json!({ "path": session.engine_path, "payload": payload }))
+        })
     })
+    .await
+    .map_err(|error| format!("worker_task_error: {error}"))?
 }
 
 /// Forward one engine-owned media job. The frontend supplies the protocol
@@ -433,30 +457,34 @@ pub fn engine_worker_media_begin(
 
 /// Read only PNG files produced by the engine below the app media cache.
 #[tauri::command]
-pub fn engine_worker_media_read_asset(
+pub async fn engine_worker_media_read_asset(
     app: AppHandle,
     path: String,
 ) -> Result<Response, String> {
-    let cache_directory = media_cache_directory(&app)?;
-    let requested = PathBuf::from(&path)
-        .canonicalize()
-        .map_err(|error| format!("media_asset_error: failed to resolve cached asset: {error}"))?;
-    if !requested.starts_with(&cache_directory)
-        || requested.extension().and_then(|value| value.to_str()) != Some("png")
-    {
-        return Err("media_asset_error: cached preview path is outside the media cache".to_owned());
-    }
-    let metadata = fs::metadata(&requested)
-        .map_err(|error| format!("media_asset_error: failed to inspect cached asset: {error}"))?;
-    if !metadata.is_file() || metadata.len() > MAX_CACHED_PREVIEW_BYTES {
-        return Err("media_asset_error: cached preview is invalid or too large".to_owned());
-    }
-    let bytes = fs::read(&requested)
-        .map_err(|error| format!("media_asset_error: failed to read cached preview: {error}"))?;
-    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Err("media_asset_error: cached preview is not a PNG file".to_owned());
-    }
-    Ok(Response::new(bytes))
+    tauri::async_runtime::spawn_blocking(move || {
+        let cache_directory = media_cache_directory(&app)?;
+        let requested = PathBuf::from(&path)
+            .canonicalize()
+            .map_err(|error| format!("media_asset_error: failed to resolve cached asset: {error}"))?;
+        if !requested.starts_with(&cache_directory)
+            || requested.extension().and_then(|value| value.to_str()) != Some("png")
+        {
+            return Err("media_asset_error: cached preview path is outside the media cache".to_owned());
+        }
+        let metadata = fs::metadata(&requested)
+            .map_err(|error| format!("media_asset_error: failed to inspect cached asset: {error}"))?;
+        if !metadata.is_file() || metadata.len() > MAX_CACHED_PREVIEW_BYTES {
+            return Err("media_asset_error: cached preview is invalid or too large".to_owned());
+        }
+        let bytes = fs::read(&requested)
+            .map_err(|error| format!("media_asset_error: failed to read cached preview: {error}"))?;
+        if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Err("media_asset_error: cached preview is not a PNG file".to_owned());
+        }
+        Ok(Response::new(bytes))
+    })
+    .await
+    .map_err(|error| format!("media_asset_task_error: {error}"))?
 }
 
 #[derive(Debug, Deserialize)]
@@ -722,7 +750,7 @@ fn kernel_json(kernel: &KernelCommand) -> Value {
     Value::Object(object)
 }
 
-fn analyze_command(request: &WorkerAnalyzeRequest) -> Value {
+fn analyze_command(request: &WorkerAnalyzeRequest) -> Result<Value, String> {
     let mut metric = Map::new();
     if let Some(value) = request.metric.crop_left {
         metric.insert("crop_left".to_owned(), json!(value));
@@ -773,9 +801,11 @@ fn analyze_command(request: &WorkerAnalyzeRequest) -> Value {
                 .unwrap_or_default(),
         );
     } else {
-        command["kernel"] = kernel_json(
-            request.kernel.as_ref().expect("height mode requires kernel"),
-        );
+        let kernel = request
+            .kernel
+            .as_ref()
+            .ok_or_else(|| "bad_request: height mode requires kernel".to_owned())?;
+        command["kernel"] = kernel_json(kernel);
         command["candidates"] = json!(request.candidates);
         if let Some(grid) = &request.grid {
             command["grid"] = json!({
@@ -788,7 +818,7 @@ fn analyze_command(request: &WorkerAnalyzeRequest) -> Value {
     if let Some(worker_count) = request.worker_count {
         command["worker_count"] = json!(worker_count);
     }
-    command
+    Ok(command)
 }
 
 #[tauri::command]
@@ -797,7 +827,7 @@ pub fn engine_worker_analyze(
     request: WorkerAnalyzeRequest,
 ) -> Result<Value, String> {
     validate_analyze(&request)?;
-    let command = analyze_command(&request);
+    let command = analyze_command(&request)?;
     let request_id = request.request_id.clone();
     state.with_live_session(|session| session.write_command(&command))?;
     Ok(json!({ "requestId": request_id, "queued": true }))
@@ -820,16 +850,21 @@ pub fn engine_worker_cancel(state: State<'_, WorkerManager>, job_id: String) -> 
 }
 
 #[tauri::command]
-pub fn engine_worker_shutdown(state: State<'_, WorkerManager>) -> Result<(), String> {
-    let session = state
-        .session
-        .lock()
-        .map_err(|_| "worker_internal_error: session lock poisoned".to_owned())?
-        .take();
-    if let Some(mut session) = session {
-        session.terminate();
-    }
-    Ok(())
+pub async fn engine_worker_shutdown(state: State<'_, WorkerManager>) -> Result<(), String> {
+    let manager = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let session = manager
+            .session
+            .lock()
+            .map_err(|_| "worker_internal_error: session lock poisoned".to_owned())?
+            .take();
+        if let Some(mut session) = session {
+            session.terminate();
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("worker_task_error: {error}"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,7 +1041,7 @@ mod tests {
 
     #[test]
     fn analyze_command_serializes_the_wire_shape() {
-        let command = analyze_command(&analyze_request());
+        let command = analyze_command(&analyze_request()).unwrap();
         assert_eq!(command["protocol_version"], json!(1));
         assert_eq!(command["type"], json!("analyze"));
         assert_eq!(command["request_id"], json!("req-1"));
@@ -1033,7 +1068,7 @@ mod tests {
             c: Some(9.0),
             taps: Some(3),
         });
-        let command = analyze_command(&request);
+        let command = analyze_command(&request).unwrap();
         assert_eq!(command["kernel"], json!({"id": "lanczos", "taps": 3}));
     }
 
@@ -1059,7 +1094,7 @@ mod tests {
         }))
         .unwrap();
         validate_analyze(&request).unwrap();
-        let command = analyze_command(&request);
+        let command = analyze_command(&request).unwrap();
         assert_eq!(command["mode"], json!("kernel"));
         assert_eq!(command["candidate"], json!("200"));
         assert_eq!(
@@ -1325,7 +1360,9 @@ mod tests {
             grid: None,
         };
         validate_analyze(&request).unwrap();
-        session.write_command(&analyze_command(&request)).unwrap();
+        session
+            .write_command(&analyze_command(&request).unwrap())
+            .unwrap();
 
         let mut saw_accepted = false;
         let mut saw_progress = false;
@@ -1361,7 +1398,7 @@ mod tests {
         );
 
         // Session cache: the same candidates again must hit warm plans.
-        let mut second = analyze_command(&request);
+        let mut second = analyze_command(&request).unwrap();
         second["request_id"] = json!("gui-req-2");
         session.write_command(&second).unwrap();
         loop {
@@ -1463,7 +1500,9 @@ mod tests {
             base_width: None,
             grid: None,
         };
-        session.write_command(&analyze_command(&request)).unwrap();
+        session
+            .write_command(&analyze_command(&request).unwrap())
+            .unwrap();
         loop {
             match rx.recv_timeout(Duration::from_secs(30)) {
                 Ok(WorkerOutput::Event(value)) if value["type"] == "result" => {
@@ -1577,7 +1616,9 @@ mod tests {
                 }))
                 .unwrap();
                 validate_analyze(&request).unwrap();
-                session.write_command(&analyze_command(&request)).unwrap();
+                session
+                    .write_command(&analyze_command(&request).unwrap())
+                    .unwrap();
 
                 let actual = loop {
                     match rx.recv_timeout(Duration::from_secs(60)) {

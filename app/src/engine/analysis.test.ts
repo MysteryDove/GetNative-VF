@@ -17,7 +17,7 @@ import {
   requestCancel,
   runGroupProgress,
 } from "./runReducer";
-import type { HeightAnalyzeRequest, KernelAnalyzeRequest, VerifyRequest } from "./protocol";
+import type { HeightAnalyzeRequest, KernelAnalyzeRequest, VerifyRequest, WorkerEvent } from "./protocol";
 import type { EngineEnvelope } from "./types";
 import { createTranslator } from "../i18n";
 import { backendOptionLabel, verifySelectableBackends } from "./backendSelection";
@@ -470,6 +470,74 @@ describe("GUI-3 analysis foundation", () => {
     });
     assert(state.jobsById.job_3.phase === "failed", "error fails job");
     assert(state.runsById.run_3.result === null, "error does not invent result");
+  });
+
+  it("ignores cancel requests against terminal phases, including partial", () => {
+    const terminalEvents: WorkerEvent[] = [
+      {
+        type: "result",
+        protocolVersion: 1,
+        requestId: "req_t",
+        jobId: "job_t",
+        runId: "run_t",
+        timestampMs: 2,
+        mode: "height",
+        payload: { series: [] },
+      },
+      {
+        type: "cancelled",
+        protocolVersion: 1,
+        requestId: "req_t",
+        jobId: "job_t",
+        runId: "run_t",
+        timestampMs: 2,
+        partial: true,
+      },
+      {
+        type: "cancelled",
+        protocolVersion: 1,
+        requestId: "req_t",
+        jobId: "job_t",
+        runId: "run_t",
+        timestampMs: 2,
+        partial: false,
+      },
+      {
+        type: "error",
+        protocolVersion: 1,
+        requestId: "req_t",
+        jobId: "job_t",
+        runId: "run_t",
+        timestampMs: 2,
+        code: "engine_failed",
+        message: "boom",
+        retryable: false,
+      },
+    ];
+    for (const event of terminalEvents) {
+      let state = emptyExecutionState();
+      state = queueJob(state, {
+        jobId: "job_t",
+        requestId: "req_t",
+        runId: "run_t",
+        mode: "height",
+        label: "Resolution Test",
+        total: 2,
+        inputSnapshotKey: "snap_t",
+        nowMs: 1,
+      });
+      state = reduceWorkerEvent(state, event);
+      const phase = state.jobsById.job_t.phase;
+      assert(
+        phase === "completed" || phase === "partial" || phase === "cancelled" || phase === "failed",
+        `terminal phase reached: ${phase}`,
+      );
+      const next = requestCancel(state, { requestId: "req_t", nowMs: 3 });
+      assert(
+        next.jobsById.job_t.cancelRequested === false,
+        `cancel request ignored for terminal phase ${phase}`,
+      );
+    }
   });
 
   it("isolates candidate throughput from plan progress and keeps it monotonic", () => {
