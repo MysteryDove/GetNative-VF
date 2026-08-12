@@ -168,60 +168,90 @@ jobs:
       - name: Install JavaScript dependencies
         working-directory: app
         run: pnpm install --frozen-lockfile
-      - name: Build NSIS installer
+      - name: Build portable application
         working-directory: app
         env:
           GETNATIVE_WINDOWS_BACKENDS: cpu
           GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}\.deps\ffmpeg-windows-x64
           GETNATIVE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}\.deps\ffmpeg-windows-x64\bin
           RUSTFLAGS: -C target-feature=+crt-static
-        run: pnpm tauri build --bundles nsis
+        run: pnpm tauri build --no-bundle --ci
+      - name: Assemble portable ZIP
+        shell: pwsh
+        run: |
+          $version = (Get-Content app/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $portableName = "GetNative VF_${version}_x64-portable"
+          $artifactRoot = "artifacts/windows-x64"
+          $portableRoot = Join-Path $artifactRoot $portableName
+          $archive = Join-Path $artifactRoot "$portableName.zip"
+
+          New-Item -ItemType Directory -Force $portableRoot | Out-Null
+          Copy-Item -LiteralPath app/src-tauri/target/release/getnative-gui.exe `
+            -Destination $portableRoot
+          Copy-Item -Path app/src-tauri/bundle-stage/* -Destination $portableRoot -Recurse
+          Compress-Archive -LiteralPath $portableRoot -DestinationPath $archive `
+            -CompressionLevel Optimal
+          Remove-Item -LiteralPath $portableRoot -Recurse -Force
       - name: Verify package media runtime
         shell: pwsh
         run: |
-          $installer = Get-ChildItem app/src-tauri/target/release/bundle/nsis -Filter *.exe
-          if ($installer.Count -ne 1) { throw "expected one NSIS installer, found $($installer.Count)" }
+          $archives = @(Get-ChildItem artifacts/windows-x64 -Filter *-portable.zip)
+          if ($archives.Count -ne 1) { throw "expected one portable ZIP, found $($archives.Count)" }
 
-          $checkRoot = Join-Path $env:RUNNER_TEMP "getnative-nsis-check"
-          New-Item -ItemType Directory -Force $checkRoot | Out-Null
-          & 7z x $installer.FullName "-o$checkRoot" -y | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw "failed to extract the NSIS installer" }
+          $checkRoot = Join-Path $env:RUNNER_TEMP "getnative-portable-check"
+          Remove-Item -LiteralPath $checkRoot -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath $archives[0].FullName -DestinationPath $checkRoot
+          $packageRoots = @(Get-ChildItem -LiteralPath $checkRoot -Directory)
+          if ($packageRoots.Count -ne 1) { throw "portable ZIP must contain one top-level directory" }
+          $packageRoot = $packageRoots[0].FullName
+
+          foreach ($required in @(
+            "getnative-gui.exe",
+            "bin/getnative-engine.exe",
+            "build-provenance.json",
+            "share/getnative/THIRD_PARTY_NOTICES.md"
+          )) {
+            if (-not (Test-Path (Join-Path $packageRoot $required) -PathType Leaf)) {
+              throw "$required is missing from the portable ZIP"
+            }
+          }
 
           $forbidden = @(
             "ffmpeg.exe", "ffprobe.exe",
             "avfilter-11.dll", "avdevice-62.dll", "swresample-6.dll"
           )
           foreach ($name in $forbidden) {
-            if (Get-ChildItem $checkRoot -Recurse -File -Filter $name) {
-              throw "$name entered the NSIS installer"
+            if (Get-ChildItem $packageRoot -Recurse -File -Filter $name) {
+              throw "$name entered the portable ZIP"
             }
           }
           foreach ($library in @("avformat-62.dll", "avcodec-62.dll", "avutil-60.dll", "swscale-9.dll")) {
             $expectedPath = Join-Path ".deps/ffmpeg-windows-x64/bin" $library
             $expected = (Get-FileHash $expectedPath -Algorithm SHA256).Hash
-            $matches = Get-ChildItem $checkRoot -Recurse -File -Filter $library
-            if (-not $matches) { throw "$library is missing from the NSIS installer" }
-            foreach ($match in $matches) {
-              if ((Get-FileHash $match.FullName -Algorithm SHA256).Hash -ne $expected) {
-                throw "$library in the NSIS installer does not match the pinned SDK"
-              }
+            $matches = @(Get-ChildItem $packageRoot -Recurse -File -Filter $library)
+            if ($matches.Count -ne 1) { throw "expected one $library in the portable ZIP" }
+            if ((Get-FileHash $matches[0].FullName -Algorithm SHA256).Hash -ne $expected) {
+              throw "$library in the portable ZIP does not match the pinned SDK"
             }
           }
-          if (-not (Get-ChildItem $checkRoot -Recurse -File -Filter "zlib-1.3.1.tar.gz")) {
-            throw "zlib source archive is missing from the NSIS installer"
+          if (-not (Get-ChildItem $packageRoot -Recurse -File -Filter "zlib-1.3.1.tar.gz")) {
+            throw "zlib source archive is missing from the portable ZIP"
           }
-          if (-not (Get-ChildItem $checkRoot -Recurse -File -Filter "LICENSE" |
+          if (-not (Get-ChildItem $packageRoot -Recurse -File -Filter "LICENSE" |
               Where-Object { $_.FullName -match "[\\/]ffmpeg[\\/]zlib[\\/]LICENSE$" })) {
-            throw "zlib license is missing from the NSIS installer"
+            throw "zlib license is missing from the portable ZIP"
           }
+
+          $capabilities = & (Join-Path $packageRoot "bin/getnative-engine.exe") capabilities |
+            ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "portable engine failed to start" }
+          if ($capabilities.media.ffmpeg_abi -ne "62.62.60.9") { throw "unexpected FFmpeg ABI" }
       - name: Package checksums
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force artifacts/windows-x64 | Out-Null
-          $installers = Get-ChildItem app/src-tauri/target/release/bundle/nsis -Filter *.exe
-          if ($installers.Count -ne 1) { throw "expected one NSIS installer, found $($installers.Count)" }
-          Copy-Item $installers.FullName artifacts/windows-x64/
-          Get-ChildItem artifacts/windows-x64/*.exe | ForEach-Object {
+          $archives = @(Get-ChildItem artifacts/windows-x64 -Filter *-portable.zip)
+          if ($archives.Count -ne 1) { throw "expected one portable ZIP, found $($archives.Count)" }
+          $archives | ForEach-Object {
             "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
           } | Set-Content artifacts/windows-x64/SHA256SUMS-windows-x64.txt
       - uses: actions/upload-artifact@v4
