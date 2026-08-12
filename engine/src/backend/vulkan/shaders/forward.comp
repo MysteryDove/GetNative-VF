@@ -1,0 +1,75 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer PlanBuffer {
+    uint plan_data[];
+};
+layout(set = 0, binding = 2, std430) buffer WorkspaceBuffer {
+    float workspace_data[];
+};
+layout(push_constant, std430) uniform PushConstants {
+    uint value[32];
+} pc;
+
+const uint BOTH_AXES = 2U;
+const uint VERTICAL_FIRST = 1U;
+const uint CANDIDATE_WORDS = 29U;
+
+uint candidate_word(uint candidate, uint field) {
+    return plan_data[candidate * CANDIDATE_WORDS + field];
+}
+
+uint axis_word(uint candidate, bool vertical, uint field) {
+    return candidate_word(candidate, (vertical ? 12U : 0U) + field);
+}
+
+float forward_point(uint candidate, bool vertical, uint row,
+                    uint input_base, uint input_stride) {
+    const uint source_size = axis_word(candidate, vertical, 0U);
+    const uint width = axis_word(candidate, vertical, 3U);
+    const uint left_base = axis_word(candidate, vertical, 4U);
+    const uint weights_base = axis_word(candidate, vertical, 5U);
+    const int left = int(plan_data[left_base + row]);
+    precise float sum = 0.0;
+    for (uint tap = 0U; tap < width; ++tap) {
+        const float weight = uintBitsToFloat(
+            plan_data[weights_base + tap * source_size + row]);
+        sum = fma(weight,
+                  workspace_data[input_base + uint(left + int(tap)) * input_stride],
+                  sum);
+    }
+    return sum;
+}
+
+void main() {
+    const uint local_candidate = gl_GlobalInvocationID.y;
+    if (local_candidate >= pc.value[4]) return;
+    const uint candidate = pc.value[3] + local_candidate;
+    if (candidate_word(candidate, 24U) != BOTH_AXES) return;
+
+    const uint index = gl_GlobalInvocationID.x;
+    const uint width = pc.value[0];
+    const uint height = pc.value[1];
+    const uint native_width = axis_word(candidate, false, 1U);
+    const uint native_height = axis_word(candidate, true, 1U);
+    const uint workspace_base = candidate_word(candidate, 26U);
+    const uint intermediate_elements = candidate_word(candidate, 27U);
+    const uint native_base = workspace_base + intermediate_elements;
+
+    if (candidate_word(candidate, 25U) == VERTICAL_FIRST) {
+        const uint elements = height * native_width;
+        if (index >= elements) return;
+        const uint row = index / native_width;
+        const uint column = index - row * native_width;
+        workspace_data[workspace_base + index] = forward_point(
+            candidate, true, row, native_base + column, native_width);
+    } else {
+        const uint elements = native_height * width;
+        if (index >= elements) return;
+        const uint row = index / width;
+        const uint column = index - row * width;
+        workspace_data[workspace_base + index] = forward_point(
+            candidate, false, column, native_base + row * native_width, 1U);
+    }
+}

@@ -1,0 +1,151 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer PlanBuffer {
+    uint plan_data[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer SourceBuffer {
+    float source_data[];
+};
+layout(set = 0, binding = 2, std430) buffer WorkspaceBuffer {
+    float workspace_data[];
+};
+layout(push_constant, std430) uniform PushConstants {
+    uint value[32];
+} pc;
+
+const uint HORIZONTAL_AXES = 0U;
+const uint VERTICAL_AXES = 1U;
+const uint BOTH_AXES = 2U;
+const uint CANDIDATE_WORDS = 29U;
+const uint MAXIMUM_BAND = 15U;
+
+uint candidate_word(uint candidate, uint field) {
+    return plan_data[candidate * CANDIDATE_WORDS + field];
+}
+
+uint axis_word(uint candidate, bool vertical, uint field) {
+    return candidate_word(candidate, (vertical ? 12U : 0U) + field);
+}
+
+float plan_float(uint word) {
+    return uintBitsToFloat(plan_data[word]);
+}
+
+float input_value(bool source_input, uint base, uint index, uint stride) {
+    return source_input
+        ? source_data[base + index * stride]
+        : workspace_data[base + index * stride];
+}
+
+void inverse_axis(uint candidate, bool vertical, bool source_input,
+                  uint input_base, uint input_stride,
+                  uint output_base, uint output_stride) {
+    const uint size = axis_word(candidate, vertical, 1U);
+    const uint band = axis_word(candidate, vertical, 2U);
+    const uint transpose_offsets = axis_word(candidate, vertical, 6U);
+    const uint transpose_indices = axis_word(candidate, vertical, 7U);
+    const uint transpose_weights = axis_word(candidate, vertical, 8U);
+    const uint lower_ld = axis_word(candidate, vertical, 9U);
+    const uint upper_l = axis_word(candidate, vertical, 10U);
+    const uint inverse_diagonal = axis_word(candidate, vertical, 11U);
+    float recent[15];
+    for (uint distance = 0U; distance < MAXIMUM_BAND; ++distance) {
+        recent[distance] = 0.0;
+    }
+
+    for (uint index = 0U; index < size; ++index) {
+        precise float sum = 0.0;
+        const uint begin = plan_data[transpose_offsets + index];
+        const uint end = plan_data[transpose_offsets + index + 1U];
+        for (uint position = begin; position < end; ++position) {
+            const uint input_index = plan_data[transpose_indices + position];
+            sum = fma(plan_float(transpose_weights + position),
+                      input_value(source_input, input_base, input_index, input_stride),
+                      sum);
+        }
+        const uint available = min(band, index);
+        for (uint reverse = MAXIMUM_BAND; reverse > 0U; --reverse) {
+            if (reverse <= available) {
+                const uint factor = lower_ld + (reverse - 1U) * size + index;
+                sum = fma(-plan_float(factor), recent[reverse - 1U], sum);
+            }
+        }
+        const float current = sum * plan_float(inverse_diagonal + index);
+        workspace_data[output_base + index * output_stride] = current;
+        for (uint distance = MAXIMUM_BAND - 1U; distance > 0U; --distance) {
+            recent[distance] = recent[distance - 1U];
+        }
+        recent[0] = current;
+    }
+
+    if (size < 2U) return;
+    recent[0] = workspace_data[output_base + (size - 1U) * output_stride];
+    for (uint distance = 1U; distance < MAXIMUM_BAND; ++distance) {
+        recent[distance] = 0.0;
+    }
+    for (uint reverse_index = size - 1U; reverse_index > 0U; --reverse_index) {
+        const uint index = reverse_index - 1U;
+        const uint available = min(band, size - index - 1U);
+        precise float sum = 0.0;
+        if (band == 3U) {
+            for (uint distance = 1U; distance <= MAXIMUM_BAND; ++distance) {
+                if (distance <= available) {
+                    const uint factor = upper_l + (distance - 1U) * size + index;
+                    sum = fma(plan_float(factor), recent[distance - 1U], sum);
+                }
+            }
+        } else {
+            for (uint distance = MAXIMUM_BAND; distance > 0U; --distance) {
+                if (distance <= available) {
+                    const uint factor = upper_l + (distance - 1U) * size + index;
+                    sum = fma(plan_float(factor), recent[distance - 1U], sum);
+                }
+            }
+        }
+        const float current =
+            workspace_data[output_base + index * output_stride] - sum;
+        workspace_data[output_base + index * output_stride] = current;
+        for (uint distance = MAXIMUM_BAND - 1U; distance > 0U; --distance) {
+            recent[distance] = recent[distance - 1U];
+        }
+        recent[0] = current;
+    }
+}
+
+void main() {
+    const uint local_candidate = gl_GlobalInvocationID.y;
+    if (local_candidate >= pc.value[4]) return;
+    const uint candidate = pc.value[3] + local_candidate;
+    const uint axes = candidate_word(candidate, 24U);
+    const uint vector = gl_GlobalInvocationID.x;
+    const uint width = pc.value[0];
+    const uint height = pc.value[1];
+    const uint source_elements = pc.value[2];
+    const uint workspace_base = candidate_word(candidate, 26U);
+    const uint intermediate_elements = candidate_word(candidate, 27U);
+    const bool vertical = pc.value[12] != 0U;
+
+    if (!vertical) {
+        if (axes == VERTICAL_AXES || vector >= height) return;
+        const uint native_width = axis_word(candidate, false, 1U);
+        inverse_axis(candidate, false, true,
+                     source_elements + vector, height,
+                     axes == BOTH_AXES
+                         ? workspace_base + vector * native_width
+                         : workspace_base + vector,
+                     axes == BOTH_AXES ? 1U : height);
+        return;
+    }
+
+    if (axes == HORIZONTAL_AXES) return;
+    const bool both = axes == BOTH_AXES;
+    const uint native_width = both ? axis_word(candidate, false, 1U) : width;
+    if (vector >= native_width) return;
+    inverse_axis(candidate, true, !both,
+                 both ? workspace_base + vector : vector,
+                 native_width,
+                 workspace_base + intermediate_elements + vector,
+                 native_width);
+}
