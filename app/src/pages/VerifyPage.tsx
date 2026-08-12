@@ -1,14 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, Play } from "lucide-react";
+import { ChevronDown, ChevronRight } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
 import type { BackendPreference } from "../engine/protocol";
-import { activateRecipeInState, activeRecipe, recipeReadiness, recipesByUpdatedAt } from "../project/recipe";
+import { activeRecipe, recipeReadiness, recipesByUpdatedAt } from "../project/recipe";
+import { activateRecipe } from "../project/recipeApply";
+import { buildFrameSample, nextSampleOrder } from "../project/samples";
+import { useRunGroupSubmit } from "../hooks/useRunGroupSubmit";
 import { RecipeSummaryStrip } from "../components/RecipeSummaryStrip";
 import { DEFAULT_SERIES_COLOR, ErrorLinePlot, plotSeriesColor, type ErrorPlotDatum } from "../components/ErrorLinePlot";
 import { toggleSetValue } from "../utils/collections";
 import { PERFECTLY_DESCALE_THRESHOLD } from "../components/ResultMetricTable";
 import { missingFieldLabels } from "../components/RecipeReviewDialog";
+import { EmptyInlineAction } from "../components/EmptyInlineAction";
+import { RecipePicker } from "../components/RecipePicker";
+import { RunGroupPlanCard } from "../components/RunGroupPlanCard";
+import { RunLaunchButton } from "../components/RunLaunchButton";
 import { backendOptionLabel, verifySelectableBackends } from "../engine/backendSelection";
 import {
   defaultVerifyDraft,
@@ -19,7 +26,7 @@ import {
 } from "../engine/verifyPlan";
 import { startVerifyRunGroup, type VerifyFrameEntry } from "../engine/executeVerify";
 import type { ExecutionBridge } from "../engine/executeRunGroup";
-import type { ProjectRoute, ProjectState, Run, Sample } from "../project/types";
+import type { ProjectRoute, ProjectState, Run } from "../project/types";
 
 /** Stored verify result shape: engine payload + orchestrator-merged frames. */
 export function storedVerifyFrames(run: Run): VerifyFrameEntry[] | null {
@@ -65,7 +72,7 @@ export function VerifyPage({
   executionBridge: ExecutionBridge;
 }) {
   const [draft, setDraft] = useState<VerifyDraft>(() => defaultVerifyDraft());
-  const [submitting, setSubmitting] = useState(false);
+  const { submitting, notice: submitNotice, submit: submitRunGroup } = useRunGroupSubmit();
   const [notice, setNotice] = useState("");
   const [liveFrames, setLiveFrames] = useState<Record<string, VerifyFrameEntry[]>>({});
   const [reviewThreshold, setReviewThreshold] = useState("");
@@ -188,10 +195,7 @@ export function VerifyPage({
   }
 
   function changeActiveRecipe(recipeId: string) {
-    onProjectChange((current) => {
-      const result = activateRecipeInState(current, recipeId);
-      return result.ok ? result.state : current;
-    });
+    onProjectChange((current) => activateRecipe(current, recipeId));
   }
 
   const startBlockedReason = !analyzeAvailable
@@ -212,40 +216,34 @@ export function VerifyPage({
 
   const canStart = analyzeAvailable && plan !== null && !submitting;
 
-  async function startRun() {
-    if (!plan || !recipe || submitting) return;
-    setSubmitting(true);
+  function startRun() {
+    if (!plan || !recipe) return;
     setNotice("");
-    try {
-      const result = await startVerifyRunGroup({
-        plan,
-        recipe,
-        state,
-        onProjectChange,
-        bridge: executionBridge,
-        onFrames: (runId, entries) => {
-          if (!mounted.current) return;
-          setLiveFrames((current) => ({
-            ...current,
-            [runId]: [...(current[runId] ?? []), ...entries],
-          }));
-        },
-      });
-      if (!result.ok) {
-        setNotice(t("analyze.submitFailed", { detail: result.reason }));
-        return;
-      }
-      setNotice(
-        t("analyze.runSubmitted", {
-          submitted: String(result.submitted),
-          failedNote: result.failed > 0 ? `, ${result.failed} failed` : "",
+    void submitRunGroup(
+      () =>
+        startVerifyRunGroup({
+          plan,
+          recipe,
+          state,
+          onProjectChange,
+          bridge: executionBridge,
+          onFrames: (runId, entries) => {
+            if (!mounted.current) return;
+            setLiveFrames((current) => ({
+              ...current,
+              [runId]: [...(current[runId] ?? []), ...entries],
+            }));
+          },
         }),
-      );
-    } catch (error) {
-      setNotice(t("analyze.submitFailed", { detail: String(error) }));
-    } finally {
-      setSubmitting(false);
-    }
+      {
+        submitted: (result) =>
+          t("analyze.runSubmitted", {
+            submitted: String(result.submitted),
+            failedNote: result.failed > 0 ? `, ${result.failed} failed` : "",
+          }),
+        failed: (detail) => t("analyze.submitFailed", { detail }),
+      },
+    );
   }
 
   function addFrameToSamples(run: Run, entry: VerifyFrameEntry) {
@@ -264,26 +262,18 @@ export function VerifyPage({
       setNotice(t("verify.sampleExists"));
       return;
     }
-    const order =
-      Math.max(-1, ...Object.values(state.samplesById).map((sample) => sample.order)) + 1;
-    const stream = source.videoStreams.find((item) => item.index === streamIndex);
-    const sample: Sample = {
-      id: `smp_${crypto.randomUUID()}`,
-      sourceId: source.id,
-      sourceFingerprint: source.fingerprint ?? null,
-      label: `${source.label || source.path} #${entry.frameIndex}`,
-      included: true,
+    const order = nextSampleOrder(state.samplesById);
+    const sample = buildFrameSample({
+      source,
       order,
-      frameIndex: entry.frameIndex,
+      label: `${source.label || source.path} #${entry.frameIndex}`,
       streamIndex,
+      frameIndex: entry.frameIndex,
       pts: entry.pts ?? null,
       bestEffortTimestamp: entry.pts ?? null,
-      timeBaseNum: stream?.timeBaseNum ?? null,
-      timeBaseDen: stream?.timeBaseDen ?? null,
       timestampSeconds: entry.timestampSeconds ?? null,
-      tags: [],
       originRunId: run.id,
-    };
+    });
     onProjectChange((current) => ({
       ...current,
       samplesById: { ...current.samplesById, [sample.id]: sample },
@@ -301,24 +291,13 @@ export function VerifyPage({
         <h3>{t("verify.activeRecipe")}</h3>
         {recipeOptions.length > 0 ? (
           <div className="verify-current-row">
-            <select
-              aria-label={t("verify.selectRecipe")}
+            <RecipePicker
+              t={t}
               value={state.project.activeRecipeId ?? ""}
-              onChange={(event) => {
-                if (event.target.value) changeActiveRecipe(event.target.value);
-              }}
-            >
-              {!state.project.activeRecipeId ? (
-                <option value="" disabled>
-                  —
-                </option>
-              ) : null}
-              {recipeOptions.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.name} · {t("recipe.revision", { revision: item.revision })}
-                </option>
-              ))}
-            </select>
+              options={recipeOptions}
+              onChange={changeActiveRecipe}
+              ariaLabel={t("verify.selectRecipe")}
+            />
             <RecipeSummaryStrip
               t={t}
               recipe={recipe}
@@ -334,11 +313,9 @@ export function VerifyPage({
               activeRecipeId={state.project.activeRecipeId}
               emptyLabel={t("verify.noActiveRecipe")}
             />
-            <div className="empty-inline">
-              <button className="secondary-button" type="button" onClick={() => onNavigate("analyze")}>
-                {t("nav.analyze")}
-              </button>
-            </div>
+            <EmptyInlineAction label={t("nav.analyze")} onClick={() => onNavigate("analyze")}>
+              {null}
+            </EmptyInlineAction>
           </>
         )}
       </section>
@@ -347,12 +324,9 @@ export function VerifyPage({
         <aside className="analyze-samples pane">
           <h3>{t("verify.sourcesTitle")}</h3>
           {readyVideos.length === 0 ? (
-            <div className="empty-inline">
+            <EmptyInlineAction label={t("nav.media")} onClick={() => onNavigate("media")}>
               <p>{t("verify.noVideos")}</p>
-              <button className="secondary-button" type="button" onClick={() => onNavigate("media")}>
-                {t("nav.media")}
-              </button>
-            </div>
+            </EmptyInlineAction>
           ) : (
             <ul className="analyze-sample-list">
               {readyVideos.map((source) => (
@@ -381,25 +355,20 @@ export function VerifyPage({
           )}
 
           {plan ? (
-            <div className="run-group-plan">
-              <h3>{t("analyze.runGroupPlan")}</h3>
-              <p className="help-copy">
-                {t("analyze.runGroupType", { type: plan.groupType })}
-                {" · "}
-                {t("analyze.memberCount", { count: String(plan.memberCount) })}
-              </p>
-              <ul className="run-group-members">
-                {plan.members.slice(0, 12).map((member) => (
-                  <li key={member.planKey}>
-                    <strong>{member.sourceLabel}</strong>
-                    <span>{scopeLabel(t, member.scanScope.selection)}</span>
-                  </li>
-                ))}
-              </ul>
-              {plan.memberCount > 1 ? (
-                <p className="help-copy">{t("verify.memberPerSource")}</p>
-              ) : null}
-            </div>
+            <RunGroupPlanCard
+              t={t}
+              title={t("analyze.runGroupPlan")}
+              summary={
+                `${t("analyze.runGroupType", { type: plan.groupType })}` +
+                ` · ${t("analyze.memberCount", { count: String(plan.memberCount) })}`
+              }
+              members={plan.members.map((member) => ({
+                key: member.planKey,
+                title: member.sourceLabel,
+                subtitle: scopeLabel(t, member.scanScope.selection),
+              }))}
+              multiMemberNote={plan.memberCount > 1 ? t("verify.memberPerSource") : null}
+            />
           ) : null}
         </aside>
 
@@ -492,7 +461,9 @@ export function VerifyPage({
             </div>
           ) : null}
           <p className="help-copy">{t("verify.reviewFilterHint")}</p>
-          {notice ? <p className="help-copy">{notice}</p> : null}
+          {notice || submitNotice ? (
+            <p className="help-copy">{notice || submitNotice}</p>
+          ) : null}
           {runs.map((run) => (
             <VerifyRunReview
               key={run.id}
@@ -632,22 +603,16 @@ export function VerifyPage({
             ) : null}
           </label>
 
-          <div className="analyze-run-block">
-            <button
-              className="primary-button"
-              type="button"
-              disabled={!canStart}
-              onClick={startRun}
-            >
-              <Play size={15} />
-              {submitting
-                ? t("diagnostics.working")
-                : draft.scopeKind === "full"
-                  ? t("verify.startFull")
-                  : t("verify.startPreview")}
-            </button>
-            {startBlockedReason ? <p className="help-copy">{startBlockedReason}</p> : null}
-          </div>
+          <RunLaunchButton
+            t={t}
+            disabled={!canStart}
+            submitting={submitting}
+            label={
+              draft.scopeKind === "full" ? t("verify.startFull") : t("verify.startPreview")
+            }
+            blockedReason={startBlockedReason}
+            onClick={startRun}
+          />
         </aside>
       </div>
     </div>

@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { X } from "lucide-react";
 import type { Translator } from "../i18n";
+import { Modal } from "./Modal";
 
 export type ApplyGeometryValues = {
   baseHeight: number | null;
@@ -45,55 +45,45 @@ export function ApplyGeometryDialog({
   }
 
   return (
-    <div className="modal-backdrop" role="presentation" onClick={onCancel}>
-      <div
-        className="modal-card"
-        role="dialog"
-        aria-modal="true"
-        aria-label={t("analyze.applyToRecipe")}
-        onClick={(event) => event.stopPropagation()}
-      >
-        <div className="modal-header">
-          <h3>{t("analyze.applyToRecipe")}</h3>
-          <button className="icon-button" type="button" onClick={onCancel} aria-label={t("common.close")}>
-            <X size={16} />
-          </button>
-        </div>
-
-        <p className="help-copy">{t("analyze.applyDialog.hint")}</p>
-        <label className="block">
-          <span>{t("analyze.baseHeight")}</span>
-          <input
-            value={heightText}
-            inputMode="decimal"
-            onChange={(event) => {
-              setHeightText(event.target.value);
-              setError("");
-            }}
-          />
-        </label>
-        <label className="block">
-          <span>{t("analyze.baseWidth")}</span>
-          <input
-            value={widthText}
-            inputMode="decimal"
-            onChange={(event) => {
-              setWidthText(event.target.value);
-              setError("");
-            }}
-          />
-        </label>
-        {error ? <p className="help-copy warning-copy">{error}</p> : null}
-
-        <div className="modal-actions">
+    <Modal
+      onClose={onCancel}
+      title={t("analyze.applyToRecipe")}
+      closeLabel={t("common.close")}
+      actions={
+        <>
           <button className="secondary-button" type="button" onClick={onCancel}>
             {t("common.cancel")}
           </button>
           <button className="primary-button" type="button" disabled={busy} onClick={handleConfirm}>
             {t("analyze.applyToRecipe")}
           </button>
-        </div>
-      </div>
-    </div>
+        </>
+      }
+    >
+      <p className="help-copy">{t("analyze.applyDialog.hint")}</p>
+      <label className="block">
+        <span>{t("analyze.baseHeight")}</span>
+        <input
+          value={heightText}
+          inputMode="decimal"
+          onChange={(event) => {
+            setHeightText(event.target.value);
+            setError("");
+          }}
+        />
+      </label>
+      <label className="block">
+        <span>{t("analyze.baseWidth")}</span>
+        <input
+          value={widthText}
+          inputMode="decimal"
+          onChange={(event) => {
+            setWidthText(event.target.value);
+            setError("");
+          }}
+        />
+      </label>
+      {error ? <p className="help-copy warning-copy">{error}</p> : null}
+    </Modal>
   );
 }

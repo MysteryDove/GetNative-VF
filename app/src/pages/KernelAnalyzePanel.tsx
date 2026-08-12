@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Play, SlidersHorizontal } from "lucide-react";
+import { SlidersHorizontal } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
 import { kernelDisplayName, profileDisplayName } from "../engine/displayNames";
@@ -35,10 +35,13 @@ import {
 import { startKernelRunGroup, type ExecutionBridge } from "../engine/executeRunGroup";
 import { applyPayloadToCurrentRecipe } from "../project/recipeApply";
 import { includedSamples as selectIncludedSamples } from "../project/samples";
+import { useRunGroupSubmit } from "../hooks/useRunGroupSubmit";
 import type { ProjectState, Run } from "../project/types";
 import { BlockedState } from "../components/BlockedState";
 import { MetricEditor } from "../components/MetricEditor";
 import { ResultMetricTable } from "../components/ResultMetricTable";
+import { RunGroupPlanCard } from "../components/RunGroupPlanCard";
+import { RunLaunchButton } from "../components/RunLaunchButton";
 import { backendOptionLabel, pNormMaximumForBackend } from "../engine/backendSelection";
 import { toggleSetValue } from "../utils/collections";
 
@@ -76,7 +79,7 @@ export function KernelAnalyzePanel({
   const [selectedSignature, setSelectedSignature] = useState<string | null>(null);
   const [addNotice, setAddNotice] = useState("");
   const [applyNotice, setApplyNotice] = useState("");
-  const [submitting, setSubmitting] = useState(false);
+  const { submitting, notice: submitNotice, submit: submitRunGroup } = useRunGroupSubmit();
   /** Samples excluded from the kernel test (default: every included sample). */
   const [excludedSampleIds, setExcludedSampleIds] = useState<Set<string>>(new Set());
   /** Result table sample switch: null = all samples. */
@@ -390,33 +393,27 @@ export function KernelAnalyzePanel({
 
   const canRun = analyzeAvailable && recipeGeometry !== null && plan !== null && !submitting;
 
-  async function startRun() {
-    if (!plan || submitting) return;
-    setSubmitting(true);
+  function startRun() {
+    if (!plan) return;
     setApplyNotice("");
-    try {
-      const result = await startKernelRunGroup({
-        plan,
-        state,
-        onProjectChange,
-        bridge: executionBridge,
-        mediaFrameBatch: capabilities?.payload.features?.media_frame_batch === true,
-      });
-      if (!result.ok) {
-        setApplyNotice(t("analyze.submitFailed", { detail: result.reason }));
-        return;
-      }
-      setApplyNotice(
-        t("analyze.runSubmitted", {
-          submitted: String(result.submitted),
-          failedNote: result.failed > 0 ? `, ${result.failed} failed` : "",
+    void submitRunGroup(
+      () =>
+        startKernelRunGroup({
+          plan,
+          state,
+          onProjectChange,
+          bridge: executionBridge,
+          mediaFrameBatch: capabilities?.payload.features?.media_frame_batch === true,
         }),
-      );
-    } catch (error) {
-      setApplyNotice(t("analyze.submitFailed", { detail: String(error) }));
-    } finally {
-      setSubmitting(false);
-    }
+      {
+        submitted: (result) =>
+          t("analyze.runSubmitted", {
+            submitted: String(result.submitted),
+            failedNote: result.failed > 0 ? `, ${result.failed} failed` : "",
+          }),
+        failed: (detail) => t("analyze.submitFailed", { detail }),
+      },
+    );
   }
 
   return (
@@ -464,19 +461,16 @@ export function KernelAnalyzePanel({
         )}
 
         {plan ? (
-          <div className="run-group-plan">
-            <h3>{t("analyze.runGroupPlan")}</h3>
-            <p className="help-copy">
-              {t("analyze.runGroupType", { type: plan.groupType })}
-              {" · "}
-              {t("analyze.memberCount", { count: String(plan.memberCount) })}
-              {" · "}
-              {t("analyze.workEstimate", { count: String(plan.workEstimate) })}
-            </p>
-            {plan.memberCount > 1 ? (
-              <p className="help-copy">{t("analyze.k.memberPerSample")}</p>
-            ) : null}
-          </div>
+          <RunGroupPlanCard
+            t={t}
+            title={t("analyze.runGroupPlan")}
+            summary={
+              `${t("analyze.runGroupType", { type: plan.groupType })}` +
+              ` · ${t("analyze.memberCount", { count: String(plan.memberCount) })}`
+            }
+            workEstimate={t("analyze.workEstimate", { count: String(plan.workEstimate) })}
+            multiMemberNote={plan.memberCount > 1 ? t("analyze.k.memberPerSample") : null}
+          />
         ) : null}
       </aside>
 
@@ -559,7 +553,9 @@ export function KernelAnalyzePanel({
                     {t("analyze.k.applyWithDivergedMetric")}
                   </button>
                 ) : null}
-                {applyNotice ? <span className="help-copy">{applyNotice}</span> : null}
+                {applyNotice || submitNotice ? (
+                  <span className="help-copy">{applyNotice || submitNotice}</span>
+                ) : null}
               </div>
             </div>
           ) : (
@@ -854,18 +850,14 @@ export function KernelAnalyzePanel({
           ) : null}
         </fieldset>
 
-        <div className="analyze-run-block">
-          <button
-            className="primary-button"
-            type="button"
-            disabled={!canRun}
-            onClick={startRun}
-          >
-            <Play size={15} />
-            {submitting ? t("diagnostics.working") : t("analyze.k.runKernel")}
-          </button>
-          {runBlockedReason ? <p className="help-copy">{runBlockedReason}</p> : null}
-        </div>
+        <RunLaunchButton
+          t={t}
+          disabled={!canRun}
+          submitting={submitting}
+          label={t("analyze.k.runKernel")}
+          blockedReason={runBlockedReason}
+          onClick={startRun}
+        />
       </aside>
     </div>
   );

@@ -1,15 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ChevronDown, ChevronRight, Play, RotateCcw, SlidersHorizontal } from "lucide-react";
+import { ChevronDown, ChevronRight, RotateCcw, SlidersHorizontal } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
 import { kernelDisplayName, profileDisplayName } from "../engine/displayNames";
 import { resolveGeometrySnapshot } from "../engine/geometryResolve";
 import {
+  activateRecipe,
   applyPayloadToCurrentRecipe,
   setRecipeNameSuffix,
 } from "../project/recipeApply";
-import { activeRecipe, activateRecipeInState, createRecipe } from "../project/recipe";
+import { activeRecipe, createRecipe } from "../project/recipe";
 import { includedSamples as selectIncludedSamples } from "../project/samples";
+import { useRunGroupSubmit } from "../hooks/useRunGroupSubmit";
 import { startHeightRunGroup, type ExecutionBridge } from "../engine/executeRunGroup";
 import { KernelAnalyzePanel } from "./KernelAnalyzePanel";
 import { defaultKernelDraft, type KernelDraft } from "../engine/kernelDraft";
@@ -34,6 +36,10 @@ import {
 } from "../engine/runGroupPlan";
 import type { ProjectState, Run } from "../project/types";
 import { BlockedState } from "../components/BlockedState";
+import { EmptyInlineAction } from "../components/EmptyInlineAction";
+import { RecipePicker } from "../components/RecipePicker";
+import { RunGroupPlanCard } from "../components/RunGroupPlanCard";
+import { RunLaunchButton } from "../components/RunLaunchButton";
 import {
   ApplyGeometryDialog,
   type ApplyGeometryValues,
@@ -77,7 +83,7 @@ export function AnalyzePage({
   const [applyBusy, setApplyBusy] = useState(false);
   const [applyNotice, setApplyNotice] = useState("");
   const [applyDialogOpen, setApplyDialogOpen] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
+  const { submitting, notice: submitNotice, submit: submitRunGroup } = useRunGroupSubmit();
   // Kernel draft is lifted here so the hand-built scan list survives subroute
   // switches (height ↔ kernel). It does NOT survive leaving the Analyze route
   // (uiStateByRoute persistence is out of scope).
@@ -273,33 +279,27 @@ export function AnalyzePage({
 
   const canRun = analyzeAvailable && plan !== null && !submitting;
 
-  async function startRun() {
-    if (!plan || submitting) return;
-    setSubmitting(true);
+  function startRun() {
+    if (!plan) return;
     setApplyNotice("");
-    try {
-      const result = await startHeightRunGroup({
-        plan,
-        state,
-        onProjectChange,
-        bridge: executionBridge,
-        mediaFrameBatch: capabilities?.payload.features?.media_frame_batch === true,
-      });
-      if (!result.ok) {
-        setApplyNotice(t("analyze.submitFailed", { detail: result.reason }));
-        return;
-      }
-      setApplyNotice(
-        t("analyze.runSubmitted", {
-          submitted: String(result.submitted),
-          failedNote: result.failed > 0 ? `, ${result.failed} failed` : "",
+    void submitRunGroup(
+      () =>
+        startHeightRunGroup({
+          plan,
+          state,
+          onProjectChange,
+          bridge: executionBridge,
+          mediaFrameBatch: capabilities?.payload.features?.media_frame_batch === true,
         }),
-      );
-    } catch (error) {
-      setApplyNotice(t("analyze.submitFailed", { detail: String(error) }));
-    } finally {
-      setSubmitting(false);
-    }
+      {
+        submitted: (result) =>
+          t("analyze.runSubmitted", {
+            submitted: String(result.submitted),
+            failedNote: result.failed > 0 ? `, ${result.failed} failed` : "",
+          }),
+        failed: (detail) => t("analyze.submitFailed", { detail }),
+      },
+    );
   }
 
   function patch(partial: Partial<HeightDraft>) {
@@ -365,10 +365,7 @@ export function AnalyzePage({
   }
 
   function changeCurrentRecipe(recipeId: string) {
-    const result = activateRecipeInState(state, recipeId);
-    if (!result.ok) return;
-    const next = result.state;
-    onProjectChange(() => next);
+    onProjectChange((current) => activateRecipe(current, recipeId));
   }
 
   /** Locale text the apply/naming layer needs. */
@@ -463,23 +460,13 @@ export function AnalyzePage({
           <span className="recipe-strip-label">{t("recipe.strip.active")}</span>
           <div className="editing-target-row">
             {recipeOptions.length ? (
-              <select
+              <RecipePicker
+                t={t}
                 value={currentRecipe?.id ?? ""}
-                onChange={(event) => {
-                  if (event.target.value) changeCurrentRecipe(event.target.value);
-                }}
-              >
-                {!currentRecipe ? (
-                  <option value="" disabled>
-                    —
-                  </option>
-                ) : null}
-                {recipeOptions.map((recipe) => (
-                  <option key={recipe.id} value={recipe.id}>
-                    {recipe.name} · {t("recipe.revision", { revision: recipe.revision })}
-                  </option>
-                ))}
-              </select>
+                options={recipeOptions}
+                onChange={changeCurrentRecipe}
+                ariaLabel={t("recipe.strip.active")}
+              />
             ) : null}
             <button className="secondary-button" type="button" onClick={createNewRecipe}>
               {t("recipe.newDraft")}
@@ -541,12 +528,9 @@ export function AnalyzePage({
           <aside className="analyze-samples pane">
             <h3>{t("analyze.samplesTitle")}</h3>
             {includedSamples.length === 0 ? (
-              <div className="empty-inline">
+              <EmptyInlineAction label={t("nav.samples")} onClick={onOpenSamples}>
                 <p>{t("analyze.noSamples")}</p>
-                <button className="secondary-button" type="button" onClick={onOpenSamples}>
-                  {t("nav.samples")}
-                </button>
-              </div>
+              </EmptyInlineAction>
             ) : (
               <ul className="analyze-sample-list">
                 {includedSamples.map((sample, index) => {
@@ -586,34 +570,24 @@ export function AnalyzePage({
             )}
 
             {plan ? (
-              <div className="run-group-plan">
-                <h3>{t("analyze.runGroupPlan")}</h3>
-                <p className="help-copy">
-                  {t("analyze.runGroupType", { type: plan.groupType })}
-                  {" · "}
-                  {t("analyze.memberCount", { count: String(plan.memberCount) })}
-                  {" · "}
-                  {t("analyze.workEstimate", { count: String(plan.workEstimate) })}
-                </p>
-                <ul className="run-group-members">
-                  {plan.members.slice(0, 12).map((member) => (
-                    <li key={member.planKey}>
-                      <strong>{member.sampleLabel}</strong>
-                      <span>
-                        {member.kernel.id}
-                        {" · "}
-                        {member.heightGrid.candidates.length} h
-                      </span>
-                    </li>
-                  ))}
-                  {plan.members.length > 12 ? (
-                    <li className="muted">+{plan.members.length - 12}</li>
-                  ) : null}
-                </ul>
-                {plan.memberCount > 1 ? (
-                  <p className="help-copy">{t("analyze.runGroupIsNotSingleRun")}</p>
-                ) : null}
-              </div>
+              <RunGroupPlanCard
+                t={t}
+                title={t("analyze.runGroupPlan")}
+                summary={
+                  `${t("analyze.runGroupType", { type: plan.groupType })}` +
+                  ` · ${t("analyze.memberCount", { count: String(plan.memberCount) })}`
+                }
+                workEstimate={t("analyze.workEstimate", { count: String(plan.workEstimate) })}
+                members={plan.members.map((member) => ({
+                  key: member.planKey,
+                  title: member.sampleLabel,
+                  subtitle: `${member.kernel.id} · ${member.heightGrid.candidates.length} h`,
+                }))}
+                truncateAt={12}
+                multiMemberNote={
+                  plan.memberCount > 1 ? t("analyze.runGroupIsNotSingleRun") : null
+                }
+              />
             ) : null}
           </aside>
 
@@ -643,7 +617,9 @@ export function AnalyzePage({
               >
                 {t("analyze.applyToRecipe")}
               </button>
-              {applyNotice ? <span className="help-copy">{applyNotice}</span> : null}
+              {applyNotice || submitNotice ? (
+                <span className="help-copy">{applyNotice || submitNotice}</span>
+              ) : null}
             </div>
             {seriesRows.incompatibleCount > 0 ? (
               <p className="help-copy warning-copy">
@@ -1176,18 +1152,14 @@ export function AnalyzePage({
               ) : null}
             </fieldset>
 
-            <div className="analyze-run-block">
-              <button
-                className="primary-button"
-                type="button"
-                disabled={!canRun}
-                onClick={startRun}
-              >
-                <Play size={15} />
-                {submitting ? t("diagnostics.working") : t("analyze.runHeight")}
-              </button>
-              {runBlockedReason ? <p className="help-copy">{runBlockedReason}</p> : null}
-            </div>
+            <RunLaunchButton
+              t={t}
+              disabled={!canRun}
+              submitting={submitting}
+              label={t("analyze.runHeight")}
+              blockedReason={runBlockedReason}
+              onClick={startRun}
+            />
           </aside>
         </div>
       )}

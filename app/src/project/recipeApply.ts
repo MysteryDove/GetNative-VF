@@ -124,3 +124,13 @@ function uniqueRecipeName(state: ProjectState, base: string, excludeId: string):
     if (!taken.has(candidate)) return candidate;
   }
 }
+
+/**
+ * Canonical Recipe activation for page handlers: returns the activated state,
+ * or the input state unchanged when the Recipe is missing. Usable directly
+ * inside `onProjectChange((current) => ...)`.
+ */
+export function activateRecipe(state: ProjectState, recipeId: string): ProjectState {
+  const result = activateRecipeInState(state, recipeId);
+  return result.ok ? result.state : state;
+}

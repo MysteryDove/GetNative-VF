@@ -1,8 +1,8 @@
-import { X } from "lucide-react";
 import type { Translator } from "../i18n";
 import { kernelDisplayName, profileDisplayName } from "../engine/displayNames";
 import { recipeReadiness } from "../project/recipe";
 import type { Recipe } from "../project/types";
+import { Modal } from "./Modal";
 
 export const MISSING_LABEL_KEYS = {
   name: "recipe.missing.name",
@@ -46,86 +46,12 @@ export function RecipeReviewDialog({
   const readiness = recipeReadiness(recipe);
 
   return (
-    <div className="modal-backdrop" role="presentation" onClick={onClose}>
-      <div
-        className="modal-card"
-        role="dialog"
-        aria-modal="true"
-        aria-label={t("recipe.reviewTitle")}
-        onClick={(event) => event.stopPropagation()}
-      >
-        <div className="modal-header">
-          <h3>{t("recipe.reviewTitle")}</h3>
-          <button className="icon-button" type="button" onClick={onClose} aria-label={t("common.close")}>
-            <X size={16} />
-          </button>
-        </div>
-
-        <p>
-          <strong>{recipe.name}</strong>
-        </p>
-
-        <div className="dense-table recipe-summary">
-          <div className="dense-row">
-            <strong>{t("recipe.field.geometry")}</strong>
-            <span>
-              {recipe.geometry
-                ? `${recipe.geometry.canvasWidth}×${recipe.geometry.canvasHeight}` +
-                  ` · src (${recipe.geometry.srcLeft}, ${recipe.geometry.srcTop}) ` +
-                  `${recipe.geometry.srcWidth}×${recipe.geometry.srcHeight}`
-                : t("recipe.fieldMissing")}
-            </span>
-          </div>
-          <div className="dense-row">
-            <strong>{t("recipe.field.kernel")}</strong>
-            <span>
-              {recipe.kernel?.id
-                ? kernelDisplayName(t, recipe.kernel.id) +
-                  (Object.keys(recipe.kernel.parameters).length
-                    ? ` (${Object.entries(recipe.kernel.parameters)
-                        .map(([key, value]) => `${key}=${value}`)
-                        .join(", ")})`
-                    : "")
-                : t("recipe.fieldMissing")}
-            </span>
-          </div>
-          <div className="dense-row">
-            <strong>{t("recipe.field.metric")}</strong>
-            <span>
-              {recipe.metric
-                ? `crop ${recipe.metric.cropLeft}/${recipe.metric.cropRight}/` +
-                  `${recipe.metric.cropTop}/${recipe.metric.cropBottom}` +
-                  ` · ${t("analyze.pixelExclusion")} ${recipe.metric.pixelExclusionThreshold}` +
-                  ` · p=${recipe.metric.pNorm}`
-                : t("recipe.fieldMissing")}
-            </span>
-          </div>
-          <div className="dense-row">
-            <strong>{t("recipe.field.profile")}</strong>
-            <span>
-              {recipe.profileId ? profileDisplayName(t, recipe.profileId) : t("recipe.fieldMissing")}
-            </span>
-          </div>
-          <div className="dense-row">
-            <strong>{t("recipe.field.mathMode")}</strong>
-            <span>{recipe.mathMode ?? t("recipe.fieldMissing")}</span>
-          </div>
-        </div>
-
-        {!readiness.ok ? (
-          <div className="review-blockers">
-            <p className="help-copy warning-copy">{t("recipe.lockIncomplete")}</p>
-            <ul className="blocker-list">
-              {readiness.missing.map((field) => (
-                <li key={field}>
-                  {t(MISSING_LABEL_KEYS[field as keyof typeof MISSING_LABEL_KEYS] ?? "recipe.fieldMissing")}
-                </li>
-              ))}
-            </ul>
-          </div>
-        ) : null}
-
-        <div className="modal-actions">
+    <Modal
+      onClose={onClose}
+      title={t("recipe.reviewTitle")}
+      closeLabel={t("common.close")}
+      actions={
+        <>
           {!isActive ? (
             <button className="primary-button" type="button" onClick={onSetActive}>
               {t("recipe.setActive")}
@@ -134,8 +60,72 @@ export function RecipeReviewDialog({
           <button className="secondary-button" type="button" onClick={onClose}>
             {t("common.close")}
           </button>
+        </>
+      }
+    >
+      <p>
+        <strong>{recipe.name}</strong>
+      </p>
+
+      <div className="dense-table recipe-summary">
+        <div className="dense-row">
+          <strong>{t("recipe.field.geometry")}</strong>
+          <span>
+            {recipe.geometry
+              ? `${recipe.geometry.canvasWidth}×${recipe.geometry.canvasHeight}` +
+                ` · src (${recipe.geometry.srcLeft}, ${recipe.geometry.srcTop}) ` +
+                `${recipe.geometry.srcWidth}×${recipe.geometry.srcHeight}`
+              : t("recipe.fieldMissing")}
+          </span>
+        </div>
+        <div className="dense-row">
+          <strong>{t("recipe.field.kernel")}</strong>
+          <span>
+            {recipe.kernel?.id
+              ? kernelDisplayName(t, recipe.kernel.id) +
+                (Object.keys(recipe.kernel.parameters).length
+                  ? ` (${Object.entries(recipe.kernel.parameters)
+                      .map(([key, value]) => `${key}=${value}`)
+                      .join(", ")})`
+                  : "")
+              : t("recipe.fieldMissing")}
+          </span>
+        </div>
+        <div className="dense-row">
+          <strong>{t("recipe.field.metric")}</strong>
+          <span>
+            {recipe.metric
+              ? `crop ${recipe.metric.cropLeft}/${recipe.metric.cropRight}/` +
+                `${recipe.metric.cropTop}/${recipe.metric.cropBottom}` +
+                ` · ${t("analyze.pixelExclusion")} ${recipe.metric.pixelExclusionThreshold}` +
+                ` · p=${recipe.metric.pNorm}`
+              : t("recipe.fieldMissing")}
+          </span>
+        </div>
+        <div className="dense-row">
+          <strong>{t("recipe.field.profile")}</strong>
+          <span>
+            {recipe.profileId ? profileDisplayName(t, recipe.profileId) : t("recipe.fieldMissing")}
+          </span>
+        </div>
+        <div className="dense-row">
+          <strong>{t("recipe.field.mathMode")}</strong>
+          <span>{recipe.mathMode ?? t("recipe.fieldMissing")}</span>
         </div>
       </div>
-    </div>
+
+      {!readiness.ok ? (
+        <div className="review-blockers">
+          <p className="help-copy warning-copy">{t("recipe.lockIncomplete")}</p>
+          <ul className="blocker-list">
+            {readiness.missing.map((field) => (
+              <li key={field}>
+                {t(MISSING_LABEL_KEYS[field as keyof typeof MISSING_LABEL_KEYS] ?? "recipe.fieldMissing")}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </Modal>
   );
 }

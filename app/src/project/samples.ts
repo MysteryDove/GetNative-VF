@@ -1,4 +1,4 @@
-import type { ProjectState, Sample } from "./types";
+import type { ProjectState, Sample, Source } from "./types";
 
 /**
  * Sample selectors and shared Source-error patches used by Media/Samples
@@ -35,5 +35,48 @@ export function applySourceError(
         errorDetail: error.detail,
       },
     },
+  };
+}
+
+/** Next `order` value for a new Sample: max existing order + 1 (0 when empty). */
+export function nextSampleOrder(samplesById: Record<string, Sample>): number {
+  return Math.max(-1, ...Object.values(samplesById).map((sample) => sample.order)) + 1;
+}
+
+/**
+ * One Sample builder for both MediaPage (manual frame pick) and VerifyPage
+ * (add-from-review): fills the id, source linkage, inclusion, time base (from
+ * the Source's stream list) and empty tags. Label and pts semantics stay at
+ * the call site — the two pages drift there on purpose.
+ */
+export function buildFrameSample(fields: {
+  source: Source;
+  order: number;
+  label: string;
+  streamIndex: number | null;
+  frameIndex: number | null;
+  pts?: number | null;
+  bestEffortTimestamp?: number | null;
+  timestampSeconds?: number | null;
+  originRunId?: string | null;
+}): Sample {
+  const { source, order, label, streamIndex, frameIndex } = fields;
+  const stream = source.videoStreams.find((item) => item.index === streamIndex);
+  return {
+    id: `smp_${crypto.randomUUID()}`,
+    sourceId: source.id,
+    sourceFingerprint: source.fingerprint ?? null,
+    label,
+    included: true,
+    order,
+    frameIndex,
+    streamIndex,
+    pts: fields.pts ?? null,
+    bestEffortTimestamp: fields.bestEffortTimestamp ?? null,
+    timeBaseNum: stream?.timeBaseNum ?? null,
+    timeBaseDen: stream?.timeBaseDen ?? null,
+    timestampSeconds: fields.timestampSeconds ?? null,
+    tags: [],
+    ...(fields.originRunId !== undefined ? { originRunId: fields.originRunId } : {}),
   };
 }
