@@ -179,7 +179,7 @@ std::vector<std::uint8_t> serialize(const MediaIndex &index) {
 
 void sync_file(const std::filesystem::path &path) {
 #if defined(_WIN32)
-    const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+    const HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE,
                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                     nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE || !FlushFileBuffers(file)) {
