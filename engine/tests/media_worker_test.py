@@ -240,18 +240,15 @@ def main():
                 maximum_dimension=64)
             assert missing_preview["decoded_frames"] >= 30
 
-        readonly = root / "readonly"
-        readonly.mkdir()
-        readonly_media = readonly / "readonly.mp4"
-        shutil.copy2(media, readonly_media)
-        readonly.chmod(0o555)
-        try:
-            fallback_cache = root / "fallback-cache"
-            fallback, _ = begin(worker, "readonly", "media_index_begin",
-                                readonly_media, fallback_cache, decoder="software")
-            assert pathlib.Path(fallback["index_path"]).is_relative_to(fallback_cache)
-        finally:
-            readonly.chmod(0o755)
+        blocked = root / "blocked-sidecar"
+        blocked.mkdir()
+        blocked_media = blocked / "blocked.mp4"
+        shutil.copy2(media, blocked_media)
+        pathlib.Path(f"{blocked_media}.gnvf.lwi").mkdir()
+        fallback_cache = root / "fallback-cache"
+        fallback, _ = begin(worker, "blocked", "media_index_begin",
+                            blocked_media, fallback_cache, decoder="software")
+        assert pathlib.Path(fallback["index_path"]).is_relative_to(fallback_cache)
 
         long_media = root / "cancel.mp4"
         if encode(ffmpeg, long_media, frames=6000, size="64x64"):
