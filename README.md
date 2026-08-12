@@ -28,11 +28,18 @@ require VapourSynth, Python, plugins, or `.vpy` scripts at runtime.
   uses 168.750 MiB peak arena workspace and 252.230 MiB across all explicit
   Metal buffers.
 - `getnative_cuda` is a rebuilt Driver-API backend for horizontal, vertical,
-  and combined-axis p=1 analysis. It uses persistent execution slots, pinned
+  and combined-axis p=1..4 analysis. It uses persistent execution slots, pinned
   staging, resident plan caches, candidate tiling, axis-specific kernels,
   source/tile transposes, and fused reconstruction/metric passes. The public
   variant remains `cpp-generic`; unsupported specialization and inline-PTX
   variants fail closed.
+- `verify_media_begin` indexes and decodes video inside the engine through the
+  FFmpeg 8 shared-library ABI. CPU uses software decode. CUDA shares the
+  analysis `CUcontext` with FFmpeg for direct NVDEC NV12/P010-to-F32 input;
+  Vulkan shares one `VkInstance`/`VkDevice`, queues, and timeline semaphore
+  state with FFmpeg for Vulkan Video decode. Unsupported hardware decode emits
+  one structured fallback warning and continues with software decode plus the
+  selected compute backend.
 - On the RTX 5080 verification host, the 1920x1080 -> 1280x720, 64-candidate
   benchmark has five-run medians of 4.025 ms vertical, 5.028 ms horizontal, and
   9.676 ms combined at concurrency one. At concurrency 16 it reaches 17.45k,
@@ -46,9 +53,8 @@ require VapourSynth, Python, plugins, or `.vpy` scripts at runtime.
   It reports compile, device, and analysis-command availability separately and
   does not display placeholder curves, valleys, or analysis controls while the
   `analyze` command is unavailable. Windows builds can embed the optional CUDA
-  backend without adding a driver import to CPU-only startup. Decode, the
-  long-running worker protocol, exports, and real GUI analysis remain
-  incomplete.
+  backend without adding a driver import to CPU-only startup. The legacy
+  FFmpeg/mmap verify ring remains available when engine media decode is absent.
 
 The accepted architecture and implementation sequence are documented in
 `docs/architecture.md` and `.omx/plans/standalone-getnative.md`.
@@ -77,6 +83,14 @@ cmake -S engine -B build/engine -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/engine --parallel
 ctest --test-dir build/engine --output-on-failure
 
+# Debian/Ubuntu development metadata for the optional in-engine media layer.
+# These pkg-config modules must resolve to the FFmpeg 8 ABI.
+sudo apt install pkg-config libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+
+# Linux Vulkan build and validation tools. A recent LunarG SDK may be used
+# instead by exporting VULKAN_SDK before configuring.
+sudo apt install libvulkan-dev glslc spirv-tools vulkan-tools vulkan-validationlayers
+
 # Planner bitwise and final-output numerical comparisons with the pinned cores.
 cmake -S engine -B build/engine-conformance -DCMAKE_BUILD_TYPE=Release \
   -DGETNATIVE_BUILD_UPSTREAM_CONFORMANCE=ON
@@ -93,7 +107,7 @@ cmake --build build/engine-metal --parallel
 ctest --test-dir build/engine-metal --output-on-failure
 build/engine-metal/getnative_metal_benchmark --full --assert
 
-# Windows CUDA correctness and throughput verification.
+# Windows/Linux CUDA correctness, NVDEC bridge, and throughput verification.
 cmake -S engine -B build/engine-cuda -DGETNATIVE_ENABLE_CUDA=ON \
   -DGETNATIVE_CUDA_MIN_ARCHITECTURE=75
 cmake --build build/engine-cuda --config Release --parallel
@@ -101,12 +115,58 @@ ctest --test-dir build/engine-cuda -C Release --output-on-failure
 build/engine-cuda/Release/getnative_cuda_throughput_benchmark --full \
   --axes both --concurrency 1
 
+# Linux Vulkan compute and Vulkan Video bridge verification.
+cmake -S engine -B build/engine-vulkan -DGETNATIVE_ENABLE_VULKAN=ON
+cmake --build build/engine-vulkan --parallel
+ctest --test-dir build/engine-vulkan --output-on-failure
+
 cd app
 npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 npm run tauri build -- --bundles app
 ```
+
+`GETNATIVE_ENABLE_MEDIA=ON` is the default. If the FFmpeg 8 development
+metadata is missing, a development build keeps image workflows available and
+reports video as unavailable. There is no external-FFmpeg fallback. Release
+packaging requires the in-process media commands and stages only the pinned
+LGPL `avformat`/`avcodec`/`avutil`/`swscale` shared libraries beside the engine;
+`ffmpeg` and `ffprobe` executables are never packaged or launched at runtime.
+On macOS, `npm run stage:ffmpeg:macos` prepares the pinned libraries in
+`src-tauri/ffmpeg-runtime`; subsequent engine/package builds consume that
+directory automatically.
+
+Vulkan compute needs headers, a loader, and `glslc` or
+`glslangValidator`; test builds also require `spirv-val`. Vulkan Video is
+advertised at runtime only when the selected device exposes Vulkan 1.3, a
+decode queue, timeline semaphores, and a supported H.264/HEVC/AV1/VP9 decode
+extension. Missing video capability falls back to software decode plus Vulkan
+upload, so it does not disable Vulkan compute or media verification.
+
+On Linux, `npm run build:engine` uses `GETNATIVE_LINUX_BACKENDS=auto` by
+default. `auto` enables CUDA when a toolkit containing `bin/nvcc` is found in
+`GETNATIVE_CUDA_ROOT`, `CUDAToolkit_ROOT`, `CUDA_PATH`, `CUDA_HOME`, or
+`/usr/local/cuda`; otherwise it builds CPU-only. Use `cpu`, `cuda`, `vulkan`, or
+`cuda-vulkan` to choose explicitly. For a release package, point
+`GETNATIVE_FFMPEG_RUNTIME_DIR` at the pinned FFmpeg 8 shared-library directory.
+The build stages only the ABI-matched avformat 62, avcodec 62, avutil 60, and
+swscale 9 libraries beside the engine and records every file hash in
+`build-provenance.json`. For example:
+
+```bash
+cd app
+VULKAN_SDK=/path/to/vulkan-sdk/x86_64 \
+GETNATIVE_LINUX_BACKENDS=cuda-vulkan \
+GETNATIVE_FFMPEG_RUNTIME_DIR=/usr/lib/x86_64-linux-gnu \
+npm run build:engine
+```
+
+Omit `VULKAN_SDK` when the Vulkan headers, loader, shader compiler, validation
+layers, and SPIR-V tools are installed in standard system paths. The packaged
+engine reports `features.verify_engine_decode` and the `software`, `nvdec`,
+and `vulkan_video` entries in `decode_backends`; the GUI uses the legacy ring
+when engine decode is not compiled.
 
 On Apple platforms CMake enables Metal when both `metal` and `metallib` are
 installed. If the optional MetalToolchain component is unavailable it emits a
@@ -132,9 +192,9 @@ The Windows engine has three explicit CMake switches:
 
 CUDA uses the runtime-loaded Driver API. A CUDA-enabled package still starts
 without an NVIDIA driver and reports `compiled`, `device_available`, and
-`analysis_command_available` separately. The product has no analysis worker
-yet, so `commands.analyze` and every `analysis_command_available` field remain
-`false`.
+`analysis_command_available` separately. The resident worker exposes analysis
+when its backend and device are available; one-shot CLI capability discovery
+continues to report the analysis command as unavailable.
 
 On Windows, `npm run build:engine` and the Tauri package build use
 `GETNATIVE_WINDOWS_BACKENDS=cpu` by default. Set it to `cuda` to build and test

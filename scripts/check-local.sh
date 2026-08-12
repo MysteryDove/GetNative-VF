@@ -4,6 +4,7 @@
 # 用法:
 #   scripts/check-local.sh                    # 全部步骤
 #   scripts/check-local.sh --skip-cuda        # 跳过 CUDA 构建/测试（无显卡/无 toolkit 时）
+#   scripts/check-local.sh --skip-vulkan      # 跳过 Vulkan 构建/测试
 #   scripts/check-local.sh --skip-media       # 跳过 FFmpeg 媒体冒烟
 #   scripts/check-local.sh --skip-engine      # 只跑 app 侧
 #   scripts/check-local.sh --skip-app         # 只跑引擎侧
@@ -11,10 +12,11 @@
 #
 # 环境变量:
 #   JOBS                          并行度（默认 nproc）
-#   GETNATIVE_CUDA_INCLUDE_DIR    CUDA toolkit include 目录（默认自动探测 /usr/local/cuda*/include）
+#   GETNATIVE_CUDA_ROOT           CUDA toolkit 根目录（默认检查常见环境变量和 /usr/local/cuda*）
+#   GETNATIVE_CUDA_INCLUDE_DIR    兼容旧用法；由 include 目录反推 toolkit 根目录
 #   GETNATIVE_FFMPEG_PATH         媒体冒烟/打包用 ffmpeg（默认 PATH 探测）
 #   GETNATIVE_FFPROBE_PATH        媒体冒烟/打包用 ffprobe（默认 PATH 探测）
-#   PACKAGE_ENGINE                测试包内嵌引擎: auto(默认,有 CUDA 用 CUDA) | cuda | cpu
+#   PACKAGE_ENGINE                测试包内嵌引擎: auto(默认 CUDA>Vulkan>CPU) | cuda | vulkan | cpu
 #
 # 注意: 全程串行——cargo 与 cmake 并发会在引擎二进制上撞 ETXTBSY 造成假失败。
 
@@ -24,14 +26,16 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 engine_dir="${repo_root}/engine"
 build_cpu="${repo_root}/build/engine"
 build_cuda="${repo_root}/build/engine-cuda"
+build_vulkan="${repo_root}/build/engine-vulkan"
 app_dir="${repo_root}/app"
 src_tauri="${app_dir}/src-tauri"
 
 jobs="${JOBS:-$(nproc 2>/dev/null || echo 8)}"
-skip_cuda=0 skip_media=0 skip_engine=0 skip_app=0 skip_package=0
+skip_cuda=0 skip_vulkan=0 skip_media=0 skip_engine=0 skip_app=0 skip_package=0
 for arg in "$@"; do
   case "$arg" in
     --skip-cuda) skip_cuda=1 ;;
+    --skip-vulkan) skip_vulkan=1 ;;
     --skip-media) skip_media=1 ;;
     --skip-engine) skip_engine=1 ;;
     --skip-app) skip_app=1 ;;
@@ -69,26 +73,60 @@ build_and_test_cpu() {
     ctest --test-dir "${build_cpu}" --output-on-failure -j "${jobs}"
 }
 
-cuda_include_dir() {
+cuda_root_dir() {
+  local candidate include_parent
   if [ -n "${GETNATIVE_CUDA_INCLUDE_DIR:-}" ]; then
-    echo "${GETNATIVE_CUDA_INCLUDE_DIR}"; return 0
+    include_parent=$(CDPATH= cd -- "${GETNATIVE_CUDA_INCLUDE_DIR}/.." 2>/dev/null && pwd) || return 1
   fi
-  local candidate
-  for candidate in /usr/local/cuda/include /usr/local/cuda-*/include; do
-    if [ -d "${candidate}" ]; then echo "${candidate}"; return 0; fi
+  for candidate in \
+      "${GETNATIVE_CUDA_ROOT:-}" \
+      "${CUDAToolkit_ROOT:-}" \
+      "${CUDA_PATH:-}" \
+      "${CUDA_HOME:-}" \
+      "${include_parent:-}" \
+      /usr/local/cuda \
+      /usr/local/cuda-*; do
+    [ -n "${candidate}" ] || continue
+    if [ -x "${candidate}/bin/nvcc" ] &&
+       [ -x "${candidate}/bin/cuobjdump" ] &&
+       [ -f "${candidate}/include/cuda.h" ]; then
+      CDPATH= cd -- "${candidate}" && pwd
+      return 0
+    fi
   done
   return 1
 }
 
 configure_cuda() {
-  local include
-  include=$(cuda_include_dir) || return 1
+  local root
+  root=$(cuda_root_dir) || return 1
+  echo "使用 CUDA Toolkit: ${root}"
   cmake -S "${engine_dir}" -B "${build_cuda}" -DCMAKE_BUILD_TYPE=Release \
-    -DGETNATIVE_ENABLE_CUDA=ON -DGETNATIVE_CUDA_INCLUDE_DIR="${include}"
+    -DGETNATIVE_ENABLE_CUDA=ON -DGETNATIVE_CUDA_ROOT="${root}"
 }
 build_and_test_cuda() {
   cmake --build "${build_cuda}" -j "${jobs}" &&
     ctest --test-dir "${build_cuda}" --output-on-failure -j "${jobs}"
+}
+
+vulkan_tools_available() {
+  local sdk="${VULKAN_SDK:-}"
+  { [ -f /usr/include/vulkan/vulkan.h ] || [ -f "${sdk}/include/vulkan/vulkan.h" ]; } &&
+    { [ -f /usr/lib/x86_64-linux-gnu/libvulkan.so.1 ] ||
+      [ -f /usr/lib64/libvulkan.so.1 ] ||
+      compgen -G "${sdk}/lib/libvulkan.so*" >/dev/null; } &&
+    { command -v glslc >/dev/null || command -v glslangValidator >/dev/null ||
+      [ -x "${sdk}/bin/glslc" ] || [ -x "${sdk}/bin/glslangValidator" ]; } &&
+    { command -v spirv-val >/dev/null || [ -x "${sdk}/bin/spirv-val" ]; }
+}
+
+configure_vulkan() {
+  cmake -S "${engine_dir}" -B "${build_vulkan}" -DCMAKE_BUILD_TYPE=Release \
+    -DGETNATIVE_ENABLE_CUDA=OFF -DGETNATIVE_ENABLE_VULKAN=ON
+}
+build_and_test_vulkan() {
+  cmake --build "${build_vulkan}" -j "${jobs}" &&
+    ctest --test-dir "${build_vulkan}" --output-on-failure -j "${jobs}"
 }
 
 # --- App -------------------------------------------------------------------
@@ -96,7 +134,7 @@ build_and_test_cuda() {
 app_js_gates() {
   cd "${app_dir}"
   [ -d node_modules ] || npm install
-  npx vitest run && npx tsc --noEmit && node src/i18n/check-locale.mjs && npm run build
+  npx vitest run && npx tsc --noEmit && node src/i18n/check-locale.mjs && node scripts/check-csp.mjs && npm run build
 }
 
 app_rust_gates() {
@@ -106,7 +144,10 @@ app_rust_gates() {
 
 real_engine_roundtrip() {
   local engine_bin="${build_cuda}/getnative-engine"
-  [ "${skip_cuda}" -eq 0 ] && [ -x "${engine_bin}" ] || engine_bin="${build_cpu}/getnative-engine"
+  if [ "${skip_cuda}" -ne 0 ] || [ ! -x "${engine_bin}" ]; then
+    engine_bin="${build_vulkan}/getnative-engine"
+  fi
+  [ "${skip_vulkan}" -eq 0 ] && [ -x "${engine_bin}" ] || engine_bin="${build_cpu}/getnative-engine"
   if [ ! -x "${engine_bin}" ]; then
     echo "找不到引擎二进制: ${engine_bin}" >&2; return 1
   fi
@@ -153,14 +194,17 @@ package_dir="${app_dir}/dist-test"
 package_engine_bin() {
   case "${PACKAGE_ENGINE:-auto}" in
     cuda) echo "${build_cuda}/getnative-engine" ;;
+    vulkan) echo "${build_vulkan}/getnative-engine" ;;
     cpu) echo "${build_cpu}/getnative-engine" ;;
     auto)
       if [ -x "${build_cuda}/getnative-engine" ]; then
         echo "${build_cuda}/getnative-engine"
+      elif [ -x "${build_vulkan}/getnative-engine" ]; then
+        echo "${build_vulkan}/getnative-engine"
       else
         echo "${build_cpu}/getnative-engine"
       fi ;;
-    *) echo "PACKAGE_ENGINE 必须是 auto/cuda/cpu" >&2; return 1 ;;
+    *) echo "PACKAGE_ENGINE 必须是 auto/cuda/vulkan/cpu" >&2; return 1 ;;
   esac
 }
 
@@ -230,11 +274,19 @@ if [ "${skip_engine}" -eq 0 ]; then
   run_step "引擎 CPU: configure" configure_cpu
   run_step "引擎 CPU: 构建 + ctest" build_and_test_cpu
   if [ "${skip_cuda}" -eq 0 ]; then
-    if cuda_include_dir >/dev/null 2>&1; then
+    if cuda_root_dir >/dev/null 2>&1; then
       run_step "引擎 CUDA: configure" configure_cuda
       run_step "引擎 CUDA: 构建 + ctest" build_and_test_cuda
     else
-      banner "引擎 CUDA: 跳过（未找到 CUDA include，可用 GETNATIVE_CUDA_INCLUDE_DIR 指定）"
+      banner "引擎 CUDA: 跳过（未找到完整 CUDA Toolkit，可用 GETNATIVE_CUDA_ROOT 指定）"
+    fi
+  fi
+  if [ "${skip_vulkan}" -eq 0 ]; then
+    if vulkan_tools_available; then
+      run_step "引擎 Vulkan: configure" configure_vulkan
+      run_step "引擎 Vulkan: 构建 + ctest" build_and_test_vulkan
+    else
+      banner "引擎 Vulkan: 跳过（未找到 headers/loader/shader tools）"
     fi
   fi
 fi
@@ -272,3 +324,4 @@ echo "全部门禁通过。"
 echo "可执行测试包: ${package_dir}/getnative-gui（内嵌引擎 + ffmpeg sidecar，双击或终端直接跑）"
 echo "开发模式: cd app && npm run tauri dev"
 echo "CUDA 引擎跑 dev: GETNATIVE_ENGINE_PATH=${build_cuda}/getnative-engine npm run tauri dev --prefix app"
+echo "Vulkan 引擎跑 dev: GETNATIVE_ENGINE_PATH=${build_vulkan}/getnative-engine npm run tauri dev --prefix app"

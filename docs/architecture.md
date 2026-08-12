@@ -283,7 +283,12 @@ The CUDA dataflow is axis-specific:
 - Combined-axis horizontal solves use a shared-memory local transpose to emit
   row-major native data without a full-frame transpose pass. The final
   vertical-first reconstruction stages a narrow row span in shared memory and
-  fuses thresholding and p=1 partial reduction.
+  fuses thresholding and p=1..4 partial reduction.
+- CUDA forms p=1..4 moments with the same Float32 multiplication order as the
+  CPU fast path, accumulates fixed-order Double partials, divides by the full
+  cropped pixel count, and applies the p2..p4 root on the host after readback.
+  No per-pixel `pow` or fast-math mode is used. Explicit CUDA rejects p>4;
+  `auto` falls back to CPU for those norms. Verify remains CPU-only.
 - Device event telemetry separates staging, transfer, each kernel family,
   readback, cache hits, allocation counts, tile counts, and slot waits.
 
@@ -422,9 +427,9 @@ declared 1920x1080 bicubic fixture with 1000 height candidates, the five-run
 Metal median is 125.409 ms, the maximum CPU/Metal metric difference is 5.61e-8,
 the valley distance is zero, peak arena workspace is 168.750 MiB, and all
 explicit Metal buffers total 252.230 MiB at peak. Other p-norms, media input,
-CUDA, and GUI analysis integration remain outside this proof; the GUI exposes
-only the real geometry command until analysis exists.
+and CUDA remain outside this Metal-host proof.
 
-`nvcc`, FFmpeg, zimg, pkg-config, and VapourSynth are not installed. CUDA
-correctness and performance require a real NVIDIA CI/host and cannot be claimed
-from this Mac.
+CUDA has a separate real-device gate on an RTX 5080. The p1..4 correctness,
+resource, and throughput evidence is recorded in
+`docs/performance/cuda-pnorm-1-4-20260810.md`; it does not derive any CUDA claim
+from the Metal host above.

@@ -1,5 +1,10 @@
 # Tauri Worker Transport (E0 App-Side Half)
 
+> Historical E0 record. The current indexed-media transport is specified in
+> `docs/worker-protocol-v1.md` section 2.8. Its engine-owned video path replaces
+> the external-FFmpeg frame export described below; `media.rs` now handles
+> still images only.
+
 - Status: Implemented; verified against a real worker build.
 - Date: 2026-08-07.
 - Roadmap anchor: `docs/dsmvc-port-strategy.md` phase E0; engine-side half

@@ -4,12 +4,12 @@
 - Branch: `main` (phase E4 of `docs/dsmvc-port-strategy.md`).
 - Host: Linux x86-64, AMD Ryzen 9 5950X (16C/32T), NVMe page cache,
   Release build, GCC 15.2.
-- Decision: **ADOPT** the L1 single-flight LRU (default, zero cost);
-  **ADOPT AS OPT-IN** the L2 pack store (`GETNATIVE_PLAN_CACHE=on` or
-  `GETNATIVE_PLAN_CACHE_DIR=<dir>`) — on this host class the parallel
-  batch build beats pack fetch latency at every measured shape, so the
-  store serves low-parallelism hosts and future sparse patterns, not the
-  default path.
+- Decision at evaluation time: **ADOPT** the L1 single-flight LRU (default,
+  zero cost); adopt the L2 pack store as opt-in because parallel batch build
+  won on this host class. Current product policy supersedes that default: L2
+  is enabled and stores packs beside `getnative-engine` unless
+  `GETNATIVE_PLAN_CACHE_DIR` overrides the directory or
+  `GETNATIVE_PLAN_CACHE=off` disables it.
 
 ## 1. What landed
 
@@ -64,11 +64,11 @@ A 1,000-plan batch builds in ~107-148 ms on 16 planner workers
 ~0.12-0.20 ms/plan. The store's premise ("large-taps rebuilds are the
 expensive case") does not survive contact with the parallel batch build
 at 16 cores; the cliff the store fixes (30% of 143 ms ≈ 43 ms per
-over-cap scan) is cheaper than the cure. **The L2 store is therefore
-opt-in** (`GETNATIVE_PLAN_CACHE=on` / explicit dir); it wins where the
-parallel build is weak (few-core hosts) and for sparse single-plan
-patterns a batch rebuild cannot serve cheaply. The L1 LRU adoption is
-unaffected and stays default-on.
+over-cap scan) is cheaper than the cure. The evaluation therefore recommended
+opt-in operation; the current product requirement instead enables L2 by
+default beside the executable. It still wins where the parallel build is weak
+(few-core hosts) and for sparse single-plan patterns a batch rebuild cannot
+serve cheaply. The L1 LRU adoption is unaffected and stays default-on.
 
 ### 3.1 Latency bugs found and fixed en route (measured)
 
@@ -133,7 +133,8 @@ Landed anyway: GNPK **v4** stores transpose offsets/indices raw (one
 bounds-checked pass replaces per-element varint/delta decode), fetch
 −4%, pack +5-7%, −30 lines (`9a5dda4`). A zero-copy/span-backed AxisPlan
 consuming blobs in place could reach ~1.3-1.6x over build for sinc
-kernels only — below the bar for that refactor. **Verdict unchanged:
-opt-in, not a throughput feature on this host class.** Poly-kernel grids
+kernels only — below the bar for that refactor. **Measurement verdict:
+not a throughput feature on this host class.** The later product decision to
+enable it by default is about portable cross-process reuse. Poly-kernel grids
 (bicubic/bilinear/spline) build in ~1 ms per 1000 plans, so no encoding
 can ever win there; any future flip should also be filter-gated.

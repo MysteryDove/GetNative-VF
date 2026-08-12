@@ -33,6 +33,7 @@ compile_commands.json
 /app/dist/
 /app/src-tauri/target/
 /app/src-tauri/bundle-stage/
+/app/src-tauri/ffmpeg-runtime/
 
 # Local-only benchmark input. Commit its checksum/manifest, not the media frame.
 /engine/bench/fixtures/6.2-1.png
@@ -83,3 +84,4 @@ Thumbs.db
 *.user
 *.sw?
 __pycache__/
+/CMakeFiles/

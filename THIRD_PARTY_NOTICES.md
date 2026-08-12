@@ -51,10 +51,12 @@ Source: https://github.com/sekrit-twc/zimg
 
 ## FFmpeg
 
-The desktop application may distribute `ffmpeg` and `ffprobe` from FFmpeg
-8.1.2 as separate executables. They are built without GPL or nonfree
-components and are licensed under the GNU Lesser General Public License,
-version 2.1 or later.
+The desktop application may distribute `ffmpeg`, `ffprobe`, and the FFmpeg
+8.1.2 shared libraries used by the in-engine media layer. They are built
+without GPL or nonfree components and are licensed under the GNU Lesser
+General Public License, version 2.1 or later. Development builds may link a
+compatible system FFmpeg 8 installation; release artifacts use the pinned
+build described below.
 
 The packaged `share/ffmpeg/` directory contains the corresponding unmodified
 source archive, license text, and exact build configuration. The reproducible

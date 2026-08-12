@@ -9,10 +9,11 @@
   fusion adopted; large-taps CUDA per-kernel rewrite rejected — headroom
   is candidate-batched merged solves, D1.2;
   `docs/performance/e3-kernel-increments-20260808.md`), E4 (L1
-  single-flight LRU default + L2 pack store opt-in,
+  single-flight LRU default + L2 pack store default beside the engine
+  executable (overrideable in Settings),
   `docs/performance/e4-cold-plan-store-20260808.md` — hit-rate criterion
-  met; store loses to the parallel build on 16-core NVMe hosts, hence
-  opt-in), D1.2 (register-ring inverse +77-95% wide taps, 2-deep
+  met; the historical throughput result remains recorded, D1.2
+  (register-ring inverse +77-95% wide taps, 2-deep
   candidate pipeline, steady-state CUDA scan 4-10x CPU;
   `docs/performance/d12-cuda-wide-taps-and-pipeline-20260808.md`), D1.3
   (pack-into-pinned scan host path, pipeline depth 3; lanczos8 h_plus_w
