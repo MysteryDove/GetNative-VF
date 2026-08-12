@@ -18,11 +18,13 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { EngineEnvelope } from "./types";
 import type {
   AxisMode,
+  ActualBackend,
   ComputationMode,
   JobId,
   RequestId,
   RunId,
   WorkerEvent,
+  EndpointRule,
 } from "./protocol";
 
 export type FrameAssetRef = {
@@ -45,8 +47,13 @@ export type HeightJobParams = {
     threshold?: number;
     pNorm?: number;
   };
-  backend?: "cpu" | "cuda" | "auto";
+  backend?: "cpu" | "cuda" | "vulkan" | "auto";
   workerCount?: number;
+  profileId?: string;
+  endpointRule?: EndpointRule;
+  baseHeight?: string | null;
+  baseWidth?: string | null;
+  grid?: { start: string; stop: string; step: string };
 };
 
 export type KernelJobParams = {
@@ -57,15 +64,44 @@ export type KernelJobParams = {
   /** Ordered kernel list; result rows key on the decimal index into this list. */
   kernels: Array<{ id: string; b?: number; c?: number; taps?: number }>;
   metric: HeightJobParams["metric"];
-  backend?: "cpu" | "cuda" | "auto";
+  backend?: "cpu" | "cuda" | "vulkan" | "auto";
   workerCount?: number;
+  profileId?: string;
+  endpointRule?: EndpointRule;
+  baseHeight?: string | null;
+  baseWidth?: string | null;
+};
+
+export type VerifyMediaJobParams = {
+  path: string;
+  fingerprint?: string | null;
+  streamIndex: number;
+  width: number;
+  height: number;
+  selection: "all" | "decoded_i_picture" | "every_n";
+  everyN?: number | null;
+  startFrame?: number | null;
+  endFrame?: number | null;
+  axisMode: AxisMode;
+  kernel: { id: string; b?: number; c?: number; taps?: number };
+  candidate: string;
+  metric: HeightJobParams["metric"];
+  backend?: "cpu" | "cuda" | "vulkan" | "auto";
+  concurrency: number;
 };
 
 export type WorkerHello = {
   path: string;
   payload: {
     engine_version: string;
-    commands: { analyze: boolean; cancel: boolean };
+    commands: {
+      analyze: boolean;
+      cancel: boolean;
+      media_index_begin?: boolean;
+      media_frame_window?: boolean;
+      media_preview_begin?: boolean;
+      media_asset_batch_begin?: boolean;
+    };
   };
 };
 
@@ -74,6 +110,17 @@ export type SubmittedJob = {
   jobId: JobId;
   runId: RunId;
 };
+
+export type AcceptedJob = {
+  jobId: string;
+  backend?: ActualBackend;
+  device?: string;
+  workerCount?: number;
+  suggestedInFlight?: number;
+  concurrency?: number;
+};
+
+export type OnPrepared = (job: SubmittedJob) => void;
 
 type WireEvent = {
   protocol_version?: number;
@@ -92,7 +139,20 @@ type WireEvent = {
   payload?: unknown;
   worker_count?: number;
   suggested_in_flight?: number;
-  results?: Array<{ seq?: number; error?: number | null }>;
+  concurrency?: number;
+  backend?: string;
+  device?: string;
+  from?: string;
+  to?: string;
+  reason?: string;
+  frame_seq?: number;
+  results?: Array<{
+    seq?: number;
+    error?: number | null;
+    frame_index?: number;
+    pts?: number | null;
+    timestamp_seconds?: number | null;
+  }>;
 };
 
 type TrackedJob = {
@@ -100,6 +160,13 @@ type TrackedJob = {
   jobId: JobId;
   runId: RunId;
   engineJobId: string | null;
+  workerCount?: number;
+  suggestedInFlight?: number;
+  concurrency?: number;
+  acceptedBackend?: ActualBackend;
+  acceptedDevice?: string;
+  preparedAtMs: number;
+  frontendQueueMs?: number;
   finished: boolean;
   cancelRequested: boolean;
 };
@@ -171,7 +238,7 @@ export class EngineWorkerClient {
   }
 
   /** Submit one height-mode analyze job. Events stream to subscribers. */
-  async submitHeight(params: HeightJobParams): Promise<SubmittedJob> {
+  async submitHeight(params: HeightJobParams, onPrepared?: OnPrepared): Promise<SubmittedJob> {
     return this.submitAnalyze("height", {
       kernel: params.kernel,
       candidates: params.candidates,
@@ -180,11 +247,16 @@ export class EngineWorkerClient {
       metric: params.metric,
       backend: params.backend ?? "cpu",
       workerCount: params.workerCount,
-    });
+      profileId: params.profileId ?? "muf-d278cd3",
+      endpointRule: params.endpointRule ?? "inclusive",
+      baseHeight: params.baseHeight ?? null,
+      baseWidth: params.baseWidth ?? null,
+      grid: params.grid,
+    }, onPrepared);
   }
 
   /** Submit one kernel-mode analyze job (protocol v1.1): fixed geometry, ordered kernels. */
-  async submitKernel(params: KernelJobParams): Promise<SubmittedJob> {
+  async submitKernel(params: KernelJobParams, onPrepared?: OnPrepared): Promise<SubmittedJob> {
     return this.submitAnalyze("kernel", {
       kernels: params.kernels,
       candidates: [params.candidate],
@@ -193,12 +265,17 @@ export class EngineWorkerClient {
       metric: params.metric,
       backend: params.backend ?? "cpu",
       workerCount: params.workerCount,
-    });
+      profileId: params.profileId ?? "muf-d278cd3",
+      endpointRule: params.endpointRule ?? "inclusive",
+      baseHeight: params.baseHeight ?? null,
+      baseWidth: params.baseWidth ?? null,
+    }, onPrepared);
   }
 
   private async submitAnalyze(
     mode: "height" | "kernel",
     body: Record<string, unknown>,
+    onPrepared?: OnPrepared,
   ): Promise<SubmittedJob> {
     this.sequence += 1;
     const submitted: SubmittedJob = {
@@ -206,13 +283,16 @@ export class EngineWorkerClient {
       jobId: `gui-job-${this.sequence}`,
       runId: `gui-run-${this.sequence}`,
     };
-    this.jobsByRequest.set(submitted.requestId, {
+    const tracked: TrackedJob = {
       ...submitted,
       engineJobId: null,
+      preparedAtMs: Date.now(),
       finished: false,
       cancelRequested: false,
-    });
+    };
+    this.jobsByRequest.set(submitted.requestId, tracked);
     try {
+      onPrepared?.(submitted);
       await invoke("engine_worker_analyze", {
         request: {
           requestId: submitted.requestId,
@@ -221,7 +301,8 @@ export class EngineWorkerClient {
         },
       });
     } catch (error) {
-      this.jobsByRequest.delete(submitted.requestId);
+      this.emitSubmissionFailure(tracked, error);
+      this.cleanupTracked(tracked);
       throw error;
     }
     return submitted;
@@ -253,20 +334,23 @@ export class EngineWorkerClient {
     backend?: "cpu" | "auto";
     workerCount?: number;
     expectedFrames?: number;
-  }): Promise<SubmittedJob> {
+  }, onPrepared?: OnPrepared): Promise<SubmittedJob> {
     this.sequence += 1;
     const submitted: SubmittedJob = {
       requestId: `gui-req-${this.sequence}`,
       jobId: `gui-job-${this.sequence}`,
       runId: `gui-run-${this.sequence}`,
     };
-    this.jobsByRequest.set(submitted.requestId, {
+    const tracked: TrackedJob = {
       ...submitted,
       engineJobId: null,
+      preparedAtMs: Date.now(),
       finished: false,
       cancelRequested: false,
-    });
+    };
+    this.jobsByRequest.set(submitted.requestId, tracked);
     try {
+      onPrepared?.(submitted);
       await invoke("engine_worker_verify_begin", {
         request: {
           requestId: submitted.requestId,
@@ -282,16 +366,75 @@ export class EngineWorkerClient {
         },
       });
     } catch (error) {
-      this.jobsByRequest.delete(submitted.requestId);
+      this.emitSubmissionFailure(tracked, error);
+      this.cleanupTracked(tracked);
+      throw error;
+    }
+    return submitted;
+  }
+
+  /** Engine-owned media decode path. No frame producer or verifyEnd is used. */
+  async verifyMediaBegin(
+    params: VerifyMediaJobParams,
+    onPrepared?: OnPrepared,
+  ): Promise<SubmittedJob> {
+    this.sequence += 1;
+    const submitted: SubmittedJob = {
+      requestId: `gui-req-${this.sequence}`,
+      jobId: `gui-job-${this.sequence}`,
+      runId: `gui-run-${this.sequence}`,
+    };
+    const tracked: TrackedJob = {
+      ...submitted,
+      engineJobId: null,
+      preparedAtMs: Date.now(),
+      finished: false,
+      cancelRequested: false,
+    };
+    this.jobsByRequest.set(submitted.requestId, tracked);
+    try {
+      onPrepared?.(submitted);
+      await invoke("engine_worker_verify_media_begin", {
+        request: {
+          requestId: submitted.requestId,
+          path: params.path,
+          fingerprint: params.fingerprint ?? null,
+          streamIndex: params.streamIndex,
+          width: params.width,
+          height: params.height,
+          selection: params.selection,
+          everyN: params.everyN ?? null,
+          startFrame: params.startFrame ?? null,
+          endFrame: params.endFrame ?? null,
+          axisMode: params.axisMode,
+          kernel: params.kernel,
+          candidate: params.candidate,
+          metric: params.metric,
+          backend: params.backend ?? "auto",
+          concurrency: params.concurrency,
+        },
+      });
+    } catch (error) {
+      this.emitSubmissionFailure(tracked, error);
+      this.cleanupTracked(tracked);
       throw error;
     }
     return submitted;
   }
 
   /** Resolves with the engine-assigned job id once the job is accepted. */
-  waitAccepted(requestId: RequestId): Promise<string> {
+  waitAccepted(requestId: RequestId): Promise<AcceptedJob> {
     const tracked = this.jobsByRequest.get(requestId);
-    if (tracked?.engineJobId) return Promise.resolve(tracked.engineJobId);
+    if (tracked?.engineJobId) {
+      return Promise.resolve({
+        jobId: tracked.engineJobId,
+        backend: tracked.acceptedBackend,
+        device: tracked.acceptedDevice,
+        workerCount: tracked.workerCount,
+        suggestedInFlight: tracked.suggestedInFlight,
+        concurrency: tracked.concurrency,
+      });
+    }
     return new Promise((resolve, reject) => {
       this.acceptedWaiters.set(requestId, { resolve, reject });
     });
@@ -326,8 +469,36 @@ export class EngineWorkerClient {
 
   private acceptedWaiters = new Map<
     RequestId,
-    { resolve: (engineJobId: string) => void; reject: (error: Error) => void }
+    { resolve: (accepted: AcceptedJob) => void; reject: (error: Error) => void }
   >();
+
+  private emitSubmissionFailure(tracked: TrackedJob, error: unknown): void {
+    if (tracked.finished) return;
+    tracked.finished = true;
+    this.emit({
+      protocolVersion: 1,
+      requestId: tracked.requestId,
+      jobId: tracked.jobId,
+      runId: tracked.runId,
+      timestampMs: Date.now(),
+      type: "error",
+      code: "submit_failed",
+      message: error instanceof Error ? error.message : String(error),
+      retryable: true,
+    });
+  }
+
+  private cleanupTracked(tracked: TrackedJob): void {
+    this.jobsByRequest.delete(tracked.requestId);
+    if (tracked.engineJobId !== null) {
+      this.jobsByEngineId.delete(tracked.engineJobId);
+    }
+    const waiter = this.acceptedWaiters.get(tracked.requestId);
+    if (waiter) {
+      this.acceptedWaiters.delete(tracked.requestId);
+      waiter.reject(new Error("job ended before it was accepted"));
+    }
+  }
 
   private emit(event: WorkerEvent): void {
     for (const listener of this.eventListeners) {
@@ -353,23 +524,40 @@ export class EngineWorkerClient {
       return;
     }
 
+    // Media jobs are owned by media/service.ts and do not belong in the
+    // analysis Job Tray. That service correlates these same wire events by
+    // request_id and still uses the shared worker/cancel transport.
+    if (wire.mode?.startsWith("media_") || wire.request_id?.startsWith("media-req-")) return;
+
     const tracked = this.resolveTracked(wire);
     if (wire.type === "accepted" && tracked && typeof wire.job_id === "string") {
       tracked.engineJobId = wire.job_id;
+      tracked.workerCount = wire.worker_count;
+      tracked.suggestedInFlight = wire.suggested_in_flight;
+      tracked.concurrency = wire.concurrency;
+      tracked.acceptedBackend = wireBackend(wire.backend);
+      tracked.acceptedDevice = typeof wire.device === "string" ? wire.device : undefined;
+      tracked.frontendQueueMs = Math.max(0, Date.now() - tracked.preparedAtMs);
       this.jobsByEngineId.set(wire.job_id, tracked);
       const waiter = this.acceptedWaiters.get(tracked.requestId);
       if (waiter) {
         this.acceptedWaiters.delete(tracked.requestId);
-        waiter.resolve(wire.job_id);
+        waiter.resolve({
+          jobId: wire.job_id,
+          backend: wireBackend(wire.backend),
+          device: typeof wire.device === "string" ? wire.device : undefined,
+          workerCount: wire.worker_count,
+          suggestedInFlight: wire.suggested_in_flight,
+          concurrency: wire.concurrency,
+        });
       }
       if (tracked.cancelRequested) {
         void invoke("engine_worker_cancel", { jobId: wire.job_id }).catch(() => undefined);
       }
     }
-    if (
-      tracked &&
-      (wire.type === "result" || wire.type === "cancelled" || wire.type === "error")
-    ) {
+    const terminal =
+      tracked && (wire.type === "result" || wire.type === "cancelled" || wire.type === "error");
+    if (terminal) {
       tracked.finished = true;
       const waiter = this.acceptedWaiters.get(tracked.requestId);
       if (waiter) {
@@ -394,6 +582,9 @@ export class EngineWorkerClient {
           mode: wireMode(wire.mode),
           suggestedInFlight: wire.suggested_in_flight,
           workerCount: wire.worker_count,
+          concurrency: wire.concurrency,
+          backend: wireBackend(wire.backend),
+          device: typeof wire.device === "string" ? wire.device : undefined,
         });
         break;
       case "progress":
@@ -414,6 +605,9 @@ export class EngineWorkerClient {
                       : typeof entry.error === "number" && Number.isFinite(entry.error)
                         ? entry.error
                         : null,
+                  frameIndex: entry.frame_index,
+                  pts: entry.pts,
+                  timestampSeconds: entry.timestamp_seconds,
                 }))
             : undefined,
         });
@@ -424,6 +618,10 @@ export class EngineWorkerClient {
           type: "warning",
           code: wire.code ?? "internal",
           message: wire.message ?? "",
+          from: wire.from,
+          to: wire.to,
+          reason: wire.reason,
+          frameSeq: wire.frame_seq,
         });
         break;
       case "result":
@@ -431,7 +629,11 @@ export class EngineWorkerClient {
           ...base,
           type: "result",
           mode: wireMode(wire.mode),
-          payload: wire.payload,
+          payload: enrichFrontendTelemetry(
+            wire.payload,
+            tracked?.frontendQueueMs
+              ?? (tracked ? Math.max(0, Date.now() - tracked.preparedAtMs) : undefined),
+          ),
         });
         break;
       case "cancelled":
@@ -448,6 +650,9 @@ export class EngineWorkerClient {
         break;
       default:
         break;
+    }
+    if (terminal) {
+      this.cleanupTracked(tracked);
     }
   }
 
@@ -487,8 +692,28 @@ export class EngineWorkerClient {
   }
 }
 
+function enrichFrontendTelemetry(payload: unknown, frontendQueueMs: number | undefined): unknown {
+  if (frontendQueueMs === undefined || !payload || typeof payload !== "object") return payload;
+  const record = payload as Record<string, unknown>;
+  const telemetry = record.telemetry;
+  if (!telemetry || typeof telemetry !== "object" || Array.isArray(telemetry)) return payload;
+  return {
+    ...record,
+    telemetry: {
+      ...(telemetry as Record<string, unknown>),
+      frontend_queue_ms: frontendQueueMs,
+    },
+  };
+}
+
 function wireMode(mode: string | undefined): ComputationMode {
   return mode === "kernel" || mode === "verify" ? mode : "height";
+}
+
+function wireBackend(backend: string | undefined): ActualBackend | undefined {
+  return backend === "cpu" || backend === "cuda" || backend === "vulkan"
+    ? backend
+    : undefined;
 }
 
 /** Process-wide session used by the app shell and (later) the analysis pages. */

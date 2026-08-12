@@ -4,6 +4,7 @@ import {
   fixedKernelsForDraft,
   resolveHeightGrid,
   type HeightDraft,
+  validateBackendPNorm,
 } from "./heightDraft";
 import { validateHeightShape } from "./shapeGuards";
 import type { HeightAnalyzeRequest } from "./protocol";
@@ -47,7 +48,7 @@ export type HeightRunGroupPlan = {
   intentSnapshot: {
     preset: HeightDraft["preset"];
     axisMode: HeightDraft["axisMode"];
-    compareCommonKernels: boolean;
+    compareKernels: KernelRef[];
     metric: MetricSpec;
     profileId: string;
     heightGrid: CandidateGridSpec;
@@ -88,6 +89,14 @@ export function planHeightRunGroup(input: {
   const included = input.samples.filter((sample) => sample.included);
   if (included.length === 0) return { ok: false, reason: "no_samples" };
 
+  const pNorm = validateBackendPNorm(
+    input.capabilities,
+    input.draft.backendPreference,
+    input.draft.metric.pNorm,
+    input.draft.axisMode,
+  );
+  if (!pNorm.ok) return pNorm;
+
   const grid = resolveHeightGrid(input.draft);
   if (!grid.ok) return grid;
 
@@ -100,7 +109,7 @@ export function planHeightRunGroup(input: {
   const now = input.nowMs ?? Date.now();
   const baseHeight = input.draft.baseHeight?.trim() || null;
   const baseWidth = input.draft.baseWidth?.trim() || null;
-  const baseValid = (value: string | null) => value === null || /^\d+(\.\d+)?$/.test(value);
+  const baseValid = (value: string | null) => value === null || /^[1-9]\d*$/.test(value);
   if (!baseValid(baseHeight) || !baseValid(baseWidth)) {
     return { ok: false, reason: "base_invalid" };
   }
@@ -184,7 +193,7 @@ export function planHeightRunGroup(input: {
     plan: {
       groupType,
       label: multiKernel
-        ? "Compare Common Kernels / Resolution Test"
+        ? "Compare Kernels / Resolution Test"
         : multiSample
           ? "Multi-Sample Resolution Test"
           : "Resolution Test",
@@ -195,7 +204,10 @@ export function planHeightRunGroup(input: {
       intentSnapshot: {
         preset: input.draft.preset,
         axisMode: input.draft.axisMode,
-        compareCommonKernels: input.draft.compareCommonKernels,
+        compareKernels: input.draft.compareKernels.map((kernel) => ({
+          id: kernel.id,
+          parameters: { ...kernel.parameters },
+        })),
         metric: { ...input.draft.metric },
         profileId: input.draft.profileId,
         heightGrid: grid.grid,

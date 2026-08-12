@@ -1,5 +1,6 @@
 import type {
   GeometrySnapshot,
+  AxisMode,
   KernelRef,
   MathMode,
   MetricSpec,
@@ -90,6 +91,8 @@ export type RecipeStatus = "draft" | "locked" | "superseded";
 export type Recipe = {
   id: string;
   name: string;
+  /** Optional user tag appended to derived names: `WxH-kernel-suffix`. */
+  nameSuffix?: string | null;
   status: RecipeStatus;
   /** Derived view kept for the schema-1 manifest `locked` flag: status !== "draft". */
   locked: boolean;
@@ -100,6 +103,7 @@ export type Recipe = {
   geometry: GeometrySnapshot | null;
   kernel: KernelRef | null;
   metric: MetricSpec | null;
+  axisMode: AxisMode;
   profileId: string | null;
   mathMode: MathMode | null;
 };
@@ -223,6 +227,7 @@ export type ProjectManifestDto = {
   recipes: Array<{
     id: string;
     name: string;
+    name_suffix?: string | null;
     /** Legacy schema-1 flag: true for both locked and superseded Recipes. */
     locked?: boolean;
     status?: RecipeStatus;
@@ -233,6 +238,7 @@ export type ProjectManifestDto = {
     geometry?: GeometrySnapshot | null;
     kernel?: KernelRef | null;
     metric?: MetricSpec | null;
+    axis_mode?: AxisMode;
     profile_id?: string | null;
     math_mode?: MathMode | null;
   }>;

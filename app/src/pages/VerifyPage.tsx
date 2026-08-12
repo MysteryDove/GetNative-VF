@@ -1,15 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Play } from "lucide-react";
+import { ChevronDown, ChevronRight, Play } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
-import { kernelDisplayName, profileDisplayName } from "../engine/displayNames";
 import type { BackendPreference } from "../engine/protocol";
-import { activeRecipe } from "../project/recipe";
-import { selectableBackends } from "../engine/heightDraft";
+import { activateRecipeInState, activeRecipe, recipeReadiness } from "../project/recipe";
+import { RecipeSummaryStrip } from "../components/RecipeSummaryStrip";
+import { ErrorLinePlot, plotSeriesColor, type ErrorPlotDatum } from "../components/ErrorLinePlot";
+import { PERFECTLY_DESCALE_THRESHOLD } from "../components/ResultMetricTable";
+import { missingFieldLabels } from "../components/RecipeReviewDialog";
+import { backendOptionLabel, verifySelectableBackends } from "../engine/backendSelection";
 import {
   defaultVerifyDraft,
   planVerifyRunGroup,
   verificationRuns,
+  validVerifyConcurrency,
   type VerifyDraft,
 } from "../engine/verifyPlan";
 import { startVerifyRunGroup, type VerifyFrameEntry } from "../engine/executeVerify";
@@ -65,6 +69,31 @@ export function VerifyPage({
   const [liveFrames, setLiveFrames] = useState<Record<string, VerifyFrameEntry[]>>({});
   const [reviewThreshold, setReviewThreshold] = useState("");
   const [topN, setTopN] = useState("20");
+  const [logDisplay, setLogDisplay] = useState(true);
+  /** Hidden runs stay in the project but leave the overlay plot. */
+  const [hiddenRunIds, setHiddenRunIds] = useState<Set<string>>(new Set());
+  /** Drag-zoomed frame range on the plot; null = full view. */
+  const [zoomRange, setZoomRange] = useState<{ xMin: number; xMax: number } | null>(null);
+  /** Result tables default to collapsed; the plot owns the main area. */
+  const [expandedRunIds, setExpandedRunIds] = useState<Set<string>>(new Set());
+
+  function toggleRunExpanded(runId: string) {
+    setExpandedRunIds((current) => {
+      const next = new Set(current);
+      if (next.has(runId)) next.delete(runId);
+      else next.add(runId);
+      return next;
+    });
+  }
+
+  function toggleRunVisible(runId: string) {
+    setHiddenRunIds((current) => {
+      const next = new Set(current);
+      if (next.has(runId)) next.delete(runId);
+      else next.add(runId);
+      return next;
+    });
+  }
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
@@ -74,6 +103,14 @@ export function VerifyPage({
   }, []);
 
   const recipe = activeRecipe(state);
+  const recipeOptions = useMemo(
+    () =>
+      Object.values(state.recipesById).sort((a, b) =>
+        b.updatedAt.localeCompare(a.updatedAt),
+      ),
+    [state.recipesById],
+  );
+  const recipeGaps = recipe ? recipeReadiness(recipe) : null;
   const readyVideos = useMemo(
     () =>
       Object.values(state.sourcesById).filter(
@@ -93,6 +130,64 @@ export function VerifyPage({
   }, [draft, recipe, state.sourcesById]);
 
   const runs = useMemo(() => verificationRuns(state), [state]);
+  const concurrencyCapability = capabilities?.payload.features?.media_verify_concurrency;
+  const concurrencyMin = concurrencyCapability?.min ?? 1;
+  const concurrencyMax = concurrencyCapability?.max ?? 8;
+  const concurrencyInvalid = !validVerifyConcurrency(draft.concurrency);
+
+  /** Stable per-run colors (indexed over all runs, not the filtered view). */
+  const runColorById = useMemo(
+    () => new Map(runs.map((run, index) => [run.id, plotSeriesColor(index)])),
+    [runs],
+  );
+  const runLabelById = useMemo(
+    () =>
+      new Map(
+        runs.map((run) => {
+          const source = run.sourceId ? state.sourcesById[run.sourceId] : null;
+          const snapshot = run.inputSnapshot as { recipeId?: string } | null;
+          const recipeName = snapshot?.recipeId
+            ? state.recipesById[snapshot.recipeId]?.name
+            : null;
+          const sourceLabel = source?.label || source?.path || run.sourceId || run.id;
+          return [run.id, recipeName ? `${sourceLabel} · ${recipeName}` : sourceLabel];
+        }),
+      ),
+    [runs, state.sourcesById, state.recipesById],
+  );
+  const plotData = useMemo<ErrorPlotDatum[]>(
+    () =>
+      runs
+        .filter((run) => !hiddenRunIds.has(run.id))
+        .flatMap((run) =>
+          (storedVerifyFrames(run) ?? liveFrames[run.id] ?? [])
+            .filter((frame) => frame.error !== null)
+            .map((frame) => ({
+              key: `${run.id}-${frame.frameIndex}`,
+              runId: run.id,
+              x: String(frame.frameIndex),
+              metric: frame.error as number,
+              color: runColorById.get(run.id) ?? "#3b82f6",
+              label: runLabelById.get(run.id),
+            })),
+        ),
+    [runs, hiddenRunIds, liveFrames, runColorById, runLabelById],
+  );
+
+  /** Highest-error frame inside the zoomed range, across visible runs. */
+  const rangeWorst = useMemo(() => {
+    if (!zoomRange) return null;
+    let worst: { run: Run; frame: VerifyFrameEntry } | null = null;
+    for (const run of runs) {
+      if (hiddenRunIds.has(run.id)) continue;
+      for (const frame of storedVerifyFrames(run) ?? liveFrames[run.id] ?? []) {
+        if (frame.error === null) continue;
+        if (frame.frameIndex < zoomRange.xMin || frame.frameIndex > zoomRange.xMax) continue;
+        if (!worst || frame.error > (worst.frame.error as number)) worst = { run, frame };
+      }
+    }
+    return worst;
+  }, [zoomRange, runs, hiddenRunIds, liveFrames]);
 
   function patch(partial: Partial<VerifyDraft>) {
     setDraft((current) => ({ ...current, ...partial }));
@@ -107,15 +202,28 @@ export function VerifyPage({
     }));
   }
 
+  function changeActiveRecipe(recipeId: string) {
+    onProjectChange((current) => {
+      const result = activateRecipeInState(current, recipeId);
+      return result.ok ? result.state : current;
+    });
+  }
+
   const startBlockedReason = !analyzeAvailable
     ? t("verify.blocked.noCommand")
     : !recipe
       ? t("verify.blocked.noRecipe")
-      : draft.sourceIds.length === 0
-        ? t("verify.blocked.noSources")
-        : !plan
-          ? t("verify.blocked.invalidPlan")
-          : null;
+      : recipeGaps && !recipeGaps.ok
+        ? t("verify.blocked.incomplete", {
+            missing: missingFieldLabels(t, recipeGaps.missing),
+          })
+        : draft.sourceIds.length === 0
+          ? t("verify.blocked.noSources")
+          : concurrencyInvalid
+            ? t("verify.blocked.concurrency")
+          : !plan
+            ? t("verify.blocked.invalidPlan")
+            : null;
 
   const canStart = analyzeAvailable && plan !== null && !submitting;
 
@@ -130,6 +238,9 @@ export function VerifyPage({
         state,
         onProjectChange,
         bridge: executionBridge,
+        verifyFrameRing: capabilities?.payload.features?.verify_frame_ring === true,
+        verifyEngineDecode:
+          capabilities?.payload.features?.verify_engine_decode === true,
         onFrames: (runId, entries) => {
           if (!mounted.current) return;
           setLiveFrames((current) => ({
@@ -206,41 +317,48 @@ export function VerifyPage({
 
       <section className="page-section verify-recipe-strip">
         <h3>{t("verify.activeRecipe")}</h3>
-        {recipe ? (
-          <div className="dense-table">
-            <div className="dense-row">
-              <strong>
-                {recipe.name}
-                <span className="recipe-badge active">{t("recipe.active")}</span>
-              </strong>
-              <span>
-                {t("recipe.revision", { revision: recipe.revision })}
-                {recipe.geometry
-                  ? ` · ${recipe.geometry.canvasWidth}×${recipe.geometry.canvasHeight}`
-                  : ""}
-                {recipe.kernel?.id ? ` · ${kernelDisplayName(t, recipe.kernel.id)}` : ""}
-                {recipe.profileId ? ` · ${profileDisplayName(t, recipe.profileId)}` : ""}
-                {recipe.mathMode ? ` · ${recipe.mathMode}` : ""}
-                {recipe.metric
-                  ? ` · ${t("analyze.pixelExclusion")} ${recipe.metric.pixelExclusionThreshold}`
-                  : ""}
-              </span>
-            </div>
-            <p className="help-copy">{t("verify.recipeReadOnly")}</p>
+        {recipeOptions.length > 0 ? (
+          <div className="verify-current-row">
+            <select
+              aria-label={t("verify.selectRecipe")}
+              value={state.project.activeRecipeId ?? ""}
+              onChange={(event) => {
+                if (event.target.value) changeActiveRecipe(event.target.value);
+              }}
+            >
+              {!state.project.activeRecipeId ? (
+                <option value="" disabled>
+                  —
+                </option>
+              ) : null}
+              {recipeOptions.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name} · {t("recipe.revision", { revision: item.revision })}
+                </option>
+              ))}
+            </select>
+            <RecipeSummaryStrip
+              t={t}
+              recipe={recipe}
+              activeRecipeId={state.project.activeRecipeId}
+              emptyLabel={t("verify.noActiveRecipe")}
+            />
           </div>
         ) : (
-          <div className="empty-inline">
-            <p>{t("verify.noActiveRecipe")}</p>
-            <button className="secondary-button" type="button" onClick={() => onNavigate("overview")}>
-              {t("verify.changeRecipe")}
-            </button>
-          </div>
+          <>
+            <RecipeSummaryStrip
+              t={t}
+              recipe={recipe}
+              activeRecipeId={state.project.activeRecipeId}
+              emptyLabel={t("verify.noActiveRecipe")}
+            />
+            <div className="empty-inline">
+              <button className="secondary-button" type="button" onClick={() => onNavigate("analyze")}>
+                {t("nav.analyze")}
+              </button>
+            </div>
+          </>
         )}
-        {recipe ? (
-          <button className="link-button" type="button" onClick={() => onNavigate("overview")}>
-            {t("verify.changeRecipe")}
-          </button>
-        ) : null}
       </section>
 
       <div className="analyze-layout">
@@ -257,22 +375,24 @@ export function VerifyPage({
             <ul className="analyze-sample-list">
               {readyVideos.map((source) => (
                 <li key={source.id}>
-                  <label className="checkbox-row">
-                    <input
-                      type="checkbox"
-                      checked={draft.sourceIds.includes(source.id)}
-                      onChange={() => toggleSource(source.id)}
-                    />
+                  <input
+                    type="checkbox"
+                    className="sample-check"
+                    checked={draft.sourceIds.includes(source.id)}
+                    aria-label={source.label || source.path}
+                    onChange={() => toggleSource(source.id)}
+                  />
+                  <div>
+                    <strong>{source.label || source.path}</strong>
                     <span>
-                      {source.label || source.path}
                       {source.width && source.height
-                        ? ` · ${source.width}×${source.height}`
+                        ? `${source.width}×${source.height}`
                         : ""}
                       {source.durationSeconds != null
                         ? ` · ${source.durationSeconds.toFixed(1)}s`
                         : ""}
                     </span>
-                  </label>
+                  </div>
                 </li>
               ))}
             </ul>
@@ -304,6 +424,14 @@ export function VerifyPage({
         <section className="analyze-plot pane">
           <div className="analyze-table-toolbar">
             <h3>{t("verify.reviewTitle")}</h3>
+            <label className="series-visibility">
+              <input
+                type="checkbox"
+                checked={logDisplay}
+                onChange={(event) => setLogDisplay(event.target.checked)}
+              />
+              <span>{t("analyze.logDisplay")}</span>
+            </label>
             <label className="block verify-filter">
               <span>{t("verify.reviewThreshold")}</span>
               <input
@@ -320,51 +448,113 @@ export function VerifyPage({
               />
             </label>
           </div>
-          <p className="help-copy">{t("verify.reviewFilterHint")}</p>
-          {notice ? <p className="help-copy">{notice}</p> : null}
+          {runs.length > 1 ? (
+            <div className="plot-legend">
+              {runs.map((run) => (
+                <label key={run.id} className="plot-legend-item">
+                  <input
+                    type="checkbox"
+                    checked={!hiddenRunIds.has(run.id)}
+                    onChange={() => toggleRunVisible(run.id)}
+                  />
+                  <span className="swatch" style={{ background: runColorById.get(run.id) }} />
+                  <span>{runLabelById.get(run.id)}</span>
+                </label>
+              ))}
+            </div>
+          ) : null}
           {runs.length === 0 ? (
             <p className="empty-copy">{t("verify.noRuns")}</p>
           ) : (
-            runs.map((run) => (
-              <VerifyRunReview
-                key={run.id}
-                t={t}
-                run={run}
-                state={state}
-                live={liveFrames[run.id] ?? null}
-                threshold={reviewThreshold}
-                topN={topN}
-                onAddFrame={(entry) => addFrameToSamples(run, entry)}
-              />
-            ))
+            <div className="analyze-plot-host">
+              {plotData.length ? (
+                <ErrorLinePlot
+                  data={plotData}
+                  logScale={logDisplay}
+                  threshold={PERFECTLY_DESCALE_THRESHOLD}
+                  title={t("verify.plotTitle")}
+                  xAxisLabel={t("verify.col.frame")}
+                  yAxisLabel={t("analyze.axisRelativeError")}
+                  thresholdLabel={t("analyze.perfectThreshold")}
+                  resetLabel={t("plot.resetZoom")}
+                  onZoomRangeChange={setZoomRange}
+                />
+              ) : (
+                <p className="empty-copy">{t("verify.noFramesAbove")}</p>
+              )}
+            </div>
           )}
+          {zoomRange ? (
+            <div className="verify-range-bar">
+              <span className="help-copy">
+                {t("verify.zoomRange", {
+                  from: String(Math.round(zoomRange.xMin)),
+                  to: String(Math.round(zoomRange.xMax)),
+                })}
+                {rangeWorst
+                  ? ` · ${t("verify.zoomWorstFrame", {
+                      frame: String(rangeWorst.frame.frameIndex),
+                      error: (rangeWorst.frame.error as number).toExponential(2),
+                    })}`
+                  : ""}
+              </span>
+              {rangeWorst ? (
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => addFrameToSamples(rangeWorst.run, rangeWorst.frame)}
+                >
+                  {t("verify.addToSamples")}
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+          <p className="help-copy">{t("verify.reviewFilterHint")}</p>
+          {notice ? <p className="help-copy">{notice}</p> : null}
+          {runs.map((run) => (
+            <VerifyRunReview
+              key={run.id}
+              t={t}
+              run={run}
+              state={state}
+              live={liveFrames[run.id] ?? null}
+              threshold={reviewThreshold}
+              topN={topN}
+              expanded={expandedRunIds.has(run.id)}
+              onToggleExpanded={() => toggleRunExpanded(run.id)}
+              onAddFrame={(entry) => addFrameToSamples(run, entry)}
+            />
+          ))}
         </section>
 
         <aside className="analyze-params pane">
           <h3>{t("verify.setupTitle")}</h3>
 
-          <fieldset className={`metric-fieldset scope-${draft.scopeKind}`}>
+          <fieldset className="metric-fieldset">
             <legend>{t("verify.scope")}</legend>
-            <label className={`checkbox-row scope-option scope-full ${draft.scopeKind === "full" ? "active" : ""}`}>
-              <input
-                type="radio"
-                name="verify-scope"
-                checked={draft.scopeKind === "full"}
-                onChange={() => patch({ scopeKind: "full" })}
-              />
-              <span>{t("verify.scopeFull")}</span>
-            </label>
-            <p className="help-copy">{t("verify.scopeFullHint")}</p>
-            <label className={`checkbox-row scope-option scope-preview ${draft.scopeKind === "preview" ? "active" : ""}`}>
-              <input
-                type="radio"
-                name="verify-scope"
-                checked={draft.scopeKind === "preview"}
-                onChange={() => patch({ scopeKind: "preview" })}
-              />
-              <span>{t("verify.scopePreview")}</span>
-            </label>
-            <p className="help-copy">{t("verify.scopePreviewHint")}</p>
+            <div className="button-radio" role="radiogroup" aria-label={t("verify.scope")}>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={draft.scopeKind === "preview"}
+                className={draft.scopeKind === "preview" ? "active" : ""}
+                onClick={() => patch({ scopeKind: "preview" })}
+              >
+                {t("verify.scopePreview")}
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={draft.scopeKind === "full"}
+                className={draft.scopeKind === "full" ? "active" : ""}
+                onClick={() => patch({ scopeKind: "full" })}
+              >
+                {t("verify.scopeFull")}
+              </button>
+            </div>
+            <p className="help-copy">
+              {t(draft.scopeKind === "preview" ? "verify.scopePreviewHint" : "verify.scopeFullHint")}
+            </p>
             {draft.scopeKind === "preview" ? (
               <>
                 <label className="block">
@@ -417,19 +607,47 @@ export function VerifyPage({
           <label className="block">
             <span>{t("analyze.backend")}</span>
             <select
+              className="backend-select"
               value={draft.backendPreference}
+              title={backendOptionLabel(
+                t,
+                draft.backendPreference,
+                capabilities,
+                recipe?.metric?.pNorm ?? 1,
+                undefined,
+                capabilities?.payload.features?.verify_engine_decode !== true,
+              )}
               onChange={(event) =>
                 patch({ backendPreference: event.target.value as BackendPreference })
               }
             >
-              {selectableBackends(capabilities).map((backend) => (
+              {verifySelectableBackends(capabilities).map((backend) => (
                 <option key={backend} value={backend}>
-                  {backend === "auto"
-                    ? t("analyze.backend.auto")
-                    : t(`backend.${backend}` as "backend.cpu")}
+                  {backendOptionLabel(t, backend, capabilities, 1, undefined, true)}
                 </option>
               ))}
             </select>
+          </label>
+
+          <label className="block">
+            <span>{t("verify.concurrency")}</span>
+            <input
+              type="number"
+              min={concurrencyMin}
+              max={concurrencyMax}
+              step={1}
+              value={draft.concurrency}
+              aria-invalid={concurrencyInvalid}
+              onChange={(event) => patch({ concurrency: Number(event.target.value) })}
+            />
+            {concurrencyInvalid ? (
+              <small className="field-error">
+                {t("verify.concurrencyInvalid", {
+                  min: String(concurrencyMin),
+                  max: String(concurrencyMax),
+                })}
+              </small>
+            ) : null}
           </label>
 
           <div className="analyze-run-block">
@@ -461,6 +679,8 @@ function VerifyRunReview({
   live,
   threshold,
   topN,
+  expanded,
+  onToggleExpanded,
   onAddFrame,
 }: {
   t: Translator;
@@ -469,6 +689,8 @@ function VerifyRunReview({
   live: VerifyFrameEntry[] | null;
   threshold: string;
   topN: string;
+  expanded: boolean;
+  onToggleExpanded: () => void;
   onAddFrame: (entry: VerifyFrameEntry) => void;
 }) {
   const stored = useMemo(() => storedVerifyFrames(run), [run]);
@@ -486,96 +708,100 @@ function VerifyRunReview({
     return [...above].sort((a, b) => (b.error as number) - (a.error as number)).slice(0, limit);
   }, [frames, threshold, topN]);
 
-  const timeline = useMemo(() => bucketTimeline(frames, 240), [frames]);
   const coverage =
     run.total > 0 ? `${Math.min(run.completed, run.total)}/${run.total}` : `${run.completed}`;
+  const concurrency = verifyRunConcurrency(run);
 
   return (
     <div className="verify-run-block">
-      <div className="dense-row">
-        <strong>{source?.label || source?.path || run.sourceId || "—"}</strong>
-        <span>
+      <button
+        type="button"
+        className="analyze-table-toggle"
+        aria-expanded={expanded}
+        onClick={onToggleExpanded}
+      >
+        {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        <span>{source?.label || source?.path || run.sourceId || "—"}</span>
+        <span className="analyze-table-count">{filtered.length}</span>
+        <span className="help-copy">
           {run.status}
           {" · "}
           {t("verify.col.coverage")} {coverage}
           {frames.length ? ` · ${t("verify.frameMetrics", { count: String(frames.length) })}` : ""}
+          {concurrency
+            ? ` · ${t("verify.concurrencyTelemetry", {
+                concurrency: String(concurrency.effective),
+                inflight: concurrency.maxInflight == null
+                  ? "-"
+                  : String(concurrency.maxInflight),
+              })}`
+            : ""}
         </span>
-      </div>
+      </button>
 
-      {timeline.length ? (
-        <div className="verify-timeline" aria-label={t("verify.timeline")}>
-          {timeline.map((bucket, index) => (
-            <div
-              key={index}
-              className="verify-timeline-bar"
-              style={{ height: `${Math.max(3, bucket.normalized * 100)}%` }}
-              title={`#${bucket.frameIndex}: ${bucket.error?.toPrecision(3) ?? "—"}`}
-            />
-          ))}
-        </div>
-      ) : null}
-
-      {filtered.length ? (
-        <div className="result-table" role="table" aria-label={t("verify.reviewTable")}>
-          <div className="result-table-head" role="row">
-            <span role="columnheader">{t("verify.col.frame")}</span>
-            <span role="columnheader">{t("verify.col.time")}</span>
-            <span role="columnheader">{t("verify.col.error")}</span>
-            <span role="columnheader" />
-          </div>
-          {filtered.map((frame) => (
-            <div className="result-table-row" role="row" key={frame.seq}>
-              <span role="cell">#{frame.frameIndex}</span>
-              <span role="cell">
-                {frame.timestampSeconds != null ? `${frame.timestampSeconds.toFixed(3)}s` : "—"}
-              </span>
-              <span role="cell">{frame.error != null ? frame.error.toPrecision(6) : "—"}</span>
-              <span role="cell">
-                <button
-                  className="link-button"
-                  type="button"
-                  onClick={() => onAddFrame(frame)}
-                >
-                  {t("verify.addToSamples")}
-                </button>
-              </span>
+      {expanded ? (
+        filtered.length ? (
+          <div className="result-table" role="table" aria-label={t("verify.reviewTable")}>
+            <div className="result-table-head" role="row">
+              <span role="columnheader">{t("verify.col.frame")}</span>
+              <span role="columnheader">{t("verify.col.time")}</span>
+              <span role="columnheader">{t("verify.col.error")}</span>
+              <span role="columnheader" />
             </div>
-          ))}
-        </div>
-      ) : (
-        <p className="help-copy">{frames.length ? t("verify.noFramesAbove") : null}</p>
-      )}
+            {filtered.map((frame) => (
+              <div className="result-table-row" role="row" key={frame.seq}>
+                <span role="cell">#{frame.frameIndex}</span>
+                <span role="cell">
+                  {frame.timestampSeconds != null ? `${frame.timestampSeconds.toFixed(3)}s` : "—"}
+                </span>
+                <span role="cell">{frame.error != null ? frame.error.toPrecision(6) : "—"}</span>
+                <span role="cell">
+                  <button
+                    className="link-button"
+                    type="button"
+                    onClick={() => onAddFrame(frame)}
+                  >
+                    {t("verify.addToSamples")}
+                  </button>
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="help-copy">{frames.length ? t("verify.noFramesAbove") : null}</p>
+        )
+      ) : null}
     </div>
   );
 }
 
-/** Bucket many frames into a bounded timeline; each bucket keeps its max-error frame. */
-function bucketTimeline(
-  frames: VerifyFrameEntry[],
-  maxBuckets: number,
-): Array<{ frameIndex: number; error: number | null; normalized: number }> {
-  const valid = frames.filter((frame) => frame.error !== null);
-  if (!valid.length) return [];
-  const sorted = [...valid].sort((a, b) => a.frameIndex - b.frameIndex);
-  const buckets: Array<{ frameIndex: number; error: number | null }> = [];
-  if (sorted.length <= maxBuckets) {
-    buckets.push(...sorted.map((frame) => ({ frameIndex: frame.frameIndex, error: frame.error })));
-  } else {
-    const perBucket = Math.ceil(sorted.length / maxBuckets);
-    for (let i = 0; i < sorted.length; i += perBucket) {
-      const slice = sorted.slice(i, i + perBucket);
-      const worst = slice.reduce((a, b) => ((b.error as number) > (a.error as number) ? b : a));
-      buckets.push({ frameIndex: worst.frameIndex, error: worst.error });
+function verifyRunConcurrency(
+  run: Run,
+): { effective: number; maxInflight: number | null } | null {
+  const result = run.result && typeof run.result === "object"
+    ? run.result as Record<string, unknown>
+    : null;
+  const telemetry = result?.telemetry;
+  if (telemetry && typeof telemetry === "object" && !Array.isArray(telemetry)) {
+    const values = telemetry as Record<string, unknown>;
+    const effective = Number(values.effective_concurrency);
+    const maxInflight = Number(values.max_inflight);
+    if (Number.isInteger(effective) && effective >= 1) {
+      return {
+        effective,
+        maxInflight: Number.isInteger(maxInflight) && maxInflight >= 0
+          ? maxInflight
+          : null,
+      };
     }
   }
-  const maxLog = Math.max(
-    1e-12,
-    ...buckets.map((bucket) => Math.abs(Math.log10((bucket.error as number) + 1e-9))),
-  );
-  return buckets.map((bucket) => ({
-    ...bucket,
-    normalized: Math.abs(Math.log10((bucket.error as number) + 1e-9)) / maxLog,
-  }));
+  const snapshot = run.inputSnapshot && typeof run.inputSnapshot === "object"
+    ? run.inputSnapshot as Record<string, unknown>
+    : null;
+  const requested = Number(snapshot?.concurrency);
+  return Number.isInteger(requested) && requested >= 1
+    ? { effective: requested, maxInflight: null }
+    : null;
 }
 
 function scopeLabel(t: Translator, selection: string): string {

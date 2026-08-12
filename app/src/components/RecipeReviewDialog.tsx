@@ -1,10 +1,10 @@
-import { Lock, X } from "lucide-react";
+import { X } from "lucide-react";
 import type { Translator } from "../i18n";
 import { kernelDisplayName, profileDisplayName } from "../engine/displayNames";
-import { recipeLockReadiness } from "../project/recipe";
+import { recipeReadiness } from "../project/recipe";
 import type { Recipe } from "../project/types";
 
-const MISSING_LABEL_KEYS = {
+export const MISSING_LABEL_KEYS = {
   name: "recipe.missing.name",
   geometry: "recipe.missing.geometry",
   kernel: "recipe.missing.kernel",
@@ -14,30 +14,36 @@ const MISSING_LABEL_KEYS = {
   math_mode: "recipe.missing.mathMode",
 } as const;
 
+/** Localize a `recipeReadiness` missing-code list for notices/dialogs. */
+export function missingFieldLabels(t: Translator, missing: string[]): string {
+  return missing
+    .map((field) =>
+      t(MISSING_LABEL_KEYS[field as keyof typeof MISSING_LABEL_KEYS] ?? "recipe.fieldMissing"),
+    )
+    .join(" · ");
+}
+
 /**
- * Recipe Review: the full semantic summary is inspected before locking.
- * Locking makes the Recipe immutable; activation stays a separate explicit
- * action. Which MetricSpec the Recipe owns is decided upstream by explicit
- * apply actions (Resolution Test by default, or the diverged Algorithm Test
- * MetricSpec via its own explicit command) — this dialog shows the result.
+ * Recipe detail: the full semantic summary of one Recipe, including any
+ * missing fields that would block whole-video Verification. Which MetricSpec
+ * the Recipe owns is decided upstream by explicit apply actions (Resolution
+ * Test by default, or the diverged Algorithm Test MetricSpec via its own
+ * explicit command) — this dialog shows the result.
  */
 export function RecipeReviewDialog({
   t,
   recipe,
+  isActive,
   onClose,
-  onRename,
-  onLock,
-  onActivate,
+  onSetActive,
 }: {
   t: Translator;
   recipe: Recipe;
+  isActive: boolean;
   onClose: () => void;
-  onRename: (name: string) => void;
-  onLock: () => void;
-  onActivate: () => void;
+  onSetActive: () => void;
 }) {
-  const readiness = recipeLockReadiness(recipe);
-  const canLock = recipe.status === "draft" && readiness.ok;
+  const readiness = recipeReadiness(recipe);
 
   return (
     <div className="modal-backdrop" role="presentation" onClick={onClose}>
@@ -55,19 +61,9 @@ export function RecipeReviewDialog({
           </button>
         </div>
 
-        {recipe.status === "draft" ? (
-          <label className="block">
-            <span>{t("recipe.name")}</span>
-            <input
-              value={recipe.name}
-              onChange={(event) => onRename(event.target.value)}
-            />
-          </label>
-        ) : (
-          <p>
-            <strong>{recipe.name}</strong>
-          </p>
-        )}
+        <p>
+          <strong>{recipe.name}</strong>
+        </p>
 
         <div className="dense-table recipe-summary">
           <div className="dense-row">
@@ -130,29 +126,15 @@ export function RecipeReviewDialog({
         ) : null}
 
         <div className="modal-actions">
-          {recipe.status === "draft" ? (
-            <button
-              className="primary-button"
-              type="button"
-              disabled={!canLock}
-              onClick={onLock}
-            >
-              <Lock size={15} />
-              {t("recipe.lock")}
-            </button>
-          ) : null}
-          {recipe.status === "locked" ? (
-            <button className="primary-button" type="button" onClick={onActivate}>
-              {t("recipe.activate")}
+          {!isActive ? (
+            <button className="primary-button" type="button" onClick={onSetActive}>
+              {t("recipe.setActive")}
             </button>
           ) : null}
           <button className="secondary-button" type="button" onClick={onClose}>
             {t("common.close")}
           </button>
         </div>
-        {recipe.status === "draft" ? (
-          <p className="help-copy">{t("recipe.lockHint")}</p>
-        ) : null}
       </div>
     </div>
   );

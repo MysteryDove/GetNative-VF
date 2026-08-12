@@ -7,11 +7,11 @@ import {
 } from "./verifyPlan";
 import type { Recipe, Source } from "../project/types";
 
-const lockedRecipe: Recipe = {
+const completeRecipe: Recipe = {
   id: "recipe_1",
   name: "Bicubic 720p",
-  status: "locked",
-  locked: true,
+  status: "draft",
+  locked: false,
   revision: 3,
   parentRecipeId: null,
   createdAt: "2026-08-01T00:00:00Z",
@@ -39,6 +39,7 @@ const lockedRecipe: Recipe = {
     pixelExclusionThreshold: 0.015,
     pNorm: 1,
   },
+  axisMode: "h_only",
   profileId: "muf-d278cd3",
   mathMode: "raw",
 };
@@ -56,13 +57,16 @@ const video: Source = {
 };
 
 describe("resolveScanScope", () => {
+  it("defaults media verification concurrency to two", () => {
+    expect(defaultVerifyDraft().concurrency).toBe(2);
+  });
   it("builds a full-scan scope and validates ranges", () => {
-    const full = resolveScanScope(defaultVerifyDraft(), 0);
+    const full = resolveScanScope({ ...defaultVerifyDraft(), scopeKind: "full" }, 0);
     expect(full.ok).toBe(true);
     if (full.ok) expect(full.scope.selection).toBe("all");
 
     const bad = resolveScanScope(
-      { ...defaultVerifyDraft(), startFrame: "100", endFrame: "10" },
+      { ...defaultVerifyDraft(), scopeKind: "full", startFrame: "100", endFrame: "10" },
       0,
     );
     expect(bad.ok).toBe(false);
@@ -100,10 +104,10 @@ describe("resolveScanScope", () => {
 
 describe("planVerifyRunGroup", () => {
   it("creates one member VerificationRun per source with the recipe snapshot", () => {
-    const draft = { ...defaultVerifyDraft(), sourceIds: ["src_1"] };
+    const draft = { ...defaultVerifyDraft(), scopeKind: "full" as const, sourceIds: ["src_1"] };
     const result = planVerifyRunGroup({
       draft,
-      recipe: lockedRecipe,
+      recipe: completeRecipe,
       sourcesById: { src_1: video },
       nowMs: 7,
       requestIdPrefix: "t",
@@ -116,21 +120,43 @@ describe("planVerifyRunGroup", () => {
     expect(member?.request.recipeRevision).toBe(3);
     expect(member?.request.kernel.id).toBe("bicubic");
     expect(member?.request.scanScope.selection).toBe("all");
+    expect(member?.request.concurrency).toBe(2);
+    expect(result.plan.intentSnapshot.concurrency).toBe(2);
   });
 
-  it("rejects draft recipes, missing sources, and non-video sources", () => {
+  it("accepts only integer concurrency values from one through eight", () => {
+    for (const concurrency of [1, 2, 4, 8]) {
+      const result = planVerifyRunGroup({
+        draft: { ...defaultVerifyDraft(), sourceIds: ["src_1"], concurrency },
+        recipe: completeRecipe,
+        sourcesById: { src_1: video },
+      });
+      expect(result.ok).toBe(true);
+    }
+    for (const concurrency of [0, 9, -1, 1.5, Number.NaN]) {
+      const result = planVerifyRunGroup({
+        draft: { ...defaultVerifyDraft(), sourceIds: ["src_1"], concurrency },
+        recipe: completeRecipe,
+        sourcesById: { src_1: video },
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toBe("verify_concurrency_invalid");
+    }
+  });
+
+  it("rejects incomplete recipes, missing sources, and non-video sources", () => {
     const draft = { ...defaultVerifyDraft(), sourceIds: ["src_1"] };
-    const draftRecipe = planVerifyRunGroup({
+    const incomplete = planVerifyRunGroup({
       draft,
-      recipe: { ...lockedRecipe, status: "draft", locked: false },
+      recipe: { ...completeRecipe, kernel: null },
       sourcesById: { src_1: video },
     });
-    expect(draftRecipe.ok).toBe(false);
-    if (!draftRecipe.ok) expect(draftRecipe.reason).toBe("recipe_not_locked");
+    expect(incomplete.ok).toBe(false);
+    if (!incomplete.ok) expect(incomplete.reason).toBe("recipe_incomplete");
 
     const noSources = planVerifyRunGroup({
       draft: { ...draft, sourceIds: [] },
-      recipe: lockedRecipe,
+      recipe: completeRecipe,
       sourcesById: { src_1: video },
     });
     expect(noSources.ok).toBe(false);
@@ -138,7 +164,7 @@ describe("planVerifyRunGroup", () => {
 
     const still = planVerifyRunGroup({
       draft,
-      recipe: lockedRecipe,
+      recipe: completeRecipe,
       sourcesById: { src_1: { ...video, kind: "still" } },
     });
     expect(still.ok).toBe(false);

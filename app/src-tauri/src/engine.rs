@@ -24,6 +24,14 @@ struct CommandCapabilities {
     capabilities: bool,
     geometry: bool,
     analyze: bool,
+    #[serde(default)]
+    media_index_begin: bool,
+    #[serde(default)]
+    media_frame_window: bool,
+    #[serde(default)]
+    media_preview_begin: bool,
+    #[serde(default)]
+    media_asset_batch_begin: bool,
 }
 
 #[derive(Deserialize)]
@@ -53,6 +61,8 @@ struct PNormRange {
     maximum: u64,
 }
 
+const CUDA_MAXIMUM_P_NORM: u64 = 4;
+
 #[derive(Deserialize)]
 struct BackendCapability {
     id: String,
@@ -63,6 +73,12 @@ struct BackendCapability {
     p_norms: Option<PNormRange>,
     max_half_bandwidth: Option<u32>,
     max_forward_width: Option<u32>,
+    #[serde(default)]
+    device: Option<String>,
+    #[serde(default)]
+    device_type: Option<String>,
+    #[serde(default)]
+    auto_priority: Option<u32>,
     #[serde(default)]
     compiled_isa: Option<Vec<String>>,
     #[serde(default)]
@@ -82,7 +98,54 @@ struct BackendCapability {
 #[derive(Deserialize)]
 struct ProfileCapability {
     id: String,
+    grid_semantics: String,
+    default_grid: ProfileGridCapability,
+    default_axis_mode: String,
     default_crop: u32,
+    default_threshold: f64,
+    threshold_comparison: String,
+    default_kernel: ProfileKernelCapability,
+}
+
+#[derive(Deserialize)]
+struct ProfileGridCapability {
+    start: String,
+    stop: String,
+    step: String,
+    endpoint_rule: String,
+}
+
+#[derive(Deserialize)]
+struct ProfileKernelCapability {
+    id: String,
+    b: f64,
+    c: f64,
+    taps: u32,
+}
+
+#[derive(Deserialize, Default)]
+struct FeatureCapabilities {
+    #[serde(default)]
+    verify_engine_decode: bool,
+}
+
+#[derive(Deserialize)]
+struct DecodeBackendCapability {
+    id: String,
+    compiled: bool,
+    runtime_device: bool,
+    codecs: Vec<String>,
+    zero_copy: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MediaCapability {
+    available: bool,
+    ffmpeg_abi: Option<String>,
+    index_version: Option<u32>,
+    index_format: String,
 }
 
 #[derive(Deserialize)]
@@ -93,6 +156,12 @@ struct EngineCapabilities {
     kernels: Vec<KernelCapability>,
     backends: Vec<BackendCapability>,
     profiles: Vec<ProfileCapability>,
+    #[serde(default)]
+    features: FeatureCapabilities,
+    #[serde(default)]
+    decode_backends: Vec<DecodeBackendCapability>,
+    #[serde(default)]
+    media: Option<MediaCapability>,
 }
 
 fn engine_candidates(app: &AppHandle) -> Vec<PathBuf> {
@@ -160,8 +229,65 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
     if capabilities.schema_version != 2 || capabilities.engine != "getnative-engine" {
         return Err("getnative-engine returned an unsupported capability schema".to_owned());
     }
+    if !capabilities.decode_backends.is_empty() {
+        let expected = ["software", "nvdec", "vulkan_video"];
+        if capabilities.decode_backends.len() != expected.len()
+            || capabilities
+                .decode_backends
+                .iter()
+                .zip(expected)
+                .any(|(backend, id)| {
+                    backend.id != id
+                        || backend.runtime_device && !backend.compiled
+                        || backend.zero_copy && !backend.runtime_device
+                        || backend.compiled && backend.codecs.is_empty()
+                        || !backend.compiled
+                            && backend.reason.as_deref().is_none_or(str::is_empty)
+                })
+        {
+            return Err("getnative-engine returned invalid decode capabilities".to_owned());
+        }
+        let software = &capabilities.decode_backends[0];
+        if capabilities.features.verify_engine_decode
+            != (software.compiled && software.runtime_device)
+        {
+            return Err(
+                "getnative-engine media decode feature is inconsistent".to_owned(),
+            );
+        }
+    } else if capabilities.features.verify_engine_decode {
+        return Err("getnative-engine omitted decode capabilities".to_owned());
+    }
     if !capabilities.commands.capabilities || !capabilities.commands.geometry {
         return Err("getnative-engine command availability is inconsistent".to_owned());
+    }
+    let media_commands = [
+        capabilities.commands.media_index_begin,
+        capabilities.commands.media_frame_window,
+        capabilities.commands.media_preview_begin,
+        capabilities.commands.media_asset_batch_begin,
+    ];
+    let media_available = capabilities
+        .media
+        .as_ref()
+        .is_some_and(|media| media.available);
+    if media_commands.iter().any(|available| *available != media_available)
+        || capabilities.features.verify_engine_decode != media_available
+    {
+        return Err("getnative-engine media command availability is inconsistent".to_owned());
+    }
+    if let Some(media) = &capabilities.media {
+        if media.index_format != "gnvf.lwi"
+            || (media.available
+                && (media.ffmpeg_abi.as_deref().is_none_or(str::is_empty)
+                    || media.index_version != Some(1)))
+            || (!media.available
+                && (media.ffmpeg_abi.is_some() || media.index_version.is_some()))
+        {
+            return Err("getnative-engine media capability schema is invalid".to_owned());
+        }
+    } else if media_available {
+        return Err("getnative-engine omitted media capabilities".to_owned());
     }
 
     let kernel_ids = capabilities
@@ -195,14 +321,14 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
 
     let mut backends = HashMap::new();
     for backend in &capabilities.backends {
-        if !matches!(backend.id.as_str(), "cpu" | "metal" | "cuda") {
+        if !matches!(backend.id.as_str(), "cpu" | "metal" | "cuda" | "vulkan") {
             return Err("getnative-engine returned an unknown backend id".to_owned());
         }
         if backends.insert(backend.id.as_str(), backend).is_some() {
             return Err("getnative-engine returned a duplicate backend id".to_owned());
         }
     }
-    if backends.len() != 3 {
+    if backends.len() != 4 {
         return Err("getnative-engine did not return all required backends".to_owned());
     }
     let cpu = backends
@@ -242,23 +368,26 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
             .is_none_or(|values| values.len() != 1 || values[0] != "production")
         || cpu.selected_math_mode.as_deref() != Some("production")
         || cpu.selection_reason.as_deref().is_none_or(str::is_empty)
+        || cpu.device_type.is_some()
+        || cpu.auto_priority.is_some_and(|priority| priority != 100)
     {
         return Err("getnative-engine returned invalid CPU capabilities".to_owned());
     }
 
-    for id in ["metal", "cuda"] {
+    for id in ["metal", "cuda", "vulkan"] {
         let backend = backends
             .get(id)
             .ok_or_else(|| format!("getnative-engine did not return the {id} backend"))?;
         let valid_shape = if backend.compiled {
             backend.axes == ["horizontal", "vertical", "both"]
-                && matches!(
-                    backend.p_norms,
-                    Some(PNormRange {
-                        minimum: 1,
-                        maximum: 1
-                    })
-                )
+                && backend.p_norms.as_ref().is_some_and(|range| {
+                    range.minimum == 1
+                        && match id {
+                            "cuda" => (1..=CUDA_MAXIMUM_P_NORM).contains(&range.maximum),
+                            "metal" | "vulkan" => range.maximum == 1,
+                            _ => false,
+                        }
+                })
                 && backend.max_half_bandwidth == Some(15)
                 && backend.max_forward_width == Some(16)
                 && (backend.device_available
@@ -279,9 +408,37 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
             "cuda" => backend.math_modes.is_none() && backend.selected_math_mode.is_none(),
             _ => true,
         };
+        let valid_device = !backend.device_available
+            || backend.device.as_deref().is_some_and(|device| !device.is_empty());
+        let valid_device_type = match id {
+            "vulkan" => backend.device_type.as_deref().is_none_or(|device_type| {
+                matches!(
+                    device_type,
+                    "discrete_gpu" | "integrated_gpu" | "virtual_gpu" | "cpu" | "other"
+                )
+            }),
+            _ => backend.device_type.is_none(),
+        };
+        let valid_auto_priority = match id {
+            "metal" => backend.auto_priority.is_none(),
+            "cuda" => backend.auto_priority.is_none_or(|priority| {
+                priority == 10 && backend.compiled && backend.device_available
+            }),
+            "vulkan" => backend.auto_priority.is_none_or(|priority| {
+                priority == 20
+                    && backend.compiled
+                    && backend.device_available
+                    && backend.device_type.as_deref() == Some("discrete_gpu")
+            }),
+            _ => false,
+        };
         if backend.device_available && !backend.compiled
             || !valid_shape
             || !valid_math_mode
+            || !valid_device
+            || !valid_device_type
+            || !valid_auto_priority
+            || id == "metal" && backend.analysis_command_available
         {
             return Err(format!(
                 "getnative-engine returned invalid {id} capabilities"
@@ -298,17 +455,28 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
     {
         return Err("getnative-engine analysis availability is inconsistent".to_owned());
     }
-    let profile_contract = capabilities
-        .profiles
-        .iter()
-        .map(|profile| (profile.id.as_str(), profile.default_crop))
-        .collect::<Vec<_>>();
-    if profile_contract
-        != [
-            ("muf-d278cd3", 5),
-            ("getfnative-44c8d0f", 10),
-            ("modern", 5),
-        ]
+    let expected_profiles = [
+        ("muf-d278cd3", "repeated_addition", "1", 5),
+        ("getfnative-44c8d0f", "index_multiplication", "0.25", 10),
+        ("modern", "decimal_fixed_point", "1", 5),
+    ];
+    if capabilities.profiles.len() != expected_profiles.len()
+        || capabilities.profiles.iter().zip(expected_profiles).any(|(profile, expected)| {
+            profile.id != expected.0
+                || profile.grid_semantics != expected.1
+                || profile.default_grid.start != "500"
+                || profile.default_grid.stop != "1000"
+                || profile.default_grid.step != expected.2
+                || profile.default_grid.endpoint_rule != "inclusive"
+                || profile.default_axis_mode != "h_plus_w"
+                || profile.default_crop != expected.3
+                || (profile.default_threshold - 0.015).abs() > f64::EPSILON
+                || profile.threshold_comparison != "strict_greater_than"
+                || profile.default_kernel.id != "bicubic"
+                || profile.default_kernel.b != 0.0
+                || profile.default_kernel.c != 0.5
+                || profile.default_kernel.taps != 3
+        })
     {
         return Err("getnative-engine returned an unexpected profile contract".to_owned());
     }
@@ -431,14 +599,15 @@ mod tests {
                 {"id": "spline64", "parameters": {"kind": "none"}}
             ],
             "backends": [
-                {"id": "cpu", "compiled": true, "device_available": true, "analysis_command_available": false, "axes": ["horizontal", "vertical", "both"], "p_norms": {"minimum": 1, "maximum": 4294967295_u64}, "max_half_bandwidth": 29, "max_forward_width": 30, "compiled_isa": ["scalar", "sse2", "avx2", "avx512"], "available_isa": ["scalar", "sse2", "avx2"], "selected_isa": "avx2", "math_modes": ["production"], "selected_math_mode": "production", "selection_reason": "avx512 not benchmark-approved"},
-                {"id": "metal", "compiled": true, "device_available": true, "analysis_command_available": false, "axes": ["horizontal", "vertical", "both"], "p_norms": {"minimum": 1, "maximum": 1}, "max_half_bandwidth": 15, "max_forward_width": 16},
-                {"id": "cuda", "compiled": false, "device_available": false, "analysis_command_available": false, "axes": [], "p_norms": null, "max_half_bandwidth": null, "max_forward_width": null, "reason": "not compiled"}
+                {"id": "cpu", "compiled": true, "device_available": true, "analysis_command_available": false, "auto_priority": 100, "axes": ["horizontal", "vertical", "both"], "p_norms": {"minimum": 1, "maximum": 4294967295_u64}, "max_half_bandwidth": 29, "max_forward_width": 30, "compiled_isa": ["scalar", "sse2", "avx2", "avx512"], "available_isa": ["scalar", "sse2", "avx2"], "selected_isa": "avx2", "math_modes": ["production"], "selected_math_mode": "production", "selection_reason": "avx512 not benchmark-approved"},
+                {"id": "metal", "compiled": true, "device_available": true, "analysis_command_available": false, "auto_priority": null, "device": "Apple GPU", "axes": ["horizontal", "vertical", "both"], "p_norms": {"minimum": 1, "maximum": 1}, "max_half_bandwidth": 15, "max_forward_width": 16},
+                {"id": "cuda", "compiled": false, "device_available": false, "analysis_command_available": false, "auto_priority": null, "axes": [], "p_norms": null, "max_half_bandwidth": null, "max_forward_width": null, "reason": "not compiled"},
+                {"id": "vulkan", "compiled": false, "device_available": false, "analysis_command_available": false, "auto_priority": null, "axes": [], "p_norms": null, "max_half_bandwidth": null, "max_forward_width": null, "reason": "not compiled"}
             ],
             "profiles": [
-                {"id": "muf-d278cd3", "default_crop": 5},
-                {"id": "getfnative-44c8d0f", "default_crop": 10},
-                {"id": "modern", "default_crop": 5}
+                {"id": "muf-d278cd3", "grid_semantics": "repeated_addition", "default_grid": {"start": "500", "stop": "1000", "step": "1", "endpoint_rule": "inclusive"}, "default_axis_mode": "h_plus_w", "default_crop": 5, "default_threshold": 0.015, "threshold_comparison": "strict_greater_than", "default_kernel": {"id": "bicubic", "b": 0.0, "c": 0.5, "taps": 3}},
+                {"id": "getfnative-44c8d0f", "grid_semantics": "index_multiplication", "default_grid": {"start": "500", "stop": "1000", "step": "0.25", "endpoint_rule": "inclusive"}, "default_axis_mode": "h_plus_w", "default_crop": 10, "default_threshold": 0.015, "threshold_comparison": "strict_greater_than", "default_kernel": {"id": "bicubic", "b": 0.0, "c": 0.5, "taps": 3}},
+                {"id": "modern", "grid_semantics": "decimal_fixed_point", "default_grid": {"start": "500", "stop": "1000", "step": "1", "endpoint_rule": "inclusive"}, "default_axis_mode": "h_plus_w", "default_crop": 5, "default_threshold": 0.015, "threshold_comparison": "strict_greater_than", "default_kernel": {"id": "bicubic", "b": 0.0, "c": 0.5, "taps": 3}}
             ]
         })
     }
@@ -512,16 +681,23 @@ mod tests {
     }
 
     #[test]
-    fn capability_schema_accepts_consistent_cpu_or_metal_analysis() {
+    fn capability_schema_accepts_consistent_cpu_cuda_or_vulkan_analysis() {
         let mut cpu = valid_capabilities();
         cpu["commands"]["analyze"] = json!(true);
         cpu["backends"][0]["analysis_command_available"] = json!(true);
         assert!(validate_capabilities(&cpu).is_ok());
 
-        let mut metal = valid_capabilities();
-        metal["commands"]["analyze"] = json!(true);
-        metal["backends"][1]["analysis_command_available"] = json!(true);
-        assert!(validate_capabilities(&metal).is_ok());
+        let mut vulkan = valid_capabilities();
+        vulkan["commands"]["analyze"] = json!(true);
+        vulkan["backends"][3] = json!({
+            "id": "vulkan", "compiled": true, "device_available": true,
+            "analysis_command_available": true, "auto_priority": 20,
+            "device": "Discrete GPU", "device_type": "discrete_gpu",
+            "axes": ["horizontal", "vertical", "both"],
+            "p_norms": {"minimum": 1, "maximum": 1},
+            "max_half_bandwidth": 15, "max_forward_width": 16
+        });
+        assert!(validate_capabilities(&vulkan).is_ok());
     }
 
     #[test]
@@ -534,11 +710,10 @@ mod tests {
         backend_only["backends"][0]["analysis_command_available"] = json!(true);
         assert!(validate_capabilities(&backend_only).is_err());
 
-        let mut unavailable_metal = valid_capabilities();
-        unavailable_metal["commands"]["analyze"] = json!(true);
-        unavailable_metal["backends"][1]["device_available"] = json!(false);
-        unavailable_metal["backends"][1]["analysis_command_available"] = json!(true);
-        assert!(validate_capabilities(&unavailable_metal).is_err());
+        let mut metal_transport = valid_capabilities();
+        metal_transport["commands"]["analyze"] = json!(true);
+        metal_transport["backends"][1]["analysis_command_available"] = json!(true);
+        assert!(validate_capabilities(&metal_transport).is_err());
 
         let mut cuda = valid_capabilities();
         cuda["backends"][2]["compiled"] = json!(true);
@@ -560,17 +735,33 @@ mod tests {
             "id": "cuda", "compiled": true, "device_available": false,
             "analysis_command_available": false,
             "axes": ["horizontal", "vertical", "both"],
-            "p_norms": {"minimum": 1, "maximum": 1},
+            "p_norms": {"minimum": 1, "maximum": 4},
             "max_half_bandwidth": 15, "max_forward_width": 16,
+            "auto_priority": null,
             "reason": "CUDA driver is unavailable"
         });
         assert!(validate_capabilities(&no_device).is_ok());
+
+        let mut legacy_cuda = no_device.clone();
+        legacy_cuda["backends"][2]["p_norms"]["maximum"] = json!(1);
+        assert!(validate_capabilities(&legacy_cuda).is_ok());
 
         let mut invalid_math_mode = no_device.clone();
         invalid_math_mode["backends"][2]["math_modes"] =
             json!(["strict", "relaxed-fma", "fast-math"]);
         invalid_math_mode["backends"][2]["selected_math_mode"] = json!("strict");
         assert!(validate_capabilities(&invalid_math_mode).is_err());
+
+        let mut integrated_auto = valid_capabilities();
+        integrated_auto["backends"][3] = json!({
+            "id": "vulkan", "compiled": true, "device_available": true,
+            "analysis_command_available": false, "auto_priority": 20,
+            "device": "Integrated GPU", "device_type": "integrated_gpu",
+            "axes": ["horizontal", "vertical", "both"],
+            "p_norms": {"minimum": 1, "maximum": 1},
+            "max_half_bandwidth": 15, "max_forward_width": 16
+        });
+        assert!(validate_capabilities(&integrated_auto).is_err());
 
         let mut duplicate = valid_capabilities();
         duplicate["backends"][1]["id"] = json!("cuda");

@@ -19,18 +19,26 @@ import {
 } from "lucide-react";
 import type { Translator } from "../i18n";
 import {
-  getFrameWindow,
   getMediaCapabilities,
-  getMediaPreview,
   pickMediaFiles,
   probeMedia,
+  requestFrameWindow,
+  requestMediaPreview,
+  requestMediaPreviewBatch,
   type FrameWindowTarget,
   type MediaCapabilities,
   type MediaFrameWindow,
 } from "../media/service";
 import type { ProjectState, Sample, Source } from "../project/types";
 import { findDuplicateSampleId, frameStepFromKeyboard } from "../media/frameBrowser";
-import { fileName, importMediaPaths, sourceFromProbe } from "../media/importSources";
+import {
+  beginSourceMediaIndex,
+  cancelSourceImport,
+  fileName,
+  importMediaPaths,
+  indexedVideoProbe,
+  sourceFromProbe,
+} from "../media/importSources";
 import { useFileDrop } from "../media/useFileDrop";
 
 type ProjectUpdater = (updater: (state: ProjectState) => ProjectState) => void;
@@ -53,6 +61,7 @@ export function MediaPage({
   );
   const [mediaCapabilities, setMediaCapabilities] = useState<MediaCapabilities | null>(null);
   const [importing, setImporting] = useState(0);
+  const [indexProgress, setIndexProgress] = useState<Record<string, number>>({});
   const [error, setError] = useState("");
   const [frameWindowState, setFrameWindowState] = useState<{
     sourceKey: string;
@@ -69,9 +78,25 @@ export function MediaPage({
   const [pixelPosition, setPixelPosition] = useState<string | null>(null);
   const previewRequestId = useRef(0);
   const sourceSessionId = useRef(0);
-  const thumbnailSessionId = useRef(0);
-  const thumbnailSourceKey = useRef("");
-  const thumbnailUrlCache = useRef(new Map<number, string>());
+  const activeMediaTask = useRef<{ cancel: () => Promise<void> } | null>(null);
+  /** Tracks which source/stream the displayed preview belongs to. */
+  const previewKeyRef = useRef("");
+  const previewUrlRef = useRef<string | null>(null);
+  const thumbnailUrlsRef = useRef<Record<number, string>>({});
+
+  /** Atomic preview swap: the old image stays visible until its replacement exists. */
+  const swapPreviewUrl = useCallback((next: string | null) => {
+    const previous = previewUrlRef.current;
+    previewUrlRef.current = next;
+    setPreviewUrl(next);
+    if (previous && previous !== next) URL.revokeObjectURL(previous);
+  }, []);
+
+  const swapThumbnailUrls = useCallback((next: Record<number, string>) => {
+    for (const url of Object.values(thumbnailUrlsRef.current)) URL.revokeObjectURL(url);
+    thumbnailUrlsRef.current = next;
+    setThumbnailUrls(next);
+  }, []);
 
   const selectedSource = selectedSourceId ? state.sourcesById[selectedSourceId] : null;
   const frameWindow =
@@ -122,6 +147,28 @@ export function MediaPage({
     [onProjectChange],
   );
 
+  const markSourceMissing = useCallback(
+    (sourceId: string, detail: string) => {
+      onProjectChange((current) => {
+        const source = current.sourcesById[sourceId];
+        if (!source || source.state === "missing") return current;
+        return {
+          ...current,
+          sourcesById: {
+            ...current.sourcesById,
+            [sourceId]: {
+              ...source,
+              state: "missing",
+              errorCode: "media_missing",
+              errorDetail: detail,
+            },
+          },
+        };
+      });
+    },
+    [onProjectChange],
+  );
+
   const importPaths = useCallback(
     async (paths: string[]) => {
       if (state.project.readOnly) return;
@@ -132,6 +179,9 @@ export function MediaPage({
         onProjectChange,
         onPending: (id) => selectSource(id),
         onBusyDelta: (delta) => setImporting((count) => Math.max(0, count + delta)),
+        onIndexProgress: (id, frames) => {
+          setIndexProgress((current) => ({ ...current, [id]: frames }));
+        },
       });
     },
     [onProjectChange, selectSource, state],
@@ -149,34 +199,38 @@ export function MediaPage({
   const dropActive = useFileDrop((paths) => void importPaths(paths));
 
   const showPreview = useCallback(async (
-    request: Parameters<typeof getMediaPreview>[0],
+    request: Parameters<typeof requestMediaPreview>[0],
     sourceId?: string,
   ) => {
     const requestId = ++previewRequestId.current;
+    await activeMediaTask.current?.cancel().catch(() => undefined);
+    const task = requestMediaPreview(request);
+    activeMediaTask.current = task;
     setPreviewBusy(true);
     try {
-      const nextUrl = await getMediaPreview(request);
+      const nextUrl = await task.promise;
       if (previewRequestId.current !== requestId) {
         URL.revokeObjectURL(nextUrl);
         return;
       }
-      setPreviewUrl((current) => {
-        if (current) URL.revokeObjectURL(current);
-        return nextUrl;
-      });
+      swapPreviewUrl(nextUrl);
       setError("");
     } catch (reason) {
+      // Keep the last good preview on screen; the error banner carries the detail.
       if (previewRequestId.current === requestId) {
         const detail = String(reason);
         setError(detail);
-        if (sourceId && detail.includes("media_fingerprint_mismatch")) {
+        previewKeyRef.current = "";
+        if (sourceId && isFingerprintError(detail)) {
           markSourceChanged(sourceId, detail);
+        } else if (sourceId && detail.includes("media_missing")) {
+          markSourceMissing(sourceId, detail);
         }
       }
     } finally {
       if (previewRequestId.current === requestId) setPreviewBusy(false);
     }
-  }, [markSourceChanged]);
+  }, [markSourceChanged, markSourceMissing, swapPreviewUrl]);
 
   const selectVideoFrame = useCallback(
     async (
@@ -188,9 +242,10 @@ export function MediaPage({
       const streamIndex = source.selectedStreamIndex ?? source.videoStreams[0]?.index;
       if (streamIndex === undefined) return;
       const requestId = ++previewRequestId.current;
+      await activeMediaTask.current?.cancel().catch(() => undefined);
       setPreviewBusy(true);
       try {
-        const window = await getFrameWindow({
+        const windowTask = requestFrameWindow({
           path: source.path,
           fingerprint: source.fingerprint,
           streamIndex,
@@ -199,32 +254,47 @@ export function MediaPage({
           timestampSeconds,
           windowRadius: 12,
         });
+        activeMediaTask.current = windowTask;
+        const window = await windowTask.promise;
         if (previewRequestId.current !== requestId) return;
-        const nextUrl = await getMediaPreview({
+        const batchTask = requestMediaPreviewBatch({
           path: source.path,
           fingerprint: source.fingerprint,
           streamIndex,
-          frameIndex: window.selected.frame_index,
-          exact: true,
+          frames: [
+            { itemId: "main", frameIndex: window.selected.frame_index, maxDimension: 1600 },
+            ...window.frames.slice(0, 25).map((frame) => ({
+              itemId: `thumb-${frame.frame_index}`,
+              frameIndex: frame.frame_index,
+              maxDimension: 160,
+            })),
+          ],
         });
+        activeMediaTask.current = batchTask;
+        const batch = await batchTask.promise;
         if (previewRequestId.current !== requestId) {
-          URL.revokeObjectURL(nextUrl);
+          for (const asset of batch.assets) URL.revokeObjectURL(asset.url);
           return;
         }
+        const main = batch.assets.find((asset) => asset.itemId === "main");
+        if (!main) throw new Error("media_decode_error: preview batch omitted the main frame");
+        const thumbnails = Object.fromEntries(
+          batch.assets
+            .filter((asset) => asset.itemId.startsWith("thumb-"))
+            .map((asset) => [asset.frameIndex, asset.url]),
+        );
         setFrameWindowState({ sourceKey: sourceStreamKey(source), window });
         setFrameInput(String(window.selected.frame_index));
         setScrubFrame(window.selected.frame_index);
         setTimeInput((window.selected.timestamp_seconds ?? 0).toFixed(3));
-        setPreviewUrl((current) => {
-          if (current) URL.revokeObjectURL(current);
-          return nextUrl;
-        });
+        swapPreviewUrl(main.url);
+        swapThumbnailUrls(thumbnails);
         setError("");
       } catch (reason) {
         if (previewRequestId.current === requestId) {
           const detail = String(reason);
           setError(detail);
-          if (detail.includes("media_fingerprint_mismatch")) {
+          if (isFingerprintError(detail)) {
             markSourceChanged(source.id, detail);
           }
         }
@@ -232,7 +302,7 @@ export function MediaPage({
         if (previewRequestId.current === requestId) setPreviewBusy(false);
       }
     },
-    [markSourceChanged],
+    [markSourceChanged, swapPreviewUrl, swapThumbnailUrls],
   );
 
   const initializeVideoSource = useCallback(
@@ -241,67 +311,44 @@ export function MediaPage({
       if (streamIndex === undefined) return;
       setTimeInput("0.000");
       setIndexBusy(true);
-      await showPreview(
-        {
-          path: source.path,
-          fingerprint: source.fingerprint,
-          streamIndex,
-          timestampSeconds: 0,
-          exact: false,
-        },
-        source.id,
-      );
-      if (sourceSessionId.current !== sessionId) return;
       try {
-        const window = await getFrameWindow({
-          path: source.path,
-          fingerprint: source.fingerprint,
-          streamIndex,
-          target: "frame",
-          frameIndex: 0,
-          windowRadius: 12,
-        });
-        if (sourceSessionId.current !== sessionId) return;
-        setFrameWindowState({ sourceKey: sourceStreamKey(source), window });
-        setFrameInput(String(window.selected.frame_index));
-        setScrubFrame(window.selected.frame_index);
-        setTimeInput((window.selected.timestamp_seconds ?? 0).toFixed(3));
-        await showPreview(
-          {
-            path: source.path,
-            fingerprint: source.fingerprint,
-            streamIndex,
-            frameIndex: window.selected.frame_index,
-            exact: true,
-          },
-          source.id,
-        );
+        await selectVideoFrame(source, "frame", 0);
       } catch (reason) {
         if (sourceSessionId.current !== sessionId) return;
         const detail = String(reason);
         setError(detail);
-        if (detail.includes("media_fingerprint_mismatch")) {
+        if (isFingerprintError(detail)) {
           markSourceChanged(source.id, detail);
         }
       } finally {
         if (sourceSessionId.current === sessionId) setIndexBusy(false);
       }
     },
-    [markSourceChanged, showPreview],
+    [markSourceChanged, selectVideoFrame],
   );
+
+  const selectedPreviewKey =
+    selectedSource && selectedSource.state === "ready"
+      ? selectedSource.kind === "video"
+        ? `video:${sourceStreamKey(selectedSource)}`
+        : `still:${selectedSource.id}:${selectedSource.fingerprint ?? ""}`
+      : "";
 
   useEffect(() => {
     const sessionId = ++sourceSessionId.current;
+    // Same source already on screen (e.g. autosave rebuilt state objects with
+    // fresh identities): keep the preview instead of reloading it.
+    if (previewKeyRef.current === selectedPreviewKey && previewUrlRef.current) return;
+    previewKeyRef.current = selectedPreviewKey;
     setFrameWindowState(null);
     setIndexBusy(false);
     setZoom(1);
     setPixelPosition(null);
     previewRequestId.current += 1;
-    setPreviewUrl((current) => {
-      if (current) URL.revokeObjectURL(current);
-      return null;
-    });
-    if (!selectedSource || selectedSource.state !== "ready") return;
+    void activeMediaTask.current?.cancel().catch(() => undefined);
+    swapPreviewUrl(null);
+    swapThumbnailUrls({});
+    if (!selectedSource || !selectedPreviewKey) return;
     if (selectedSource.kind === "video") {
       if (mediaCapabilities?.video_decode_available) {
         void initializeVideoSource(selectedSource, sessionId);
@@ -312,104 +359,16 @@ export function MediaPage({
         selectedSource.id,
       );
     }
-  }, [initializeVideoSource, mediaCapabilities?.video_decode_available, selectedSource, showPreview]);
+    // selectedSource is read from the render that produced selectedPreviewKey.
+  }, [initializeVideoSource, mediaCapabilities?.video_decode_available, selectedPreviewKey, showPreview, swapPreviewUrl, swapThumbnailUrls]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Revoke the live object URL only on unmount; in-flight swaps own their URLs.
   useEffect(
     () => () => {
       previewRequestId.current += 1;
-      if (previewUrl) URL.revokeObjectURL(previewUrl);
-    },
-    [previewUrl],
-  );
-
-  useEffect(() => {
-    const sessionId = ++thumbnailSessionId.current;
-    let disposed = false;
-
-    if (
-      !selectedSource ||
-      selectedSource.kind !== "video" ||
-      !selectedSource.fingerprint ||
-      selectedSource.selectedStreamIndex == null ||
-      !frameWindow
-    ) {
-      for (const url of thumbnailUrlCache.current.values()) URL.revokeObjectURL(url);
-      thumbnailUrlCache.current.clear();
-      thumbnailSourceKey.current = "";
-      setThumbnailUrls({});
-      return () => {
-        disposed = true;
-      };
-    }
-
-    const sourceKey = sourceStreamKey(selectedSource);
-    if (thumbnailSourceKey.current !== sourceKey) {
-      for (const url of thumbnailUrlCache.current.values()) URL.revokeObjectURL(url);
-      thumbnailUrlCache.current.clear();
-      thumbnailSourceKey.current = sourceKey;
-    }
-
-    let cursor = 0;
-    const frames = frameWindow.frames;
-    const activeFrames = new Set(frames.map((frame) => frame.frame_index));
-    for (const [frameIndex, url] of thumbnailUrlCache.current) {
-      if (!activeFrames.has(frameIndex)) {
-        URL.revokeObjectURL(url);
-        thumbnailUrlCache.current.delete(frameIndex);
-      }
-    }
-    setThumbnailUrls(Object.fromEntries(thumbnailUrlCache.current));
-
-    const loadNext = async () => {
-      while (!disposed && cursor < frames.length) {
-        const frame = frames[cursor++];
-        if (thumbnailUrlCache.current.has(frame.frame_index)) continue;
-        try {
-          const url = await getMediaPreview({
-            path: selectedSource.path,
-            fingerprint: selectedSource.fingerprint,
-            streamIndex: selectedSource.selectedStreamIndex,
-            frameIndex: frame.frame_index,
-            exact: true,
-            maxDimension: 160,
-          });
-          if (disposed || thumbnailSessionId.current !== sessionId) {
-            URL.revokeObjectURL(url);
-            continue;
-          }
-          const previous = thumbnailUrlCache.current.get(frame.frame_index);
-          if (previous) URL.revokeObjectURL(previous);
-          thumbnailUrlCache.current.set(frame.frame_index, url);
-          setThumbnailUrls(Object.fromEntries(thumbnailUrlCache.current));
-        } catch (reason) {
-          const detail = String(reason);
-          if (detail.includes("media_fingerprint_mismatch")) {
-            markSourceChanged(selectedSource.id, detail);
-            return;
-          }
-        }
-      }
-    };
-
-    void Promise.all(Array.from({ length: Math.min(3, frames.length) }, loadNext));
-    return () => {
-      disposed = true;
-    };
-  }, [
-    frameWindow,
-    markSourceChanged,
-    selectedSource?.fingerprint,
-    selectedSource?.id,
-    selectedSource?.kind,
-    selectedSource?.path,
-    selectedSource?.selectedStreamIndex,
-  ]);
-
-  useEffect(
-    () => () => {
-      thumbnailSessionId.current += 1;
-      for (const url of thumbnailUrlCache.current.values()) URL.revokeObjectURL(url);
-      thumbnailUrlCache.current.clear();
+      void activeMediaTask.current?.cancel().catch(() => undefined);
+      if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
+      for (const url of Object.values(thumbnailUrlsRef.current)) URL.revokeObjectURL(url);
     },
     [],
   );
@@ -441,6 +400,26 @@ export function MediaPage({
           [source.id]: sourceFromProbe(source.id, probe, source.label),
         },
       }));
+      if (probe.kind === "video" && probe.state === "probing") {
+        const task = beginSourceMediaIndex(
+          source.id,
+          { path: probe.path, fingerprint: probe.fingerprint },
+          (progress) => setIndexProgress((current) => ({
+            ...current,
+            [source.id]: progress.completed,
+          })),
+        );
+        const indexed = indexedVideoProbe(probe, await task.promise);
+        onProjectChange((current) => current.sourcesById[source.id]
+          ? {
+              ...current,
+              sourcesById: {
+                ...current.sourcesById,
+                [source.id]: sourceFromProbe(source.id, indexed, source.label),
+              },
+            }
+          : current);
+      }
     } catch (reason) {
       setError(String(reason));
     }
@@ -448,6 +427,7 @@ export function MediaPage({
 
   function removeSource(source: Source) {
     if (Object.values(state.samplesById).some((sample) => sample.sourceId === source.id)) return;
+    void cancelSourceImport(source.id).catch(() => undefined);
     onProjectChange((current) => {
       const sourcesById = { ...current.sourcesById };
       delete sourcesById[source.id];
@@ -457,41 +437,13 @@ export function MediaPage({
     setSelectedSourceId(next?.id ?? null);
   }
 
-  function selectVideoStream(source: Source, streamIndex: number) {
-    const stream = source.videoStreams.find((item) => item.index === streamIndex);
-    if (!stream) return;
-    onProjectChange((current) => ({
-      ...current,
-      sourcesById: {
-        ...current.sourcesById,
-        [source.id]: {
-          ...current.sourcesById[source.id],
-          selectedStreamIndex: stream.index,
-          width: stream.width ?? current.sourcesById[source.id].width,
-          height: stream.height ?? current.sourcesById[source.id].height,
-          durationSeconds:
-            stream.durationSeconds ?? current.sourcesById[source.id].durationSeconds,
-        },
-      },
-    }));
-  }
-
   function showNearbyTime(source: Source) {
     const streamIndex = source.selectedStreamIndex ?? source.videoStreams[0]?.index;
     const requested = Number(timeInput);
     if (streamIndex === undefined || !Number.isFinite(requested) || requested < 0) return;
     const timestampSeconds = Math.min(requested, source.durationSeconds ?? requested);
     setTimeInput(timestampSeconds.toFixed(3));
-    void showPreview(
-      {
-        path: source.path,
-        fingerprint: source.fingerprint,
-        streamIndex,
-        timestampSeconds,
-        exact: false,
-      },
-      source.id,
-    );
+    void selectVideoFrame(source, "timestamp", undefined, timestampSeconds);
   }
 
   function handleFrameBrowserKeyDown(
@@ -602,24 +554,6 @@ export function MediaPage({
               sample.frameIndex === currentFrame)),
       ),
   );
-  const streamControl =
-    selectedSource?.kind === "video" && selectedSource.videoStreams.length > 1 ? (
-      <label>
-        <span>{t("media.videoStream")}</span>
-        <select
-          value={selectedSource.selectedStreamIndex ?? ""}
-          disabled={previewBusy || indexBusy}
-          onChange={(event) => selectVideoStream(selectedSource, Number(event.target.value))}
-        >
-          {selectedSource.videoStreams.map((stream) => (
-            <option key={stream.index} value={stream.index}>
-              {videoStreamLabel(stream)}
-            </option>
-          ))}
-        </select>
-      </label>
-    ) : null;
-
   return (
     <div className={`page-panel media-page ${dropActive ? "drop-active" : ""}`}>
       <div className="page-header media-header">
@@ -672,7 +606,12 @@ export function MediaPage({
                   </span>
                   <span className="source-copy">
                     <strong>{source.label ?? fileName(source.path)}</strong>
-                    <small>{sourceSummary(source, t)}</small>
+                    <small>
+                      {sourceSummary(source, t)}
+                      {source.state === "probing" && indexProgress[source.id] != null
+                        ? ` · ${t("media.indexedFrames", { count: indexProgress[source.id] })}`
+                        : ""}
+                    </small>
                   </span>
                   {source.state === "probing" ? <LoaderCircle className="spin" size={14} /> : null}
                 </button>
@@ -738,6 +677,7 @@ export function MediaPage({
                   <img
                     src={previewUrl}
                     alt={selectedSource.label ?? fileName(selectedSource.path)}
+                    draggable={false}
                     style={{ transform: `scale(${zoom})` }}
                   />
                 ) : (
@@ -771,7 +711,6 @@ export function MediaPage({
                     <>
                       <p className="frame-keyboard-help">{t("media.keyboardHelp")}</p>
                       <div className="frame-controls">
-                        {streamControl}
                         <button
                           className="icon-button"
                           type="button"
@@ -837,8 +776,12 @@ export function MediaPage({
                         value={scrubFrame}
                         aria-label={t("media.timeline")}
                         onChange={(event) => setScrubFrame(Number(event.target.value))}
-                        onPointerUp={() => void selectVideoFrame(selectedSource, "frame", scrubFrame)}
-                        onKeyUp={() => void selectVideoFrame(selectedSource, "frame", scrubFrame)}
+                        onPointerUp={(event) => void selectVideoFrame(
+                          selectedSource, "frame", Number(event.currentTarget.value),
+                        )}
+                        onKeyUp={(event) => void selectVideoFrame(
+                          selectedSource, "frame", Number(event.currentTarget.value),
+                        )}
                       />
                       <div className="filmstrip" aria-label={t("media.frameWindow")}>
                         {frameWindow.frames.map((frame) => {
@@ -861,6 +804,7 @@ export function MediaPage({
                                   className="filmstrip-thumbnail"
                                   src={thumbnailUrls[frame.frame_index]}
                                   alt=""
+                                  draggable={false}
                                 />
                               ) : (
                                 <span className="filmstrip-thumbnail-placeholder">
@@ -879,7 +823,6 @@ export function MediaPage({
                   ) : (
                     <>
                       <div className="frame-controls">
-                        {streamControl}
                         <label>
                           <span>{t("media.timestamp")}</span>
                           <input
@@ -915,8 +858,14 @@ export function MediaPage({
                         disabled={!selectedSource.durationSeconds}
                         aria-label={t("media.timeline")}
                         onChange={(event) => setTimeInput(Number(event.target.value).toFixed(3))}
-                        onPointerUp={() => showNearbyTime(selectedSource)}
-                        onKeyUp={() => showNearbyTime(selectedSource)}
+                        onPointerUp={(event) => void selectVideoFrame(
+                          selectedSource, "timestamp", undefined,
+                          Number(event.currentTarget.value),
+                        )}
+                        onKeyUp={(event) => void selectVideoFrame(
+                          selectedSource, "timestamp", undefined,
+                          Number(event.currentTarget.value),
+                        )}
                       />
                     </>
                   )}
@@ -1000,14 +949,13 @@ function videoSampleLabel(source: Source, frameIndex: number | undefined, t: Tra
   return `${sourceLabel}${streamLabel} #${frameIndex ?? "-"}`;
 }
 
-function videoStreamLabel(stream: Source["videoStreams"][number]): string {
-  const dimensions =
-    stream.width && stream.height ? `${stream.width} x ${stream.height}` : "-";
-  return `#${stream.index} · ${stream.codecName ?? "-"} · ${dimensions}`;
-}
-
 function sourceStreamKey(source: Source): string {
   return [source.id, source.fingerprint ?? "", source.selectedStreamIndex ?? ""].join(":");
+}
+
+function isFingerprintError(detail: string): boolean {
+  return detail.includes("media_fingerprint_mismatch")
+    || detail.includes("media_fingerprint_error");
 }
 
 function mediaViewState(state: ProjectState): { selectedSourceId?: string } {

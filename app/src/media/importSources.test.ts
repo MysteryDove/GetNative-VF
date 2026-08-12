@@ -1,6 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  beginSourceMediaIndex,
+  cancelSourceImport,
   finalSourceIdFor,
+  indexedVideoProbe,
   mergeProbedSource,
   sourceFromProbe,
   stillSampleForSource,
@@ -65,5 +68,78 @@ describe("importSources", () => {
       state: "error",
     });
     expect(stillSampleForSource(state, "src_3")).toBeNull();
+  });
+
+  it("keeps a video probing until one indexed default stream is committed", () => {
+    const probing: MediaProbeResult = {
+      ...stillProbe,
+      path: "/tmp/clip.mkv",
+      file_name: "clip.mkv",
+      kind: "video",
+      state: "probing",
+      width: null,
+      height: null,
+      decoder: null,
+    };
+    const ready = indexedVideoProbe(probing, {
+      kind: "video",
+      state: "ready",
+      fingerprint: "indexed-fp",
+      size_bytes: 999,
+      stream_index: 2,
+      codec: "h264",
+      width: 1280,
+      height: 720,
+      duration_seconds: 12.5,
+      frame_count: 300,
+      time_base_num: 1,
+      time_base_den: 24000,
+      decoder: "software",
+      index_version: 1,
+      rebuilt: true,
+    });
+    expect(probing.state).toBe("probing");
+    expect(ready.state).toBe("ready");
+    expect(ready.selected_stream_index).toBe(2);
+    expect(ready.video_streams).toEqual([expect.objectContaining({
+      index: 2, frame_count: 300, time_base_den: 24000,
+    })]);
+  });
+
+  it("tracks every Source index so deleting the Source cancels the engine job", async () => {
+    const cancel = vi.fn(async () => undefined);
+    let finish!: (value: Parameters<typeof indexedVideoProbe>[1]) => void;
+    const pending = new Promise<Parameters<typeof indexedVideoProbe>[1]>((resolve) => {
+      finish = resolve;
+    });
+    const result = indexedVideoProbe({
+      ...stillProbe,
+      path: "/tmp/clip.mkv",
+      kind: "video",
+      state: "probing",
+    }, {
+      kind: "video", state: "ready", fingerprint: "fp", size_bytes: 1,
+      stream_index: 0, codec: "h264", width: 16, height: 16,
+      duration_seconds: 1, frame_count: 1, time_base_num: 1, time_base_den: 1,
+      decoder: "software", index_version: 1, rebuilt: true,
+    });
+    const task = beginSourceMediaIndex(
+      "src_video",
+      { path: "/tmp/clip.mkv", fingerprint: "fp" },
+      undefined,
+      () => ({ requestId: "request", promise: pending, cancel }),
+    );
+
+    await cancelSourceImport("src_video");
+    expect(cancel).toHaveBeenCalledOnce();
+    finish({
+      kind: "video", state: "ready", fingerprint: result.fingerprint, size_bytes: 1,
+      stream_index: 0, codec: "h264", width: 16, height: 16,
+      duration_seconds: 1, frame_count: 1, time_base_num: 1, time_base_den: 1,
+      decoder: "software", index_version: 1, rebuilt: false,
+    });
+    await task.promise;
+    await cancelSourceImport("src_video");
+    expect(cancel).toHaveBeenCalledOnce();
   });
 });

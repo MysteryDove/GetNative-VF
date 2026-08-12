@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { ChevronDown, ChevronRight, Download } from "lucide-react";
+import { ChevronDown, ChevronRight, Download, Trash2 } from "lucide-react";
 import type { Translator } from "../i18n";
 import { metricCompatibilityKey } from "../engine/runGroupPlan";
 import {
@@ -11,6 +11,54 @@ import {
   saveArtifact,
 } from "../project/export";
 import type { ProjectState, Run, RunGroup } from "../project/types";
+import { actualBackendLabel } from "../engine/backendSelection";
+import type { ActualBackend } from "../engine/protocol";
+
+const ACTIVE_STATUSES = new Set(["queued", "running"]);
+
+export function runActualBackend(
+  run: Run,
+): { backend: ActualBackend; device?: string } | null {
+  if (!run.result || typeof run.result !== "object") return null;
+  const telemetry = (run.result as Record<string, unknown>).telemetry;
+  if (!telemetry || typeof telemetry !== "object" || Array.isArray(telemetry)) return null;
+  const values = telemetry as Record<string, unknown>;
+  const backend = values.backend;
+  if (backend !== "cpu" && backend !== "cuda" && backend !== "vulkan") return null;
+  const deviceKey = backend === "cuda"
+    ? "cuda_device"
+    : backend === "vulkan"
+      ? "vulkan_device"
+      : null;
+  const device = deviceKey && typeof values[deviceKey] === "string"
+    ? values[deviceKey] as string
+    : undefined;
+  return { backend, device };
+}
+
+export function runDecodeProvenance(
+  run: Run,
+): { decoder: string; zeroCopy: boolean; fallbackReason?: string } | null {
+  if (!run.result || typeof run.result !== "object") return null;
+  const provenance = (run.result as Record<string, unknown>).provenance;
+  if (!provenance || typeof provenance !== "object" || Array.isArray(provenance)) {
+    return null;
+  }
+  const values = provenance as Record<string, unknown>;
+  if (typeof values.decoder !== "string" || typeof values.zero_copy !== "boolean") {
+    return null;
+  }
+  let fallbackReason: string | undefined;
+  if (Array.isArray(values.fallback_chain)) {
+    for (const entry of values.fallback_chain) {
+      if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+        const reason = (entry as Record<string, unknown>).reason;
+        if (typeof reason === "string" && reason) fallbackReason = reason;
+      }
+    }
+  }
+  return { decoder: values.decoder, zeroCopy: values.zero_copy, fallbackReason };
+}
 
 /**
  * Results: immutable Run/RunGroup history with provenance, compatibility-gated
@@ -19,9 +67,11 @@ import type { ProjectState, Run, RunGroup } from "../project/types";
 export function ResultsPage({
   t,
   state,
+  onProjectChange,
 }: {
   t: Translator;
   state: ProjectState;
+  onProjectChange: (updater: (state: ProjectState) => ProjectState) => void;
 }) {
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [selectedRuns, setSelectedRuns] = useState<Set<string>>(new Set());
@@ -91,6 +141,58 @@ export function ResultsPage({
       const next = new Set(current);
       if (next.has(runId)) next.delete(runId);
       else next.add(runId);
+      return next;
+    });
+  }
+
+  function groupActive(group: RunGroup): boolean {
+    return group.memberRunIds.some((id) => ACTIVE_STATUSES.has(state.runsById[id]?.status ?? ""));
+  }
+
+  function deleteGroup(group: RunGroup) {
+    if (groupActive(group)) return;
+    if (!window.confirm(t("results.deleteGroupConfirm", { label: group.label || group.groupType }))) {
+      return;
+    }
+    onProjectChange((current) => {
+      const runsById = { ...current.runsById };
+      const verificationReviewsByRunId = { ...current.verificationReviewsByRunId };
+      for (const id of group.memberRunIds) {
+        delete runsById[id];
+        delete verificationReviewsByRunId[id];
+      }
+      const runGroupsById = { ...current.runGroupsById };
+      delete runGroupsById[group.id];
+      return { ...current, runsById, runGroupsById, verificationReviewsByRunId };
+    });
+    setSelectedRuns((current) => {
+      const next = new Set(current);
+      for (const id of group.memberRunIds) next.delete(id);
+      return next;
+    });
+  }
+
+  function deleteRun(run: Run) {
+    if (ACTIVE_STATUSES.has(run.status)) return;
+    if (!window.confirm(t("results.deleteRunConfirm"))) return;
+    onProjectChange((current) => {
+      const runsById = { ...current.runsById };
+      delete runsById[run.id];
+      const verificationReviewsByRunId = { ...current.verificationReviewsByRunId };
+      delete verificationReviewsByRunId[run.id];
+      let runGroupsById = current.runGroupsById;
+      const group = run.runGroupId ? current.runGroupsById[run.runGroupId] : null;
+      if (group) {
+        const memberRunIds = group.memberRunIds.filter((id) => id !== run.id);
+        runGroupsById = { ...current.runGroupsById };
+        if (memberRunIds.length === 0) delete runGroupsById[group.id];
+        else runGroupsById[group.id] = { ...group, memberRunIds };
+      }
+      return { ...current, runsById, runGroupsById, verificationReviewsByRunId };
+    });
+    setSelectedRuns((current) => {
+      const next = new Set(current);
+      next.delete(run.id);
       return next;
     });
   }
@@ -206,8 +308,11 @@ export function ResultsPage({
                   state={state}
                   expanded={expandedGroups.has(group.id)}
                   onToggle={() => toggleGroup(group.id)}
+                  onDelete={() => deleteGroup(group)}
+                  deleteDisabled={groupActive(group)}
                   selectedRuns={selectedRuns}
                   onToggleRun={toggleRun}
+                  onDeleteRun={deleteRun}
                   runSelectable={runSelectable}
                 />
               ))}
@@ -219,6 +324,8 @@ export function ResultsPage({
                   state={state}
                   selected={selectedRuns.has(run.id)}
                   onToggle={() => toggleRun(run.id)}
+                  onDelete={() => deleteRun(run)}
+                  deleteDisabled={ACTIVE_STATUSES.has(run.status)}
                   selectable={runSelectable(run)}
                 />
               ))}
@@ -236,8 +343,11 @@ function RunGroupBlock({
   state,
   expanded,
   onToggle,
+  onDelete,
+  deleteDisabled,
   selectedRuns,
   onToggleRun,
+  onDeleteRun,
   runSelectable,
 }: {
   t: Translator;
@@ -245,8 +355,11 @@ function RunGroupBlock({
   state: ProjectState;
   expanded: boolean;
   onToggle: () => void;
+  onDelete: () => void;
+  deleteDisabled: boolean;
   selectedRuns: Set<string>;
   onToggleRun: (runId: string) => void;
+  onDeleteRun: (run: Run) => void;
   runSelectable: (run: Run) => { selectable: boolean; reason: "no_results" | "incompatible" | null };
 }) {
   const members = group.memberRunIds
@@ -254,16 +367,27 @@ function RunGroupBlock({
     .filter((run): run is Run => Boolean(run));
   return (
     <div className="run-group-block">
-      <button className="dense-row run-group-header" type="button" onClick={onToggle}>
-        <strong>
-          {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-          {group.label || group.groupType}
-        </strong>
-        <span>
-          {t("analyze.memberCount", { count: String(members.length) })}
-          {group.createdAt ? ` · ${group.createdAt.slice(0, 10)}` : ""}
-        </span>
-      </button>
+      <div className="dense-row run-group-header">
+        <button className="run-group-toggle" type="button" onClick={onToggle}>
+          <strong>
+            {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            {group.label || group.groupType}
+          </strong>
+          <span>
+            {t("analyze.memberCount", { count: String(members.length) })}
+            {group.createdAt ? ` · ${group.createdAt.slice(0, 10)}` : ""}
+          </span>
+        </button>
+        <button
+          className="icon-button danger"
+          type="button"
+          disabled={deleteDisabled}
+          title={deleteDisabled ? t("results.deleteActiveHint") : t("results.deleteGroup")}
+          onClick={onDelete}
+        >
+          <Trash2 size={14} />
+        </button>
+      </div>
       {expanded
         ? members.map((run) => (
             <RunRow
@@ -273,6 +397,8 @@ function RunGroupBlock({
               state={state}
               selected={selectedRuns.has(run.id)}
               onToggle={() => onToggleRun(run.id)}
+              onDelete={() => onDeleteRun(run)}
+              deleteDisabled={ACTIVE_STATUSES.has(run.status)}
               selectable={runSelectable(run)}
               indented
             />
@@ -288,6 +414,8 @@ function RunRow({
   state,
   selected,
   onToggle,
+  onDelete,
+  deleteDisabled,
   selectable,
   indented,
 }: {
@@ -296,10 +424,14 @@ function RunRow({
   state: ProjectState;
   selected: boolean;
   onToggle: () => void;
+  onDelete?: () => void;
+  deleteDisabled?: boolean;
   selectable: { selectable: boolean; reason: "no_results" | "incompatible" | null };
   indented?: boolean;
 }) {
   const rows = extractRunRows(run);
+  const actualBackend = runActualBackend(run);
+  const decode = runDecodeProvenance(run);
   return (
     <div className={`dense-row run-row ${indented ? "indented" : ""}`}>
       <label className="checkbox-row">
@@ -324,7 +456,30 @@ function RunRow({
         {runStatusLabel(run.status, t)}
         {run.total > 0 ? ` · ${run.completed}/${run.total}` : ""}
         {rows.length ? ` · ${t("results.points", { count: String(rows.length) })}` : ""}
+        {actualBackend
+          ? ` · ${t("results.actualBackend", {
+              backend: actualBackendLabel(t, actualBackend.backend, actualBackend.device),
+            })}`
+          : ""}
+        {decode
+          ? ` · ${t("results.decoder", { decoder: decode.decoder })} · ${t("results.zeroCopy", {
+              state: t(decode.zeroCopy ? "common.yes" : "common.no"),
+            })}${decode.fallbackReason
+              ? ` · ${t("results.decodeFallback", { reason: decode.fallbackReason })}`
+              : ""}`
+          : ""}
       </span>
+      {onDelete ? (
+        <button
+          className="icon-button danger"
+          type="button"
+          disabled={deleteDisabled}
+          title={deleteDisabled ? t("results.deleteActiveHint") : t("results.deleteRun")}
+          onClick={onDelete}
+        >
+          <Trash2 size={14} />
+        </button>
+      ) : null}
     </div>
   );
 }

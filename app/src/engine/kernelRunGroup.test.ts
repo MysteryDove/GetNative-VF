@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  addBicubicGridToScanList,
+  addKernelToScanList,
+  bicubicRefFromDraft,
+  clearScanList,
   defaultKernelDraft,
   geometryGroupKey,
   resolveKernelCandidates,
@@ -105,32 +109,33 @@ describe("resolveKernelCandidates", () => {
     expect(result.candidates[5]?.parameters).toEqual({ taps: 3 });
   });
 
-  it("expands the Bicubic grid b-outer, c-inner with exact decimal strings", () => {
-    const d = { ...draft(), scanMode: "bicubic_grid" as const, bStop: "0.5", bStep: "0.5", cStop: "0.5", cStep: "0.5" };
-    const result = resolveKernelCandidates(d, capabilities);
+  it("expands the Bicubic grid b-outer, c-inner with normalized numeric parameters", () => {
+    const d = clearScanList({
+      ...draft(),
+      bStop: "0.5",
+      bStep: "0.5",
+      cStop: "0.5",
+      cStep: "0.5",
+    });
+    const added = addBicubicGridToScanList(d);
+    expect(added.ok).toBe(true);
+    if (!added.ok) return;
+    expect(added.added).toBe(4);
+    const result = resolveKernelCandidates(added.draft, capabilities);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.candidates.map((kernel) => kernel.parameters)).toEqual([
-      { b: "0", c: "0" },
-      { b: "0", c: "0.5" },
-      { b: "0.5", c: "0" },
-      { b: "0.5", c: "0.5" },
+      { b: 0, c: 0 },
+      { b: 0, c: 0.5 },
+      { b: 0.5, c: 0 },
+      { b: 0.5, c: 0.5 },
     ]);
   });
 
-  it("rejects invalid bicubic parameters and empty family selection", () => {
+  it("rejects invalid bicubic parameters at add time and empty lists at resolve time", () => {
     const bad = { ...draft(), bicubicB: "abc" };
-    expect(resolveKernelCandidates(bad, capabilities).ok).toBe(false);
-    const none = draft();
-    none.families = {
-      bilinear: false,
-      bicubic: false,
-      spline16: false,
-      spline36: false,
-      spline64: false,
-      lanczos: false,
-    };
-    const result = resolveKernelCandidates(none, capabilities);
+    expect(bicubicRefFromDraft(bad)).toBeNull();
+    const result = resolveKernelCandidates(clearScanList(draft()), capabilities);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe("no_kernels");
   });
@@ -192,15 +197,12 @@ describe("planKernelRunGroup", () => {
   });
 
   it("rejects a single-candidate scan as too small for a kernel run", () => {
-    const d = draft();
-    d.families = {
-      bilinear: true,
-      bicubic: false,
-      spline16: false,
-      spline36: false,
-      spline64: false,
-      lanczos: false,
-    };
+    const single = addKernelToScanList(clearScanList(draft()), {
+      id: "bilinear",
+      parameters: {},
+    });
+    expect(single.added).toBe(true);
+    const d = single.draft;
     const result = planKernelRunGroup({
       draft: d,
       samples: [sample],

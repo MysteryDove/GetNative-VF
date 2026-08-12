@@ -1,5 +1,11 @@
 import type { ProjectState, Sample, Source } from "../project/types";
-import { probeMedia, type MediaProbeResult } from "./service";
+import {
+  beginMediaIndex,
+  probeMedia,
+  type MediaIndexResult,
+  type MediaProbeResult,
+  type MediaTask,
+} from "./service";
 import { findDuplicateSampleId } from "./frameBrowser";
 
 /**
@@ -122,6 +128,75 @@ export type ImportOutcome = {
   failed: number;
 };
 
+const activeVideoIndexes = new Map<string, Set<MediaTask<MediaIndexResult>>>();
+
+export async function cancelSourceImport(sourceId: string): Promise<void> {
+  const tasks = activeVideoIndexes.get(sourceId);
+  if (!tasks) return;
+  await Promise.all([...tasks].map((task) => task.cancel()));
+}
+
+export function beginSourceMediaIndex(
+  sourceId: string,
+  request: Parameters<typeof beginMediaIndex>[0],
+  onProgress?: Parameters<typeof beginMediaIndex>[1],
+  start: typeof beginMediaIndex = beginMediaIndex,
+): MediaTask<MediaIndexResult> {
+  const base = start(request, onProgress);
+  let tracked: MediaTask<MediaIndexResult>;
+  tracked = {
+    ...base,
+    promise: base.promise.finally(() => {
+      const tasks = activeVideoIndexes.get(sourceId);
+      tasks?.delete(tracked);
+      if (tasks?.size === 0) {
+        activeVideoIndexes.delete(sourceId);
+      }
+    }),
+  };
+  const tasks = activeVideoIndexes.get(sourceId) ?? new Set();
+  tasks.add(tracked);
+  activeVideoIndexes.set(sourceId, tasks);
+  return tracked;
+}
+
+export function indexedVideoProbe(probe: MediaProbeResult, index: MediaIndexResult): MediaProbeResult {
+  return {
+    ...probe,
+    kind: "video",
+    state: "ready",
+    fingerprint: index.fingerprint,
+    size_bytes: index.size_bytes,
+    width: index.width,
+    height: index.height,
+    duration_seconds: index.duration_seconds,
+    decoder: index.decoder,
+    selected_stream_index: index.stream_index,
+    diagnostic: null,
+    video_streams: [{
+      index: index.stream_index,
+      codec_name: index.codec,
+      width: index.width,
+      height: index.height,
+      duration_seconds: index.duration_seconds,
+      frame_count: index.frame_count,
+      time_base_num: index.time_base_num,
+      time_base_den: index.time_base_den,
+      frame_rate_num: null,
+      frame_rate_den: null,
+    }],
+  };
+}
+
+function mediaErrorCode(error: unknown): string {
+  const detail = String(error).replace(/^Error:\s*/, "");
+  const match = detail.match(/^([a-z][a-z0-9_]+):/);
+  const code = match?.[1] ?? "media_index_error";
+  return code === "media_fingerprint_error"
+    ? "media_fingerprint_mismatch"
+    : code;
+}
+
 export async function importMediaPaths(input: {
   paths: string[];
   state: ProjectState;
@@ -131,6 +206,7 @@ export async function importMediaPaths(input: {
   /** Called synchronously with the first provisional Source id (e.g. to select it). */
   onPending?: (provisionalId: string) => void;
   onBusyDelta?: (delta: number) => void;
+  onIndexProgress?: (sourceId: string, decodedFrames: number) => void;
 }): Promise<ImportOutcome> {
   const outcome: ImportOutcome = { pending: 0, sampled: 0, videos: 0, failed: 0 };
   const { state, onProjectChange } = input;
@@ -176,9 +252,26 @@ export async function importMediaPaths(input: {
           sourcesById: mergeProbedSource(current.sourcesById, record.id, probe),
         }));
         sourcesSnapshot = mergeProbedSource(sourcesSnapshot, record.id, probe);
-        if (probe.kind === "video") outcome.videos += 1;
+        let completedProbe = probe;
+        if (probe.kind === "video" && probe.state === "probing") {
+          outcome.videos += 1;
+          const task = beginSourceMediaIndex(
+            record.id,
+            { path: probe.path, fingerprint: probe.fingerprint },
+            (progress) => input.onIndexProgress?.(record.id, progress.completed),
+          );
+          completedProbe = indexedVideoProbe(probe, await task.promise);
+          onProjectChange((current) => {
+            if (!current.sourcesById[record.id]) return current;
+            return {
+              ...current,
+              sourcesById: mergeProbedSource(current.sourcesById, record.id, completedProbe),
+            };
+          });
+          sourcesSnapshot = mergeProbedSource(sourcesSnapshot, record.id, completedProbe);
+        }
         if (input.createSamplesForStills && probe.kind === "still" && probe.state === "ready") {
-          const finalId = finalSourceIdFor(sourcesSnapshot, record.id, probe);
+          const finalId = finalSourceIdFor(sourcesSnapshot, record.id, completedProbe);
           const sample = finalId
             ? stillSampleForSource(
                 { ...state, sourcesById: sourcesSnapshot, samplesById: samplesSnapshot },
@@ -202,15 +295,17 @@ export async function importMediaPaths(input: {
         outcome.failed += 1;
         onProjectChange((current) => ({
           ...current,
-          sourcesById: {
-            ...current.sourcesById,
-            [record.id]: {
-              ...current.sourcesById[record.id],
-              state: "error",
-              errorCode: "media_probe_error",
-              errorDetail: String(probeError),
-            },
-          },
+          sourcesById: current.sourcesById[record.id]
+            ? {
+                ...current.sourcesById,
+                [record.id]: {
+                  ...current.sourcesById[record.id],
+                  state: "error",
+                  errorCode: mediaErrorCode(probeError),
+                  errorDetail: String(probeError),
+                },
+              }
+            : current.sourcesById,
         }));
       } finally {
         input.onBusyDelta?.(-1);

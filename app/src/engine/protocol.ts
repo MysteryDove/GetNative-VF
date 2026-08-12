@@ -20,7 +20,8 @@ export type EndpointRule = "inclusive" | "exclusive_stop";
 
 export type MathMode = "raw" | "log_display";
 
-export type BackendPreference = "cpu" | "cuda" | "metal" | "auto";
+export type BackendPreference = "cpu" | "cuda" | "vulkan" | "metal" | "auto";
+export type ActualBackend = "cpu" | "cuda" | "vulkan";
 
 /** Decimal grid; candidates are resolved as exact decimal strings, not binary floats. */
 export type CandidateGridSpec = {
@@ -29,6 +30,7 @@ export type CandidateGridSpec = {
   stop: string;
   step: string;
   endpointRule: EndpointRule;
+  gridSemantics?: import("./types").GridSemantics;
   /** Fully resolved candidate sequence, or empty when only the content hash is stored. */
   candidates: string[];
   contentHash?: string | null;
@@ -108,6 +110,7 @@ export type KernelAnalyzeRequest = {
   streamIndex?: number | null;
   frameIndex?: number | null;
   geometry: GeometrySnapshot;
+  axisMode: AxisMode;
   kernels: KernelRef[];
   metric: MetricSpec;
   profileId: string;
@@ -138,10 +141,12 @@ export type VerifyRequest = {
   geometry: GeometrySnapshot;
   kernel: KernelRef;
   metric: MetricSpec;
+  axisMode: AxisMode;
   profileId: string;
   mathMode: MathMode;
   scanScope: ScanScope;
   backendPreference: BackendPreference;
+  concurrency: number;
 };
 
 export type AnalyzeRequest = HeightAnalyzeRequest | KernelAnalyzeRequest | VerifyRequest;
@@ -166,6 +171,10 @@ export type WorkerAcceptedEvent = WorkerEventBase & {
   /** Verify mode (v1.1): engine-advised producer pacing hint. */
   suggestedInFlight?: number;
   workerCount?: number;
+  concurrency?: number;
+  /** Backend initialized and confirmed by the worker. Missing on older workers. */
+  backend?: ActualBackend;
+  device?: string;
 };
 
 /** One streamed verify frame result (v1.1 progress batches). */
@@ -173,6 +182,9 @@ export type VerifyFrameResult = {
   seq: number;
   /** Null marks a frame the engine failed to load; the job continues. */
   error: number | null;
+  frameIndex?: number;
+  pts?: number | null;
+  timestampSeconds?: number | null;
 };
 
 export type WorkerProgressEvent = WorkerEventBase & {
@@ -188,6 +200,10 @@ export type WorkerWarningEvent = WorkerEventBase & {
   type: "warning";
   code: string;
   message: string;
+  from?: string;
+  to?: string;
+  reason?: string;
+  frameSeq?: number;
 };
 
 /** Result payloads are engine-owned; the GUI stores them append-only and never fabricates them. */
@@ -216,6 +232,10 @@ export type WorkerHelloEvent = {
   commands: {
     analyze: boolean;
     cancel: boolean;
+    media_index_begin?: boolean;
+    media_frame_window?: boolean;
+    media_preview_begin?: boolean;
+    media_asset_batch_begin?: boolean;
   };
 };
 

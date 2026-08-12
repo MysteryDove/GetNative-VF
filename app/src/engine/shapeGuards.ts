@@ -113,6 +113,13 @@ export function validateVerifyShape(request: VerifyRequest): ShapeGuardResult {
   if (!request.geometry) {
     return fail("verify_geometry_required", "Verification Recipe must include geometry");
   }
+  if (!Number.isInteger(request.concurrency)
+      || request.concurrency < 1 || request.concurrency > 8) {
+    return fail(
+      "verify_concurrency_invalid",
+      "Verification concurrency must be an integer within 1..8",
+    );
+  }
   const scope = request.scanScope;
   if (scope == null || !Number.isInteger(scope.streamIndex) || scope.streamIndex < 0) {
     return fail("verify_stream_required", "ScanScope requires a non-negative stream index");

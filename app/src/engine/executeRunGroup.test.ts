@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   applyTerminalEventToRun,
+  backendForWire,
   kernelParamsForWire,
   startHeightRunGroup,
   type ExecutionBridge,
@@ -90,7 +91,101 @@ describe("kernelParamsForWire", () => {
   });
 });
 
+describe("backendForWire", () => {
+  it("preserves explicit Vulkan analyze requests without changing auto", () => {
+    expect(backendForWire("vulkan")).toBe("vulkan");
+    expect(backendForWire("auto")).toBe("auto");
+    expect(backendForWire("metal")).toBe("auto");
+  });
+});
+
 describe("startHeightRunGroup", () => {
+  it("uses one prepared media batch for same-source video frames when advertised", async () => {
+    const plan = makePlan();
+    let state: ProjectState = emptyProjectState({ id: "p1" });
+    state.sourcesById = {
+      src_1: { ...sources.src_1, kind: "video", videoStreams: [], selectedStreamIndex: 0 },
+    } as unknown as ProjectState["sourcesById"];
+    const { bridge, queued } = makeBridge();
+    const batchRequests: Array<{ frames: Array<{ itemId: string; frameIndex: number }> }> = [];
+    let singleExports = 0;
+
+    const result = await startHeightRunGroup({
+      plan,
+      state,
+      onProjectChange: (updater) => { state = updater(state); },
+      bridge,
+      mediaFrameBatch: true,
+      exportAsset: async () => {
+        singleExports += 1;
+        throw new Error("single export should not run");
+      },
+      exportBatch: async (request, onAsset) => {
+        batchRequests.push(request);
+        for (const frame of request.frames) {
+          await onAsset({
+            ticket: "batch-1",
+            itemId: frame.itemId,
+            frameIndex: frame.frameIndex,
+            path: `/cache/${frame.frameIndex}.f32`,
+            format: "f32le",
+            width: request.width,
+            height: request.height,
+            from_cache: false,
+          });
+        }
+      },
+      worker: {
+        submitHeight: async (_params, onPrepared) => {
+          const index = queued.length + 1;
+          const job = { requestId: `r${index}`, jobId: `j${index}`, runId: `g${index}` };
+          onPrepared?.(job);
+          return job;
+        },
+      },
+    });
+
+    expect(result).toMatchObject({ ok: true, submitted: 2, failed: 0 });
+    expect(singleExports).toBe(0);
+    expect(batchRequests).toHaveLength(1);
+    expect(batchRequests[0]?.frames.map((frame) => frame.frameIndex)).toEqual([12, 40]);
+    expect(queued).toHaveLength(2);
+  });
+
+  it("keeps the per-frame exporter when the batch capability is absent", async () => {
+    const plan = makePlan();
+    let state: ProjectState = emptyProjectState({ id: "p1" });
+    state.sourcesById = { ...sources } as unknown as ProjectState["sourcesById"];
+    const { bridge } = makeBridge();
+    let singleExports = 0;
+    let batchExports = 0;
+    const result = await startHeightRunGroup({
+      plan,
+      state,
+      onProjectChange: (updater) => { state = updater(state); },
+      bridge,
+      mediaFrameBatch: false,
+      exportAsset: async () => {
+        singleExports += 1;
+        return {
+          path: `/cache/${singleExports}.f32`, format: "f32le" as const,
+          width: 1920, height: 1080, from_cache: false,
+        };
+      },
+      exportBatch: async () => { batchExports += 1; },
+      worker: {
+        submitHeight: async (_params, onPrepared) => {
+          const job = { requestId: "r", jobId: "j", runId: "g" };
+          onPrepared?.(job);
+          return job;
+        },
+      },
+    });
+    expect(result).toMatchObject({ ok: true, submitted: 2, failed: 0 });
+    expect(singleExports).toBe(2);
+    expect(batchExports).toBe(0);
+  });
+
   it("materializes the group, exports assets, submits members, and binds runs", async () => {
     const plan = makePlan();
     let state: ProjectState = emptyProjectState({ id: "p1" });
@@ -112,13 +207,15 @@ describe("startHeightRunGroup", () => {
         from_cache: false,
       }),
       worker: {
-        submitHeight: async (params) => {
+        submitHeight: async (params, onPrepared) => {
           submittedParams.push(params);
-          return {
+          const job = {
             requestId: `req-${submittedParams.length}`,
             jobId: `job-${submittedParams.length}`,
             runId: `gui-run-${submittedParams.length}`,
           };
+          onPrepared?.(job);
+          return job;
         },
       },
       nowMs: () => 1000,
@@ -136,7 +233,10 @@ describe("startHeightRunGroup", () => {
     // Wire params: grid candidates, metric threshold mapping, bicubic numbers.
     expect(submittedParams).toHaveLength(2);
     expect(submittedParams[0]?.candidates).toEqual(["710", "711", "712"]);
-    expect(submittedParams[0]?.metric.threshold).toBe(0);
+    expect(submittedParams[0]?.metric.threshold).toBe(0.015);
+    expect(submittedParams[0]?.profileId).toBe("muf-d278cd3");
+    expect(submittedParams[0]?.endpointRule).toBe("inclusive");
+    expect(submittedParams[0]?.grid).toEqual({ start: "710", stop: "712", step: "1" });
     expect(submittedParams[0]?.metric.pNorm).toBe(1);
     expect(submittedParams[0]?.kernel.id).toBe("bicubic");
     expect(submittedParams[0]?.frameAsset).toEqual({
@@ -178,7 +278,11 @@ describe("startHeightRunGroup", () => {
         };
       },
       worker: {
-        submitHeight: async () => ({ requestId: "r", jobId: "j", runId: "g" }),
+        submitHeight: async (_params, onPrepared) => {
+          const job = { requestId: "r", jobId: "j", runId: "g" };
+          onPrepared?.(job);
+          return job;
+        },
       },
       nowMs: () => 1000,
     });
@@ -286,10 +390,10 @@ describe("startKernelRunGroup", () => {
       cropLeft: 0, cropRight: 0, cropTop: 0, cropBottom: 0,
       pixelExclusionThreshold: 0, pNorm: 1,
     }, "muf-d278cd3", "raw", "auto");
-    draft.families = {
-      bilinear: true, bicubic: true, spline16: false,
-      spline36: false, spline64: false, lanczos: false,
-    };
+    draft.scanList = [
+      { id: "bilinear", parameters: {} },
+      { id: "bicubic", parameters: { b: 0, c: 0.5 } },
+    ];
     const geometry = {
       mode: "standard" as const,
       activeWidth: 1920, activeHeight: 1080,
@@ -311,6 +415,7 @@ describe("startKernelRunGroup", () => {
     if (!planned.ok) return;
 
     let state: ProjectState = emptyProjectState({ id: "p1" });
+    state.sourcesById = { ...sources } as unknown as ProjectState["sourcesById"];
     const { bridge, queued } = makeBridge();
     const submissions: Array<Record<string, unknown>> = [];
     const result = await startKernelRunGroup({
@@ -322,9 +427,11 @@ describe("startKernelRunGroup", () => {
         path: "/cache/f.f32", format: "f32le", width: 1920, height: 1080, from_cache: false,
       }),
       worker: {
-        submitKernel: async (params) => {
+        submitKernel: async (params, onPrepared) => {
           submissions.push(params as unknown as Record<string, unknown>);
-          return { requestId: "r1", jobId: "j1", runId: "g1" };
+          const job = { requestId: "r1", jobId: "j1", runId: "g1" };
+          onPrepared?.(job);
+          return job;
         },
       },
       nowMs: () => 1000,

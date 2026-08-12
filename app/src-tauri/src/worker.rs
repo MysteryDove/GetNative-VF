@@ -15,13 +15,14 @@ use crate::engine::{find_engine, validate_capabilities};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{ipc::Response, AppHandle, Emitter, Manager, State};
 
 const PROTOCOL_VERSION: u32 = 1;
 const STDERR_TAIL_LINES: usize = 50;
@@ -29,6 +30,34 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FRAME_AXIS: u32 = 65_536;
 const MAX_CANDIDATES: usize = 100_000;
+const CUDA_MAXIMUM_P_NORM: u32 = 4;
+const MAX_CACHED_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
+
+fn media_cache_directory(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_cache = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("media_cache_error: {error}"))?;
+    let legacy = app_cache.join("media-index");
+    if let Ok(entries) = fs::read_dir(&legacy) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let removable = path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+                || path.file_name().and_then(|value| value.to_str())
+                    .is_some_and(|value| value.contains(".jsonl.") || value.ends_with(".tmp"));
+            if removable {
+                let _ = fs::remove_file(path);
+            }
+        }
+        let _ = fs::remove_dir(&legacy);
+    }
+    let directory = app_cache.join("media");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("media_cache_error: failed to create cache directory: {error}"))?;
+    directory
+        .canonicalize()
+        .map_err(|error| format!("media_cache_error: failed to resolve cache directory: {error}"))
+}
 
 /// Output of the stdout reader thread. Kept transport-agnostic so the
 /// session logic is testable without a running Tauri application.
@@ -146,9 +175,23 @@ fn dispatch_event(value: Value, pending: &PendingMap, sink: &WorkerSink) {
     sink(WorkerOutput::Event(value));
 }
 
-fn spawn_session(engine_path: &Path, sink: WorkerSink) -> Result<WorkerSession, String> {
-    let mut child = Command::new(engine_path)
+fn spawn_session(
+    engine_path: &Path,
+    sink: WorkerSink,
+    configured_cache_dir: Option<&Path>,
+) -> Result<WorkerSession, String> {
+    // Keep the L2 cache enabled for packaged engines, including older staged
+    // binaries that predate the engine-side executable-directory default.
+    // The preference path is explicit so the GUI and CLI use one location.
+    let cache_dir = configured_cache_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| engine_path.parent().unwrap_or(Path::new(".")).to_path_buf());
+    let mut command = Command::new(engine_path);
+    command
         .arg("worker")
+        .env("GETNATIVE_PLAN_CACHE", "on")
+        .env("GETNATIVE_PLAN_CACHE_DIR", &cache_dir);
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -267,6 +310,7 @@ impl WorkerManager {
         })?;
         action(session)
     }
+
 }
 
 #[tauri::command]
@@ -284,7 +328,10 @@ pub fn engine_worker_start(app: AppHandle, state: State<'_, WorkerManager>) -> R
     }
 
     let path: PathBuf = find_engine(&app)?;
-    let mut session = spawn_session(&path, tauri_sink(&app))?;
+    let configured_cache_dir = crate::prefs::load_preferences(&app)
+        .ok()
+        .and_then(|prefs| prefs.axis_plan_cache_dir.map(PathBuf::from));
+    let mut session = spawn_session(&path, tauri_sink(&app), configured_cache_dir.as_deref())?;
     let hello = session.roundtrip(json!({
         "protocol_version": PROTOCOL_VERSION,
         "type": "hello",
@@ -322,6 +369,96 @@ pub fn engine_worker_capabilities(state: State<'_, WorkerManager>) -> Result<Val
     })
 }
 
+/// Forward one engine-owned media job. The frontend supplies the protocol
+/// fields in snake_case; this boundary owns protocol version and cache paths.
+#[tauri::command]
+pub fn engine_worker_media_begin(
+    app: AppHandle,
+    state: State<'_, WorkerManager>,
+    mut request: Value,
+) -> Result<Value, String> {
+    let object = request
+        .as_object_mut()
+        .ok_or_else(|| "bad_request: media request must be an object".to_owned())?;
+    let request_id = object
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "bad_request: request_id must not be empty".to_owned())?
+        .to_owned();
+    let command_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "bad_request: media request type is required".to_owned())?
+        .to_owned();
+    if !matches!(
+        command_type.as_str(),
+        "media_index_begin"
+            | "media_frame_window"
+            | "media_preview_begin"
+            | "media_asset_batch_begin"
+    ) {
+        return Err(format!("bad_request: unsupported media command {command_type}"));
+    }
+    let path = object
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "bad_request: media path is required".to_owned())?
+        .to_owned();
+    let canonical_path = crate::media::validated_media_path(&path)?;
+    object.insert("path".to_owned(), json!(canonical_path));
+    object.insert("protocol_version".to_owned(), json!(PROTOCOL_VERSION));
+    object.insert(
+        "cache_directory".to_owned(),
+        json!(media_cache_directory(&app)?),
+    );
+    state.with_live_session(|session| {
+        let available = session
+            .hello
+            .get("payload")
+            .and_then(|payload| payload.get("commands"))
+            .and_then(|commands| commands.get(&command_type))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !available {
+            return Err(
+                "video_backend_unavailable: the engine was built without in-process media support"
+                    .to_owned(),
+            );
+        }
+        session.write_command(&request)
+    })?;
+    Ok(json!({ "requestId": request_id, "queued": true }))
+}
+
+/// Read only PNG files produced by the engine below the app media cache.
+#[tauri::command]
+pub fn engine_worker_media_read_asset(
+    app: AppHandle,
+    path: String,
+) -> Result<Response, String> {
+    let cache_directory = media_cache_directory(&app)?;
+    let requested = PathBuf::from(&path)
+        .canonicalize()
+        .map_err(|error| format!("media_asset_error: failed to resolve cached asset: {error}"))?;
+    if !requested.starts_with(&cache_directory)
+        || requested.extension().and_then(|value| value.to_str()) != Some("png")
+    {
+        return Err("media_asset_error: cached preview path is outside the media cache".to_owned());
+    }
+    let metadata = fs::metadata(&requested)
+        .map_err(|error| format!("media_asset_error: failed to inspect cached asset: {error}"))?;
+    if !metadata.is_file() || metadata.len() > MAX_CACHED_PREVIEW_BYTES {
+        return Err("media_asset_error: cached preview is invalid or too large".to_owned());
+    }
+    let bytes = fs::read(&requested)
+        .map_err(|error| format!("media_asset_error: failed to read cached preview: {error}"))?;
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err("media_asset_error: cached preview is not a PNG file".to_owned());
+    }
+    Ok(Response::new(bytes))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameAssetRef {
@@ -351,6 +488,22 @@ pub struct MetricCommand {
     pub p_norm: Option<u32>,
 }
 
+fn default_profile_id() -> String {
+    "muf-d278cd3".to_owned()
+}
+
+fn default_endpoint_rule() -> String {
+    "inclusive".to_owned()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateGridCommand {
+    pub start: String,
+    pub stop: String,
+    pub step: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerAnalyzeRequest {
@@ -367,12 +520,22 @@ pub struct WorkerAnalyzeRequest {
     pub metric: MetricCommand,
     pub backend: String,
     pub worker_count: Option<u32>,
+    #[serde(default = "default_profile_id")]
+    pub profile_id: String,
+    #[serde(default = "default_endpoint_rule")]
+    pub endpoint_rule: String,
+    pub base_height: Option<String>,
+    pub base_width: Option<String>,
+    pub grid: Option<CandidateGridCommand>,
 }
 
 fn validate_kernel_command(kernel: &KernelCommand) -> Result<(), String> {
     match kernel.id.as_str() {
         "bilinear" | "spline16" | "spline36" | "spline64" => {}
         "bicubic" => {
+            if kernel.b.is_none() || kernel.c.is_none() {
+                return Err("bad_request: bicubic requires explicit b and c".to_owned());
+            }
             for (label, value) in [("b", kernel.b), ("c", kernel.c)] {
                 if value.is_some_and(|value| !value.is_finite()) {
                     return Err(format!("bad_request: bicubic {label} must be finite"));
@@ -380,6 +543,9 @@ fn validate_kernel_command(kernel: &KernelCommand) -> Result<(), String> {
             }
         }
         "lanczos" => {
+            if kernel.taps.is_none() {
+                return Err("bad_request: lanczos requires explicit taps".to_owned());
+            }
             if kernel.taps.is_some_and(|taps| !(1..=15).contains(&taps)) {
                 return Err("bad_request: lanczos taps must be within 1..=15".to_owned());
             }
@@ -416,6 +582,33 @@ fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), String> {
     }
     if !matches!(request.axis_mode.as_str(), "h_only" | "w_only" | "h_plus_w") {
         return Err(format!("bad_request: unknown axisMode {}", request.axis_mode));
+    }
+    if !matches!(
+        request.profile_id.as_str(),
+        "muf-d278cd3" | "getfnative-44c8d0f" | "modern"
+    ) {
+        return Err(format!("bad_request: unknown profileId {}", request.profile_id));
+    }
+    if !matches!(request.endpoint_rule.as_str(), "inclusive" | "exclusive_stop") {
+        return Err(format!(
+            "bad_request: unknown endpointRule {}",
+            request.endpoint_rule
+        ));
+    }
+    for (label, value) in [
+        ("baseHeight", request.base_height.as_deref()),
+        ("baseWidth", request.base_width.as_deref()),
+    ] {
+        if let Some(value) = value {
+            let parsed = value.parse::<u32>().map_err(|_| {
+                format!("bad_request: {label} must be a positive integer decimal")
+            })?;
+            if parsed == 0 || parsed > MAX_FRAME_AXIS {
+                return Err(format!(
+                    "bad_request: {label} must be within 1..={MAX_FRAME_AXIS}"
+                ));
+            }
+        }
     }
     fn validate_kernel(kernel: &KernelCommand) -> Result<(), String> {
         validate_kernel_command(kernel)
@@ -455,6 +648,23 @@ fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), String> {
                 "bad_request: candidates must contain 1..={MAX_CANDIDATES} values"
             ));
         }
+        if let Some(grid) = &request.grid {
+            for (label, value) in [
+                ("grid.start", grid.start.as_str()),
+                ("grid.stop", grid.stop.as_str()),
+                ("grid.step", grid.step.as_str()),
+            ] {
+                let parsed = value.parse::<f64>().map_err(|_| {
+                    format!("bad_request: {label} must be a decimal")
+                })?;
+                if !parsed.is_finite() {
+                    return Err(format!("bad_request: {label} must be finite"));
+                }
+            }
+            if grid.step.parse::<f64>().unwrap_or(0.0) <= 0.0 {
+                return Err("bad_request: grid.step must be positive".to_owned());
+            }
+        }
     }
     for candidate in &request.candidates {
         let Ok(value) = candidate.parse::<f64>() else {
@@ -466,8 +676,8 @@ fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), String> {
             ));
         }
     }
-    if request.metric.p_norm.is_some_and(|p| p != 1) {
-        return Err("unsupported: only p_norm=1 is available in worker protocol v1".to_owned());
+    if request.metric.p_norm == Some(0) {
+        return Err("bad_request: p_norm must be a positive integer".to_owned());
     }
     if request
         .metric
@@ -476,11 +686,19 @@ fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), String> {
     {
         return Err("bad_request: threshold must be finite and non-negative".to_owned());
     }
-    if !matches!(request.backend.as_str(), "cpu" | "cuda" | "auto") {
+    if !matches!(request.backend.as_str(), "cpu" | "cuda" | "vulkan" | "auto") {
         return Err(format!(
-            "unsupported: backend must be one of cpu/cuda/auto in worker protocol v1, got {}",
+            "unsupported: backend must be one of cpu/cuda/vulkan/auto in worker protocol v1, got {}",
             request.backend
         ));
+    }
+    if request.backend == "cuda"
+        && request.metric.p_norm.unwrap_or(1) > CUDA_MAXIMUM_P_NORM
+    {
+        return Err("unsupported: CUDA only supports p_norm in 1..4".to_owned());
+    }
+    if request.backend == "vulkan" && request.metric.p_norm.unwrap_or(1) != 1 {
+        return Err("unsupported: Vulkan currently supports only p_norm=1".to_owned());
     }
     Ok(())
 }
@@ -536,6 +754,10 @@ fn analyze_command(request: &WorkerAnalyzeRequest) -> Value {
             "height": request.frame_asset.height,
         },
         "axis_mode": request.axis_mode,
+        "profile_id": request.profile_id,
+        "endpoint_rule": request.endpoint_rule,
+        "base_height": request.base_height,
+        "base_width": request.base_width,
         "metric": Value::Object(metric),
         "backend": request.backend,
     });
@@ -555,6 +777,13 @@ fn analyze_command(request: &WorkerAnalyzeRequest) -> Value {
             request.kernel.as_ref().expect("height mode requires kernel"),
         );
         command["candidates"] = json!(request.candidates);
+        if let Some(grid) = &request.grid {
+            command["grid"] = json!({
+                "start": grid.start,
+                "stop": grid.stop,
+                "step": grid.step,
+            });
+        }
     }
     if let Some(worker_count) = request.worker_count {
         command["worker_count"] = json!(worker_count);
@@ -641,6 +870,32 @@ pub struct VerifyEndRequest {
     pub total: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyMediaBeginRequest {
+    pub request_id: String,
+    pub path: String,
+    pub fingerprint: Option<String>,
+    pub stream_index: u32,
+    pub width: u32,
+    pub height: u32,
+    pub selection: String,
+    pub every_n: Option<u64>,
+    pub start_frame: Option<u64>,
+    pub end_frame: Option<u64>,
+    pub axis_mode: String,
+    pub kernel: KernelCommand,
+    pub candidate: String,
+    pub metric: MetricCommand,
+    pub backend: String,
+    #[serde(default = "default_media_verify_concurrency")]
+    pub concurrency: u32,
+}
+
+fn default_media_verify_concurrency() -> u32 {
+    2
+}
+
 fn validate_frame_asset_ref(asset: &FrameAssetRef) -> Result<(), String> {
     if asset.path.trim().is_empty() {
         return Err("bad_request: frameAsset.path must not be empty".to_owned());
@@ -695,6 +950,84 @@ fn validate_verify_begin(request: &VerifyBeginRequest) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_verify_media_begin(request: &VerifyMediaBeginRequest) -> Result<(), String> {
+    if request.request_id.trim().is_empty() || request.path.trim().is_empty() {
+        return Err("bad_request: requestId and path must not be empty".to_owned());
+    }
+    if request.width < 2
+        || request.height < 2
+        || request.width > MAX_FRAME_AXIS
+        || request.height > MAX_FRAME_AXIS
+    {
+        return Err(format!(
+            "bad_request: verify geometry must be within 2..={MAX_FRAME_AXIS}"
+        ));
+    }
+    if !matches!(request.axis_mode.as_str(), "h_only" | "w_only" | "h_plus_w") {
+        return Err(format!("bad_request: unknown axisMode {}", request.axis_mode));
+    }
+    validate_kernel_command(&request.kernel)?;
+    let candidate = request
+        .candidate
+        .parse::<f64>()
+        .map_err(|_| "bad_request: candidate must be a decimal".to_owned())?;
+    if !candidate.is_finite() || candidate < 2.0 {
+        return Err("bad_request: candidate must be finite and >= 2".to_owned());
+    }
+    if !matches!(request.backend.as_str(), "cpu" | "cuda" | "vulkan" | "auto") {
+        return Err(format!(
+            "unsupported: media verify backend must be cpu/cuda/vulkan/auto, got {}",
+            request.backend
+        ));
+    }
+    if !(1..=8).contains(&request.concurrency) {
+        return Err("bad_request: concurrency must be within 1..=8".to_owned());
+    }
+    if request.backend == "cuda" && request.metric.p_norm.unwrap_or(1) > CUDA_MAXIMUM_P_NORM {
+        return Err("unsupported: CUDA verify only supports p_norm in 1..4".to_owned());
+    }
+    if request.backend == "vulkan" && request.metric.p_norm.unwrap_or(1) != 1 {
+        return Err("unsupported: Vulkan verify currently supports only p_norm=1".to_owned());
+    }
+    match request.selection.as_str() {
+        "all" | "decoded_i_picture" => {}
+        "every_n" if request.every_n.is_some_and(|value| value >= 1) => {}
+        "every_n" => {
+            return Err("bad_request: every-N selection requires everyN >= 1".to_owned())
+        }
+        other => return Err(format!("bad_request: unknown selection rule {other}")),
+    }
+    if request
+        .start_frame
+        .zip(request.end_frame)
+        .is_some_and(|(start, end)| start > end)
+    {
+        return Err("bad_request: range start must be <= end".to_owned());
+    }
+    Ok(())
+}
+
+fn metric_json(metric: &MetricCommand) -> Value {
+    let mut result = Map::new();
+    for (key, value) in [
+        ("crop_left", metric.crop_left),
+        ("crop_right", metric.crop_right),
+        ("crop_top", metric.crop_top),
+        ("crop_bottom", metric.crop_bottom),
+    ] {
+        if let Some(value) = value {
+            result.insert(key.to_owned(), json!(value));
+        }
+    }
+    if let Some(value) = metric.threshold {
+        result.insert("threshold".to_owned(), json!(value));
+    }
+    if let Some(value) = metric.p_norm {
+        result.insert("p_norm".to_owned(), json!(value));
+    }
+    Value::Object(result)
+}
+
 #[tauri::command]
 pub fn engine_worker_verify_begin(
     state: State<'_, WorkerManager>,
@@ -737,6 +1070,42 @@ pub fn engine_worker_verify_begin(
     if let Some(expected) = request.expected_frames {
         command["expected_frames"] = json!(expected);
     }
+    let request_id = request.request_id.clone();
+    state.with_live_session(|session| session.write_command(&command))?;
+    Ok(json!({ "requestId": request_id, "queued": true }))
+}
+
+#[tauri::command]
+pub fn engine_worker_verify_media_begin(
+    app: AppHandle,
+    state: State<'_, WorkerManager>,
+    request: VerifyMediaBeginRequest,
+) -> Result<Value, String> {
+    validate_verify_media_begin(&request)?;
+    let command = json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "type": "verify_media_begin",
+        "request_id": request.request_id,
+        "media": {
+            "path": request.path,
+            "fingerprint": request.fingerprint,
+            "stream_index": request.stream_index,
+            "cache_directory": media_cache_directory(&app)?,
+        },
+        "geometry": { "width": request.width, "height": request.height },
+        "scan_scope": {
+            "selection": request.selection,
+            "every_n": request.every_n,
+            "start_frame": request.start_frame,
+            "end_frame": request.end_frame,
+        },
+        "axis_mode": request.axis_mode,
+        "kernel": kernel_json(&request.kernel),
+        "candidate": request.candidate,
+        "metric": metric_json(&request.metric),
+        "backend": request.backend,
+        "concurrency": request.concurrency,
+    });
     let request_id = request.request_id.clone();
     state.with_live_session(|session| session.write_command(&command))?;
     Ok(json!({ "requestId": request_id, "queued": true }))
@@ -806,6 +1175,11 @@ mod tests {
             "axisMode": "h_only",
             "kernel": {"id": "bicubic", "b": 0.0, "c": 0.5},
             "candidates": ["230", "231.5"],
+            "profileId": "getfnative-44c8d0f",
+            "endpointRule": "exclusive_stop",
+            "baseHeight": "241",
+            "baseWidth": "321",
+            "grid": {"start": "230", "stop": "233", "step": "1.5"},
             "metric": {"cropLeft": 10, "threshold": 0.015, "pNorm": 1},
             "backend": "cpu",
         }))
@@ -821,6 +1195,14 @@ mod tests {
         assert_eq!(command["frame_asset"]["format"], json!("f32le"));
         assert_eq!(command["kernel"], json!({"id": "bicubic", "b": 0.0, "c": 0.5}));
         assert_eq!(command["metric"]["p_norm"], json!(1));
+        assert_eq!(command["profile_id"], json!("getfnative-44c8d0f"));
+        assert_eq!(command["endpoint_rule"], json!("exclusive_stop"));
+        assert_eq!(command["base_height"], json!("241"));
+        assert_eq!(command["base_width"], json!("321"));
+        assert_eq!(
+            command["grid"],
+            json!({"start": "230", "stop": "233", "step": "1.5"})
+        );
         assert!(command.get("worker_count").is_none());
     }
 
@@ -932,6 +1314,12 @@ mod tests {
         assert!(validate_analyze(&request).is_ok());
 
         let mut request = analyze_request();
+        request.backend = "vulkan".to_owned();
+        assert!(validate_analyze(&request).is_ok());
+        request.metric.p_norm = Some(2);
+        assert!(validate_analyze(&request).is_err());
+
+        let mut request = analyze_request();
         request.backend = "metal".to_owned();
         assert!(validate_analyze(&request).is_err());
 
@@ -944,7 +1332,11 @@ mod tests {
         assert!(validate_analyze(&request).is_err());
 
         let mut request = analyze_request();
-        request.metric.p_norm = Some(2);
+        request.metric.p_norm = Some(4);
+        assert!(validate_analyze(&request).is_ok());
+        request.backend = "cuda".to_owned();
+        assert!(validate_analyze(&request).is_ok());
+        request.metric.p_norm = Some(5);
         assert!(validate_analyze(&request).is_err());
 
         let mut request = analyze_request();
@@ -953,6 +1345,79 @@ mod tests {
             kernel.id = "lanczos".to_owned();
         }
         assert!(validate_analyze(&request).is_err());
+    }
+
+    #[test]
+    fn verify_validation_is_cpu_only_and_keeps_auto_explicit() {
+        let value = json!({
+            "requestId": "verify-1",
+            "width": 320,
+            "height": 240,
+            "axisMode": "h_only",
+            "kernel": {"id": "bicubic", "b": 0.0, "c": 0.5},
+            "candidate": "200",
+            "metric": {"pNorm": 1},
+            "backend": "auto"
+        });
+        let request: VerifyBeginRequest = serde_json::from_value(value.clone()).unwrap();
+        assert!(validate_verify_begin(&request).is_ok());
+
+        let mut cpu = value.clone();
+        cpu["backend"] = json!("cpu");
+        let request: VerifyBeginRequest = serde_json::from_value(cpu).unwrap();
+        assert!(validate_verify_begin(&request).is_ok());
+
+        for backend in ["cuda", "vulkan"] {
+            let mut rejected = value.clone();
+            rejected["backend"] = json!(backend);
+            let request: VerifyBeginRequest = serde_json::from_value(rejected).unwrap();
+            assert!(validate_verify_begin(&request).is_err());
+        }
+    }
+
+    #[test]
+    fn media_verify_concurrency_defaults_and_validates() {
+        let value = json!({
+            "requestId": "verify-media-1",
+            "path": "/tmp/video.mkv",
+            "fingerprint": null,
+            "streamIndex": 0,
+            "width": 320,
+            "height": 240,
+            "selection": "all",
+            "everyN": null,
+            "startFrame": null,
+            "endFrame": null,
+            "axisMode": "h_only",
+            "kernel": {"id": "bicubic", "b": 0.0, "c": 0.5},
+            "candidate": "200",
+            "metric": {"pNorm": 1},
+            "backend": "cpu"
+        });
+        let request: VerifyMediaBeginRequest =
+            serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(request.concurrency, 2);
+        assert!(validate_verify_media_begin(&request).is_ok());
+
+        for concurrency in 1..=8 {
+            let mut accepted = value.clone();
+            accepted["concurrency"] = json!(concurrency);
+            let request: VerifyMediaBeginRequest =
+                serde_json::from_value(accepted).unwrap();
+            assert!(validate_verify_media_begin(&request).is_ok());
+        }
+        for concurrency in [0, 9] {
+            let mut rejected = value.clone();
+            rejected["concurrency"] = json!(concurrency);
+            let request: VerifyMediaBeginRequest =
+                serde_json::from_value(rejected).unwrap();
+            assert!(validate_verify_media_begin(&request).is_err());
+        }
+        for invalid in [json!(-1), json!(1.5), json!("two")] {
+            let mut rejected = value.clone();
+            rejected["concurrency"] = invalid;
+            assert!(serde_json::from_value::<VerifyMediaBeginRequest>(rejected).is_err());
+        }
     }
 
     #[test]
@@ -1004,7 +1469,7 @@ mod tests {
         let sink: WorkerSink = Arc::new(move |output| {
             let _ = tx.send(output);
         });
-        let mut session = spawn_session(&engine, sink).unwrap();
+        let mut session = spawn_session(&engine, sink, None).unwrap();
 
         let hello = session
             .roundtrip(json!({"protocol_version": 1, "type": "hello"}))
@@ -1063,6 +1528,11 @@ mod tests {
             },
             backend: "cpu".to_owned(),
             worker_count: None,
+            profile_id: default_profile_id(),
+            endpoint_rule: default_endpoint_rule(),
+            base_height: None,
+            base_width: None,
+            grid: None,
         };
         validate_analyze(&request).unwrap();
         session.write_command(&analyze_command(&request)).unwrap();
@@ -1164,7 +1634,7 @@ mod tests {
         let sink: WorkerSink = Arc::new(move |output| {
             let _ = tx.send(output);
         });
-        let mut session = spawn_session(&engine, sink).unwrap();
+        let mut session = spawn_session(&engine, sink, None).unwrap();
         session
             .roundtrip(json!({"protocol_version": 1, "type": "hello"}))
             .unwrap();
@@ -1197,6 +1667,11 @@ mod tests {
             },
             backend: "cpu".to_owned(),
             worker_count: None,
+            profile_id: default_profile_id(),
+            endpoint_rule: default_endpoint_rule(),
+            base_height: None,
+            base_width: None,
+            grid: None,
         };
         session.write_command(&analyze_command(&request)).unwrap();
         loop {
@@ -1228,6 +1703,126 @@ mod tests {
         let _ = std::fs::remove_dir_all(cache_dir);
     }
 
+    #[test]
+    #[ignore = "requires GETNATIVE_ENGINE_PATH and GETNATIVE_MUF_FIXTURE"]
+    fn muf_reference_image_conformance() {
+        let engine = PathBuf::from(
+            std::env::var_os("GETNATIVE_ENGINE_PATH").expect("GETNATIVE_ENGINE_PATH must be set"),
+        );
+        let fixture = PathBuf::from(
+            std::env::var_os("GETNATIVE_MUF_FIXTURE").expect("GETNATIVE_MUF_FIXTURE must be set"),
+        );
+        let cache_dir = std::env::temp_dir().join(format!(
+            "getnative_muf_conformance_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let asset = crate::media::frame_asset_still(
+            &fixture,
+            &crate::media::MediaFrameAssetRequest {
+                path: fixture.display().to_string(),
+                fingerprint: None,
+                stream_index: None,
+                frame_index: None,
+                width: Some(1920),
+                height: Some(1080),
+            },
+            &cache_dir,
+        )
+        .unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let sink: WorkerSink = Arc::new(move |output| {
+            let _ = tx.send(output);
+        });
+        let mut session = spawn_session(&engine, sink, None).unwrap();
+        session
+            .roundtrip(json!({"protocol_version": 1, "type": "hello"}))
+            .unwrap();
+        let capabilities = session
+            .roundtrip(json!({"protocol_version": 1, "type": "capabilities"}))
+            .unwrap();
+        let cuda_available = capabilities["payload"]["backends"]
+            .as_array()
+            .is_some_and(|backends| {
+                backends.iter().any(|backend| {
+                    backend["id"] == "cuda"
+                        && backend["compiled"] == true
+                        && backend["device_available"] == true
+                })
+            });
+        let backends: &[&str] = if cuda_available {
+            &["cpu", "cuda"]
+        } else {
+            &["cpu"]
+        };
+
+        for backend in backends {
+            for (axis_mode, expected) in [
+                ("h_only", 1.695259983e-7_f64),
+                ("h_plus_w", 2.251854147e-6_f64),
+            ] {
+                let request: WorkerAnalyzeRequest = serde_json::from_value(json!({
+                    "requestId": format!("muf-conformance-{backend}-{axis_mode}"),
+                    "mode": "height",
+                    "frameAsset": {
+                        "path": asset.path,
+                        "format": "f32le",
+                        "width": asset.width,
+                        "height": asset.height,
+                    },
+                    "axisMode": axis_mode,
+                    "kernel": {"id": "bicubic", "b": 0.0, "c": 0.5},
+                    "candidates": ["810"],
+                    "profileId": "muf-d278cd3",
+                    "endpointRule": "inclusive",
+                    "baseHeight": null,
+                    "baseWidth": null,
+                    "grid": {"start": "810", "stop": "810", "step": "1"},
+                    "metric": {
+                        "cropLeft": 5, "cropRight": 5, "cropTop": 5, "cropBottom": 5,
+                        "threshold": 0.015, "pNorm": 1
+                    },
+                    "backend": backend,
+                }))
+                .unwrap();
+                validate_analyze(&request).unwrap();
+                session.write_command(&analyze_command(&request)).unwrap();
+
+                let actual = loop {
+                    match rx.recv_timeout(Duration::from_secs(60)) {
+                        Ok(WorkerOutput::Event(value)) if value["type"] == "result" => {
+                            break value["payload"]["candidates"][0]["error"]
+                                .as_f64()
+                                .expect("candidate error must be numeric");
+                        }
+                        Ok(WorkerOutput::Event(value)) if value["type"] == "error" => {
+                            panic!("engine reported an error: {value}")
+                        }
+                        Ok(WorkerOutput::Event(_)) => {}
+                        Ok(WorkerOutput::Exited { stderr_tail }) => {
+                            panic!("worker exited mid-job: {stderr_tail:?}")
+                        }
+                        Err(error) => {
+                            panic!("timed out waiting for conformance result: {error}")
+                        }
+                    }
+                };
+                let relative_error = (actual - expected).abs() / expected.abs();
+                println!(
+                    "MUF {backend} {axis_mode}: actual={actual:.12e}, expected={expected:.12e}, relative={relative_error:.3e}"
+                );
+                assert!(
+                    relative_error <= 1e-5,
+                    "{backend} {axis_mode}: actual={actual:.12e}, expected={expected:.12e}, relative={relative_error:.3e}"
+                );
+            }
+        }
+
+        session.terminate();
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
     /// A fake worker that answers hello and then exits: the sink must observe
     /// the exit and pending roundtrips must fail instead of hanging.
     #[cfg(unix)]
@@ -1253,7 +1848,7 @@ mod tests {
             let _ = tx.send(output);
         });
         // spawn_session appends the "worker" argument; the script ignores it.
-        let mut session = spawn_session(&script, sink).unwrap();
+        let mut session = spawn_session(&script, sink, None).unwrap();
         let hello = session
             .roundtrip(json!({"protocol_version": 1, "type": "hello"}))
             .unwrap();
@@ -1287,7 +1882,7 @@ mod tests {
         let sink: WorkerSink = Arc::new(move |output| {
             let _ = tx.send(output);
         });
-        let mut session = spawn_session(&script, sink).unwrap();
+        let mut session = spawn_session(&script, sink, None).unwrap();
         match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
             WorkerOutput::Event(value) => {
                 assert_eq!(value["type"], json!("error"));

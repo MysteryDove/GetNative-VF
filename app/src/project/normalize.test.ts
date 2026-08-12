@@ -158,7 +158,7 @@ export function runPureModuleChecks(): void {
   const runnable = readiness(state, true);
   assert(runnable.heightReady, "included Sample with a ready source enables Resolution Test");
   assert(runnable.kernelReady, "included Sample with a ready source enables Algorithm Test");
-  assert(!runnable.verifyReady, "Full Video Check requires an active locked Recipe");
+  assert(!runnable.verifyReady, "Full Video Check requires a complete current Recipe");
 
   state.recipesById.recipe_1 = {
     id: "recipe_1",
@@ -169,14 +169,59 @@ export function runPureModuleChecks(): void {
     parentRecipeId: null,
     createdAt: "2026-01-01T00:00:00Z",
     updatedAt: "2026-01-01T00:00:00Z",
-    geometry: null,
+    geometry: {
+      mode: "standard",
+      activeWidth: 1920,
+      activeHeight: 1080,
+      canvasWidth: 1920,
+      canvasHeight: 1080,
+      srcLeft: 0,
+      srcTop: 0,
+      srcWidth: 1920,
+      srcHeight: 1080,
+      baseHeight: 720,
+      baseWidth: null,
+      parity: null,
+    },
     kernel: { id: "bicubic", parameters: { b: 0, c: 0.5 } },
-    metric: null,
+    metric: {
+      cropLeft: 10,
+      cropRight: 10,
+      cropTop: 10,
+      cropBottom: 10,
+      pixelExclusionThreshold: 0.015,
+      pNorm: 1,
+    },
+    axisMode: "h_plus_w",
     profileId: "muf-d278cd3",
     mathMode: "raw",
   };
   state.project.activeRecipeId = "recipe_1";
-  assert(readiness(state, true).verifyReady, "ready video and active locked Recipe enable checking");
+  assert(
+    readiness(state, true).verifyReady,
+    "ready video and a complete current Recipe enable checking",
+  );
+
+  // An incomplete current Recipe blocks Verification (field-completeness gate).
+  state.recipesById.recipe_1.geometry = null;
+  assert(
+    !readiness(state, true).verifyReady,
+    "current Recipe missing geometry blocks checking",
+  );
+  state.recipesById.recipe_1.geometry = {
+    mode: "standard",
+    activeWidth: 1920,
+    activeHeight: 1080,
+    canvasWidth: 1920,
+    canvasHeight: 1080,
+    srcLeft: 0,
+    srcTop: 0,
+    srcWidth: 1920,
+    srcHeight: 1080,
+    baseHeight: 720,
+    baseWidth: null,
+    parity: null,
+  };
 
   const recipeManifest = projectStateToManifest(state);
   const storedRecipe = recipeManifest.recipes[0];

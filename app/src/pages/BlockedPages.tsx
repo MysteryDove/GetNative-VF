@@ -1,15 +1,44 @@
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
+import { Check, FolderOpen, RotateCcw } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import type { Translator } from "../i18n";
 
 export function SettingsPage({
   t,
   language,
   onLanguageChange,
+  axisPlanCacheDir,
+  onAxisPlanCacheDirChange,
 }: {
   t: Translator;
   language: "zh-CN" | "en";
   onLanguageChange: (locale: "zh-CN" | "en") => void;
+  axisPlanCacheDir: string | null;
+  onAxisPlanCacheDirChange: (path: string | null) => Promise<void>;
 }) {
+  const [cachePath, setCachePath] = useState(axisPlanCacheDir ?? "");
+  const [cacheBusy, setCacheBusy] = useState(false);
+
+  useEffect(() => setCachePath(axisPlanCacheDir ?? ""), [axisPlanCacheDir]);
+
+  async function chooseCachePath() {
+    try {
+      const path = await invoke<string | null>("app_pick_axis_plan_cache_dir");
+      if (path) setCachePath(path);
+    } catch {
+      // The path can still be entered manually if the native chooser fails.
+    }
+  }
+
+  async function saveCachePath() {
+    setCacheBusy(true);
+    try {
+      await onAxisPlanCacheDirChange(cachePath.trim() || null);
+    } finally {
+      setCacheBusy(false);
+    }
+  }
+
   return (
     <PageFrame title={t("settings.title")}>
       <section className="page-section">
@@ -26,7 +55,51 @@ export function SettingsPage({
         <p className="help-copy">{t("settings.languageHelp")}</p>
       </section>
       <section className="page-section">
-        <h3>{t("settings.persistence")}</h3>
+        <h3>{t("settings.cacheTitle")}</h3>
+        <label className="cache-path-field">
+          <span>{t("settings.cachePath")}</span>
+          <div className="cache-path-row">
+            <input
+              value={cachePath}
+              onChange={(event) => setCachePath(event.target.value)}
+              placeholder={t("settings.cachePathPlaceholder")}
+              spellCheck={false}
+              disabled={cacheBusy}
+            />
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={() => void chooseCachePath()}
+              disabled={cacheBusy}
+              title={t("settings.cacheBrowse")}
+            >
+              <FolderOpen size={15} />
+              {t("settings.cacheBrowse")}
+            </button>
+          </div>
+        </label>
+        <div className="cache-path-actions">
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={() => void saveCachePath()}
+            disabled={cacheBusy}
+          >
+            <Check size={15} />
+            {t("settings.cacheSave")}
+          </button>
+          <button
+            className="icon-button"
+            type="button"
+            onClick={() => setCachePath("")}
+            disabled={cacheBusy || cachePath.length === 0}
+            title={t("settings.cacheReset")}
+            aria-label={t("settings.cacheReset")}
+          >
+            <RotateCcw size={15} />
+          </button>
+        </div>
+        <p className="help-copy">{t("settings.cacheHelp")}</p>
         <p className="help-copy">{t("settings.persistenceHelp")}</p>
       </section>
     </PageFrame>

@@ -2,6 +2,8 @@ import {
   Activity,
   Cpu,
   Gauge,
+  PanelLeftClose,
+  PanelLeftOpen,
   Play,
   SlidersHorizontal,
   Zap,
@@ -27,19 +29,25 @@ export function ProjectNavigator({
   t,
   route,
   counts,
+  collapsed,
   onNavigate,
+  onToggleCollapse,
   onSettings,
   onDiagnostics,
 }: {
   t: Translator;
   route: ProjectRoute;
   counts: { sources: number; samples: number; runs: number };
+  collapsed: boolean;
   onNavigate: (route: ProjectRoute) => void;
+  onToggleCollapse: () => void;
   onSettings: () => void;
   onDiagnostics: () => void;
 }) {
+  const CollapseIcon = collapsed ? PanelLeftOpen : PanelLeftClose;
+  const collapseLabel = t(collapsed ? "nav.expand" : "nav.collapse");
   return (
-    <nav className="project-nav" aria-label={t("app.name")}>
+    <nav className={`project-nav ${collapsed ? "collapsed" : ""}`} aria-label={t("app.name")}>
       <div className="project-nav-main">
         {items.map((item) => {
           const Icon = item.icon;
@@ -61,6 +69,16 @@ export function ProjectNavigator({
         })}
       </div>
       <div className="project-nav-footer">
+        <button
+          className="nav-item nav-collapse-toggle"
+          onClick={onToggleCollapse}
+          aria-label={collapseLabel}
+          aria-expanded={!collapsed}
+          title={collapseLabel}
+        >
+          <CollapseIcon size={16} />
+          <span>{collapseLabel}</span>
+        </button>
         <button
           className={`nav-item ${route === "settings" ? "active" : ""}`}
           onClick={onSettings}

@@ -1,22 +1,31 @@
 import { useEffect, useMemo, useState } from "react";
-import { Play, SlidersHorizontal } from "lucide-react";
+import { ChevronDown, ChevronRight, Play, RotateCcw, SlidersHorizontal } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
 import { kernelDisplayName, profileDisplayName } from "../engine/displayNames";
 import { resolveGeometrySnapshot } from "../engine/geometryResolve";
-import { applyPayloadToRecipeDraft } from "../project/recipeApply";
+import {
+  applyPayloadToCurrentRecipe,
+  setRecipeNameSuffix,
+} from "../project/recipeApply";
+import { activeRecipe, activateRecipeInState, createRecipe } from "../project/recipe";
 import { startHeightRunGroup, type ExecutionBridge } from "../engine/executeRunGroup";
 import { KernelAnalyzePanel } from "./KernelAnalyzePanel";
+import { defaultKernelDraft, type KernelDraft } from "../engine/kernelDraft";
 import {
   applyPreset,
+  applyProfileDefaults,
+  CUDA_MAXIMUM_P_NORM,
   defaultHeightDraft,
   estimateHeightWork,
   fixedKernelsForDraft,
+  kernelSignature,
+  resolveBackendPreference,
   resolveHeightGrid,
   selectableBackends,
   type HeightDraft,
 } from "../engine/heightDraft";
-import type { SearchPreset } from "../engine/protocol";
+import type { KernelRef, SearchPreset } from "../engine/protocol";
 import {
   extractHeightSeries,
   metricCompatibilityKey,
@@ -25,6 +34,17 @@ import {
 } from "../engine/runGroupPlan";
 import type { ProjectState, Run } from "../project/types";
 import { BlockedState } from "../components/BlockedState";
+import {
+  ApplyGeometryDialog,
+  type ApplyGeometryValues,
+} from "../components/ApplyGeometryDialog";
+import { ErrorLinePlot, plotSeriesColor, type ErrorPlotDatum } from "../components/ErrorLinePlot";
+import { RecipeSummaryStrip } from "../components/RecipeSummaryStrip";
+import {
+  PERFECTLY_DESCALE_THRESHOLD,
+  ResultMetricTable,
+} from "../components/ResultMetricTable";
+import { backendOptionLabel } from "../engine/backendSelection";
 
 export function AnalyzePage({
   t,
@@ -49,16 +69,41 @@ export function AnalyzePage({
   const [draftSeeded, setDraftSeeded] = useState(Boolean(capabilities));
   const [hiddenSampleIds, setHiddenSampleIds] = useState<Set<string>>(new Set());
   const [selectedHeight, setSelectedHeight] = useState<string | null>(null);
-  const [logDisplay, setLogDisplay] = useState(false);
+  const [logDisplay, setLogDisplay] = useState(true);
+  // null = auto: expanded while empty (candidate preview), collapsed once results land.
+  const [tableCollapsed, setTableCollapsed] = useState<boolean | null>(null);
   const [applyBusy, setApplyBusy] = useState(false);
   const [applyNotice, setApplyNotice] = useState("");
+  const [applyDialogOpen, setApplyDialogOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  // Kernel draft is lifted here so the hand-built scan list survives subroute
+  // switches (height ↔ kernel). It does NOT survive leaving the Analyze route
+  // (uiStateByRoute persistence is out of scope).
+  const [kernelDraft, setKernelDraft] = useState<KernelDraft | null>(null);
+  const [kernelInheritMetric, setKernelInheritMetric] = useState(true);
 
   useEffect(() => {
     if (draftSeeded || !capabilities) return;
     setDraft(defaultHeightDraft(capabilities));
     setDraftSeeded(true);
   }, [capabilities, draftSeeded]);
+
+  // Seed the kernel draft lazily: capabilities can arrive after first render.
+  useEffect(() => {
+    if (kernelDraft !== null || !capabilities) return;
+    setKernelDraft(
+      defaultKernelDraft(
+        capabilities,
+        draft.metric,
+        draft.profileId,
+        draft.mathMode,
+        draft.backendPreference,
+      ),
+    );
+    // The kernel panel mirrors the current Recipe's geometry base into the
+    // draft once mounted, so seeding stays profile/metric-only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [capabilities, kernelDraft]);
 
   const includedSamples = useMemo(
     () =>
@@ -80,6 +125,17 @@ export function AnalyzePage({
   const backends = useMemo(() => selectableBackends(capabilities), [capabilities]);
   const kernelOptions = capabilities?.payload.kernels ?? [];
   const profileOptions = capabilities?.payload.profiles ?? [];
+  const resolvedBackend = resolveBackendPreference(
+    capabilities,
+    draft.backendPreference,
+    draft.metric.pNorm,
+    draft.axisMode,
+  );
+  const pNormMaximum = capabilities?.payload.backends.find(
+    (backend) => backend.id === resolvedBackend,
+  )?.p_norms?.maximum ?? (resolvedBackend === "cuda"
+    ? CUDA_MAXIMUM_P_NORM
+    : resolvedBackend === "vulkan" ? 1 : 4_294_967_295);
 
   const planResult = useMemo(() => {
     if (draft.subroute !== "height") return null;
@@ -103,32 +159,108 @@ export function AnalyzePage({
 
   const activeMetricKey = metricCompatibilityKey(draft.metric);
   const seriesRows = useMemo(
-    () => buildSeriesTable(heightRuns, state, hiddenSampleIds, activeMetricKey, logDisplay),
-    [heightRuns, state, hiddenSampleIds, activeMetricKey, logDisplay],
+    () => buildSeriesTable(heightRuns, state, hiddenSampleIds, activeMetricKey),
+    [heightRuns, state, hiddenSampleIds, activeMetricKey],
+  );
+
+  const [hiddenRunIds, setHiddenRunIds] = useState<Set<string>>(new Set());
+  const [kernelFilter, setKernelFilter] = useState<string | null>(null);
+
+  // One plot series per run (sample × kernel variant), each with a stable color.
+  const runSeries = useMemo(
+    () =>
+      seriesRows.seriesMeta.map((meta, index) => ({
+        ...meta,
+        color: plotSeriesColor(index),
+        label: `${meta.sampleLabel} · ${kernelMetaLabel(t, meta)}`,
+      })),
+    [seriesRows, t],
+  );
+  const runColorById = useMemo(
+    () => new Map(runSeries.map((series) => [series.runId, series.color])),
+    [runSeries],
+  );
+  const runLabelById = useMemo(
+    () => new Map(runSeries.map((series) => [series.runId, series.label])),
+    [runSeries],
+  );
+  const runKernelById = useMemo(
+    () =>
+      new Map(
+        seriesRows.seriesMeta.map((meta) => [meta.runId, kernelMetaLabel(t, meta)]),
+      ),
+    [seriesRows, t],
+  );
+
+  const plotData = useMemo<ErrorPlotDatum[]>(
+    () =>
+      seriesRows.points
+        .filter((point) => !hiddenRunIds.has(point.runId))
+        .map((point) => ({
+          key: `${point.runId}-${point.height}`,
+          runId: point.runId,
+          x: point.height,
+          metric: point.metric,
+          color: runColorById.get(point.runId) ?? "#3b82f6",
+          label: runLabelById.get(point.runId),
+        })),
+    [seriesRows, hiddenRunIds, runColorById, runLabelById],
   );
 
   // Reading aids for the getnative workflow: valley (best point) and the
-  // perfectly-descale threshold (error <= 1e-6), in whatever display mode the
-  // plot currently uses.
+  // perfectly-descale threshold (error <= 1e-6), over the visible series.
   const plotAids = useMemo(() => {
-    const pts = seriesRows.points;
-    if (!pts.length) return null;
-    let best = pts[0];
-    for (const point of pts) if (point.metric < best.metric) best = point;
-    const perfectCount = pts.filter(
+    if (!plotData.length) return null;
+    let best = plotData[0];
+    for (const point of plotData) if (point.metric < best.metric) best = point;
+    const perfectCount = plotData.filter(
       (point) => point.metric <= PERFECTLY_DESCALE_THRESHOLD,
     ).length;
-    const thresholdValue = logDisplay
-      ? Math.abs(Math.log10(PERFECTLY_DESCALE_THRESHOLD + 1e-9))
-      : PERFECTLY_DESCALE_THRESHOLD;
     return {
-      bestKey: `${best.runId}-${best.height}`,
-      bestHeight: best.height,
+      bestKey: best.key,
+      bestHeight: best.x,
       bestMetric: best.metric,
+      bestKernel: runKernelById.get(best.runId) ?? "",
       perfectCount,
-      thresholdNormalized: Math.min(1, thresholdValue / seriesRows.maxAbs),
     };
-  }, [seriesRows, logDisplay]);
+  }, [plotData, runKernelById]);
+
+  // Kernel group selector for the result table (only when runs differ by kernel).
+  const kernelGroups = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const meta of seriesRows.seriesMeta) {
+      if (!seen.has(meta.kernelKey)) seen.set(meta.kernelKey, kernelMetaLabel(t, meta));
+    }
+    return [...seen.entries()].map(([key, label]) => ({ key, label }));
+  }, [seriesRows, t]);
+
+  const visibleSamples = includedSamples.filter((sample) => !hiddenSampleIds.has(sample.id));
+  const plotTitle =
+    visibleSamples.length === 1
+      ? visibleSamples[0].label || visibleSamples[0].id
+      : t("analyze.plotTitle");
+
+  const filteredRows = useMemo(
+    () =>
+      kernelFilter
+        ? seriesRows.rows.filter((row) => row.kernelKey === kernelFilter)
+        : seriesRows.rows,
+    [seriesRows, kernelFilter],
+  );
+
+  const tableRows = useMemo(
+    () =>
+      filteredRows.map((row) => ({
+        key: `${row.runId}-${row.height}`,
+        metric: row.metric,
+        cells: [row.height, row.sampleLabel, row.kernelId, row.runId.slice(0, 10)],
+        selected: selectedHeight === row.height,
+        onSelect: () => setSelectedHeight(row.height),
+      })),
+    [filteredRows, selectedHeight],
+  );
+
+  const isTableCollapsed = tableCollapsed ?? tableRows.length > 0;
 
   const runBlockedReason = !analyzeAvailable
     ? t("analyze.runBlocked.noCommand")
@@ -151,6 +283,7 @@ export function AnalyzePage({
         state,
         onProjectChange,
         bridge: executionBridge,
+        mediaFrameBatch: capabilities?.payload.features?.media_frame_batch === true,
       });
       if (!result.ok) {
         setApplyNotice(t("analyze.submitFailed", { detail: result.reason }));
@@ -186,6 +319,15 @@ export function AnalyzePage({
     });
   }
 
+  function toggleRunVisibility(runId: string) {
+    setHiddenRunIds((current) => {
+      const next = new Set(current);
+      if (next.has(runId)) next.delete(runId);
+      else next.add(runId);
+      return next;
+    });
+  }
+
   function applyRefineFromSelection() {
     if (!selectedHeight) return;
     setDraft((current) =>
@@ -201,42 +343,109 @@ export function AnalyzePage({
     );
   }
 
-  /**
-   * Apply the selected height as the Recipe Draft geometry: resolve the real
-   * geometry through the engine geometry command (first included Sample's
-   * source shape), then store geometry + MetricSpec + profile into the draft.
-   */
-  async function applyGeometryToRecipeDraft() {
-    if (!selectedHeight || applyBusy) return;
-    const baseHeight = Number(selectedHeight);
-    if (!Number.isFinite(baseHeight) || baseHeight <= 0) return;
+  /** First included Sample's source dimensions; required to resolve geometry. */
+  const applySourceDims = useMemo(() => {
     const sample = includedSamples.find((item) => {
       const source = state.sourcesById[item.sourceId];
       return source?.width && source?.height;
     });
     const source = sample ? state.sourcesById[sample.sourceId] : null;
-    if (!sample || !source?.width || !source.height) {
+    return source?.width && source.height
+      ? { width: source.width, height: source.height }
+      : null;
+  }, [includedSamples, state.sourcesById]);
+
+  /** All Recipes, newest first — the options of the current-recipe selector. */
+  const recipeOptions = useMemo(
+    () =>
+      Object.values(state.recipesById).sort((a, b) =>
+        b.updatedAt.localeCompare(a.updatedAt),
+      ),
+    [state.recipesById],
+  );
+  const currentRecipe = activeRecipe(state);
+
+  function createNewRecipe() {
+    const result = createRecipe(state, {
+      name: `${t("recipe.defaultName")} ${Object.keys(state.recipesById).length + 1}`,
+    });
+    if (!result.ok) return;
+    const next = result.state;
+    onProjectChange(() => next);
+  }
+
+  function changeCurrentRecipe(recipeId: string) {
+    const result = activateRecipeInState(state, recipeId);
+    if (!result.ok) return;
+    const next = result.state;
+    onProjectChange(() => next);
+  }
+
+  /** Locale text the apply/naming layer needs. */
+  const applyLabels = {
+    defaultName: t("recipe.defaultName"),
+    unknownKernel: t("recipe.unknownKernel"),
+    unknownSize: t("recipe.unknownSize"),
+  };
+
+  function changeRecipeSuffix(suffix: string) {
+    if (!currentRecipe) return;
+    const result = setRecipeNameSuffix(state, currentRecipe.id, suffix, applyLabels);
+    if (!result.ok) return;
+    const next = result.state;
+    onProjectChange(() => next);
+  }
+
+  function openApplyDialog() {
+    setApplyNotice("");
+    if (!applySourceDims) {
       setApplyNotice(t("recipe.applyNoDims"));
       return;
     }
+    setApplyDialogOpen(true);
+  }
+
+  /**
+   * Apply the dialog's base height/width as the Recipe Draft geometry:
+   * resolve the real geometry through the engine geometry command (deriving
+   * the empty side proportionally), then store geometry + MetricSpec +
+   * profile into the draft.
+   */
+  async function handleApplyGeometry(values: ApplyGeometryValues) {
+    if (applyBusy) return;
     setApplyBusy(true);
     setApplyNotice("");
     try {
+      const dims = applySourceDims;
+      if (!dims) {
+        setApplyNotice(t("recipe.applyNoDims"));
+        return;
+      }
+      let baseHeight = values.baseHeight;
+      if (baseHeight == null && values.baseWidth != null) {
+        baseHeight = Math.round((values.baseWidth * dims.height) / dims.width);
+      }
+      if (baseHeight == null) {
+        setApplyNotice(t("recipe.applyFailed"));
+        return;
+      }
       const geometry = await resolveGeometrySnapshot({
         profileId: draft.profileId,
-        sourceWidth: source.width,
-        sourceHeight: source.height,
+        sourceWidth: dims.width,
+        sourceHeight: dims.height,
         baseHeight,
+        baseWidth: values.baseWidth,
       });
-      const result = applyPayloadToRecipeDraft(
+      const result = applyPayloadToCurrentRecipe(
         state,
         {
           geometry,
           metric: { ...draft.metric },
+          axisMode: draft.axisMode,
           profileId: draft.profileId,
           mathMode: draft.mathMode,
         },
-        t("recipe.defaultName"),
+        applyLabels,
       );
       if (!result.ok) {
         setApplyNotice(t("recipe.applyFailed"));
@@ -245,6 +454,7 @@ export function AnalyzePage({
       const next = result.state;
       onProjectChange(() => next);
       setApplyNotice(t("recipe.applied", { name: result.recipe.name }));
+      setApplyDialogOpen(false);
     } catch (error) {
       setApplyNotice(String(error));
     } finally {
@@ -256,6 +466,52 @@ export function AnalyzePage({
     <div className="page-panel analyze-page">
       <div className="page-header">
         <h2>{t("analyze.title")}</h2>
+      </div>
+
+      <div className="recipe-strip">
+        <div className="recipe-strip-cell">
+          <span className="recipe-strip-label">{t("recipe.strip.active")}</span>
+          <div className="editing-target-row">
+            {recipeOptions.length ? (
+              <select
+                value={currentRecipe?.id ?? ""}
+                onChange={(event) => {
+                  if (event.target.value) changeCurrentRecipe(event.target.value);
+                }}
+              >
+                {!currentRecipe ? (
+                  <option value="" disabled>
+                    —
+                  </option>
+                ) : null}
+                {recipeOptions.map((recipe) => (
+                  <option key={recipe.id} value={recipe.id}>
+                    {recipe.name} · {t("recipe.revision", { revision: recipe.revision })}
+                  </option>
+                ))}
+              </select>
+            ) : null}
+            <button className="secondary-button" type="button" onClick={createNewRecipe}>
+              {t("recipe.newDraft")}
+            </button>
+            {currentRecipe ? (
+              <input
+                className="recipe-suffix-input"
+                value={currentRecipe.nameSuffix ?? ""}
+                placeholder={t("analyze.recipeSuffixHint")}
+                aria-label={t("analyze.recipeSuffix")}
+                title={t("analyze.recipeSuffix")}
+                onChange={(event) => changeRecipeSuffix(event.target.value)}
+              />
+            ) : null}
+          </div>
+          <RecipeSummaryStrip
+            t={t}
+            recipe={currentRecipe}
+            activeRecipeId={state.project.activeRecipeId}
+            emptyLabel={t("recipe.strip.noActive")}
+          />
+        </div>
       </div>
 
       <div className="subroute-tabs">
@@ -275,21 +531,24 @@ export function AnalyzePage({
         </button>
       </div>
 
-      {draft.subroute === "kernel" ? (
+      {draft.subroute === "kernel" && kernelDraft ? (
         <KernelAnalyzePanel
           t={t}
           state={state}
           capabilities={capabilities}
           analyzeAvailable={analyzeAvailable}
+          draft={kernelDraft}
+          onDraftChange={(updater) =>
+            setKernelDraft((current) => (current ? updater(current) : current))
+          }
+          inheritMetric={kernelInheritMetric}
+          onInheritMetricChange={setKernelInheritMetric}
           inheritedMetric={draft.metric}
-          inheritedProfileId={draft.profileId}
-          inheritedMathMode={draft.mathMode}
-          inheritedBackend={draft.backendPreference}
           onOpenDiagnostics={onOpenDiagnostics}
           onProjectChange={onProjectChange}
           executionBridge={executionBridge}
         />
-      ) : (
+      ) : draft.subroute === "kernel" ? null : (
         <div className="analyze-layout">
           <aside className="analyze-samples pane">
             <h3>{t("analyze.samplesTitle")}</h3>
@@ -307,13 +566,22 @@ export function AnalyzePage({
                   const hidden = hiddenSampleIds.has(sample.id);
                   return (
                     <li key={sample.id} className={hidden ? "hidden-series" : ""}>
-                      <span className="swatch" style={{ background: seriesColor(index) }} />
+                      <span className="swatch" style={{ background: plotSeriesColor(index) }} />
                       <div>
                         <strong>{sample.label || sample.id}</strong>
                         <span>
                           {source?.label || source?.path || sample.sourceId}
                           {sample.frameIndex != null ? ` · #${sample.frameIndex}` : ""}
                         </span>
+                        {sample.tags.length ? (
+                          <span className="sample-tags">
+                            {sample.tags.map((tag) => (
+                              <span className="sample-tag" key={tag}>
+                                {tag}
+                              </span>
+                            ))}
+                          </span>
+                        ) : null}
                         <label className="series-visibility">
                           <input
                             type="checkbox"
@@ -362,48 +630,104 @@ export function AnalyzePage({
           </aside>
 
           <section className="analyze-plot pane">
+            <div className="analyze-plot-toolbar">
+              <label className="series-visibility">
+                <input
+                  type="checkbox"
+                  checked={logDisplay}
+                  onChange={(event) => setLogDisplay(event.target.checked)}
+                />
+                <span>{t("analyze.logDisplay")}</span>
+              </label>
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={!selectedHeight}
+                onClick={applyRefineFromSelection}
+              >
+                {t("analyze.refineAroundSelection")}
+              </button>
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={applyBusy || includedSamples.length === 0}
+                onClick={openApplyDialog}
+              >
+                {t("analyze.applyToRecipe")}
+              </button>
+              {applyNotice ? <span className="help-copy">{applyNotice}</span> : null}
+            </div>
+            {seriesRows.incompatibleCount > 0 ? (
+              <p className="help-copy warning-copy">
+                {t("analyze.incompatibleMetricHidden", {
+                  count: String(seriesRows.incompatibleCount),
+                })}
+              </p>
+            ) : null}
+
             <div className="analyze-plot-host">
               {seriesRows.points.length > 0 ? (
                 <div className="plot-skeleton" aria-label={t("analyze.plotTitle")}>
-                  <div className="plot-skeleton-bars">
-                    {plotAids ? (
-                      <div
-                        className="plot-threshold"
-                        style={{ bottom: `${plotAids.thresholdNormalized * 100}%` }}
-                        title={t("analyze.perfectThreshold")}
-                      >
-                        <span>1e-6</span>
-                      </div>
-                    ) : null}
-                    {seriesRows.points.slice(0, 40).map((point) => (
-                      <div
-                        key={`${point.runId}-${point.height}`}
-                        className={[
-                          "plot-bar",
-                          selectedHeight === point.height ? "selected" : "",
-                          point.metric <= PERFECTLY_DESCALE_THRESHOLD ? "perfect" : "",
-                          plotAids?.bestKey === `${point.runId}-${point.height}` ? "best" : "",
-                        ].join(" ")}
-                        style={{ height: `${Math.max(4, point.displayNormalized * 100)}%` }}
-                        title={`${point.height}: ${point.displayValue}`}
-                        onClick={() => setSelectedHeight(point.height)}
-                      />
-                    ))}
-                  </div>
-                  {plotAids ? (
-                    <p className="help-copy plot-aids">
-                      {t("analyze.bestPoint", {
-                        height: plotAids.bestHeight,
-                        metric: plotAids.bestMetric.toPrecision(3),
-                      })}
-                      {" · "}
-                      {t("analyze.perfectCount", {
-                        count: String(plotAids.perfectCount),
-                        total: String(seriesRows.points.length),
-                      })}
-                    </p>
+                  {runSeries.length > 1 ? (
+                    <div className="plot-legend">
+                      {runSeries.map((series) => (
+                        <label key={series.runId} className="plot-legend-item">
+                          <input
+                            type="checkbox"
+                            checked={!hiddenRunIds.has(series.runId)}
+                            onChange={() => toggleRunVisibility(series.runId)}
+                          />
+                          <span className="swatch" style={{ background: series.color }} />
+                          <span>{series.label}</span>
+                        </label>
+                      ))}
+                    </div>
                   ) : null}
-                  <p className="help-copy">{t("analyze.plotFromRealRuns")}</p>
+                  <ErrorLinePlot
+                    data={plotData}
+                    logScale={logDisplay}
+                    threshold={PERFECTLY_DESCALE_THRESHOLD}
+                    title={plotTitle}
+                    xAxisLabel={t("analyze.axisHeight")}
+                    yAxisLabel={t("analyze.axisRelativeError")}
+                    thresholdLabel={t("analyze.perfectThreshold")}
+                    bestKey={plotAids?.bestKey}
+                    selectedX={selectedHeight}
+                    onSelect={setSelectedHeight}
+                    resetLabel={t("plot.resetZoom")}
+                  />
+                  {plotAids ? (
+                    <button
+                      type="button"
+                      className={`plot-verdict ${plotAids.bestMetric <= PERFECTLY_DESCALE_THRESHOLD ? "perfect" : ""}`}
+                      onClick={() => setSelectedHeight(plotAids.bestHeight)}
+                      title={t("analyze.verdictSelect")}
+                    >
+                      <span className="plot-verdict-cell plot-verdict-hero">
+                        <span className="plot-verdict-label">{t("analyze.verdict.height")}</span>
+                        <strong>{plotAids.bestHeight}</strong>
+                      </span>
+                      <span className="plot-verdict-cell">
+                        <span className="plot-verdict-label">{t("analyze.verdict.kernel")}</span>
+                        <span className="plot-verdict-value">{plotAids.bestKernel}</span>
+                      </span>
+                      <span className="plot-verdict-cell">
+                        <span className="plot-verdict-label">{t("analyze.verdict.error")}</span>
+                        <span className="plot-verdict-value">
+                          {plotAids.bestMetric.toExponential(2)}
+                        </span>
+                      </span>
+                      <span className="plot-verdict-cell">
+                        <span className="plot-verdict-label">≤1e-6</span>
+                        <span className="plot-verdict-value">
+                          {t("analyze.verdict.perfectCount", {
+                            count: String(plotAids.perfectCount),
+                            total: String(plotData.length),
+                          })}
+                        </span>
+                      </span>
+                    </button>
+                  ) : null}
                 </div>
               ) : (
                 <BlockedState
@@ -425,70 +749,58 @@ export function AnalyzePage({
             </div>
 
             <div className="analyze-table-host">
-              <div className="analyze-table-toolbar">
-                <h3>{t("analyze.resultsTable")}</h3>
-                <label className="series-visibility">
-                  <input
-                    type="checkbox"
-                    checked={logDisplay}
-                    onChange={(event) => setLogDisplay(event.target.checked)}
-                  />
-                  <span>{t("analyze.logDisplay")}</span>
-                </label>
-                <button
-                  className="secondary-button"
-                  type="button"
-                  disabled={!selectedHeight}
-                  onClick={applyRefineFromSelection}
-                >
-                  {t("analyze.refineAroundSelection")}
-                </button>
-                <button
-                  className="secondary-button"
-                  type="button"
-                  disabled={!selectedHeight || applyBusy || includedSamples.length === 0}
-                  onClick={applyGeometryToRecipeDraft}
-                >
-                  {t("analyze.applyToRecipe")}
-                </button>
-                {applyNotice ? <span className="help-copy">{applyNotice}</span> : null}
-              </div>
-              {seriesRows.incompatibleCount > 0 ? (
-                <p className="help-copy warning-copy">
-                  {t("analyze.incompatibleMetricHidden", {
-                    count: String(seriesRows.incompatibleCount),
-                  })}
-                </p>
-              ) : null}
-              {seriesRows.rows.length ? (
-                <div className="result-table" role="table" aria-label={t("analyze.resultsTable")}>
-                  <div className="result-table-head" role="row">
-                    <span role="columnheader">{t("analyze.col.height")}</span>
-                    <span role="columnheader">{t("analyze.col.metric")}</span>
-                    <span role="columnheader">{t("analyze.col.sample")}</span>
-                    <span role="columnheader">{t("analyze.col.kernel")}</span>
-                    <span role="columnheader">{t("analyze.col.run")}</span>
-                  </div>
-                  {seriesRows.rows.slice(0, 200).map((row) => (
-                    <button
-                      type="button"
-                      className={[
-                        "result-table-row",
-                        selectedHeight === row.height ? "selected" : "",
-                        row.metric <= PERFECTLY_DESCALE_THRESHOLD ? "perfect" : "",
-                      ].join(" ")}
-                      role="row"
-                      key={`${row.runId}-${row.height}`}
-                      onClick={() => setSelectedHeight(row.height)}
-                    >
-                      <span role="cell">{row.height}</span>
-                      <span role="cell">{row.displayValue}</span>
-                      <span role="cell">{row.sampleLabel}</span>
-                      <span role="cell">{row.kernelId}</span>
-                      <span role="cell">{row.runId.slice(0, 10)}</span>
-                    </button>
-                  ))}
-                </div>
+              <button
+                type="button"
+                className="analyze-table-toggle"
+                aria-expanded={!isTableCollapsed}
+                onClick={() => setTableCollapsed(!isTableCollapsed)}
+              >
+                {isTableCollapsed ? (
+                  <ChevronRight size={14} />
+                ) : (
+                  <ChevronDown size={14} />
+                )}
+                <span>{t("analyze.resultsTable")}</span>
+                <span className="analyze-table-count">{tableRows.length}</span>
+              </button>
+              {!isTableCollapsed ? (
+                <>
+                  {kernelGroups.length > 1 ? (
+                    <div className="kernel-group-chips">
+                      <button
+                        type="button"
+                        className={`candidate-chip ${kernelFilter === null ? "selected" : ""}`}
+                        onClick={() => setKernelFilter(null)}
+                      >
+                        {t("analyze.allKernelGroups")}
+                      </button>
+                      {kernelGroups.map((group) => (
+                        <button
+                          key={group.key}
+                          type="button"
+                          className={`candidate-chip ${kernelFilter === group.key ? "selected" : ""}`}
+                          onClick={() => setKernelFilter(group.key)}
+                        >
+                          {group.label}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                  {tableRows.length ? (
+                <ResultMetricTable
+                  t={t}
+                  ariaLabel={t("analyze.resultsTable")}
+                  columns={[
+                    t("analyze.col.height"),
+                    t("analyze.col.metric"),
+                    t("analyze.col.sample"),
+                    t("analyze.col.kernel"),
+                    t("analyze.col.run"),
+                  ]}
+                  metricColumnIndex={1}
+                  columnTemplate="72px 96px minmax(80px, 1fr) 88px 72px"
+                  rows={tableRows}
+                />
               ) : (
                 <div>
                   <h3>{t("analyze.candidatesTitle")}</h3>
@@ -529,6 +841,8 @@ export function AnalyzePage({
                   )}
                 </div>
               )}
+                </>
+              ) : null}
             </div>
           </section>
 
@@ -538,33 +852,56 @@ export function AnalyzePage({
               {t("analyze.paramsTitle")}
             </h3>
 
-            <label className="block">
+            <div className="block">
               <span>{t("analyze.preset")}</span>
-              <select
-                value={draft.preset}
-                disabled={!canEdit}
-                onChange={(event) => setPreset(event.target.value as SearchPreset)}
-              >
-                <option value="integer_coarse">{t("analyze.preset.integerCoarse")}</option>
-                <option value="fractional_refine">{t("analyze.preset.fractionalRefine")}</option>
-                <option value="custom">{t("analyze.preset.custom")}</option>
-              </select>
-            </label>
+              <div className="button-radio" role="radiogroup" aria-label={t("analyze.preset")}>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={draft.preset === "integer_coarse"}
+                  className={draft.preset === "integer_coarse" ? "active" : ""}
+                  disabled={!canEdit}
+                  onClick={() => setPreset("integer_coarse")}
+                >
+                  {t("analyze.preset.integerCoarse")}
+                </button>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={draft.preset === "fractional_refine"}
+                  className={draft.preset === "fractional_refine" ? "active" : ""}
+                  disabled={!canEdit}
+                  onClick={() => setPreset("fractional_refine")}
+                >
+                  {t("analyze.preset.fractionalRefine")}
+                </button>
+              </div>
+            </div>
 
-            <label className="block">
+            <div className="block">
               <span>{t("analyze.axis")}</span>
-              <select
-                value={draft.axisMode}
-                disabled={!canEdit}
-                onChange={(event) =>
-                  patch({ axisMode: event.target.value as HeightDraft["axisMode"] })
-                }
-              >
-                <option value="h_only">{t("analyze.axis.hOnly")}</option>
-                <option value="w_only">{t("analyze.axis.wOnly")}</option>
-                <option value="h_plus_w">{t("analyze.axis.hPlusW")}</option>
-              </select>
-            </label>
+              <div className="button-radio" role="radiogroup" aria-label={t("analyze.axis")}>
+                {(
+                  [
+                    ["h_plus_w", "analyze.axis.hPlusW"],
+                    ["h_only", "analyze.axis.hOnly"],
+                    ["w_only", "analyze.axis.wOnly"],
+                  ] as const
+                ).map(([mode, key]) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    role="radio"
+                    aria-checked={draft.axisMode === mode}
+                    className={draft.axisMode === mode ? "active" : ""}
+                    disabled={!canEdit}
+                    onClick={() => patch({ axisMode: mode })}
+                  >
+                    {t(key)}
+                  </button>
+                ))}
+              </div>
+            </div>
 
             {draft.preset === "fractional_refine" ? (
               <>
@@ -587,6 +924,9 @@ export function AnalyzePage({
                 <label className="block">
                   <span>{t("analyze.step")}</span>
                   <input
+                    type="number"
+                    min="0.01"
+                    step="0.01"
                     value={draft.step}
                     disabled={!canEdit}
                     onChange={(event) => patch({ step: event.target.value })}
@@ -614,6 +954,9 @@ export function AnalyzePage({
                 <label className="block">
                   <span>{t("analyze.step")}</span>
                   <input
+                    type="number"
+                    min="0.01"
+                    step="0.01"
                     value={draft.step}
                     disabled={!canEdit}
                     onChange={(event) => patch({ step: event.target.value })}
@@ -622,29 +965,39 @@ export function AnalyzePage({
               </>
             )}
 
-            {draft.preset !== "integer_coarse" ? (
-              <>
-                <label className="block">
-                  <span>{t("diagnostics.baseH")}</span>
-                  <input
-                    value={draft.baseHeight}
-                    disabled={!canEdit}
-                    onChange={(event) => patch({ baseHeight: event.target.value })}
-                    placeholder={t("analyze.optional")}
-                  />
-                </label>
-                <label className="block">
-                  <span>{t("diagnostics.baseW")}</span>
-                  <input
-                    value={draft.baseWidth}
-                    disabled={!canEdit}
-                    onChange={(event) => patch({ baseWidth: event.target.value })}
-                    placeholder={t("analyze.optional")}
-                  />
-                </label>
-                <p className="help-copy">{t("analyze.baseParityHint")}</p>
-              </>
-            ) : null}
+            <label className="block">
+              <span>{t("analyze.endpointRule")}</span>
+              <select
+                value={draft.endpointRule}
+                disabled={!canEdit}
+                onChange={(event) =>
+                  patch({ endpointRule: event.target.value as HeightDraft["endpointRule"] })
+                }
+              >
+                <option value="inclusive">{t("analyze.endpoint.inclusive")}</option>
+                <option value="exclusive_stop">{t("analyze.endpoint.exclusive")}</option>
+              </select>
+            </label>
+
+            <label className="block">
+              <span>{t("analyze.baseHeight")}</span>
+              <input
+                value={draft.baseHeight}
+                disabled={!canEdit}
+                onChange={(event) => patch({ baseHeight: event.target.value })}
+                placeholder={t("analyze.optional")}
+              />
+            </label>
+            <label className="block">
+              <span>{t("analyze.baseWidth")}</span>
+              <input
+                value={draft.baseWidth}
+                disabled={!canEdit}
+                onChange={(event) => patch({ baseWidth: event.target.value })}
+                placeholder={t("analyze.optional")}
+              />
+            </label>
+            <p className="help-copy">{t("analyze.baseParityHint")}</p>
 
             <label className="block">
               <span>{t("analyze.fixedKernel")}</span>
@@ -652,10 +1005,17 @@ export function AnalyzePage({
                 value={draft.kernelId}
                 disabled={!canEdit || kernelOptions.length === 0}
                 onChange={(event) => {
-                  const kernel = kernelOptions.find((item) => item.id === event.target.value);
                   patch({
                     kernelId: event.target.value,
-                    kernelParameters: { ...(kernel?.parameters ?? {}) },
+                    kernelParameters:
+                      event.target.value === "bicubic"
+                        ? { b: 0, c: 0.5 }
+                        : event.target.value === "lanczos"
+                          ? { taps: 3 }
+                          : {},
+                    compareKernels: draft.compareKernels.filter(
+                      (item) => item.id !== event.target.value,
+                    ),
                   });
                 }}
               >
@@ -671,19 +1031,100 @@ export function AnalyzePage({
               </select>
             </label>
 
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={draft.compareCommonKernels}
-                disabled={!canEdit}
-                onChange={(event) => patch({ compareCommonKernels: event.target.checked })}
-              />
-              <span>{t("analyze.compareCommonKernels")}</span>
-            </label>
-            {draft.compareCommonKernels ? (
-              <p className="help-copy">
-                {t("analyze.compareCommonKernelsHelp", { count: String(kernels.length) })}
-              </p>
+            {draft.kernelId === "bicubic" ? (
+              <div className="metric-grid">
+                {(["b", "c"] as const).map((parameter) => (
+                  <label className="block" key={parameter}>
+                    <span>{`Bicubic ${parameter}`}</span>
+                    <input
+                      type="number"
+                      step="any"
+                      value={String(draft.kernelParameters[parameter] ?? (parameter === "b" ? 0 : 0.5))}
+                      onChange={(event) =>
+                        patch({
+                          kernelParameters: {
+                            ...draft.kernelParameters,
+                            [parameter]: event.target.value,
+                          },
+                        })
+                      }
+                    />
+                  </label>
+                ))}
+              </div>
+            ) : null}
+            {draft.kernelId === "lanczos" ? (
+              <label className="block">
+                <span>{t("analyze.lanczosTaps")}</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={15}
+                  step={1}
+                  value={String(draft.kernelParameters.taps ?? 3)}
+                  onChange={(event) =>
+                    patch({
+                      kernelParameters: { ...draft.kernelParameters, taps: event.target.value },
+                    })
+                  }
+                />
+              </label>
+            ) : null}
+
+            {kernelOptions.length > 1 ? (
+              <fieldset className="metric-fieldset kernel-compare-fieldset">
+                <legend>{t("analyze.compareKernels")}</legend>
+                <div className="kernel-compare-list">
+                  {kernelOptions
+                    .filter((kernel) => kernel.id !== draft.kernelId)
+                    .flatMap((kernel) => {
+                      // Kernels with a taps parameter (lanczos) are offered per-taps.
+                      const variants: Array<number | null> =
+                        "taps" in kernel.parameters ? [2, 3, 4, 5, 6] : [null];
+                      return variants.map((taps) => {
+                        const candidate: KernelRef = {
+                          id: kernel.id,
+                          parameters:
+                            taps != null
+                              ? { ...kernel.parameters, taps }
+                              : { ...kernel.parameters },
+                        };
+                        const signature = kernelSignature(candidate);
+                        const checked = draft.compareKernels.some(
+                          (item) => kernelSignature(item) === signature,
+                        );
+                        const name = kernelDisplayName(t, kernel.id);
+                        return (
+                          <label
+                            key={taps != null ? `${kernel.id}@${taps}` : kernel.id}
+                            className="checkbox-row"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              disabled={!canEdit}
+                              onChange={(event) =>
+                                patch({
+                                  compareKernels: event.target.checked
+                                    ? [...draft.compareKernels, candidate]
+                                    : draft.compareKernels.filter(
+                                        (item) => kernelSignature(item) !== signature,
+                                      ),
+                                })
+                              }
+                            />
+                            <span>{taps != null ? `${name} ${taps}` : name}</span>
+                          </label>
+                        );
+                      });
+                    })}
+                </div>
+                {draft.compareKernels.length > 0 ? (
+                  <p className="help-copy">
+                    {t("analyze.compareKernelsHelp", { count: String(kernels.length) })}
+                  </p>
+                ) : null}
+              </fieldset>
             ) : null}
 
             <label className="block">
@@ -704,11 +1145,28 @@ export function AnalyzePage({
                 )}
               </select>
             </label>
+            <button
+              className="secondary-button"
+              type="button"
+              title={t("analyze.applyProfileDefaults")}
+              onClick={() => setDraft((current) => applyProfileDefaults(current, capabilities))}
+            >
+              <RotateCcw size={14} />
+              {t("analyze.applyProfileDefaults")}
+            </button>
 
             <label className="block">
               <span>{t("analyze.backend")}</span>
               <select
+                className="backend-select"
                 value={draft.backendPreference}
+                title={backendOptionLabel(
+                  t,
+                  draft.backendPreference,
+                  capabilities,
+                  draft.metric.pNorm,
+                  draft.axisMode,
+                )}
                 disabled={!canEdit}
                 onChange={(event) =>
                   patch({
@@ -718,9 +1176,13 @@ export function AnalyzePage({
               >
                 {backends.map((backend) => (
                   <option key={backend} value={backend}>
-                    {backend === "auto"
-                      ? t("analyze.backend.auto")
-                      : t(`backend.${backend}` as "backend.cpu")}
+                    {backendOptionLabel(
+                      t,
+                      backend,
+                      capabilities,
+                      draft.metric.pNorm,
+                      draft.axisMode,
+                    )}
                   </option>
                 ))}
               </select>
@@ -780,6 +1242,7 @@ export function AnalyzePage({
                 <input
                   type="number"
                   min={1}
+                  max={pNormMaximum}
                   step={1}
                   value={draft.metric.pNorm}
                   disabled={!canEdit}
@@ -792,6 +1255,11 @@ export function AnalyzePage({
                     })
                   }
                 />
+                {draft.metric.pNorm > pNormMaximum ? (
+                  <span className="help-copy warning-copy">
+                    {t("analyze.pNormUnsupported", { backend: resolvedBackend })}
+                  </span>
+                ) : null}
               </label>
             </fieldset>
 
@@ -810,6 +1278,14 @@ export function AnalyzePage({
           </aside>
         </div>
       )}
+      {applyDialogOpen && applySourceDims ? (
+        <ApplyGeometryDialog
+          t={t}
+          busy={applyBusy}
+          onCancel={() => setApplyDialogOpen(false)}
+          onConfirm={handleApplyGeometry}
+        />
+      ) : null}
     </div>
   );
 }
@@ -818,10 +1294,21 @@ type SeriesTableRow = {
   runId: string;
   height: string;
   metric: number;
-  displayValue: string;
-  displayNormalized: number;
+  sampleId: string;
   sampleLabel: string;
   kernelId: string;
+  /** Kernel identity including parameter variant, e.g. "lanczos@3". */
+  kernelKey: string;
+};
+
+/** Per-run series metadata (one entry per run contributing plot points). */
+export type RunSeriesMeta = {
+  runId: string;
+  sampleId: string;
+  sampleLabel: string;
+  kernelId: string;
+  kernelTaps: number | null;
+  kernelKey: string;
 };
 
 function buildSeriesTable(
@@ -829,14 +1316,19 @@ function buildSeriesTable(
   state: ProjectState,
   hiddenSampleIds: Set<string>,
   activeMetricKey: string,
-  logDisplay: boolean,
-): { rows: SeriesTableRow[]; points: SeriesTableRow[]; incompatibleCount: number; maxAbs: number } {
+): {
+  rows: SeriesTableRow[];
+  points: SeriesTableRow[];
+  incompatibleCount: number;
+  seriesMeta: RunSeriesMeta[];
+} {
   const rows: SeriesTableRow[] = [];
+  const seriesMeta: RunSeriesMeta[] = [];
   let incompatibleCount = 0;
   for (const run of runs) {
     if (run.sampleId && hiddenSampleIds.has(run.sampleId)) continue;
     const snapshot = run.inputSnapshot as
-      | { metric?: { cropLeft: number; cropRight: number; cropTop: number; cropBottom: number; pixelExclusionThreshold: number; pNorm: number }; kernel?: { id: string } }
+      | { metric?: { cropLeft: number; cropRight: number; cropTop: number; cropBottom: number; pixelExclusionThreshold: number; pNorm: number }; kernel?: { id: string; parameters?: Record<string, string | number | boolean> } }
       | null;
     if (snapshot?.metric) {
       if (metricCompatibilityKey(snapshot.metric) !== activeMetricKey) {
@@ -848,34 +1340,37 @@ function buildSeriesTable(
     if (!series) continue;
     const sample = run.sampleId ? state.samplesById[run.sampleId] : null;
     const kernelId = snapshot?.kernel?.id ?? "—";
+    const rawTaps = Number(snapshot?.kernel?.parameters?.taps);
+    const kernelTaps = Number.isFinite(rawTaps) ? rawTaps : null;
+    const kernelKey = kernelTaps != null ? `${kernelId}@${kernelTaps}` : kernelId;
+    const sampleLabel = sample?.label ?? run.sampleId ?? "—";
+    seriesMeta.push({
+      runId: run.id,
+      sampleId: run.sampleId ?? "",
+      sampleLabel,
+      kernelId,
+      kernelTaps,
+      kernelKey,
+    });
     for (const point of series) {
-      const displayMetric = logDisplay ? Math.log10(point.metric + 1e-9) : point.metric;
       rows.push({
         runId: run.id,
         height: point.height,
         metric: point.metric,
-        displayValue: Number.isFinite(displayMetric) ? displayMetric.toPrecision(6) : "—",
-        displayNormalized: 0,
-        sampleLabel: sample?.label ?? run.sampleId ?? "—",
+        sampleId: run.sampleId ?? "",
+        sampleLabel,
         kernelId,
+        kernelKey,
       });
     }
   }
-  const maxAbs = Math.max(1e-12, ...rows.map((row) => Math.abs(logDisplay ? Math.log10(row.metric + 1e-9) : row.metric)));
-  const points = rows.map((row) => {
-    const value = logDisplay ? Math.log10(row.metric + 1e-9) : row.metric;
-    return {
-      ...row,
-      displayNormalized: Math.min(1, Math.abs(value) / maxAbs),
-    };
-  });
-  return { rows, points, incompatibleCount, maxAbs };
+  return { rows, points: rows, incompatibleCount, seriesMeta };
 }
 
-function seriesColor(index: number): string {
-  const palette = ["#3b82f6", "#22c55e", "#f59e0b", "#a855f7", "#ef4444", "#06b6d4"];
-  return palette[index % palette.length];
+function kernelMetaLabel(
+  t: Translator,
+  meta: { kernelId: string; kernelTaps: number | null },
+): string {
+  const name = kernelDisplayName(t, meta.kernelId);
+  return meta.kernelTaps != null ? `${name} ${meta.kernelTaps}` : name;
 }
-
-/** getnative convention: error <= 1e-6 means the candidate perfectly descales. */
-const PERFECTLY_DESCALE_THRESHOLD = 1e-6;

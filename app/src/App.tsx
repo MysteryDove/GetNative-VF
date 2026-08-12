@@ -34,12 +34,14 @@ import "./App.css";
 
 type AppPreferences = {
   language: LocaleCode;
+  axisPlanCacheDir: string | null;
 };
 
 const storage = createTauriProjectStorage();
 
 function App() {
   const [locale, setLocale] = useState<LocaleCode>(DEFAULT_LOCALE);
+  const [axisPlanCacheDir, setAxisPlanCacheDir] = useState<string | null>(null);
   const [prefsReady, setPrefsReady] = useState(false);
   const [project, setProject] = useState<ProjectState | null>(null);
   const [route, setRoute] = useState<ProjectRoute>("overview");
@@ -79,6 +81,7 @@ function App() {
         if (isLocaleCode(prefs.language)) {
           setLocale(prefs.language);
         }
+        setAxisPlanCacheDir(prefs.axisPlanCacheDir ?? null);
       })
       .catch((error: unknown) => {
         setLocale(DEFAULT_LOCALE);
@@ -217,6 +220,35 @@ function App() {
     } catch (error) {
       const uiError = {
         summary: createTranslator(next)("app.error.languageSave"),
+        detail: String(error),
+      };
+      if (project) {
+        setProjectError(uiError);
+      } else {
+        setHubError(uiError);
+      }
+    }
+  }
+
+  async function changeAxisPlanCacheDir(next: string | null) {
+    try {
+      const prefs = await invoke<AppPreferences>("app_set_axis_plan_cache_dir", {
+        request: { path: next },
+      });
+      setAxisPlanCacheDir(prefs.axisPlanCacheDir ?? null);
+
+      // The engine reads its cache environment when the resident process is
+      // spawned. Restart it so the new setting applies immediately.
+      await engineWorker.shutdown();
+      const hello = await engineWorker.connect();
+      const envelope = await engineWorker.capabilities();
+      setEnginePath(hello.path);
+      setCapabilities(envelope);
+      setEngineState("ready");
+      setEngineError("");
+    } catch (error: unknown) {
+      const uiError = {
+        summary: t("settings.cacheSaveError"),
         detail: String(error),
       };
       if (project) {
@@ -390,15 +422,20 @@ function App() {
     );
   }
 
-  function handleProjectChange(updater: (state: ProjectState) => ProjectState) {
-    setProject((current) => {
-      if (!current || current.project.readOnly) return current;
-      const next = updater(current);
-      return next === current
-        ? current
-        : { ...next, project: { ...next.project, dirty: true } };
-    });
-  }
+  // Stable identity: pages hang effects off this; a new function per render
+  // re-fires downstream effects (e.g. media preview reloads) on every App render.
+  const handleProjectChange = useCallback(
+    (updater: (state: ProjectState) => ProjectState) => {
+      setProject((current) => {
+        if (!current || current.project.readOnly) return current;
+        const next = updater(current);
+        return next === current
+          ? current
+          : { ...next, project: { ...next.project, dirty: true } };
+      });
+    },
+    [],
+  );
 
   const queueExecutionJob = useCallback((input: QueueJobInput) => {
     if (input.projectRunId) {
@@ -456,6 +493,8 @@ function App() {
       capabilities={capabilities}
       language={locale}
       onLanguageChange={changeLanguage}
+      axisPlanCacheDir={axisPlanCacheDir}
+      onAxisPlanCacheDirChange={changeAxisPlanCacheDir}
       onNavigate={handleNavigate}
       onClose={() => {
         setProject(null);

@@ -10,6 +10,8 @@ import type {
   Source,
   VerificationReview,
 } from "./types";
+import { profileFor } from "../engine/profiles";
+import { recipeReadiness } from "./recipe";
 
 const projectRoutes: ProjectRoute[] = [
   "overview",
@@ -120,6 +122,7 @@ export function openedToProjectState(opened: OpenedProjectDto): ProjectState {
     return {
       id: recipe.id,
       name: recipe.name,
+      nameSuffix: recipe.name_suffix ?? null,
       status,
       locked: status !== "draft",
       revision: recipe.revision ?? 1,
@@ -129,6 +132,7 @@ export function openedToProjectState(opened: OpenedProjectDto): ProjectState {
       geometry: recipe.geometry ?? null,
       kernel: recipe.kernel ?? null,
       metric: recipe.metric ?? null,
+      axisMode: recipe.axis_mode ?? profileFor(recipe.profile_id ?? "").default_axis_mode,
       profileId: recipe.profile_id ?? null,
       mathMode: recipe.math_mode ?? null,
     };
@@ -165,6 +169,8 @@ export function openedToProjectState(opened: OpenedProjectDto): ProjectState {
     tags: review.tags ?? [],
   }));
 
+  const recipesById = indexById(recipes);
+
   return {
     project: {
       id: manifest.id,
@@ -180,7 +186,7 @@ export function openedToProjectState(opened: OpenedProjectDto): ProjectState {
     },
     sourcesById: indexById(sources),
     samplesById: indexById(samples),
-    recipesById: indexById(recipes),
+    recipesById,
     runGroupsById: indexById(runGroups),
     runsById: indexById(runs),
     verificationReviewsByRunId: reviews.reduce<Record<string, VerificationReview>>((acc, review) => {
@@ -251,6 +257,7 @@ export function projectStateToManifest(state: ProjectState): ProjectManifestDto 
     recipes: Object.values(state.recipesById).map((recipe) => ({
       id: recipe.id,
       name: recipe.name,
+      name_suffix: recipe.nameSuffix ?? null,
       locked: recipe.status !== "draft",
       status: recipe.status,
       revision: recipe.revision,
@@ -260,6 +267,7 @@ export function projectStateToManifest(state: ProjectState): ProjectManifestDto 
       geometry: recipe.geometry,
       kernel: recipe.kernel,
       metric: recipe.metric,
+      axis_mode: recipe.axisMode,
       profile_id: recipe.profileId,
       math_mode: recipe.mathMode,
     })),
@@ -336,10 +344,11 @@ export function readiness(state: ProjectState, analyzeAvailable: boolean) {
   const readyVideoCount = Object.values(state.sourcesById).filter(
     (source) => source.kind === "video" && source.state === "ready",
   ).length;
-  const activeRecipe = state.project.activeRecipeId
+  const current = state.project.activeRecipeId
     ? state.recipesById[state.project.activeRecipeId]
     : null;
-  const hasActiveLockedRecipe = Boolean(activeRecipe?.locked);
+  const hasCurrentRecipe = Boolean(current);
+  const currentRecipeReady = Boolean(current && recipeReadiness(current).ok);
 
   return {
     hasMedia: sourceCount > 0,
@@ -349,7 +358,7 @@ export function readiness(state: ProjectState, analyzeAvailable: boolean) {
     hasReadyVideo: readyVideoCount > 0,
     heightReady: analyzeAvailable && sampleCount > 0 && !hasUnavailableIncludedSamples,
     kernelReady: analyzeAvailable && sampleCount > 0 && !hasUnavailableIncludedSamples,
-    hasActiveRecipe: hasActiveLockedRecipe,
-    verifyReady: analyzeAvailable && hasActiveLockedRecipe && readyVideoCount > 0,
+    hasActiveRecipe: hasCurrentRecipe,
+    verifyReady: analyzeAvailable && currentRecipeReady && readyVideoCount > 0,
   };
 }

@@ -4,8 +4,8 @@ import type { GeometrySnapshot } from "./protocol";
 
 /**
  * Resolve a real GeometrySnapshot through the engine `geometry` command.
- * Standard mode, full-frame active region; the engine owns all profile-specific
- * rounding semantics — the UI never reimplements them.
+ * The engine owns all profile-specific rounding semantics; the UI only derives
+ * the aspect-ratio-preserving active width for the requested base height.
  */
 export async function resolveGeometrySnapshot(input: {
   profileId: string;
@@ -14,23 +14,26 @@ export async function resolveGeometrySnapshot(input: {
   baseHeight: number;
   baseWidth?: number | null;
 }): Promise<GeometrySnapshot> {
+  const activeHeight = input.baseHeight;
+  const activeWidth = (input.sourceWidth / input.sourceHeight) * activeHeight;
+  const mode = input.baseWidth == null ? "standard" : "pro";
   const result = await invoke<GeometryEnvelope>("engine_geometry", {
     request: {
       profile: input.profileId,
-      mode: "standard",
+      mode,
       sourceWidth: input.sourceWidth,
       sourceHeight: input.sourceHeight,
-      activeWidth: input.sourceWidth,
-      activeHeight: input.sourceHeight,
+      activeWidth,
+      activeHeight,
       baseHeight: input.baseHeight,
       baseWidth: input.baseWidth ?? null,
     },
   });
   const g = result.payload.geometry;
   return {
-    mode: "standard",
-    activeWidth: input.sourceWidth,
-    activeHeight: input.sourceHeight,
+    mode,
+    activeWidth,
+    activeHeight,
     canvasWidth: g.width,
     canvasHeight: g.height,
     srcLeft: g.src_left,

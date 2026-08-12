@@ -39,6 +39,15 @@ export function BackendStatusList({
               `${t("status.device")}: ${row.deviceAvailable ? t("common.yes") : t("common.no")}`,
               `${t("status.command")}: ${row.analysisCommandAvailable ? t("common.yes") : t("common.no")}`,
               row.axes.length ? row.axes.map((axis) => axisLabel(axis, t)).join(" / ") : null,
+              row.device,
+              row.id === "vulkan" && row.deviceType
+                ? t(`backend.deviceType.${row.deviceType}` as "backend.deviceType.discrete_gpu")
+                : null,
+              row.deviceAvailable && (row.id === "cuda" || row.id === "vulkan")
+                ? row.autoPriority != null
+                  ? t("backend.autoEligible")
+                  : t("backend.explicitOnly")
+                : null,
               // ISA and math mode are engine code values, not localized copy.
               row.selectedIsa
                 ? `${row.selectedIsa} / ${row.selectedMathMode ?? "production"}`

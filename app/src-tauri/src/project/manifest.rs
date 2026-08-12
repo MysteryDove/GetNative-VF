@@ -116,6 +116,9 @@ pub struct SampleRecord {
 pub struct RecipeRecord {
     pub id: String,
     pub name: String,
+    /// Optional user tag appended to derived Recipe names.
+    #[serde(default)]
+    pub name_suffix: Option<String>,
     /// Schema-1 flag: true for both locked and superseded Recipes.
     #[serde(default)]
     pub locked: bool,
@@ -139,6 +142,8 @@ pub struct RecipeRecord {
     pub kernel: Option<Value>,
     #[serde(default)]
     pub metric: Option<Value>,
+    #[serde(default)]
+    pub axis_mode: Option<String>,
     #[serde(default)]
     pub profile_id: Option<String>,
     #[serde(default)]
@@ -407,16 +412,6 @@ pub fn validate_manifest(manifest: &ProjectManifest) -> Result<(), ManifestValid
                 message: format!("active_recipe_id {active} is not present in recipes"),
             });
         }
-        if !manifest
-            .recipes
-            .iter()
-            .any(|recipe| recipe.id == *active && recipe.locked)
-        {
-            return Err(ManifestValidationError {
-                code: ManifestErrorCode::InvalidManifest,
-                message: format!("active recipe {active} must be locked"),
-            });
-        }
     }
 
     for group in &manifest.run_groups {
@@ -659,11 +654,13 @@ mod tests {
     }
 
     #[test]
-    fn active_recipe_must_be_locked() {
+    fn active_recipe_need_not_be_locked() {
+        // Single-current semantics: any existing Recipe may be current.
         let mut manifest = empty_manifest("Demo", false);
         manifest.recipes.push(RecipeRecord {
             id: "recipe_1".to_owned(),
             name: "Candidate".to_owned(),
+            name_suffix: None,
             locked: false,
             status: None,
             revision: 1,
@@ -673,12 +670,12 @@ mod tests {
             geometry: None,
             kernel: None,
             metric: None,
+            axis_mode: None,
             profile_id: None,
             math_mode: None,
         });
         manifest.active_recipe_id = Some("recipe_1".to_owned());
-        let error = validate_manifest(&manifest).unwrap_err();
-        assert!(error.message.contains("must be locked"));
+        assert!(validate_manifest(&manifest).is_ok());
     }
 
     #[test]

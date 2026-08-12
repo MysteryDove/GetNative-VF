@@ -7,8 +7,13 @@ import type {
   MathMode,
   MetricSpec,
   SearchPreset,
+  EndpointRule,
 } from "./protocol";
 import { buildCandidateGrid, workEstimate } from "./candidateGrid";
+import { profileFor, profilesFor } from "./profiles";
+
+export const CUDA_MAXIMUM_P_NORM = 4;
+export const VULKAN_MAXIMUM_P_NORM = 1;
 
 export type HeightDraft = {
   subroute: "height" | "kernel";
@@ -17,12 +22,15 @@ export type HeightDraft = {
   start: string;
   stop: string;
   step: string;
+  endpointRule: EndpointRule;
   /** Used only by fractional_refine. */
   refineSelected: string;
   refineHalfSpan: string;
   kernelId: string;
   kernelParameters: Record<string, string | number | boolean>;
-  compareCommonKernels: boolean;
+  /** Additional kernels to compare against the fixed kernel (RunGroup members).
+   *  Entries may carry parameter variants, e.g. lanczos with taps 2..6. */
+  compareKernels: KernelRef[];
   profileId: string;
   mathMode: MathMode;
   backendPreference: BackendPreference;
@@ -33,43 +41,67 @@ export type HeightDraft = {
 };
 
 export function defaultHeightDraft(capabilities: EngineEnvelope | null): HeightDraft {
-  const kernels = capabilities?.payload.kernels ?? [];
-  const profiles = capabilities?.payload.profiles ?? [];
-  const bicubic = kernels.find((kernel) => kernel.id === "bicubic");
-  const defaultKernel = bicubic ?? kernels[0];
+  const profiles = profilesFor(capabilities);
   const defaultProfile =
     profiles.find((profile) => profile.id.includes("muf"))?.id ??
     profiles[0]?.id ??
     "muf-d278cd3";
 
+  return heightDraftForProfile(capabilities, defaultProfile);
+}
+
+function kernelParametersForProfile(
+  profile: ReturnType<typeof profileFor>,
+): Record<string, string | number | boolean> {
+  if (profile.default_kernel.id === "bicubic") {
+    return { b: profile.default_kernel.b, c: profile.default_kernel.c };
+  }
+  if (profile.default_kernel.id === "lanczos") {
+    return { taps: profile.default_kernel.taps };
+  }
+  return {};
+}
+
+export function heightDraftForProfile(
+  capabilities: EngineEnvelope | null,
+  profileId: string,
+): HeightDraft {
+  const profile = profileFor(profileId, capabilities);
   return {
     subroute: "height",
     preset: "integer_coarse",
-    axisMode: "h_only",
-    start: "500",
-    stop: "800",
-    step: "1",
+    axisMode: profile.default_axis_mode,
+    start: profile.default_grid.start,
+    stop: profile.default_grid.stop,
+    step: profile.default_grid.step,
+    endpointRule: profile.default_grid.endpoint_rule,
     refineSelected: "720",
     refineHalfSpan: "1.0",
-    kernelId: defaultKernel?.id ?? "bicubic",
-    kernelParameters: { ...(defaultKernel?.parameters ?? { b: 1 / 3, c: 1 / 3 }) },
-    compareCommonKernels: false,
-    profileId: defaultProfile,
+    kernelId: profile.default_kernel.id,
+    kernelParameters: kernelParametersForProfile(profile),
+    compareKernels: [],
+    profileId: profile.id,
     mathMode: "raw",
     backendPreference: "auto",
     metric: {
-      cropLeft: 0,
-      cropRight: 0,
-      cropTop: 0,
-      cropBottom: 0,
-      pixelExclusionThreshold: 0,
-      // getnative's default metric is the mean absolute retained error (p = 1),
-      // which is also what the worker protocol v1 CPU backend supports.
+      cropLeft: profile.default_crop,
+      cropRight: profile.default_crop,
+      cropTop: profile.default_crop,
+      cropBottom: profile.default_crop,
+      pixelExclusionThreshold: profile.default_threshold,
       pNorm: 1,
     },
     baseHeight: "",
     baseWidth: "",
   };
+}
+
+/** Profile selection itself preserves edits; this explicit action resets the full draft. */
+export function applyProfileDefaults(
+  draft: HeightDraft,
+  capabilities: EngineEnvelope | null,
+): HeightDraft {
+  return { ...heightDraftForProfile(capabilities, draft.profileId), subroute: draft.subroute };
 }
 
 export function applyPreset(draft: HeightDraft, preset: SearchPreset): HeightDraft {
@@ -78,7 +110,8 @@ export function applyPreset(draft: HeightDraft, preset: SearchPreset): HeightDra
       ...draft,
       preset,
       start: "500",
-      stop: "800",
+      stop: "1000",
+      endpointRule: draft.endpointRule,
       step: "1",
     };
   }
@@ -110,7 +143,8 @@ export function resolveHeightGrid(
       start,
       stop,
       step: draft.step,
-      endpointRule: "inclusive",
+      endpointRule: draft.endpointRule,
+      gridSemantics: profileFor(draft.profileId).grid_semantics,
       preset: "fractional_refine",
     });
   }
@@ -119,9 +153,15 @@ export function resolveHeightGrid(
     start: draft.start,
     stop: draft.stop,
     step: draft.step,
-    endpointRule: "inclusive",
+    endpointRule: draft.endpointRule,
+    gridSemantics: profileFor(draft.profileId).grid_semantics,
     preset: draft.preset,
   });
+}
+
+/** Identity for dedup: same id AND same parameters collapse to one member. */
+export function kernelSignature(kernel: KernelRef): string {
+  return `${kernel.id}:${JSON.stringify(kernel.parameters)}`;
 }
 
 export function fixedKernelsForDraft(
@@ -132,17 +172,21 @@ export function fixedKernelsForDraft(
     id: draft.kernelId,
     parameters: { ...draft.kernelParameters },
   };
-  if (!draft.compareCommonKernels) return [primary];
-  const known = capabilities?.payload.kernels ?? [];
-  const commonIds = ["bilinear", "bicubic", "lanczos", "spline36"];
-  const fromCaps = commonIds
-    .map((id) => known.find((kernel) => kernel.id === id))
-    .filter((kernel): kernel is NonNullable<typeof kernel> => Boolean(kernel))
-    .map((kernel) => ({ id: kernel.id, parameters: { ...kernel.parameters } }));
-  if (fromCaps.length === 0) return [primary];
-  // Ensure primary is first and unique by id.
-  const rest = fromCaps.filter((kernel) => kernel.id !== primary.id);
-  return [primary, ...rest];
+  const seen = new Set<string>([kernelSignature(primary)]);
+  const extras: KernelRef[] = [];
+  for (const kernel of draft.compareKernels) {
+    const signature = kernelSignature(kernel);
+    if (seen.has(signature)) continue;
+    seen.add(signature);
+    const known = capabilities?.payload.kernels.find(
+      (candidate) => candidate.id === kernel.id,
+    );
+    extras.push({
+      id: kernel.id,
+      parameters: { ...(known?.parameters ?? {}), ...kernel.parameters },
+    });
+  }
+  return [primary, ...extras];
 }
 
 export function estimateHeightWork(
@@ -166,14 +210,8 @@ export function estimateHeightWork(
   };
 }
 
-export function selectableBackends(capabilities: EngineEnvelope | null): BackendPreference[] {
-  const backends = capabilities?.payload.backends ?? [];
-  const options: BackendPreference[] = ["auto"];
-  const cpu = backends.find((backend) => backend.id === "cpu");
-  if (cpu?.compiled && cpu.device_available) options.push("cpu");
-  const cuda = backends.find((backend) => backend.id === "cuda");
-  if (cuda?.compiled && cuda.device_available) options.push("cuda");
-  // Metal is not offered as a runnable preference: the worker protocol accepts
-  // cpu/cuda/auto only. Vulkan remains a reserved capability slot.
-  return options;
-}
+export {
+  resolveBackendPreference,
+  selectableBackends,
+  validateBackendPNorm,
+} from "./backendSelection";

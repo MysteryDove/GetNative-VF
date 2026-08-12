@@ -1,26 +1,33 @@
 import type {
   GeometrySnapshot,
+  AxisMode,
   KernelRef,
   MathMode,
   MetricSpec,
 } from "../engine/protocol";
 import { validateMetricSpec } from "../engine/shapeGuards";
+import { profileFor } from "../engine/profiles";
 import type { ProjectState, Recipe } from "./types";
 
 /**
  * Recipe domain operations. All functions are pure ProjectState transforms so
  * they can be tested directly and plugged into the shell's `onProjectChange`.
  *
- * Lifecycle (DESIGN.md): draft → locked → (superseded when a derived revision
- * locks). Locking never silently activates; activation only ever points at a
- * locked Recipe and replaces the prior pointer atomically.
+ * Single-current semantics: a Project holds any number of Recipes, all
+ * mutable; `active_recipe_id` points at the current one — the apply target
+ * for analysis pages and the input for whole-video Verification. Verification
+ * gating is field completeness (`recipeReadiness`), not a lock ceremony.
+ * The persisted `status`/`revision` fields remain for schema compatibility
+ * with older manifests and are no longer consulted.
  */
 
 export type RecipePayloadPatch = {
   name?: string;
+  nameSuffix?: string | null;
   geometry?: GeometrySnapshot | null;
   kernel?: KernelRef | null;
   metric?: MetricSpec | null;
+  axisMode?: AxisMode;
   profileId?: string | null;
   mathMode?: MathMode | null;
 };
@@ -33,7 +40,7 @@ function defaultIdFactory(): string {
   return crypto.randomUUID();
 }
 
-export function createRecipeDraft(
+export function createRecipe(
   state: ProjectState,
   input: RecipePayloadPatch & { name: string },
   idFactory: () => string = defaultIdFactory,
@@ -44,6 +51,7 @@ export function createRecipeDraft(
   const recipe: Recipe = {
     id: `recipe_${idFactory()}`,
     name,
+    nameSuffix: input.nameSuffix ?? null,
     status: "draft",
     locked: false,
     revision: 1,
@@ -53,6 +61,7 @@ export function createRecipeDraft(
     geometry: input.geometry ?? null,
     kernel: input.kernel ?? null,
     metric: input.metric ?? null,
+    axisMode: input.axisMode ?? profileFor(input.profileId ?? "").default_axis_mode,
     profileId: input.profileId ?? null,
     mathMode: input.mathMode ?? null,
   };
@@ -60,14 +69,15 @@ export function createRecipeDraft(
     ok: true,
     state: {
       ...state,
+      project: { ...state.project, activeRecipeId: recipe.id },
       recipesById: { ...state.recipesById, [recipe.id]: recipe },
     },
     recipe,
   };
 }
 
-/** Drafts are mutable; locked/superseded Recipes never change in place. */
-export function updateRecipeDraft(
+/** Every Recipe is mutable; updates always land in place. */
+export function updateRecipe(
   state: ProjectState,
   recipeId: string,
   patch: RecipePayloadPatch,
@@ -75,13 +85,14 @@ export function updateRecipeDraft(
 ): RecipeOpResult {
   const recipe = state.recipesById[recipeId];
   if (!recipe) return { ok: false, reason: "recipe_missing" };
-  if (recipe.status !== "draft") return { ok: false, reason: "recipe_immutable" };
   const next: Recipe = {
     ...recipe,
     ...(patch.name !== undefined ? { name: patch.name } : {}),
+    ...(patch.nameSuffix !== undefined ? { nameSuffix: patch.nameSuffix } : {}),
     ...(patch.geometry !== undefined ? { geometry: patch.geometry } : {}),
     ...(patch.kernel !== undefined ? { kernel: patch.kernel } : {}),
     ...(patch.metric !== undefined ? { metric: patch.metric } : {}),
+    ...(patch.axisMode !== undefined ? { axisMode: patch.axisMode } : {}),
     ...(patch.profileId !== undefined ? { profileId: patch.profileId } : {}),
     ...(patch.mathMode !== undefined ? { mathMode: patch.mathMode } : {}),
     updatedAt: nowIso,
@@ -93,14 +104,14 @@ export function updateRecipeDraft(
   };
 }
 
-export type LockReadiness = { ok: true } | { ok: false; missing: string[] };
+export type RecipeReadiness = { ok: true } | { ok: false; missing: string[] };
 
 /**
- * A Recipe can lock only when every metric-changing semantic value is present
- * and valid (DESIGN.md: "Lock Recipe requires confirmed geometry and kernel
- * plus all metric/crop parameters").
+ * A Recipe can feed whole-video Verification when every metric-changing
+ * semantic value is present and valid (DESIGN.md: confirmed geometry and
+ * kernel plus all metric/crop parameters).
  */
-export function recipeLockReadiness(recipe: Recipe): LockReadiness {
+export function recipeReadiness(recipe: Recipe): RecipeReadiness {
   const missing: string[] = [];
   if (!recipe.name.trim()) missing.push("name");
   if (!recipe.geometry) missing.push("geometry");
@@ -116,81 +127,8 @@ export function recipeLockReadiness(recipe: Recipe): LockReadiness {
 }
 
 /**
- * Lock a draft: it becomes immutable. If it was derived from a locked parent,
- * the parent becomes superseded (immutable history, no longer activatable).
- * Locking never changes `active_recipe_id`.
- */
-export function lockRecipeInState(
-  state: ProjectState,
-  recipeId: string,
-  nowIso: string = new Date().toISOString(),
-): RecipeOpResult {
-  const recipe = state.recipesById[recipeId];
-  if (!recipe) return { ok: false, reason: "recipe_missing" };
-  if (recipe.status !== "draft") return { ok: false, reason: "recipe_not_draft" };
-  const readiness = recipeLockReadiness(recipe);
-  if (!readiness.ok) return { ok: false, reason: "recipe_incomplete" };
-
-  const locked: Recipe = {
-    ...recipe,
-    status: "locked",
-    locked: true,
-    updatedAt: nowIso,
-  };
-  const recipesById = { ...state.recipesById, [recipeId]: locked };
-
-  const parent = recipe.parentRecipeId
-    ? state.recipesById[recipe.parentRecipeId]
-    : null;
-  if (parent && parent.status === "locked") {
-    recipesById[parent.id] = {
-      ...parent,
-      status: "superseded",
-      locked: true,
-      updatedAt: nowIso,
-    };
-  }
-  return { ok: true, state: { ...state, recipesById }, recipe: locked };
-}
-
-/**
- * Edit a locked/superseded Recipe by deriving a new draft linked to it.
- * The derived draft carries the next revision number; locking it creates a
- * new Recipe (the original is never mutated).
- */
-export function deriveRecipeDraft(
-  state: ProjectState,
-  recipeId: string,
-  idFactory: () => string = defaultIdFactory,
-  nowIso: string = new Date().toISOString(),
-): RecipeOpResult {
-  const source = state.recipesById[recipeId];
-  if (!source) return { ok: false, reason: "recipe_missing" };
-  if (source.status === "draft") return { ok: false, reason: "recipe_already_draft" };
-  const draft: Recipe = {
-    ...source,
-    id: `recipe_${idFactory()}`,
-    status: "draft",
-    locked: false,
-    revision: source.revision + 1,
-    parentRecipeId: source.id,
-    createdAt: nowIso,
-    updatedAt: nowIso,
-  };
-  return {
-    ok: true,
-    state: {
-      ...state,
-      recipesById: { ...state.recipesById, [draft.id]: draft },
-    },
-    recipe: draft,
-  };
-}
-
-/**
- * Activate a locked Recipe: the only activation pointer is
- * `active_recipe_id`; replacing it is one atomic assignment. Draft and
- * superseded Recipes cannot be newly activated.
+ * Make a Recipe the current one: the only pointer is `active_recipe_id`;
+ * replacing it is one atomic assignment. Any Recipe can be current.
  */
 export function activateRecipeInState(
   state: ProjectState,
@@ -198,7 +136,6 @@ export function activateRecipeInState(
 ): RecipeOpResult {
   const recipe = state.recipesById[recipeId];
   if (!recipe) return { ok: false, reason: "recipe_missing" };
-  if (recipe.status !== "locked") return { ok: false, reason: "recipe_not_activatable" };
   return {
     ok: true,
     state: {
@@ -214,7 +151,7 @@ export function deactivateRecipeInState(state: ProjectState): ProjectState {
   return { ...state, project: { ...state.project, activeRecipeId: null } };
 }
 
-/** The active Recipe must be deactivated or replaced before removal. */
+/** The current Recipe must be deactivated or replaced before removal. */
 export function removeRecipeInState(
   state: ProjectState,
   recipeId: string,

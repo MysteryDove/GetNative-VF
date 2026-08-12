@@ -265,19 +265,30 @@ export function DiagnosticsPage({
 
           <div className="kernel-section media-tool-section">
             <h3>{t("diagnostics.mediaTools")}</h3>
-            {(["ffprobe", "ffmpeg"] as const).map((name) => {
-              const tool = mediaCapabilities?.[name];
-              return (
-                <div className="kernel-row" key={name} title={tool?.path ?? undefined}>
-                  <span>{name}</span>
-                  <strong className={tool?.available ? "tool-ready" : "tool-unavailable"}>
-                    {tool?.available
-                      ? t("diagnostics.mediaToolReady", { source: tool.source })
-                      : t("diagnostics.mediaToolUnavailable")}
-                  </strong>
-                </div>
-              );
-            })}
+            <div className="kernel-row">
+              <span>{t("diagnostics.ffmpegAbi")}</span>
+              <strong className={mediaCapabilities?.video_decode_available ? "tool-ready" : "tool-unavailable"}>
+                {mediaCapabilities?.ffmpeg_abi ?? t("diagnostics.mediaToolUnavailable")}
+              </strong>
+            </div>
+            <div className="kernel-row">
+              <span>{t("diagnostics.mediaIndex")}</span>
+              <strong>
+                {mediaCapabilities?.index_version != null
+                  ? `${mediaCapabilities.index_format} v${mediaCapabilities.index_version}`
+                  : "-"}
+              </strong>
+            </div>
+            {mediaCapabilities?.decoder_backends.map((backend) => (
+              <div className="kernel-row" key={backend.id} title={backend.reason}>
+                <span>{backend.id}</span>
+                <strong className={backend.compiled && backend.runtime_device ? "tool-ready" : "tool-unavailable"}>
+                  {backend.compiled && backend.runtime_device
+                    ? t("diagnostics.decoderReady")
+                    : backend.reason ?? t("diagnostics.mediaToolUnavailable")}
+                </strong>
+              </div>
+            ))}
           </div>
 
           <div className="kernel-section">

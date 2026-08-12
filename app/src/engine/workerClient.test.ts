@@ -49,14 +49,22 @@ async function connectedClient(): Promise<EngineWorkerClient> {
   return client;
 }
 
-async function submitOne(client: EngineWorkerClient) {
+async function submitOne(
+  client: EngineWorkerClient,
+  onPrepared?: Parameters<EngineWorkerClient["submitHeight"]>[1],
+) {
   const submitted = await client.submitHeight({
     frameAsset: { path: "/tmp/frame.f32le", format: "f32le", width: 320, height: 240 },
     axisMode: "h_only",
     kernel: { id: "bicubic", b: 0, c: 0.5 },
     candidates: ["230", "231"],
     metric: { cropLeft: 10, threshold: 0.015, pNorm: 1 },
-  });
+    profileId: "modern",
+    endpointRule: "exclusive_stop",
+    baseHeight: "240",
+    baseWidth: "320",
+    grid: { start: "230", stop: "232", step: "1" },
+  }, onPrepared);
   return submitted;
 }
 
@@ -82,6 +90,11 @@ describe("EngineWorkerClient", () => {
       kernel: { id: "bicubic", b: 0, c: 0.5 },
       candidates: ["230", "231"],
       backend: "cpu",
+      profileId: "modern",
+      endpointRule: "exclusive_stop",
+      baseHeight: "240",
+      baseWidth: "320",
+      grid: { start: "230", stop: "232", step: "1" },
     });
   });
 
@@ -96,6 +109,9 @@ describe("EngineWorkerClient", () => {
       request_id: submitted.requestId,
       job_id: "job-1",
       mode: "height",
+      backend: "cuda",
+      device: "NVIDIA GeForce RTX 5080",
+      concurrency: 4,
       timestamp_ms: 10,
     });
     emitWire({
@@ -129,10 +145,60 @@ describe("EngineWorkerClient", () => {
     expect(progress.type === "progress" && progress.completed).toBe(5);
     expect(progress.type === "progress" && progress.detail).toBe("candidates");
     const result = events[2];
+    const accepted = events[0];
+    expect(accepted.type === "accepted" && accepted.backend).toBe("cuda");
+    expect(accepted.type === "accepted" && accepted.device).toBe("NVIDIA GeForce RTX 5080");
+    expect(accepted.type === "accepted" && accepted.concurrency).toBe(4);
     expect(
       result.type === "result" &&
         (result.payload as { candidates: unknown[] }).candidates.length,
     ).toBe(1);
+  });
+
+  it("prepares local identity before invoke and survives accepted/result before invoke resolves", async () => {
+    const client = await connectedClient();
+    const events = collect(client);
+    let resolveInvoke!: (value: unknown) => void;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "engine_worker_analyze") {
+        return new Promise((resolve) => {
+          resolveInvoke = resolve;
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    const prepared: Array<{ requestId: string; jobId: string; runId: string }> = [];
+    const pending = submitOne(client, (job) => prepared.push(job));
+    expect(prepared).toEqual([
+      { requestId: "gui-req-1", jobId: "gui-job-1", runId: "gui-run-1" },
+    ]);
+
+    emitWire({
+      type: "accepted",
+      request_id: "gui-req-1",
+      job_id: "engine-job-1",
+      mode: "height",
+      worker_count: 8,
+      suggested_in_flight: 16,
+    });
+    emitWire({
+      type: "result",
+      request_id: "gui-req-1",
+      job_id: "engine-job-1",
+      mode: "height",
+      payload: { candidates: [] },
+    });
+    resolveInvoke({ queued: true });
+    await expect(pending).resolves.toEqual(prepared[0]);
+    expect(events.map((event) => event.type)).toEqual(["accepted", "result"]);
+
+    // Terminal cleanup removes both indexes: a stale engine-id event no longer
+    // acquires the completed GUI identity.
+    emitWire({ type: "progress", job_id: "engine-job-1", completed: 1, total: 1 });
+    const stale = events.at(-1);
+    expect(stale?.type).toBe("progress");
+    if (stale?.type === "progress") expect(stale.jobId).toBe("engine-job-1");
   });
 
   it("correlates events that only carry the engine job id", async () => {
@@ -229,13 +295,15 @@ describe("EngineWorkerClient", () => {
     expect(exits).toEqual([["cuda init failed"]]);
   });
 
-  it("drops failed submissions so their ids are never reused by events", async () => {
+  it("emits a synthetic terminal failure with prepared ids and then drops tracking", async () => {
     const client = await connectedClient();
+    const events = collect(client);
     invokeMock.mockImplementation((command: string) =>
       command === "engine_worker_analyze"
         ? Promise.reject(new Error("worker_not_running"))
         : Promise.resolve({}),
     );
+    const prepared: Array<{ requestId: string; jobId: string; runId: string }> = [];
     await expect(
       client.submitHeight({
         frameAsset: { path: "/tmp/frame.f32le", format: "f32le", width: 320, height: 240 },
@@ -243,17 +311,62 @@ describe("EngineWorkerClient", () => {
         kernel: { id: "bilinear" },
         candidates: ["230"],
         metric: {},
-      }),
+      }, (job) => prepared.push(job)),
     ).rejects.toThrow("worker_not_running");
+    expect(prepared).toHaveLength(1);
+    const synthetic = events.find((event) => event.type === "error");
+    expect(synthetic).toMatchObject({
+      type: "error",
+      code: "submit_failed",
+      requestId: "gui-req-1",
+      jobId: "gui-job-1",
+      runId: "gui-run-1",
+    });
 
     // A late event for the rejected request id must not resolve to a job.
-    const events = collect(client);
     emitWire({ type: "progress", request_id: "gui-req-1", completed: 1, total: 2 });
-    const progress = events.find((event) => event.type === "progress");
+    const progress = events.at(-1);
     expect(progress).toBeDefined();
     if (progress?.type === "progress") {
       expect(progress.jobId).toBe("");
       expect(progress.runId).toBe("");
     }
+  });
+
+  it("adds finite frontend queue telemetry without mutating the wire payload", async () => {
+    const client = await connectedClient();
+    const events = collect(client);
+    const submitted = await submitOne(client);
+    const payload = {
+      mode: "height",
+      candidates: [],
+      telemetry: { plan_ms: 1.25 },
+    };
+    emitWire({
+      type: "accepted",
+      request_id: submitted.requestId,
+      job_id: "engine-job-telemetry",
+      mode: "height",
+    });
+    emitWire({
+      type: "result",
+      request_id: submitted.requestId,
+      job_id: "engine-job-telemetry",
+      mode: "height",
+      payload,
+    });
+
+    const result = events.find((event) => event.type === "result");
+    expect(result?.type).toBe("result");
+    if (result?.type === "result") {
+      const telemetry = (result.payload as { telemetry: Record<string, number> }).telemetry;
+      expect(Number.isFinite(telemetry.frontend_queue_ms)).toBe(true);
+      expect(telemetry.plan_ms).toBe(1.25);
+    }
+    expect(payload).toEqual({
+      mode: "height",
+      candidates: [],
+      telemetry: { plan_ms: 1.25 },
+    });
   });
 });

@@ -16,12 +16,15 @@ pub enum AppLanguage {
 #[serde(rename_all = "camelCase")]
 pub struct AppPreferences {
     pub language: AppLanguage,
+    #[serde(default)]
+    pub axis_plan_cache_dir: Option<String>,
 }
 
 impl Default for AppPreferences {
     fn default() -> Self {
         Self {
             language: AppLanguage::ZhCn,
+            axis_plan_cache_dir: None,
         }
     }
 }
@@ -30,6 +33,12 @@ impl Default for AppPreferences {
 #[serde(rename_all = "camelCase")]
 pub struct SetLanguageRequest {
     pub language: AppLanguage,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAxisPlanCacheDirRequest {
+    pub path: Option<String>,
 }
 
 fn preferences_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -71,9 +80,32 @@ pub fn app_set_language(
     app: AppHandle,
     request: SetLanguageRequest,
 ) -> Result<AppPreferences, String> {
-    let prefs = AppPreferences {
-        language: request.language,
-    };
+    // Preserve unrelated preferences (e.g. axis_plan_cache_dir) across a
+    // language change.
+    let mut prefs = load_preferences(&app)?;
+    prefs.language = request.language;
+    save_preferences(&app, &prefs)?;
+    Ok(prefs)
+}
+
+#[tauri::command]
+pub fn app_pick_axis_plan_cache_dir() -> Result<Option<String>, String> {
+    Ok(rfd::FileDialog::new()
+        .pick_folder()
+        .map(|path| path.display().to_string()))
+}
+
+#[tauri::command]
+pub fn app_set_axis_plan_cache_dir(
+    app: AppHandle,
+    request: SetAxisPlanCacheDirRequest,
+) -> Result<AppPreferences, String> {
+    let axis_plan_cache_dir = request.path.and_then(|path| {
+        let trimmed = path.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    });
+    let mut prefs = load_preferences(&app)?;
+    prefs.axis_plan_cache_dir = axis_plan_cache_dir;
     save_preferences(&app, &prefs)?;
     Ok(prefs)
 }
@@ -91,6 +123,7 @@ mod tests {
     fn language_serde_uses_stable_codes() {
         let prefs = AppPreferences {
             language: AppLanguage::En,
+            axis_plan_cache_dir: None,
         };
         let json = serde_json::to_string(&prefs).unwrap();
         assert!(json.contains("\"en\""));

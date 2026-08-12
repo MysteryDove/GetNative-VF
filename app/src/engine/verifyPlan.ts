@@ -1,10 +1,11 @@
 import type { BackendPreference, ScanScope, VerifyRequest } from "./protocol";
 import { validateVerifyShape } from "./shapeGuards";
+import { recipeReadiness } from "../project/recipe";
 import type { ProjectState, Recipe, Source } from "../project/types";
 
 /**
  * Whole-video Verification (全视频检查) setup. One member VerificationRun per
- * selected Source; every Run snapshots the active locked Recipe. Recipe
+ * selected Source; every Run snapshots the current Recipe. Recipe
  * semantics are never edited here.
  */
 
@@ -21,17 +22,20 @@ export type VerifyDraft = {
   startFrame: string;
   endFrame: string;
   backendPreference: BackendPreference;
+  concurrency: number;
 };
 
 export function defaultVerifyDraft(backendPreference: BackendPreference = "auto"): VerifyDraft {
   return {
     sourceIds: [],
-    scopeKind: "full",
+    // Preview (every decoded I-picture) is the default; full scans are opt-in.
+    scopeKind: "preview",
     previewRule: "decoded_i_picture",
     everyN: "24",
     startFrame: "",
     endFrame: "",
     backendPreference,
+    concurrency: 2,
   };
 }
 
@@ -51,6 +55,7 @@ export type VerifyRunGroupPlan = {
     recipeRevision: number;
     sourceIds: string[];
     scopeKind: VerifyScopeKind;
+    concurrency: number;
   };
 };
 
@@ -96,6 +101,10 @@ export function resolveScanScope(
   };
 }
 
+export function validVerifyConcurrency(value: number): boolean {
+  return Number.isInteger(value) && value >= 1 && value <= 8;
+}
+
 export function planVerifyRunGroup(input: {
   draft: VerifyDraft;
   recipe: Recipe;
@@ -103,14 +112,19 @@ export function planVerifyRunGroup(input: {
   nowMs?: number;
   requestIdPrefix?: string;
 }): { ok: true; plan: VerifyRunGroupPlan } | { ok: false; reason: string } {
-  if (input.recipe.status !== "locked") return { ok: false, reason: "recipe_not_locked" };
-  if (!input.recipe.geometry || !input.recipe.kernel || !input.recipe.metric) {
-    return { ok: false, reason: "recipe_incomplete" };
-  }
+  const readiness = recipeReadiness(input.recipe);
+  if (!readiness.ok) return { ok: false, reason: "recipe_incomplete" };
+  // recipeReadiness guarantees geometry/kernel/metric are present.
+  const recipeGeometry = input.recipe.geometry!;
+  const recipeKernel = input.recipe.kernel!;
+  const recipeMetric = input.recipe.metric!;
   const selected = input.draft.sourceIds
     .map((id) => input.sourcesById[id])
     .filter((source): source is Source => Boolean(source));
   if (selected.length === 0) return { ok: false, reason: "no_sources" };
+  if (!validVerifyConcurrency(input.draft.concurrency)) {
+    return { ok: false, reason: "verify_concurrency_invalid" };
+  }
 
   const prefix = input.requestIdPrefix ?? "req";
   const now = input.nowMs ?? Date.now();
@@ -131,13 +145,15 @@ export function planVerifyRunGroup(input: {
       sourceFingerprint: source.fingerprint ?? null,
       recipeId: input.recipe.id,
       recipeRevision: input.recipe.revision,
-      geometry: input.recipe.geometry,
-      kernel: input.recipe.kernel,
-      metric: input.recipe.metric,
+      geometry: recipeGeometry,
+      kernel: recipeKernel,
+      metric: recipeMetric,
+      axisMode: input.recipe.axisMode,
       profileId: input.recipe.profileId ?? "",
       mathMode: input.recipe.mathMode ?? "raw",
       scanScope: scope.scope,
       backendPreference: input.draft.backendPreference,
+      concurrency: input.draft.concurrency,
     };
     const shape = validateVerifyShape(request);
     if (!shape.ok) return { ok: false, reason: shape.code };
@@ -163,6 +179,7 @@ export function planVerifyRunGroup(input: {
         recipeRevision: input.recipe.revision,
         sourceIds: selected.map((source) => source.id),
         scopeKind: input.draft.scopeKind,
+        concurrency: input.draft.concurrency,
       },
     },
   };
@@ -215,6 +232,7 @@ export function materializeVerifyRunGroup(input: {
       planKey: member.planKey,
       request: member.request,
       scanScope: member.scanScope,
+      concurrency: member.request.concurrency,
     },
     result: null,
     errorCode: null,

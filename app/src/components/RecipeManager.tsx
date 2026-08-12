@@ -2,19 +2,19 @@ import { useState } from "react";
 import type { Translator } from "../i18n";
 import {
   activateRecipeInState,
-  deactivateRecipeInState,
-  deriveRecipeDraft,
-  lockRecipeInState,
+  createRecipe,
+  recipeReadiness,
   removeRecipeInState,
-  updateRecipeDraft,
 } from "../project/recipe";
-import type { ProjectState, Recipe } from "../project/types";
+import type { ProjectState } from "../project/types";
+import { missingFieldLabels } from "./RecipeReviewDialog";
 import { RecipeReviewDialog } from "./RecipeReviewDialog";
 
 /**
- * Recipe Manager: the whole Recipe lifecycle in one place — draft review and
- * lock, atomic activation, revision derivation, guarded removal. Rendered on
- * the Project Overview, which owns Recipe activation per the route matrix.
+ * Recipe list on the Project Overview: every Recipe is mutable; the current
+ * one (active_recipe_id) is the analysis apply target and Verification input.
+ * Rows expose set-current, inspect, and guarded removal; incomplete Recipes
+ * show their missing fields inline.
  */
 export function RecipeManager({
   t,
@@ -46,20 +46,30 @@ export function RecipeManager({
     onProjectChange(() => next);
   }
 
-  function statusLabel(recipe: Recipe): string {
-    if (recipe.status === "locked") return t("recipe.locked");
-    if (recipe.status === "superseded") return t("recipe.superseded");
-    return t("recipe.draft");
-  }
-
   return (
     <div className="recipe-manager">
+      <div className="recipe-manager-actions">
+        <button
+          className="secondary-button"
+          type="button"
+          onClick={() =>
+            run((current) =>
+              createRecipe(current, {
+                name: `${t("recipe.defaultName")} ${Object.keys(current.recipesById).length + 1}`,
+              }),
+            )
+          }
+        >
+          {t("recipe.newDraft")}
+        </button>
+      </div>
       {recipes.length === 0 ? (
         <p className="empty-copy">{t("overview.recipesEmpty")}</p>
       ) : (
         <div className="dense-table">
           {recipes.map((recipe) => {
             const isActive = state.project.activeRecipeId === recipe.id;
+            const readiness = recipeReadiness(recipe);
             return (
               <div className="dense-row recipe-row" key={recipe.id}>
                 <strong>
@@ -70,21 +80,13 @@ export function RecipeManager({
                 </strong>
                 <span>
                   {t("recipe.revision", { revision: recipe.revision })}
-                  {" · "}
-                  {statusLabel(recipe)}
                   {recipe.updatedAt ? ` · ${recipe.updatedAt.slice(0, 10)}` : ""}
+                  {!readiness.ok
+                    ? ` · ${t("recipe.missingFields", { missing: missingFieldLabels(t, readiness.missing) })}`
+                    : ""}
                 </span>
                 <span className="recipe-actions">
-                  {recipe.status === "draft" ? (
-                    <button
-                      className="link-button"
-                      type="button"
-                      onClick={() => setReviewingId(recipe.id)}
-                    >
-                      {t("recipe.review")}
-                    </button>
-                  ) : null}
-                  {recipe.status === "locked" && !isActive ? (
+                  {!isActive ? (
                     <button
                       className="link-button"
                       type="button"
@@ -92,40 +94,16 @@ export function RecipeManager({
                         run((current) => activateRecipeInState(current, recipe.id))
                       }
                     >
-                      {t("recipe.activate")}
+                      {t("recipe.setActive")}
                     </button>
                   ) : null}
-                  {isActive ? (
-                    <button
-                      className="link-button"
-                      type="button"
-                      onClick={() =>
-                        run((current) => ({ ok: true, state: deactivateRecipeInState(current) }))
-                      }
-                    >
-                      {t("recipe.deactivate")}
-                    </button>
-                  ) : null}
-                  {recipe.status !== "draft" ? (
-                    <>
-                      <button
-                        className="link-button"
-                        type="button"
-                        onClick={() => setReviewingId(recipe.id)}
-                      >
-                        {t("recipe.inspect")}
-                      </button>
-                      <button
-                        className="link-button"
-                        type="button"
-                        onClick={() =>
-                          run((current) => deriveRecipeDraft(current, recipe.id))
-                        }
-                      >
-                        {t("recipe.derive")}
-                      </button>
-                    </>
-                  ) : null}
+                  <button
+                    className="link-button"
+                    type="button"
+                    onClick={() => setReviewingId(recipe.id)}
+                  >
+                    {t("recipe.inspect")}
+                  </button>
                   {!isActive ? (
                     <button
                       className="link-button danger"
@@ -149,18 +127,9 @@ export function RecipeManager({
         <RecipeReviewDialog
           t={t}
           recipe={reviewing}
+          isActive={state.project.activeRecipeId === reviewing.id}
           onClose={() => setReviewingId(null)}
-          onRename={(name) =>
-            run((current) => updateRecipeDraft(current, reviewing.id, { name }))
-          }
-          onLock={() =>
-            run((current) => {
-              const result = lockRecipeInState(current, reviewing.id);
-              if (result.ok) setReviewingId(null);
-              return result;
-            })
-          }
-          onActivate={() =>
+          onSetActive={() =>
             run((current) => {
               const result = activateRecipeInState(current, reviewing.id);
               if (result.ok) setReviewingId(null);

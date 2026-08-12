@@ -1,5 +1,7 @@
 import type { EngineEnvelope } from "./types";
 import type { KernelRef } from "./protocol";
+import { profileFor } from "./profiles";
+import { validateBackendPNorm } from "./heightDraft";
 import {
   geometryGroupKey,
   resolveKernelCandidates,
@@ -32,7 +34,6 @@ export type KernelRunGroupPlan = {
   workEstimate: number;
   members: PlannedKernelMember[];
   intentSnapshot: {
-    scanMode: KernelDraft["scanMode"];
     kernels: KernelRef[];
     metric: KernelDraft["metric"];
     profileId: string;
@@ -57,6 +58,13 @@ export function planKernelRunGroup(input: {
 }): { ok: true; plan: KernelRunGroupPlan } | { ok: false; reason: string } {
   const included = input.samples.filter((sample) => sample.included);
   if (included.length === 0) return { ok: false, reason: "no_samples" };
+  const pNorm = validateBackendPNorm(
+    input.capabilities,
+    input.draft.backendPreference,
+    input.draft.metric.pNorm,
+    profileFor(input.draft.profileId, input.capabilities).default_axis_mode,
+  );
+  if (!pNorm.ok) return pNorm;
 
   const resolved = resolveKernelCandidates(input.draft, input.capabilities);
   if (!resolved.ok) return resolved;
@@ -107,6 +115,7 @@ export function planKernelRunGroup(input: {
       streamIndex: sample.streamIndex ?? null,
       frameIndex: sample.frameIndex ?? null,
       geometry,
+      axisMode: profileFor(input.draft.profileId, input.capabilities).default_axis_mode,
       kernels: resolved.candidates.map((kernel) => ({
         id: kernel.id,
         parameters: { ...kernel.parameters },
@@ -141,7 +150,6 @@ export function planKernelRunGroup(input: {
       workEstimate: members.length * resolved.candidates.length,
       members,
       intentSnapshot: {
-        scanMode: input.draft.scanMode,
         kernels: resolved.candidates,
         metric: { ...input.draft.metric },
         profileId: input.draft.profileId,

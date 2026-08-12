@@ -370,7 +370,7 @@ export function SamplesPage({
               <strong>{t("samples.preview")}</strong>
             </div>
             <div className="sample-preview">
-              {previewUrl ? <img src={previewUrl} alt={focusedSample?.label ?? t("samples.preview")} /> : null}
+              {previewUrl ? <img src={previewUrl} alt={focusedSample?.label ?? t("samples.preview")} draggable={false} /> : null}
               {!previewUrl ? (
                 <div className="viewport-empty">
                   {previewBusy ? <LoaderCircle className="spin" size={24} /> : <FileImage size={24} />}
