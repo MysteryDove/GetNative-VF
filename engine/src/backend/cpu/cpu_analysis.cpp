@@ -257,7 +257,9 @@ void CpuWorkspace::reserve(std::int32_t source_width, std::int32_t source_height
     (void)checked_area(source_width, source_height);
     (void)checked_area(native_width, native_height);
     const std::size_t inverse_intermediate = axes == AnalysisAxes::vertical
-        ? 0U : checked_area(native_width, source_height);
+        ? 0U : axes == AnalysisAxes::horizontal
+            ? static_cast<std::size_t>(native_width)
+            : checked_area(native_width, source_height);
     const std::size_t horizontal_first_intermediate = axes == AnalysisAxes::both
         ? checked_area(source_width, native_height) : 0U;
     const std::size_t intermediate_count =
@@ -484,15 +486,11 @@ double analyze_axis_candidate_impl(ConstImageView source, const AxisPlan &axis,
         }
         workspace.reserve(source.width, source.height, axis.destination_size, source.height,
                           AnalysisAxes::horizontal);
-        const std::ptrdiff_t native_stride = axis.destination_size;
-        for (std::int32_t y = 0; y < source.height; ++y) {
+        for (std::int32_t y = bounds.y_begin; y < bounds.y_end; ++y) {
             inverse_axis_f32(axis, source.data + static_cast<std::ptrdiff_t>(y) * source.stride, 1,
-                             workspace.intermediate.data()
-                                 + static_cast<std::ptrdiff_t>(y) * native_stride, 1);
-            forward_axis_f32(axis, workspace.intermediate.data()
-                                       + static_cast<std::ptrdiff_t>(y) * native_stride, 1,
+                             workspace.intermediate.data(), 1);
+            forward_axis_f32(axis, workspace.intermediate.data(), 1,
                              workspace.reconstruction_row.data(), 1);
-            if (y < bounds.y_begin || y >= bounds.y_end) continue;
             const float *source_row = source.data + static_cast<std::ptrdiff_t>(y) * source.stride;
             add_absolute_difference_row(
                 source_row, workspace.reconstruction_row.data(),
@@ -508,7 +506,7 @@ double analyze_axis_candidate_impl(ConstImageView source, const AxisPlan &axis,
         const std::ptrdiff_t native_stride = source.width;
         detail::inverse_columns_f32(
             axis, source.data, source.stride, workspace.native.data(), native_stride,
-            source.width, column_policy);
+            bounds.x_begin, bounds.x_end - bounds.x_begin, column_policy);
         for (std::int32_t y = bounds.y_begin; y < bounds.y_end; ++y) {
             const std::uint32_t begin = axis.forward_offsets[static_cast<std::size_t>(y)];
             const std::int32_t left = axis.forward_indices[begin];

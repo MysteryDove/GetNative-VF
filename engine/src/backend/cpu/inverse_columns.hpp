@@ -51,12 +51,23 @@ void validate_column_dispatch_policy(ColumnDispatchPolicy policy);
 
 void inverse_columns_scalar_f32(
     const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
-    float *output, std::ptrdiff_t output_row_stride, std::int32_t column_count);
+    float *output, std::ptrdiff_t output_row_stride,
+    std::int32_t column_offset, std::int32_t column_count);
 
 void inverse_columns_f32(
     const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
-    float *output, std::ptrdiff_t output_row_stride, std::int32_t column_count,
+    float *output, std::ptrdiff_t output_row_stride,
+    std::int32_t column_offset, std::int32_t column_count,
     ColumnDispatchPolicy policy = ColumnDispatchPolicy::automatic);
+
+inline void inverse_columns_f32(
+    const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
+    float *output, std::ptrdiff_t output_row_stride, std::int32_t column_count,
+    ColumnDispatchPolicy policy = ColumnDispatchPolicy::automatic) {
+    inverse_columns_f32(
+        plan, input, input_row_stride, output, output_row_stride,
+        0, column_count, policy);
+}
 
 [[nodiscard]] double analyze_axis_candidate_with_column_policy_f32(
     ConstImageView source, const AxisPlan &axis, AnalysisAxes axis_direction,

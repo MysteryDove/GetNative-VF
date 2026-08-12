@@ -127,6 +127,9 @@ void expect_same_double(double actual, double expected, const std::string &messa
     return 1;
 }
 
+[[nodiscard]] std::vector<float> make_source(
+    std::int32_t width, std::int32_t height, std::int32_t stride);
+
 [[nodiscard]] getnative::CpuFeatureSnapshot full_avx512_snapshot() {
     getnative::CpuFeatureSnapshot snapshot{};
     snapshot.x86 = true;
@@ -271,6 +274,65 @@ void test_materialized_inverse_columns(
     }
 }
 
+void test_cropped_inverse_column_ranges(
+    getnative::detail::ColumnDispatchPolicy policy) {
+    constexpr std::int32_t source_size = 53;
+    constexpr std::int32_t destination_size = 31;
+    constexpr std::int32_t columns = 41;
+    constexpr std::ptrdiff_t input_stride = columns + 5;
+    constexpr std::ptrdiff_t output_stride = columns + 7;
+    constexpr float padding = -2047.25F;
+    const auto input = make_source(columns, source_size,
+                                   static_cast<std::int32_t>(input_stride));
+
+    for (const auto &[name, filter] : filters()) {
+        const auto plan = getnative::build_axis_plan({
+            source_size, destination_size, 31.25, -0.125, filter,
+            getnative::BorderMode::mirror,
+        });
+        std::vector<float> full(
+            static_cast<std::size_t>(destination_size * output_stride), padding);
+        getnative::detail::inverse_columns_f32(
+            plan, input.data(), input_stride, full.data(), output_stride,
+            columns, getnative::detail::ColumnDispatchPolicy::scalar_only);
+
+        for (const auto &[offset, count] : std::vector<std::pair<std::int32_t, std::int32_t>>{
+                 {0, 0}, {0, 1}, {1, 3}, {3, 16}, {7, 17}, {16, 24}, {40, 1}}) {
+            std::vector<float> cropped(full.size(), padding);
+            getnative::detail::inverse_columns_f32(
+                plan, input.data(), input_stride, cropped.data(), output_stride,
+                offset, count, policy);
+            for (std::int32_t row = 0; row < destination_size; ++row) {
+                for (std::int32_t column = 0; column < output_stride; ++column) {
+                    const std::size_t index = static_cast<std::size_t>(
+                        row * output_stride + column);
+                    if (column >= offset && column < offset + count) {
+                        expect_same_float(
+                            cropped[index], full[index],
+                            name + " cropped inverse range differs at column "
+                                + std::to_string(column));
+                    } else {
+                        expect(cropped[index] == padding,
+                               name + " cropped inverse wrote outside its range");
+                    }
+                }
+            }
+        }
+    }
+
+    const auto plan = getnative::build_axis_plan({
+        source_size, destination_size, 31.25, -0.125,
+        getnative::Filter::bilinear(), getnative::BorderMode::mirror,
+    });
+    std::vector<float> output(
+        static_cast<std::size_t>(destination_size * output_stride), padding);
+    expect_throws<std::invalid_argument>([&] {
+        getnative::detail::inverse_columns_f32(
+            plan, input.data(), input_stride, output.data(), output_stride,
+            -1, 1, policy);
+    }, "negative inverse column offset is rejected");
+}
+
 void test_avx2_b5_row_major_boundaries(
     getnative::detail::ColumnDispatchPolicy policy,
     getnative::CpuIsa selected_isa) {
@@ -367,6 +429,127 @@ void test_avx2_b5_row_major_boundaries(
         }
     }
     return pixels;
+}
+
+[[nodiscard]] double full_frame_scalar_oracle(
+    getnative::ConstImageView source, const getnative::AxisPlan &horizontal,
+    const getnative::AxisPlan &vertical, getnative::AnalysisAxes axes,
+    const getnative::MetricSpec &metric) {
+    const std::size_t source_elements = static_cast<std::size_t>(source.width)
+        * static_cast<std::size_t>(source.height);
+    std::vector<float> reconstruction(source_elements, 0.0F);
+
+    if (axes == getnative::AnalysisAxes::horizontal) {
+        std::vector<float> native(
+            static_cast<std::size_t>(horizontal.destination_size));
+        for (std::int32_t y = 0; y < source.height; ++y) {
+            getnative::inverse_axis_f32(
+                horizontal,
+                source.data + static_cast<std::ptrdiff_t>(y) * source.stride, 1,
+                native.data(), 1);
+            getnative::forward_axis_f32(
+                horizontal, native.data(), 1,
+                reconstruction.data() + static_cast<std::ptrdiff_t>(y) * source.width, 1);
+        }
+    } else if (axes == getnative::AnalysisAxes::vertical) {
+        std::vector<float> native(
+            static_cast<std::size_t>(vertical.destination_size));
+        for (std::int32_t x = 0; x < source.width; ++x) {
+            getnative::inverse_axis_f32(
+                vertical, source.data + x, source.stride, native.data(), 1);
+            getnative::forward_axis_f32(
+                vertical, native.data(), 1, reconstruction.data() + x, source.width);
+        }
+    } else {
+        const std::ptrdiff_t inverse_stride = horizontal.destination_size;
+        std::vector<float> inverse_horizontal(
+            static_cast<std::size_t>(inverse_stride)
+                * static_cast<std::size_t>(source.height));
+        for (std::int32_t y = 0; y < source.height; ++y) {
+            getnative::inverse_axis_f32(
+                horizontal,
+                source.data + static_cast<std::ptrdiff_t>(y) * source.stride, 1,
+                inverse_horizontal.data()
+                    + static_cast<std::ptrdiff_t>(y) * inverse_stride, 1);
+        }
+        const std::ptrdiff_t native_stride = horizontal.destination_size;
+        std::vector<float> native(
+            static_cast<std::size_t>(native_stride)
+                * static_cast<std::size_t>(vertical.destination_size));
+        getnative::detail::inverse_columns_f32(
+            vertical, inverse_horizontal.data(), inverse_stride,
+            native.data(), native_stride, horizontal.destination_size,
+            getnative::detail::ColumnDispatchPolicy::scalar_only);
+        std::vector<float> forward_vertical(
+            static_cast<std::size_t>(native_stride)
+                * static_cast<std::size_t>(source.height));
+        for (std::int32_t x = 0; x < horizontal.destination_size; ++x) {
+            getnative::forward_axis_f32(
+                vertical, native.data() + x, native_stride,
+                forward_vertical.data() + x, native_stride);
+        }
+        for (std::int32_t y = 0; y < source.height; ++y) {
+            getnative::forward_axis_f32(
+                horizontal,
+                forward_vertical.data()
+                    + static_cast<std::ptrdiff_t>(y) * native_stride, 1,
+                reconstruction.data()
+                    + static_cast<std::ptrdiff_t>(y) * source.width, 1);
+        }
+    }
+
+    return getnative::thresholded_p_norm(
+        source, {reconstruction.data(), source.width, source.height, source.width},
+        metric);
+}
+
+void test_crop_aware_analysis_matches_full_frame_oracle(
+    getnative::detail::ColumnDispatchPolicy policy) {
+    constexpr std::int32_t width = 35;
+    constexpr std::int32_t height = 29;
+    constexpr std::int32_t stride = width + 4;
+    const auto pixels = make_source(width, height, stride);
+    const getnative::ConstImageView source{pixels.data(), width, height, stride};
+    const std::vector<getnative::MetricSpec> metrics{
+        {0, 0, 0, 0, 0.015F, 1U},
+        {1, 2, 3, 2, 0.015F, 1U},
+        {14, 13, 11, 10, 0.015F, 1U},
+    };
+
+    for (const auto &[name, filter] : filters()) {
+        const auto horizontal = getnative::build_axis_plan({
+            width, 21, 21.25, -0.125, filter, getnative::BorderMode::mirror,
+        });
+        const auto vertical = getnative::build_axis_plan({
+            height, 17, 17.25, 0.125, filter, getnative::BorderMode::mirror,
+        });
+        for (const getnative::MetricSpec &metric : metrics) {
+            for (const getnative::AnalysisAxes axes : {
+                     getnative::AnalysisAxes::horizontal,
+                     getnative::AnalysisAxes::vertical,
+                     getnative::AnalysisAxes::both}) {
+                getnative::CpuWorkspace workspace;
+                const double actual = axes == getnative::AnalysisAxes::both
+                    ? getnative::detail::analyze_candidate_with_column_policy_f32(
+                          source, horizontal, vertical, metric, workspace, policy)
+                    : getnative::detail::analyze_axis_candidate_with_column_policy_f32(
+                          source,
+                          axes == getnative::AnalysisAxes::horizontal
+                              ? horizontal : vertical,
+                          axes, metric, workspace, policy);
+                const double expected = full_frame_scalar_oracle(
+                    source, horizontal, vertical, axes, metric);
+                expect_same_double(
+                    actual, expected,
+                    name + " crop-aware analysis differs from full-frame oracle");
+                if (axes == getnative::AnalysisAxes::horizontal) {
+                    expect(workspace.intermediate.size()
+                               == static_cast<std::size_t>(horizontal.destination_size),
+                           name + " horizontal analysis retains more than one native row");
+                }
+            }
+        }
+    }
 }
 
 void expect_same_workspace(
@@ -936,10 +1119,12 @@ int main(int argc, char **argv) {
         }
         const auto policy = getnative::detail::column_dispatch_policy(request);
         test_materialized_inverse_columns(policy, dispatch.selected);
+        test_cropped_inverse_column_ranges(policy);
         test_avx2_b5_row_major_boundaries(policy, dispatch.selected);
         test_axis_and_two_axis_candidates(policy);
         test_workspace_reuse(policy);
         test_all_filters_across_axes(policy);
+        test_crop_aware_analysis_matches_full_frame_oracle(policy);
         test_all_cpu_shape_widths(policy);
         test_absolute_difference_block_boundaries(policy);
         test_vertical_reconstruction_norm1_fusion(policy);

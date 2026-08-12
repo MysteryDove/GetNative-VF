@@ -23,4 +23,12 @@ namespace getnative {
     std::optional<std::int64_t> base_height = std::nullopt,
     std::optional<std::int64_t> base_width = std::nullopt);
 
+[[nodiscard]] Geometry resolve_candidate_geometry(
+    std::int64_t source_width,
+    std::int64_t source_height,
+    GeometryAxisMode axis_mode,
+    double candidate,
+    std::optional<std::int64_t> base_height = std::nullopt,
+    std::optional<std::int64_t> base_width = std::nullopt);
+
 } // namespace getnative

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(getnative_engine VERSION 0.1.0 LANGUAGES C CXX)
+project(getnative_engine VERSION 0.1.1 LANGUAGES C CXX)
 
 include(CTest)
 find_package(Threads REQUIRED)
@@ -9,6 +9,10 @@ option(GETNATIVE_BUILD_UPSTREAM_CONFORMANCE
 option(GETNATIVE_ENABLE_METAL "Build the Metal analysis backend on macOS" ${APPLE})
 option(GETNATIVE_ENABLE_CUDA
        "Build the new generic CUDA C++ baseline backend on Windows or Linux" OFF)
+option(GETNATIVE_ENABLE_VULKAN
+       "Build the Vulkan 1.2 compute analysis backend on Windows or Linux" OFF)
+option(GETNATIVE_ENABLE_MEDIA
+       "Build in-process FFmpeg 8 media indexing and decode support" ON)
 option(GETNATIVE_BUILD_CUDA_AUTOTUNER
        "Build the standalone distributable CUDA launch-policy autotuner" OFF)
 set(GETNATIVE_PLANNER_FP_MODE "fast" CACHE STRING
@@ -64,14 +68,37 @@ set(GETNATIVE_CUDA_ARCHITECTURES
     "Native SM targets embedded in the CUDA fatbin")
 set(GETNATIVE_CUDA_PTX_ARCHITECTURES "75;121" CACHE STRING
     "Virtual compute targets embedded as CUDA PTX fallbacks")
+set(GETNATIVE_CUDA_ROOT "" CACHE PATH
+    "CUDA Toolkit root (auto-detected from common environment variables and install paths when empty)")
 if(GETNATIVE_ENABLE_CUDA
    AND NOT WIN32
    AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "GETNATIVE_ENABLE_CUDA currently requires Windows or Linux")
 endif()
+if(GETNATIVE_ENABLE_VULKAN
+   AND NOT WIN32
+   AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "GETNATIVE_ENABLE_VULKAN currently requires Windows or Linux")
+endif()
 if(GETNATIVE_BUILD_CUDA_AUTOTUNER AND NOT GETNATIVE_ENABLE_CUDA)
     message(FATAL_ERROR
         "GETNATIVE_BUILD_CUDA_AUTOTUNER requires GETNATIVE_ENABLE_CUDA=ON")
+endif()
+
+if(GETNATIVE_ENABLE_MEDIA)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(GETNATIVE_FFMPEG QUIET IMPORTED_TARGET
+            libavformat>=62 libavformat<63
+            libavcodec>=62 libavcodec<63
+            libavutil>=60 libavutil<61
+            libswscale>=9 libswscale<10)
+    endif()
+    if(NOT GETNATIVE_FFMPEG_FOUND)
+        message(WARNING
+            "FFmpeg 8 development libraries were not found; verify_media_begin will be disabled")
+        set(GETNATIVE_ENABLE_MEDIA OFF)
+    endif()
 endif()
 
 string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" GETNATIVE_SYSTEM_PROCESSOR_LOWER)
@@ -310,20 +337,50 @@ if(GETNATIVE_ENABLE_X86_SIMD)
 endif()
 
 if(GETNATIVE_ENABLE_CUDA)
+    set(GETNATIVE_CUDA_ROOT_HINTS)
+    if(GETNATIVE_CUDA_ROOT)
+        list(APPEND GETNATIVE_CUDA_ROOT_HINTS "${GETNATIVE_CUDA_ROOT}")
+    endif()
+    foreach(GETNATIVE_CUDA_ROOT_ENV
+            GETNATIVE_CUDA_ROOT CUDAToolkit_ROOT CUDA_PATH CUDA_HOME)
+        if(DEFINED ENV{${GETNATIVE_CUDA_ROOT_ENV}}
+           AND NOT "$ENV{${GETNATIVE_CUDA_ROOT_ENV}}" STREQUAL "")
+            list(APPEND GETNATIVE_CUDA_ROOT_HINTS
+                "$ENV{${GETNATIVE_CUDA_ROOT_ENV}}")
+        endif()
+    endforeach()
+    if(CMAKE_HOST_UNIX)
+        file(GLOB GETNATIVE_CUDA_VERSIONED_ROOT_HINTS
+            LIST_DIRECTORIES true "/usr/local/cuda-*")
+        list(SORT GETNATIVE_CUDA_VERSIONED_ROOT_HINTS
+            COMPARE NATURAL ORDER DESCENDING)
+        list(APPEND GETNATIVE_CUDA_ROOT_HINTS
+            "/usr/local/cuda" ${GETNATIVE_CUDA_VERSIONED_ROOT_HINTS})
+    endif()
+    list(REMOVE_DUPLICATES GETNATIVE_CUDA_ROOT_HINTS)
+
     find_program(GETNATIVE_NVCC_EXECUTABLE
         NAMES nvcc.exe nvcc
-        HINTS "$ENV{CUDA_PATH}/bin")
+        HINTS ${GETNATIVE_CUDA_ROOT_HINTS}
+        PATH_SUFFIXES bin)
     find_program(GETNATIVE_CUOBJDUMP_EXECUTABLE
         NAMES cuobjdump.exe cuobjdump
-        HINTS "$ENV{CUDA_PATH}/bin")
+        HINTS ${GETNATIVE_CUDA_ROOT_HINTS}
+        PATH_SUFFIXES bin)
     find_path(GETNATIVE_CUDA_INCLUDE_DIR
         NAMES cuda.h
-        HINTS "$ENV{CUDA_PATH}/include")
+        HINTS ${GETNATIVE_CUDA_ROOT_HINTS}
+        PATH_SUFFIXES include)
     if(NOT GETNATIVE_NVCC_EXECUTABLE OR NOT GETNATIVE_CUOBJDUMP_EXECUTABLE
        OR NOT GETNATIVE_CUDA_INCLUDE_DIR)
         message(FATAL_ERROR
-            "GETNATIVE_ENABLE_CUDA requires a CUDA Toolkit with nvcc, cuobjdump, and cuda.h")
+            "GETNATIVE_ENABLE_CUDA requires a CUDA Toolkit with nvcc, cuobjdump, and cuda.h. "
+            "Set GETNATIVE_CUDA_ROOT, CUDAToolkit_ROOT, CUDA_PATH, or CUDA_HOME to the toolkit root. "
+            "Detected nvcc='${GETNATIVE_NVCC_EXECUTABLE}', cuobjdump='${GETNATIVE_CUOBJDUMP_EXECUTABLE}', "
+            "include='${GETNATIVE_CUDA_INCLUDE_DIR}'.")
     endif()
+    message(STATUS
+        "GetNative CUDA Toolkit: nvcc=${GETNATIVE_NVCC_EXECUTABLE}, include=${GETNATIVE_CUDA_INCLUDE_DIR}")
     if(NOT GETNATIVE_CUDA_MIN_ARCHITECTURE MATCHES "^[0-9]+$")
         message(FATAL_ERROR
             "GETNATIVE_CUDA_MIN_ARCHITECTURE must be one numeric SM value such as 75")
@@ -452,6 +509,130 @@ if(GETNATIVE_ENABLE_CUDA)
     endif()
 endif()
 
+if(GETNATIVE_ENABLE_VULKAN)
+    find_package(Vulkan 1.2 QUIET)
+    if(NOT Vulkan_FOUND)
+        find_path(GETNATIVE_VULKAN_INCLUDE_DIR
+            NAMES vulkan/vulkan.h
+            HINTS "$ENV{VULKAN_SDK}"
+            PATH_SUFFIXES include Include)
+        if(WIN32)
+            find_library(GETNATIVE_VULKAN_LOADER
+                NAMES vulkan-1
+                HINTS "$ENV{VULKAN_SDK}"
+                PATH_SUFFIXES Lib lib)
+        else()
+            find_file(GETNATIVE_VULKAN_LOADER
+                NAMES libvulkan.so.1 libvulkan.so.1.4.357
+                HINTS "$ENV{VULKAN_SDK}"
+                PATHS /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib
+                PATH_SUFFIXES lib lib64 VulkanLoader/lib)
+        endif()
+        if(NOT GETNATIVE_VULKAN_INCLUDE_DIR OR NOT GETNATIVE_VULKAN_LOADER)
+            message(FATAL_ERROR
+                "GETNATIVE_ENABLE_VULKAN requires Vulkan 1.2 headers and loader. "
+                "Set VULKAN_SDK when they are not installed in standard paths.")
+        endif()
+        add_library(Vulkan::Vulkan UNKNOWN IMPORTED)
+        set_target_properties(Vulkan::Vulkan PROPERTIES
+            IMPORTED_LOCATION "${GETNATIVE_VULKAN_LOADER}"
+            INTERFACE_INCLUDE_DIRECTORIES "${GETNATIVE_VULKAN_INCLUDE_DIR}")
+        message(STATUS
+            "GetNative Vulkan fallback: include=${GETNATIVE_VULKAN_INCLUDE_DIR}, loader=${GETNATIVE_VULKAN_LOADER}")
+    endif()
+    set(GETNATIVE_VULKAN_SHADER_COMPILER "" CACHE FILEPATH
+        "Path to glslc or glslangValidator used for Vulkan compute shaders")
+    if(NOT GETNATIVE_VULKAN_SHADER_COMPILER AND Vulkan_GLSLC_EXECUTABLE)
+        set(GETNATIVE_VULKAN_SHADER_COMPILER "${Vulkan_GLSLC_EXECUTABLE}")
+    endif()
+    if(NOT GETNATIVE_VULKAN_SHADER_COMPILER)
+        find_program(GETNATIVE_VULKAN_SHADER_COMPILER
+            NAMES glslc.exe glslc glslangValidator.exe glslangValidator
+            HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    endif()
+    if(NOT GETNATIVE_VULKAN_SHADER_COMPILER)
+        message(FATAL_ERROR
+            "GETNATIVE_ENABLE_VULKAN requires glslc or glslangValidator")
+    endif()
+    get_filename_component(GETNATIVE_VULKAN_SHADER_COMPILER_NAME
+        "${GETNATIVE_VULKAN_SHADER_COMPILER}" NAME)
+    if(GETNATIVE_VULKAN_SHADER_COMPILER_NAME MATCHES "^glslc(\\.exe)?$")
+        set(GETNATIVE_VULKAN_SHADER_ARGUMENTS
+            --target-env=vulkan1.2 -O)
+    else()
+        set(GETNATIVE_VULKAN_SHADER_ARGUMENTS
+            -V --target-env vulkan1.2 -Os)
+    endif()
+    if(BUILD_TESTING)
+        find_program(GETNATIVE_SPIRV_VAL_EXECUTABLE
+            NAMES spirv-val.exe spirv-val
+            HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+        if(NOT GETNATIVE_SPIRV_VAL_EXECUTABLE)
+            message(FATAL_ERROR "Vulkan test builds require spirv-val")
+        endif()
+        set(GETNATIVE_VULKAN_VALIDATION_LAYER_DIR "" CACHE PATH
+            "Directory containing VkLayer_khronos_validation.json for tests")
+        if(NOT GETNATIVE_VULKAN_VALIDATION_LAYER_DIR
+           AND EXISTS "$ENV{VULKAN_SDK}/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json")
+            set(GETNATIVE_VULKAN_VALIDATION_LAYER_DIR
+                "$ENV{VULKAN_SDK}/share/vulkan/explicit_layer.d")
+        endif()
+    endif()
+
+    set(GETNATIVE_VULKAN_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/vulkan")
+    set(GETNATIVE_VULKAN_SPIRV)
+    set(GETNATIVE_VULKAN_GENERATED_HEADERS)
+    function(getnative_compile_vulkan_shader name)
+        set(source
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan/shaders/${name}.comp")
+        set(spirv "${GETNATIVE_VULKAN_GENERATED_DIR}/${name}.spv")
+        set(symbol "getnative_vulkan_${name}_spv")
+        set(header "${GETNATIVE_VULKAN_GENERATED_DIR}/${symbol}.hpp")
+        add_custom_command(
+            OUTPUT "${spirv}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory
+                    "${GETNATIVE_VULKAN_GENERATED_DIR}"
+            COMMAND "${GETNATIVE_VULKAN_SHADER_COMPILER}"
+                    ${GETNATIVE_VULKAN_SHADER_ARGUMENTS}
+                    -o "${spirv}" "${source}"
+            DEPENDS "${source}"
+            COMMENT "Compiling GetNative Vulkan shader ${name}"
+            VERBATIM)
+        add_custom_command(
+            OUTPUT "${header}"
+            COMMAND "${CMAKE_COMMAND}"
+                    "-DINPUT=${spirv}"
+                    "-DOUTPUT=${header}"
+                    "-DSYMBOL=${symbol}"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spirv.cmake"
+            DEPENDS "${spirv}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spirv.cmake"
+            VERBATIM)
+        set(GETNATIVE_VULKAN_SPIRV
+            ${GETNATIVE_VULKAN_SPIRV} "${spirv}" PARENT_SCOPE)
+        set(GETNATIVE_VULKAN_GENERATED_HEADERS
+            ${GETNATIVE_VULKAN_GENERATED_HEADERS} "${header}" PARENT_SCOPE)
+    endfunction()
+    getnative_compile_vulkan_shader(transpose)
+    getnative_compile_vulkan_shader(inverse)
+    getnative_compile_vulkan_shader(forward)
+    getnative_compile_vulkan_shader(metric)
+    getnative_compile_vulkan_shader(luma)
+
+    add_custom_target(getnative_vulkan_spirv
+        DEPENDS ${GETNATIVE_VULKAN_SPIRV} ${GETNATIVE_VULKAN_GENERATED_HEADERS})
+    add_library(getnative_vulkan STATIC
+        src/backend/vulkan/vulkan_backend.cpp
+        ${GETNATIVE_VULKAN_GENERATED_HEADERS})
+    add_dependencies(getnative_vulkan getnative_vulkan_spirv)
+    target_compile_features(getnative_vulkan PUBLIC cxx_std_23)
+    target_include_directories(getnative_vulkan
+        PUBLIC include
+        PRIVATE "${GETNATIVE_VULKAN_GENERATED_DIR}" src/backend/vulkan)
+    target_link_libraries(getnative_vulkan PUBLIC getnative_core Vulkan::Vulkan)
+endif()
+
 if(GETNATIVE_ENABLE_METAL)
     enable_language(OBJCXX)
     find_library(GETNATIVE_METAL_FRAMEWORK Metal REQUIRED)
@@ -504,6 +685,23 @@ if(GETNATIVE_ENABLE_METAL)
         PRIVATE "${GETNATIVE_METAL_FRAMEWORK}" "${GETNATIVE_FOUNDATION_FRAMEWORK}")
 endif()
 
+if(GETNATIVE_ENABLE_MEDIA)
+    add_library(getnative_media STATIC
+        src/media/media_decode.cpp
+        src/media/media_index.cpp)
+    target_compile_features(getnative_media PUBLIC cxx_std_23)
+    target_include_directories(getnative_media PUBLIC include)
+    target_link_libraries(getnative_media PUBLIC PkgConfig::GETNATIVE_FFMPEG)
+    if(GETNATIVE_ENABLE_CUDA)
+        target_include_directories(getnative_media PRIVATE "${GETNATIVE_CUDA_INCLUDE_DIR}")
+        target_compile_definitions(getnative_media PRIVATE GETNATIVE_HAS_CUDA=1)
+    endif()
+    if(GETNATIVE_ENABLE_VULKAN)
+        target_link_libraries(getnative_media PRIVATE Vulkan::Vulkan)
+        target_compile_definitions(getnative_media PRIVATE GETNATIVE_HAS_VULKAN=1)
+    endif()
+endif()
+
 function(getnative_enable_warnings target)
     target_compile_options(${target} PRIVATE ${GETNATIVE_WARNING_OPTIONS})
 endfunction()
@@ -518,9 +716,17 @@ if(TARGET getnative_cuda)
     getnative_enable_warnings(getnative_cuda)
     getnative_enable_strict_fp(getnative_cuda)
 endif()
+if(TARGET getnative_vulkan)
+    getnative_enable_warnings(getnative_vulkan)
+    getnative_enable_strict_fp(getnative_vulkan)
+endif()
 if(TARGET getnative_metal)
     getnative_enable_warnings(getnative_metal)
     getnative_enable_strict_fp(getnative_metal)
+endif()
+if(TARGET getnative_media)
+    getnative_enable_warnings(getnative_media)
+    getnative_enable_strict_fp(getnative_media)
 endif()
 
 add_executable(getnative-engine
@@ -529,6 +735,10 @@ add_executable(getnative-engine
     src/cli/main.cpp
     src/cli/worker.cpp)
 target_link_libraries(getnative-engine PRIVATE getnative_core)
+if(GETNATIVE_ENABLE_MEDIA)
+    target_link_libraries(getnative-engine PRIVATE getnative_media)
+    target_compile_definitions(getnative-engine PRIVATE GETNATIVE_HAS_MEDIA=1)
+endif()
 if(GETNATIVE_ENABLE_METAL)
     target_link_libraries(getnative-engine PRIVATE getnative_metal)
     target_compile_definitions(getnative-engine PRIVATE GETNATIVE_HAS_METAL=1)
@@ -536,6 +746,16 @@ endif()
 if(GETNATIVE_ENABLE_CUDA)
     target_link_libraries(getnative-engine PRIVATE getnative_cuda)
     target_compile_definitions(getnative-engine PRIVATE GETNATIVE_HAS_CUDA=1)
+endif()
+if(GETNATIVE_ENABLE_VULKAN)
+    target_link_libraries(getnative-engine PRIVATE getnative_vulkan)
+    target_compile_definitions(getnative-engine PRIVATE GETNATIVE_HAS_VULKAN=1)
+endif()
+if(GETNATIVE_ENABLE_MEDIA AND UNIX AND NOT APPLE)
+    set_target_properties(getnative-engine PROPERTIES
+        BUILD_RPATH "$ORIGIN"
+        INSTALL_RPATH "$ORIGIN"
+        BUILD_WITH_INSTALL_RPATH TRUE)
 endif()
 target_compile_features(getnative-engine PRIVATE cxx_std_23)
 getnative_enable_warnings(getnative-engine)
@@ -599,12 +819,25 @@ if(BUILD_TESTING)
     getnative_enable_warnings(getnative_json_tests)
     add_test(NAME getnative_json_tests COMMAND getnative_json_tests)
 
+    add_executable(getnative_backend_policy_tests tests/backend_policy_test.cpp)
+    target_include_directories(getnative_backend_policy_tests PRIVATE src/cli)
+    target_compile_features(getnative_backend_policy_tests PRIVATE cxx_std_23)
+    getnative_enable_warnings(getnative_backend_policy_tests)
+    add_test(NAME getnative_backend_policy_tests COMMAND getnative_backend_policy_tests)
+
     find_program(GETNATIVE_PYTHON3 NAMES python3 python)
     if(GETNATIVE_PYTHON3)
         add_test(NAME getnative_worker_protocol_tests
             COMMAND "${GETNATIVE_PYTHON3}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_protocol_test.py"
                 $<TARGET_FILE:getnative-engine>)
+        if(TARGET getnative_media)
+            add_test(NAME getnative_media_worker_tests
+                COMMAND "${GETNATIVE_PYTHON3}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/media_worker_test.py"
+                    $<TARGET_FILE:getnative-engine>)
+            set_tests_properties(getnative_media_worker_tests PROPERTIES TIMEOUT 180)
+        endif()
     endif()
 
     if(GETNATIVE_ENABLE_CUDA)
@@ -619,7 +852,7 @@ if(BUILD_TESTING)
             tests/cuda_baseline_test.cpp)
         target_link_libraries(getnative_cuda_baseline_tests PRIVATE getnative_cuda)
         target_include_directories(getnative_cuda_baseline_tests PRIVATE
-            src/backend/cuda)
+            src/backend/cuda "${GETNATIVE_CUDA_INCLUDE_DIR}")
         target_compile_features(getnative_cuda_baseline_tests PRIVATE cxx_std_23)
         getnative_enable_warnings(getnative_cuda_baseline_tests)
         getnative_enable_strict_fp(getnative_cuda_baseline_tests)
@@ -627,6 +860,32 @@ if(BUILD_TESTING)
                  COMMAND getnative_cuda_baseline_tests)
         set_tests_properties(getnative_cuda_baseline_tests PROPERTIES
             SKIP_REGULAR_EXPRESSION "^SKIP:")
+    endif()
+
+    if(GETNATIVE_ENABLE_VULKAN)
+        foreach(GETNATIVE_VULKAN_MODULE IN LISTS GETNATIVE_VULKAN_SPIRV)
+            get_filename_component(GETNATIVE_VULKAN_MODULE_NAME
+                "${GETNATIVE_VULKAN_MODULE}" NAME_WE)
+            add_test(NAME "getnative_vulkan_spirv_${GETNATIVE_VULKAN_MODULE_NAME}"
+                COMMAND "${GETNATIVE_SPIRV_VAL_EXECUTABLE}"
+                    --target-env vulkan1.2 "${GETNATIVE_VULKAN_MODULE}")
+        endforeach()
+        add_executable(getnative_vulkan_analysis_tests
+            tests/vulkan_analysis_test.cpp)
+        target_link_libraries(getnative_vulkan_analysis_tests PRIVATE
+            getnative_vulkan)
+        target_compile_features(getnative_vulkan_analysis_tests PRIVATE cxx_std_23)
+        getnative_enable_warnings(getnative_vulkan_analysis_tests)
+        getnative_enable_strict_fp(getnative_vulkan_analysis_tests)
+        add_test(NAME getnative_vulkan_analysis_tests
+                 COMMAND getnative_vulkan_analysis_tests)
+        set_tests_properties(getnative_vulkan_analysis_tests PROPERTIES
+            SKIP_REGULAR_EXPRESSION "^SKIP:")
+        if(GETNATIVE_VULKAN_VALIDATION_LAYER_DIR)
+            set_tests_properties(getnative_vulkan_analysis_tests PROPERTIES
+                ENVIRONMENT
+                    "VK_LAYER_PATH=${GETNATIVE_VULKAN_VALIDATION_LAYER_DIR}")
+        endif()
     endif()
 
     add_test(NAME getnative_cli_capabilities COMMAND getnative-engine capabilities)
@@ -640,8 +899,15 @@ if(BUILD_TESTING)
     else()
         set(GETNATIVE_EXPECTED_CUDA_CAPABILITY "\"id\":\"cuda\",\"compiled\":false")
     endif()
+    if(GETNATIVE_ENABLE_VULKAN)
+        set(GETNATIVE_EXPECTED_VULKAN_CAPABILITY
+            "\"id\":\"vulkan\",\"compiled\":true")
+    else()
+        set(GETNATIVE_EXPECTED_VULKAN_CAPABILITY
+            "\"id\":\"vulkan\",\"compiled\":false")
+    endif()
     set_tests_properties(getnative_cli_capabilities PROPERTIES
-        PASS_REGULAR_EXPRESSION "\\{\"schema_version\":2,\"engine\":\"getnative-engine\".*\"analyze\":false.*\"gui_min\":1,\"gui_max\":8,\"core_min\":1,\"core_max\":15.*\"id\":\"cpu\",\"compiled\":true,\"device_available\":true,\"analysis_command_available\":false.*\"selected_math_mode\":\"production\".*${GETNATIVE_EXPECTED_METAL_CAPABILITY}.*${GETNATIVE_EXPECTED_CUDA_CAPABILITY}.*\"muf-d278cd3\""
+        PASS_REGULAR_EXPRESSION "\\{\"schema_version\":2,\"engine\":\"getnative-engine\".*\"analyze\":false.*\"gui_min\":1,\"gui_max\":8,\"core_min\":1,\"core_max\":15.*\"id\":\"cpu\",\"compiled\":true,\"device_available\":true,\"analysis_command_available\":false.*\"selected_math_mode\":\"production\".*${GETNATIVE_EXPECTED_METAL_CAPABILITY}.*${GETNATIVE_EXPECTED_CUDA_CAPABILITY}.*${GETNATIVE_EXPECTED_VULKAN_CAPABILITY}.*\"muf-d278cd3\""
     )
 
     add_test(NAME getnative_cli_geometry

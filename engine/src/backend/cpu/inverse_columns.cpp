@@ -1,5 +1,6 @@
 #include "inverse_columns.hpp"
 
+#include <limits>
 #include <stdexcept>
 
 namespace getnative::detail {
@@ -77,9 +78,12 @@ namespace {
 
 void validate_columns(const AxisPlan &plan, const float *input,
                       std::ptrdiff_t input_row_stride, float *output,
-                      std::ptrdiff_t output_row_stride, std::int32_t column_count) {
+                      std::ptrdiff_t output_row_stride,
+                      std::int32_t column_offset, std::int32_t column_count) {
     if (!plan.valid() || input == nullptr || output == nullptr
-        || input_row_stride == 0 || output_row_stride == 0 || column_count < 0) {
+        || input_row_stride == 0 || output_row_stride == 0
+        || column_offset < 0 || column_count < 0
+        || column_offset > std::numeric_limits<std::int32_t>::max() - column_count) {
         throw std::invalid_argument("invalid inverse column arguments");
     }
 }
@@ -187,10 +191,13 @@ AnalysisRowDispatch analysis_row_dispatch(ColumnDispatchPolicy policy) {
 
 void inverse_columns_scalar_f32(
     const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
-    float *output, std::ptrdiff_t output_row_stride, std::int32_t column_count) {
+    float *output, std::ptrdiff_t output_row_stride,
+    std::int32_t column_offset, std::int32_t column_count) {
     validate_columns(
-        plan, input, input_row_stride, output, output_row_stride, column_count);
-    for (std::int32_t column = 0; column < column_count; ++column) {
+        plan, input, input_row_stride, output, output_row_stride,
+        column_offset, column_count);
+    const std::int32_t column_end = column_offset + column_count;
+    for (std::int32_t column = column_offset; column < column_end; ++column) {
         inverse_axis_f32(plan, input + column, input_row_stride,
                          output + column, output_row_stride);
     }
@@ -198,32 +205,40 @@ void inverse_columns_scalar_f32(
 
 void inverse_columns_f32(
     const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
-    float *output, std::ptrdiff_t output_row_stride, std::int32_t column_count,
+    float *output, std::ptrdiff_t output_row_stride,
+    std::int32_t column_offset, std::int32_t column_count,
     ColumnDispatchPolicy policy) {
     validate_columns(
-        plan, input, input_row_stride, output, output_row_stride, column_count);
+        plan, input, input_row_stride, output, output_row_stride,
+        column_offset, column_count);
     if (policy == ColumnDispatchPolicy::scalar_only) {
         inverse_columns_scalar_f32(
-            plan, input, input_row_stride, output, output_row_stride, column_count);
+            plan, input, input_row_stride, output, output_row_stride,
+            column_offset, column_count);
         return;
     }
+    const float *range_input = input + column_offset;
+    float *range_output = output + column_offset;
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
     if (policy == ColumnDispatchPolicy::automatic
         || policy == ColumnDispatchPolicy::required_simd) {
         inverse_columns_neon_f32(
-            plan, input, input_row_stride, output, output_row_stride, column_count);
+            plan, range_input, input_row_stride,
+            range_output, output_row_stride, column_count);
         return;
     }
 #endif
     switch (resolve_x86_policy(policy)) {
     case CpuIsa::scalar:
         inverse_columns_scalar_f32(
-            plan, input, input_row_stride, output, output_row_stride, column_count);
+            plan, input, input_row_stride, output, output_row_stride,
+            column_offset, column_count);
         return;
     case CpuIsa::sse2:
 #if GETNATIVE_X86_SSE2_COMPILED
         inverse_columns_sse2_f32(
-            plan, input, input_row_stride, output, output_row_stride, column_count);
+            plan, range_input, input_row_stride,
+            range_output, output_row_stride, column_count);
         return;
 #else
         break;
@@ -231,7 +246,8 @@ void inverse_columns_f32(
     case CpuIsa::avx2:
 #if GETNATIVE_X86_AVX2_COMPILED
         inverse_columns_avx2_f32(
-            plan, input, input_row_stride, output, output_row_stride, column_count);
+            plan, range_input, input_row_stride,
+            range_output, output_row_stride, column_count);
         return;
 #else
         break;
@@ -239,7 +255,8 @@ void inverse_columns_f32(
     case CpuIsa::avx512:
 #if GETNATIVE_X86_AVX512_COMPILED
         inverse_columns_avx512_f32(
-            plan, input, input_row_stride, output, output_row_stride, column_count);
+            plan, range_input, input_row_stride,
+            range_output, output_row_stride, column_count);
         return;
 #else
         break;
