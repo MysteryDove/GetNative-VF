@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <limits>
@@ -40,6 +41,13 @@ constexpr std::size_t maximum_tile_candidates = 65535U;
 constexpr unsigned int inverse_vertical_columns_per_thread = 2U;
 constexpr unsigned int default_pixel_threads = 256U;
 constexpr std::size_t maximum_fused_horizontal_span = 4096U;
+// Benchmark-gated: the shared input cache is opt-in until warm throughput is
+// consistently within the 3% guard on every formal kernel matrix.
+constexpr std::size_t default_input_cache_bytes = 0U;
+// Benchmark-gated: set GETNATIVE_CUDA_HOST_PLAN_CACHE_BYTES to opt in. The
+// 2026-08-10 1080p matrix improved bicubic/lanczos8 but regressed bilinear
+// beyond the 3% guard, so the experiment is intentionally not the default.
+constexpr std::size_t default_host_plan_cache_bytes = 0U;
 #if !defined(GETNATIVE_CUDA_MIN_ARCHITECTURE)
 #error "GETNATIVE_CUDA_MIN_ARCHITECTURE must describe the compatibility floor"
 #endif
@@ -84,6 +92,25 @@ constexpr std::int32_t minimum_architecture = GETNATIVE_CUDA_MIN_ARCHITECTURE;
         throw std::length_error(std::string{label} + " size overflow");
     }
     return left + right;
+}
+
+[[nodiscard]] std::size_t environment_byte_budget(
+    const char *name, std::size_t fallback) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || *value == '\0') return fallback;
+    try {
+        std::size_t parsed = 0U;
+        const unsigned long long result = std::stoull(value, &parsed, 10);
+        if (value[parsed] != '\0'
+            || result > static_cast<unsigned long long>(
+                std::numeric_limits<std::size_t>::max())) {
+            throw std::out_of_range("byte budget");
+        }
+        return static_cast<std::size_t>(result);
+    } catch (const std::exception &) {
+        throw std::invalid_argument(
+            std::string{name} + " must be an unsigned byte count");
+    }
 }
 
 [[nodiscard]] std::uint32_t checked_u32(
@@ -853,9 +880,56 @@ void validate_source_and_metric(ConstImageView source, const MetricSpec &metric)
             / static_cast<std::ptrdiff_t>(source.height - 1)) {
         throw std::length_error("CUDA source stride overflows host pointer arithmetic");
     }
-    if (metric.norm != 1U) {
-        throw std::invalid_argument("CUDA cpp-generic baseline currently supports p=1 only");
+    if (metric.norm < cuda_minimum_p_norm || metric.norm > cuda_maximum_p_norm) {
+        throw std::invalid_argument("CUDA p-norm must be in [1, 4]");
     }
+}
+
+struct CudaLumaLayout {
+    std::uint32_t storage_bytes = 0U;
+    std::uint32_t storage_shift = 0U;
+};
+
+[[nodiscard]] CudaLumaLayout validate_cuda_luma(
+    const CudaLumaFrameView &source) {
+    if (source.device_pointer == 0U || source.context == 0U
+        || source.width <= 0 || source.height <= 0
+        || source.bit_depth < 8 || source.bit_depth > 16) {
+        throw std::invalid_argument("invalid CUDA luma frame");
+    }
+
+    CudaLumaLayout layout;
+    switch (source.format) {
+    case CudaLumaFormat::nv12:
+    case CudaLumaFormat::yuv444p8:
+        if (source.bit_depth != 8) {
+            throw std::invalid_argument("8-bit CUDA luma format requires bit_depth=8");
+        }
+        layout.storage_bytes = 1U;
+        break;
+    case CudaLumaFormat::p010:
+        if (source.bit_depth != 10) {
+            throw std::invalid_argument("P010 CUDA luma requires bit_depth=10");
+        }
+        layout.storage_bytes = 2U;
+        layout.storage_shift = 6U;
+        break;
+    case CudaLumaFormat::p016:
+        layout.storage_bytes = 2U;
+        layout.storage_shift = static_cast<std::uint32_t>(16 - source.bit_depth);
+        break;
+    case CudaLumaFormat::yuv444p16:
+        layout.storage_bytes = 2U;
+        break;
+    }
+
+    const std::size_t row_bytes = checked_product(
+        static_cast<std::size_t>(source.width), layout.storage_bytes,
+        "CUDA luma row");
+    if (source.pitch_bytes < row_bytes) {
+        throw std::invalid_argument("CUDA luma pitch is smaller than one row");
+    }
+    return layout;
 }
 
 struct BatchIdentity {
@@ -934,6 +1008,16 @@ struct SourceIdentity {
     }
 };
 
+struct SharedSourceEntry {
+    SourceIdentity identity;
+    PinnedBuffer staging;
+    DeviceBuffer source;
+    DeviceBuffer transposed;
+    std::size_t retained_bytes = 0U;
+    std::uint64_t last_use = 0U;
+    bool transposed_ready = false;
+};
+
 [[nodiscard]] std::uint64_t source_probe(ConstImageView source) noexcept {
     std::uint64_t hash = 1469598103934665603ULL;
     constexpr std::size_t sample_count = 16U;
@@ -960,6 +1044,7 @@ struct ExecutionSlot {
             "cuStreamCreate");
         try {
             for (CudaEvent &event : events) event.create(api);
+            producer_ready.create(api);
         } catch (...) {
             (void)api.stream_destroy(stream);
             stream = nullptr;
@@ -1000,6 +1085,7 @@ struct ExecutionSlot {
     const DriverApi *api = nullptr;
     CUstream stream = nullptr;
     std::array<CudaEvent, 10U> events;
+    CudaEvent producer_ready;
     PinnedBuffer pinned_source;
     PinnedBuffer pinned_results;
     PinnedBuffer pinned_plan;
@@ -1022,6 +1108,14 @@ struct ExecutionSlot {
     bool plan_ready = false;
     SourceIdentity source_identity;
     bool source_ready = false;
+    bool transposed_source_ready = false;
+};
+
+struct HostPackedPlanEntry {
+    BatchIdentity identity;
+    PackedBatch packed;
+    std::vector<std::byte> image;
+    std::uint64_t last_use = 0U;
 };
 
 [[nodiscard]] double elapsed_ms(
@@ -1049,9 +1143,16 @@ void merge_telemetry(CudaRuntimeTelemetry &destination,
     destination.buffer_allocation_count += source.buffer_allocation_count;
     destination.plan_cache_hits += source.plan_cache_hits;
     destination.plan_cache_misses += source.plan_cache_misses;
+    destination.host_plan_cache_hits += source.host_plan_cache_hits;
+    destination.host_plan_cache_misses += source.host_plan_cache_misses;
+    destination.host_plan_cache_bytes = source.host_plan_cache_bytes;
     destination.source_cache_hits += source.source_cache_hits;
     destination.source_cache_misses += source.source_cache_misses;
     destination.source_upload_bytes += source.source_upload_bytes;
+    destination.source_upload_count += source.source_upload_count;
+    destination.source_conversion_bytes += source.source_conversion_bytes;
+    destination.source_conversion_count += source.source_conversion_count;
+    destination.source_transpose_count += source.source_transpose_count;
     destination.plan_upload_bytes += source.plan_upload_bytes;
     destination.result_readback_bytes += source.result_readback_bytes;
     destination.workspace_bytes = std::max(
@@ -1064,6 +1165,7 @@ void merge_telemetry(CudaRuntimeTelemetry &destination,
     destination.host_pack_ms += source.host_pack_ms;
     destination.source_staging_ms += source.source_staging_ms;
     destination.source_upload_ms += source.source_upload_ms;
+    destination.source_conversion_ms += source.source_conversion_ms;
     destination.plan_upload_ms += source.plan_upload_ms;
     destination.source_transpose_ms += source.source_transpose_ms;
     destination.horizontal_fused_ms += source.horizontal_fused_ms;
@@ -1089,8 +1191,8 @@ struct CudaAnalysisEngine::Impl {
             throw std::runtime_error(
                 "requested CUDA kernel variant has not passed the cpp-generic baseline gate");
         }
-        if (options.execution_slots == 0U || options.execution_slots > 16U) {
-            throw std::invalid_argument("CUDA execution_slots must be in [1, 16]");
+        if (options.execution_slots == 0U || options.execution_slots > 8U) {
+            throw std::invalid_argument("CUDA execution_slots must be in [1, 8]");
         }
         const CudaLaunchPolicy &policy = options.launch_policy;
         if (!is_power_of_two(policy.inverse_threads)
@@ -1170,6 +1272,8 @@ struct CudaAnalysisEngine::Impl {
                           "getnative_cuda_horizontal_fused");
             load_function(transpose_source_function,
                           "getnative_cuda_transpose_source");
+            load_function(luma_to_f32_function,
+                          "getnative_cuda_luma_to_f32");
             load_function(inverse_vertical_function,
                           "getnative_cuda_inverse_vertical");
             load_function(inverse_vertical_pair_function,
@@ -1214,7 +1318,9 @@ struct CudaAnalysisEngine::Impl {
                     "cuFuncGetAttribute(PTX_VERSION)");
                 telemetry.kernel_resources.push_back(std::move(resource));
             };
-            telemetry.kernel_resources.reserve(9U);
+            telemetry.kernel_resources.reserve(10U);
+            record_resources(
+                "getnative_cuda_luma_to_f32", luma_to_f32_function);
             record_resources(
                 "getnative_cuda_inverse_horizontal", inverse_horizontal_function);
             record_resources(
@@ -1250,6 +1356,18 @@ struct CudaAnalysisEngine::Impl {
             }
             effective_workspace_limit_elements =
                 memory_budget.workspace_limit_bytes / sizeof(float);
+            host_plan_cache_budget = environment_byte_budget(
+                "GETNATIVE_CUDA_HOST_PLAN_CACHE_BYTES",
+                default_host_plan_cache_bytes);
+            input_cache_budget = environment_byte_budget(
+                "GETNATIVE_CUDA_INPUT_CACHE_BYTES",
+                default_input_cache_bytes);
+            cuda_detail::cuda_check(
+                *api, api->stream_create(&decode_stream, CU_STREAM_NON_BLOCKING),
+                "cuStreamCreate(decode)");
+            cuda_detail::cuda_check(
+                *api, api->stream_create(&input_upload_stream, CU_STREAM_NON_BLOCKING),
+                "cuStreamCreate(input cache)");
             slots.reserve(options.execution_slots);
             for (std::size_t index = 0U; index < options.execution_slots; ++index) {
                 slots.push_back(std::make_unique<ExecutionSlot>(*api));
@@ -1258,6 +1376,14 @@ struct CudaAnalysisEngine::Impl {
             cuda_detail::cuda_check(*api, api->ctx_set_current(previous), "cuCtxSetCurrent");
         } catch (...) {
             slots.clear();
+            if (input_upload_stream != nullptr) {
+                (void)api->stream_destroy(input_upload_stream);
+                input_upload_stream = nullptr;
+            }
+            if (decode_stream != nullptr) {
+                (void)api->stream_destroy(decode_stream);
+                decode_stream = nullptr;
+            }
             if (module != nullptr) (void)api->module_unload(module);
             if (context != nullptr) (void)api->ctx_destroy(context);
             context = nullptr;
@@ -1285,15 +1411,37 @@ struct CudaAnalysisEngine::Impl {
         if (api->ctx_get_current(&previous) == CUDA_SUCCESS
             && api->ctx_set_current(context) == CUDA_SUCCESS) {
             slots.clear();
+            if (input_upload_stream != nullptr) {
+                (void)api->stream_synchronize(input_upload_stream);
+                input_cache.clear();
+                (void)api->stream_destroy(input_upload_stream);
+                input_upload_stream = nullptr;
+            }
+            if (decode_stream != nullptr) {
+                (void)api->stream_synchronize(decode_stream);
+                (void)api->stream_destroy(decode_stream);
+                decode_stream = nullptr;
+            }
             if (module != nullptr) (void)api->module_unload(module);
             (void)api->ctx_set_current(previous);
         }
         (void)api->ctx_destroy(context);
     }
 
-    [[nodiscard]] std::size_t acquire_slot(std::stop_token stop) {
+    [[nodiscard]] std::size_t acquire_slot(
+        std::stop_token stop, ConstImageView source,
+        std::span<const CandidateAnalysis> candidates,
+        std::size_t workspace_limit_elements) {
         std::unique_lock lock(slot_mutex);
         for (;;) {
+            for (std::size_t index = 0U; index < slots.size(); ++index) {
+                if (!slot_busy[index] && slots[index]->plan_ready
+                    && slots[index]->identity.matches(
+                        source, candidates, workspace_limit_elements)) {
+                    slot_busy[index] = true;
+                    return index;
+                }
+            }
             const auto available = std::find(slot_busy.begin(), slot_busy.end(), false);
             if (available != slot_busy.end()) {
                 *available = true;
@@ -1322,6 +1470,7 @@ struct CudaAnalysisEngine::Impl {
     CUfunction inverse_horizontal_function = nullptr;
     CUfunction horizontal_fused_function = nullptr;
     CUfunction transpose_source_function = nullptr;
+    CUfunction luma_to_f32_function = nullptr;
     CUfunction inverse_vertical_function = nullptr;
     CUfunction inverse_vertical_pair_function = nullptr;
     CUfunction forward_intermediate_function = nullptr;
@@ -1332,6 +1481,18 @@ struct CudaAnalysisEngine::Impl {
     std::vector<bool> slot_busy;
     std::mutex slot_mutex;
     std::condition_variable slot_available;
+    CUstream input_upload_stream = nullptr;
+    CUstream decode_stream = nullptr;
+    std::mutex input_cache_mutex;
+    std::vector<std::shared_ptr<SharedSourceEntry>> input_cache;
+    std::size_t input_cache_budget = 0U;
+    std::size_t input_cache_bytes = 0U;
+    std::uint64_t input_cache_clock = 0U;
+    std::mutex host_plan_cache_mutex;
+    std::vector<HostPackedPlanEntry> host_plan_cache;
+    std::size_t host_plan_cache_budget = 0U;
+    std::size_t host_plan_cache_bytes = 0U;
+    std::uint64_t host_plan_cache_clock = 0U;
     mutable std::mutex telemetry_mutex;
     CudaRuntimeTelemetry telemetry;
     cuda_detail::CudaMemoryBudget memory_budget;
@@ -1437,10 +1598,125 @@ void CudaAnalysisEngine::reset_analysis_telemetry() {
         impl_->memory_budget.workspace_limit_clamped;
 }
 
+std::uintptr_t CudaAnalysisEngine::native_context() const noexcept {
+    return reinterpret_cast<std::uintptr_t>(impl_->context);
+}
+
+std::uintptr_t CudaAnalysisEngine::native_decode_stream() const noexcept {
+    return reinterpret_cast<std::uintptr_t>(impl_->decode_stream);
+}
+
+void CudaAnalysisEngine::preflight_axis_batch(
+    ConstImageView dimensions,
+    std::span<const CandidateAnalysis> candidates,
+    const MetricSpec &metric, std::size_t concurrency) const {
+    validate_source_and_metric(dimensions, metric);
+    if (concurrency == 0U || concurrency > impl_->options.execution_slots) {
+        throw std::length_error(
+            "CUDA execution slots cannot satisfy the requested concurrency");
+    }
+    if (candidates.empty()) return;
+
+    PackedBatch packed;
+    packed.layout = PackedBatch::compute_layout(candidates);
+    std::vector<std::byte> staged(packed.layout.total_bytes);
+    pack_batch(
+        packed, staged.data(), dimensions, candidates,
+        impl_->effective_workspace_limit_elements,
+        impl_->options.launch_policy.pixel_threads);
+
+    const std::size_t source_bytes = checked_product(
+        checked_product(
+            static_cast<std::size_t>(dimensions.width),
+            static_cast<std::size_t>(dimensions.height), "CUDA source image"),
+        sizeof(float), "CUDA source buffer");
+    const std::size_t workspace_bytes = checked_product(
+        packed.workspace_elements, sizeof(float), "CUDA workspace buffer");
+    const std::size_t crop_width = static_cast<std::size_t>(
+        dimensions.width - metric.crop_left - metric.crop_right);
+    const std::size_t crop_height = static_cast<std::size_t>(
+        dimensions.height - metric.crop_top - metric.crop_bottom);
+    const std::size_t pixel_threads = impl_->options.launch_policy.pixel_threads;
+    const std::size_t metric_blocks = std::min<std::size_t>(
+        impl_->options.launch_policy.maximum_metric_blocks,
+        (checked_product(crop_width, crop_height, "CUDA metric pixels")
+         + pixel_threads - 1U) / pixel_threads);
+    const std::size_t fused_column_blocks =
+        (crop_width + pixel_threads * 8U - 1U) / (pixel_threads * 8U);
+    const std::size_t fused_partial_stride = checked_product(
+        fused_column_blocks, crop_height,
+        "CUDA fused metric partial stride");
+    const bool fused_grid_supported =
+        crop_height <= 65535U
+        && fused_column_blocks <= std::numeric_limits<unsigned int>::max()
+        && fused_partial_stride <= std::numeric_limits<std::uint32_t>::max();
+    std::size_t partial_count = 0U;
+    for (const PackedBatch::Tile &tile : packed.tiles) {
+        const bool horizontal_only = tile.has_horizontal && !tile.has_vertical;
+        const bool fused_both = tile.fused_both && fused_grid_supported;
+        const std::size_t stride = horizontal_only
+            ? static_cast<std::size_t>(dimensions.height)
+            : (fused_both ? fused_partial_stride : metric_blocks);
+        partial_count = std::max(
+            partial_count,
+            checked_product(
+                tile.candidate_count, stride, "CUDA metric partials"));
+    }
+    const std::size_t working_set = checked_add(
+        checked_add(
+            packed.has_horizontal
+                ? checked_add(source_bytes, source_bytes, "CUDA source buffers")
+                : source_bytes,
+            workspace_bytes, "CUDA working set"),
+        checked_add(
+            packed.layout.total_bytes,
+            checked_add(
+                checked_product(
+                    partial_count, sizeof(double), "CUDA partial buffer"),
+                checked_product(
+                    packed.maximum_tile_candidate_count, sizeof(double),
+                    "CUDA result buffer"),
+                "CUDA working set"),
+            "CUDA working set"),
+        "CUDA working set");
+    const std::size_t aggregate = checked_product(
+        working_set, concurrency, "CUDA concurrent working set");
+    if (working_set > maximum_explicit_bytes
+        || working_set > impl_->memory_budget.per_slot_budget_bytes
+        || aggregate > impl_->memory_budget.engine_budget_bytes) {
+        throw std::length_error(
+            "CUDA device memory cannot satisfy the requested concurrency");
+    }
+}
+
 std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
     ConstImageView source, std::span<const CandidateAnalysis> candidates,
     const MetricSpec &metric, std::stop_token stop) {
+    return analyze_axis_batch_impl(source, nullptr, candidates, metric, stop);
+}
+
+std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_cuda_luma(
+    const CudaLumaFrameView &source,
+    std::span<const CandidateAnalysis> candidates,
+    const MetricSpec &metric, std::stop_token stop) {
+    (void)validate_cuda_luma(source);
+    const ConstImageView dimensions{
+        reinterpret_cast<const float *>(std::uintptr_t{1}),
+        source.width,
+        source.height,
+        source.width,
+    };
+    return analyze_axis_batch_impl(dimensions, &source, candidates, metric, stop);
+}
+
+std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
+    ConstImageView source, const CudaLumaFrameView *cuda_luma,
+    std::span<const CandidateAnalysis> candidates,
+    const MetricSpec &metric, std::stop_token stop) {
     validate_source_and_metric(source, metric);
+    const bool cuda_device_source = cuda_luma != nullptr;
+    const CudaLumaLayout luma_layout = cuda_device_source
+        ? validate_cuda_luma(*cuda_luma) : CudaLumaLayout{};
     if (candidates.empty()) return {};
     if (stop.stop_requested()) throw std::runtime_error("CUDA analysis cancelled");
 
@@ -1453,34 +1729,98 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
 
     CudaRuntimeTelemetry delta;
     const auto wait_start = std::chrono::steady_clock::now();
-    const std::size_t slot_index = impl_->acquire_slot(stop);
+    const std::size_t slot_index = impl_->acquire_slot(
+        stop, source, candidates, impl_->effective_workspace_limit_elements);
     delta.execution_slot_wait_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - wait_start).count();
     CurrentContextGuard context(*impl_->api, impl_->context);
     ExecutionSlot &slot = *impl_->slots[slot_index];
+    std::shared_ptr<SharedSourceEntry> shared_source;
     ScopeExit release_slot{[&] {
         (void)impl_->api->stream_synchronize(slot.stream);
+        shared_source.reset();
         impl_->release_slot(slot_index);
     }};
-
+    if (cuda_device_source) {
+        const CUcontext frame_context = reinterpret_cast<CUcontext>(
+            cuda_luma->context);
+        if (frame_context != impl_->context) {
+            throw std::invalid_argument(
+                "CUDA luma frame belongs to a different context");
+        }
+        CUcontext pointer_context = nullptr;
+        cuda_detail::cuda_check(
+            *impl_->api,
+            impl_->api->pointer_get_attribute(
+                &pointer_context, CU_POINTER_ATTRIBUTE_CONTEXT,
+                static_cast<CUdeviceptr>(cuda_luma->device_pointer)),
+            "cuPointerGetAttribute(CONTEXT)");
+        if (pointer_context != impl_->context) {
+            throw std::invalid_argument(
+                "CUDA luma pointer belongs to a different context");
+        }
+    }
     const auto pack_start = std::chrono::steady_clock::now();
     std::size_t allocation_count = 0U;
     bool plan_cache_hit = slot.plan_ready && slot.identity.matches(
         source, candidates, impl_->effective_workspace_limit_elements);
     if (!plan_cache_hit) {
         slot.plan_ready = false;
-        slot.packed.clear_for_reuse();
-        slot.packed.layout = PackedBatch::compute_layout(candidates);
-        // The pack writes straight into pinned staging, so the pinned buffer
-        // must be sized before pack_batch runs.
-        slot.pinned_plan.reserve(
-            *impl_->api, slot.packed.layout.total_bytes, allocation_count);
-        pack_batch(
-            slot.packed, static_cast<std::byte *>(slot.pinned_plan.data()),
-            source, candidates, impl_->effective_workspace_limit_elements,
-            pixel_threads);
-        slot.identity.assign(
-            source, candidates, impl_->effective_workspace_limit_elements);
+        const std::scoped_lock cache_lock(impl_->host_plan_cache_mutex);
+        auto cached = std::find_if(
+            impl_->host_plan_cache.begin(), impl_->host_plan_cache.end(),
+            [&](const HostPackedPlanEntry &entry) {
+                return entry.identity.matches(
+                    source, candidates, impl_->effective_workspace_limit_elements);
+            });
+        if (cached != impl_->host_plan_cache.end()) {
+            cached->last_use = ++impl_->host_plan_cache_clock;
+            slot.packed = cached->packed;
+            slot.identity = cached->identity;
+            slot.pinned_plan.reserve(
+                *impl_->api, cached->image.size(), allocation_count);
+            std::memcpy(slot.pinned_plan.data(), cached->image.data(),
+                        cached->image.size());
+            delta.host_plan_cache_hits = 1U;
+        } else {
+            slot.packed.clear_for_reuse();
+            slot.packed.layout = PackedBatch::compute_layout(candidates);
+            // The pack writes straight into pinned staging, so the pinned buffer
+            // must be sized before pack_batch runs.
+            slot.pinned_plan.reserve(
+                *impl_->api, slot.packed.layout.total_bytes, allocation_count);
+            pack_batch(
+                slot.packed, static_cast<std::byte *>(slot.pinned_plan.data()),
+                source, candidates, impl_->effective_workspace_limit_elements,
+                pixel_threads);
+            slot.identity.assign(
+                source, candidates, impl_->effective_workspace_limit_elements);
+            delta.host_plan_cache_misses = 1U;
+            const std::size_t bytes = slot.packed.layout.total_bytes;
+            if (bytes <= impl_->host_plan_cache_budget) {
+                while (!impl_->host_plan_cache.empty()
+                       && impl_->host_plan_cache_bytes
+                               > impl_->host_plan_cache_budget - bytes) {
+                    const auto victim = std::min_element(
+                        impl_->host_plan_cache.begin(), impl_->host_plan_cache.end(),
+                        [](const HostPackedPlanEntry &left,
+                           const HostPackedPlanEntry &right) {
+                            return left.last_use < right.last_use;
+                        });
+                    impl_->host_plan_cache_bytes -= victim->image.size();
+                    impl_->host_plan_cache.erase(victim);
+                }
+                HostPackedPlanEntry entry;
+                entry.identity = slot.identity;
+                entry.packed = slot.packed;
+                entry.image.resize(bytes);
+                std::memcpy(entry.image.data(), slot.pinned_plan.data(), bytes);
+                entry.last_use = ++impl_->host_plan_cache_clock;
+                impl_->host_plan_cache_bytes += bytes;
+                impl_->host_plan_cache.push_back(std::move(entry));
+            }
+        }
+        delta.host_plan_cache_bytes = impl_->host_plan_cache_bytes;
         delta.plan_cache_misses = 1U;
     } else {
         delta.plan_cache_hits = 1U;
@@ -1497,6 +1837,11 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
     if (source_bytes > maximum_explicit_bytes) {
         throw std::length_error("CUDA explicit working set exceeds 2 GiB");
     }
+    const std::size_t shared_source_bytes = packed.has_horizontal
+        ? checked_add(source_bytes, source_bytes, "CUDA cached transposed source")
+        : source_bytes;
+    const bool use_shared_source = !cuda_device_source
+        && shared_source_bytes <= impl_->input_cache_budget;
     const std::size_t workspace_bytes = checked_product(
         packed.workspace_elements, sizeof(float), "CUDA workspace buffer");
     const std::size_t crop_width = static_cast<std::size_t>(
@@ -1562,9 +1907,10 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
             projected_device_bytes, std::max(buffer.bytes(), required_bytes),
             "CUDA retained device capacity");
     };
-    include_capacity(slot.device_source, source_bytes);
+    include_capacity(slot.device_source, use_shared_source ? 0U : source_bytes);
     include_capacity(
-        slot.device_transposed_source, packed.has_horizontal ? source_bytes : 0U);
+        slot.device_transposed_source,
+        use_shared_source ? 0U : (packed.has_horizontal ? source_bytes : 0U));
     include_capacity(slot.device_workspace, workspace_bytes);
     include_capacity(slot.device_partials, partial_bytes);
     include_capacity(slot.device_results, device_result_bytes);
@@ -1594,8 +1940,10 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
         }
     }
 
-    slot.pinned_source.reserve(
-        *impl_->api, source_bytes, allocation_count);
+    if (!use_shared_source && !cuda_device_source) {
+        slot.pinned_source.reserve(
+            *impl_->api, source_bytes, allocation_count);
+    }
     slot.pinned_results.reserve(
         *impl_->api, device_result_bytes, allocation_count);
     if (!plan_cache_hit) {
@@ -1605,9 +1953,11 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
         slot.pinned_plan.reserve(
             *impl_->api, packed.layout.total_bytes, allocation_count);
     }
-    slot.device_source.reserve(
-        *impl_->api, source_bytes, allocation_count);
-    if (packed.has_horizontal) {
+    if (!use_shared_source) {
+        slot.device_source.reserve(
+            *impl_->api, source_bytes, allocation_count);
+    }
+    if (packed.has_horizontal && !use_shared_source) {
         slot.device_transposed_source.reserve(
             *impl_->api, source_bytes, allocation_count);
     }
@@ -1644,18 +1994,11 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
         allocation_count);
     delta.buffer_allocation_count = allocation_count;
 
-    const std::uint64_t probe = source_probe(source);
-    const bool source_cache_hit =
-        slot.source_ready && slot.source_identity.matches(source, probe);
-    if (source_cache_hit) {
-        delta.source_cache_hits = 1U;
-    } else {
-        delta.source_cache_misses = 1U;
-    }
-
-    const auto staging_start = std::chrono::steady_clock::now();
-    if (!source_cache_hit) {
-        auto *staged_source = static_cast<float *>(slot.pinned_source.data());
+    const std::uint64_t probe = cuda_device_source ? 0U : source_probe(source);
+    bool source_cache_hit = false;
+    double shared_upload_ms = 0.0;
+    double shared_transpose_ms = 0.0;
+    const auto stage_source = [&](float *staged_source) {
         if (source.stride == source.width) {
             std::memcpy(staged_source, source.data, source_bytes);
         } else {
@@ -1669,12 +2012,214 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
                     row_bytes);
             }
         }
-    }
-    delta.source_staging_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - staging_start).count();
+    };
 
+    if (use_shared_source) {
+        const std::scoped_lock cache_lock(impl_->input_cache_mutex);
+        auto found = std::find_if(
+            impl_->input_cache.begin(), impl_->input_cache.end(),
+            [&](const std::shared_ptr<SharedSourceEntry> &entry) {
+                return entry->identity.matches(source, probe);
+            });
+        if (found != impl_->input_cache.end()) {
+            shared_source = *found;
+            shared_source->last_use = ++impl_->input_cache_clock;
+            source_cache_hit = true;
+            delta.source_cache_hits = 1U;
+            if (packed.has_horizontal && !shared_source->transposed_ready) {
+                while (!impl_->input_cache.empty()
+                       && impl_->input_cache_bytes
+                               > impl_->input_cache_budget - source_bytes) {
+                    const auto victim = std::min_element(
+                        impl_->input_cache.begin(), impl_->input_cache.end(),
+                        [&](const auto &left, const auto &right) {
+                            if (left == shared_source) return false;
+                            if (right == shared_source) return true;
+                            if (left.use_count() != 1U) return false;
+                            if (right.use_count() != 1U) return true;
+                            return left->last_use < right->last_use;
+                        });
+                    if (victim == impl_->input_cache.end()
+                        || *victim == shared_source || victim->use_count() != 1U) {
+                        break;
+                    }
+                    impl_->input_cache_bytes -= (*victim)->retained_bytes;
+                    impl_->input_cache.erase(victim);
+                }
+                if (impl_->input_cache_bytes
+                        > impl_->input_cache_budget - source_bytes) {
+                    shared_source.reset();
+                    delta.source_cache_hits = 0U;
+                } else {
+                    shared_source->transposed.reserve(
+                        *impl_->api, source_bytes, allocation_count);
+                    CUdeviceptr source_pointer = shared_source->source.pointer();
+                    CUdeviceptr transposed_pointer = shared_source->transposed.pointer();
+                    std::uint32_t width = static_cast<std::uint32_t>(source.width);
+                    std::uint32_t height = static_cast<std::uint32_t>(source.height);
+                    void *parameters[] = {
+                        &source_pointer, &width, &height, &transposed_pointer,
+                    };
+                    const auto transpose_start = std::chrono::steady_clock::now();
+                    cuda_detail::cuda_check(
+                        *impl_->api,
+                        impl_->api->launch_kernel(
+                            impl_->transpose_source_function,
+                            (width + 31U) / 32U, (height + 31U) / 32U, 1U,
+                            32U, 8U, 1U, 0U, impl_->input_upload_stream,
+                            parameters, nullptr),
+                        "cuLaunchKernel(getnative_cuda_transpose_source shared)");
+                    cuda_detail::cuda_check(
+                        *impl_->api,
+                        impl_->api->stream_synchronize(impl_->input_upload_stream),
+                        "cuStreamSynchronize(shared transpose)");
+                    shared_transpose_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - transpose_start).count();
+                    shared_source->transposed_ready = true;
+                    shared_source->retained_bytes += source_bytes;
+                    impl_->input_cache_bytes += source_bytes;
+                    ++delta.source_transpose_count;
+                }
+            }
+        } else {
+            while (!impl_->input_cache.empty()
+                   && impl_->input_cache_bytes
+                           > impl_->input_cache_budget - shared_source_bytes) {
+                const auto victim = std::min_element(
+                    impl_->input_cache.begin(), impl_->input_cache.end(),
+                    [](const auto &left, const auto &right) {
+                        if (left.use_count() != 1U) return false;
+                        if (right.use_count() != 1U) return true;
+                        return left->last_use < right->last_use;
+                    });
+                if (victim == impl_->input_cache.end() || victim->use_count() != 1U) {
+                    break;
+                }
+                impl_->input_cache_bytes -= (*victim)->retained_bytes;
+                impl_->input_cache.erase(victim);
+            }
+            if (impl_->input_cache_bytes
+                    <= impl_->input_cache_budget - shared_source_bytes) {
+                shared_source = std::make_shared<SharedSourceEntry>();
+                shared_source->staging.reserve(
+                    *impl_->api, source_bytes, allocation_count);
+                shared_source->source.reserve(
+                    *impl_->api, source_bytes, allocation_count);
+                if (packed.has_horizontal) {
+                    shared_source->transposed.reserve(
+                        *impl_->api, source_bytes, allocation_count);
+                }
+                const auto staging_start = std::chrono::steady_clock::now();
+                stage_source(static_cast<float *>(shared_source->staging.data()));
+                delta.source_staging_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - staging_start).count();
+                const auto upload_start = std::chrono::steady_clock::now();
+                cuda_detail::cuda_check(
+                    *impl_->api,
+                    impl_->api->memcpy_htod_async(
+                        shared_source->source.pointer(), shared_source->staging.data(),
+                        source_bytes, impl_->input_upload_stream),
+                    "cuMemcpyHtoDAsync_v2(shared source)");
+                if (packed.has_horizontal) {
+                    CUdeviceptr source_pointer = shared_source->source.pointer();
+                    CUdeviceptr transposed_pointer = shared_source->transposed.pointer();
+                    std::uint32_t width = static_cast<std::uint32_t>(source.width);
+                    std::uint32_t height = static_cast<std::uint32_t>(source.height);
+                    void *parameters[] = {
+                        &source_pointer, &width, &height, &transposed_pointer,
+                    };
+                    const auto transpose_start = std::chrono::steady_clock::now();
+                    cuda_detail::cuda_check(
+                        *impl_->api,
+                        impl_->api->launch_kernel(
+                            impl_->transpose_source_function,
+                            (width + 31U) / 32U, (height + 31U) / 32U, 1U,
+                            32U, 8U, 1U, 0U, impl_->input_upload_stream,
+                            parameters, nullptr),
+                        "cuLaunchKernel(getnative_cuda_transpose_source shared)");
+                    shared_transpose_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - transpose_start).count();
+                    shared_source->transposed_ready = true;
+                    ++delta.source_transpose_count;
+                }
+                cuda_detail::cuda_check(
+                    *impl_->api,
+                    impl_->api->stream_synchronize(impl_->input_upload_stream),
+                    "cuStreamSynchronize(shared source)");
+                shared_upload_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - upload_start).count();
+                shared_source->identity.assign(source, probe);
+                shared_source->retained_bytes = shared_source_bytes;
+                shared_source->last_use = ++impl_->input_cache_clock;
+                impl_->input_cache_bytes += shared_source_bytes;
+                impl_->input_cache.push_back(shared_source);
+                delta.source_cache_misses = 1U;
+                delta.source_upload_bytes = source_bytes;
+                delta.source_upload_count = 1U;
+            }
+        }
+    }
+
+    if (!shared_source && !cuda_device_source) {
+        source_cache_hit = slot.source_ready && slot.source_identity.matches(source, probe);
+        if (source_cache_hit) {
+            delta.source_cache_hits = 1U;
+        } else {
+            delta.source_cache_misses = 1U;
+        }
+        const auto staging_start = std::chrono::steady_clock::now();
+        if (!source_cache_hit) {
+            stage_source(static_cast<float *>(slot.pinned_source.data()));
+        }
+        delta.source_staging_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - staging_start).count();
+    }
+
+    if (cuda_device_source && cuda_luma->producer_stream != 0U) {
+        slot.producer_ready.record(reinterpret_cast<CUstream>(
+            cuda_luma->producer_stream));
+        cuda_detail::cuda_check(
+            *impl_->api,
+            impl_->api->stream_wait_event(
+                slot.stream, slot.producer_ready.get(), 0U),
+            "cuStreamWaitEvent(decoder frame)");
+    }
     slot.events[0].record(slot.stream);
-    if (!source_cache_hit) {
+    if (cuda_device_source) {
+        CUdeviceptr luma_pointer = static_cast<CUdeviceptr>(
+            cuda_luma->device_pointer);
+        auto pitch = static_cast<unsigned long long>(
+            cuda_luma->pitch_bytes);
+        std::uint32_t conversion_width = static_cast<std::uint32_t>(
+            source.width);
+        std::uint32_t conversion_height = static_cast<std::uint32_t>(
+            source.height);
+        std::uint32_t bit_depth = static_cast<std::uint32_t>(
+            cuda_luma->bit_depth);
+        std::uint32_t storage_bytes = luma_layout.storage_bytes;
+        std::uint32_t storage_shift = luma_layout.storage_shift;
+        std::uint32_t limited_range =
+            cuda_luma->range == CudaColorRange::limited ? 1U : 0U;
+        CUdeviceptr output_pointer = slot.device_source.pointer();
+        void *parameters[] = {
+            &luma_pointer, &pitch, &conversion_width, &conversion_height,
+            &storage_bytes, &bit_depth, &storage_shift,
+            &limited_range, &output_pointer,
+        };
+        cuda_detail::cuda_check(
+            *impl_->api,
+            impl_->api->launch_kernel(
+                impl_->luma_to_f32_function,
+                (conversion_width + 31U) / 32U,
+                (conversion_height + 7U) / 8U, 1U,
+                32U, 8U, 1U, 0U, slot.stream, parameters, nullptr),
+            "cuLaunchKernel(getnative_cuda_luma_to_f32)");
+        ++delta.kernel_launch_count;
+        delta.source_conversion_bytes = source_bytes;
+        delta.source_conversion_count = 1U;
+        slot.source_ready = false;
+        slot.transposed_source_ready = false;
+    } else if (!shared_source && !source_cache_hit) {
         cuda_detail::cuda_check(
             *impl_->api,
             impl_->api->memcpy_htod_async(
@@ -1683,6 +2228,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
             "cuMemcpyHtoDAsync_v2(source)");
         slot.source_identity.assign(source, probe);
         slot.source_ready = true;
+        slot.transposed_source_ready = false;
     }
     slot.events[1].record(slot.stream);
     if (!plan_cache_hit) {
@@ -1716,14 +2262,22 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
     update_maximum(impl_->peak_working_set_bytes, working_set);
     delta.workspace_bytes = workspace_bytes;
     delta.pinned_staging_bytes = checked_add(
-        checked_add(source_bytes, device_result_bytes, "CUDA pinned staging"),
+        checked_add(
+            shared_source || cuda_device_source ? 0U : source_bytes,
+            device_result_bytes,
+                    "CUDA pinned staging"),
         packed.layout.total_bytes, "CUDA pinned staging");
     delta.peak_workspace_elements = packed.workspace_elements;
-    delta.source_upload_bytes = source_cache_hit ? 0U : source_bytes;
+    if (!shared_source && !cuda_device_source) {
+        delta.source_upload_bytes = source_cache_hit ? 0U : source_bytes;
+        delta.source_upload_count = source_cache_hit ? 0U : 1U;
+    }
     delta.result_readback_bytes = total_result_bytes;
 
-    CUdeviceptr source_pointer = slot.device_source.pointer();
-    CUdeviceptr transposed_source_pointer = slot.device_transposed_source.pointer();
+    CUdeviceptr source_pointer = shared_source
+        ? shared_source->source.pointer() : slot.device_source.pointer();
+    CUdeviceptr transposed_source_pointer = shared_source
+        ? shared_source->transposed.pointer() : slot.device_transposed_source.pointer();
     std::uint32_t width = static_cast<std::uint32_t>(source.width);
     std::uint32_t height = static_cast<std::uint32_t>(source.height);
     CUdeviceptr forward_left_pointer = slot.device_forward_left.pointer();
@@ -1741,6 +2295,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
     std::uint32_t crop_right = static_cast<std::uint32_t>(metric.crop_right);
     std::uint32_t crop_top = static_cast<std::uint32_t>(metric.crop_top);
     std::uint32_t crop_bottom = static_cast<std::uint32_t>(metric.crop_bottom);
+    std::uint32_t norm = metric.norm;
     float threshold = metric.threshold;
     std::uint32_t metric_block_count = checked_u32(
         metric_blocks, "CUDA metric block count");
@@ -1768,7 +2323,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
         ++delta.kernel_launch_count;
     };
 
-    if (packed.has_horizontal && !source_cache_hit) {
+    if (!shared_source && packed.has_horizontal && !slot.transposed_source_ready) {
         void *parameters[] = {
             &source_pointer, &width, &height, &transposed_source_pointer,
         };
@@ -1777,6 +2332,8 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
             (width + 31U) / 32U, (height + 31U) / 32U,
             1U, 32U, 8U, 0U, parameters,
             "cuLaunchKernel(getnative_cuda_transpose_source)");
+        slot.transposed_source_ready = true;
+        ++delta.source_transpose_count;
     }
     slot.events[3].record(slot.stream);
 
@@ -1804,7 +2361,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
                     &transpose_weights_pointer, &lower_ld_pointer,
                     &upper_l_pointer, &inverse_diagonal_pointer,
                     &workspace_pointer,
-                    &crop_left, &crop_right, &crop_top, &crop_bottom,
+                    &crop_left, &crop_right, &crop_top, &crop_bottom, &norm,
                     &threshold, &partials_pointer,
                 };
                 launch(
@@ -1884,7 +2441,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
                 &candidates_pointer, &tile_candidate_count,
                 &forward_left_pointer, &forward_weights_pointer,
                 &workspace_pointer,
-                &crop_left, &crop_right, &crop_top,
+                &crop_left, &crop_right, &crop_top, &norm,
                 &threshold, &partials_pointer,
             };
             launch(
@@ -1900,7 +2457,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
                 &candidates_pointer, &tile_candidate_count,
                 &forward_left_pointer, &forward_weights_pointer,
                 &workspace_pointer,
-                &crop_left, &crop_right, &crop_top, &crop_bottom,
+                &crop_left, &crop_right, &crop_top, &crop_bottom, &norm,
                 &threshold, &partials_pointer,
             };
             launch(
@@ -1937,6 +2494,15 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
             impl_->api->stream_synchronize(slot.stream),
             "cuStreamSynchronize(staged)");
 
+        if (metric.norm > 1U) {
+            auto *tile_results = static_cast<double *>(slot.pinned_results.data());
+            const double reciprocal_norm = 1.0 / static_cast<double>(metric.norm);
+            for (std::size_t index = 0; index < tile.candidate_count; ++index) {
+                tile_results[index] = std::pow(
+                    tile_results[index], reciprocal_norm);
+            }
+        }
+
         if (tile.has_horizontal) {
             if (horizontal_only) {
                 delta.horizontal_fused_ms += elapsed_ms(
@@ -1967,17 +2533,25 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
         }
     }
     slot.plan_ready = true;
-    delta.source_upload_ms = elapsed_ms(
-        *impl_->api, slot.events[0], slot.events[1]);
+    if (cuda_device_source) {
+        delta.source_conversion_ms = elapsed_ms(
+            *impl_->api, slot.events[0], slot.events[1]);
+    } else {
+        delta.source_upload_ms = shared_source
+            ? shared_upload_ms
+            : elapsed_ms(*impl_->api, slot.events[0], slot.events[1]);
+    }
     if (!plan_cache_hit) {
         delta.plan_upload_ms = elapsed_ms(
             *impl_->api, slot.events[1], slot.events[2]);
     }
-    if (packed.has_horizontal) {
+    if (shared_source) {
+        delta.source_transpose_ms = shared_transpose_ms;
+    } else if (packed.has_horizontal) {
         delta.source_transpose_ms = elapsed_ms(
             *impl_->api, slot.events[2], slot.events[3]);
     }
-    delta.kernel_ms = delta.source_transpose_ms
+    delta.kernel_ms = delta.source_conversion_ms + delta.source_transpose_ms
         + delta.horizontal_fused_ms + delta.inverse_horizontal_ms
         + delta.inverse_vertical_ms
         + delta.forward_intermediate_ms + delta.metric_ms;

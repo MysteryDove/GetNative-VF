@@ -16,6 +16,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -34,6 +35,8 @@ struct Configuration {
     std::size_t samples = 5U;
     std::size_t concurrency = 1U;
     std::size_t workspace_mib = 0U;
+    std::uint32_t p_norm = 1U;
+    bool compare_cpu = false;
     getnative::AnalysisAxes axes = getnative::AnalysisAxes::vertical;
     getnative::Filter filter = getnative::Filter::lanczos(3);
     std::string filter_id = "lanczos3";
@@ -131,6 +134,15 @@ struct Configuration {
             result.concurrency = parse_size(next(argument), argument);
         } else if (argument == "--workspace-mib") {
             result.workspace_mib = parse_size(next(argument), argument);
+        } else if (argument == "--p-norm") {
+            const std::size_t norm = parse_size(next(argument), argument);
+            if (norm < getnative::cuda_minimum_p_norm
+                || norm > getnative::cuda_maximum_p_norm) {
+                throw std::invalid_argument("--p-norm requires an integer in 1..4");
+            }
+            result.p_norm = static_cast<std::uint32_t>(norm);
+        } else if (argument == "--compare-cpu") {
+            result.compare_cpu = true;
         } else if (argument == "--axes") {
             result.axes = parse_axes(next(argument));
         } else if (argument == "--filter") {
@@ -143,7 +155,8 @@ struct Configuration {
                    "[--width N] [--height N] [--native-height N] "
                    "[--native-width N] [--axes horizontal|vertical|both] "
                    "[--candidates N] [--warmups N] [--samples N] "
-                   "[--concurrency N] [--workspace-mib N]\n";
+                   "[--concurrency N] [--workspace-mib N] [--p-norm 1..4] "
+                   "[--compare-cpu]\n";
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown argument: " + std::string{argument});
@@ -221,15 +234,32 @@ struct Fixture {
             config.axes,
         });
     }
-    result.metric = {8, 8, 8, 8, 0.0F, 1U};
-    if (config.width <= 16 || config.height <= 16) result.metric = {};
+    result.metric = {8, 8, 8, 8, 0.0F, config.p_norm};
+    if (config.width <= 16 || config.height <= 16) {
+        result.metric = {};
+        result.metric.norm = config.p_norm;
+    }
     return result;
 }
 
 struct WaveResult {
     double milliseconds = 0.0;
     double checksum = 0.0;
+    std::vector<std::string> candidate_ranking;
 };
+
+[[nodiscard]] std::vector<std::string> rank_candidates(
+    const std::vector<getnative::CandidateResult> &results) {
+    std::vector<std::size_t> order(results.size());
+    for (std::size_t index = 0; index < order.size(); ++index) order[index] = index;
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t left, std::size_t right) {
+        return results[left].error < results[right].error;
+    });
+    std::vector<std::string> ranking;
+    ranking.reserve(order.size());
+    for (const std::size_t index : order) ranking.push_back(results[index].id);
+    return ranking;
+}
 
 [[nodiscard]] WaveResult run_wave(
     getnative::CudaAnalysisEngine &engine, const Fixture &fixture,
@@ -244,11 +274,13 @@ struct WaveResult {
         return {
             std::chrono::duration<double, std::milli>(end - start).count(),
             checksum,
+            rank_candidates(results),
         };
     }
 
     std::barrier start_gate(static_cast<std::ptrdiff_t>(concurrency + 1U));
     std::vector<double> checksums(concurrency, 0.0);
+    std::vector<std::vector<std::string>> rankings(concurrency);
     std::vector<std::exception_ptr> failures(concurrency);
     std::vector<std::jthread> workers;
     workers.reserve(concurrency);
@@ -259,6 +291,7 @@ struct WaveResult {
                 const auto results = engine.analyze_axis_batch_f32(
                     fixture.source, fixture.candidates, fixture.metric);
                 for (const auto &result : results) checksums[worker] += result.error;
+                rankings[worker] = rank_candidates(results);
             } catch (...) {
                 failures[worker] = std::current_exception();
             }
@@ -276,6 +309,21 @@ struct WaveResult {
     return {
         std::chrono::duration<double, std::milli>(end - start).count(),
         checksum,
+        rankings.front(),
+    };
+}
+
+[[nodiscard]] WaveResult run_cpu_wave(const Fixture &fixture) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto results = getnative::analyze_batch_f32(
+        fixture.source, fixture.candidates, fixture.metric);
+    const auto end = std::chrono::steady_clock::now();
+    double checksum = 0.0;
+    for (const auto &result : results) checksum += result.error;
+    return {
+        std::chrono::duration<double, std::milli>(end - start).count(),
+        checksum,
+        rank_candidates(results),
     };
 }
 
@@ -326,10 +374,12 @@ int main(int argc, char **argv) {
         std::vector<double> wave_samples;
         wave_samples.reserve(config.samples);
         double checksum = 0.0;
+        std::vector<std::string> candidate_ranking;
         for (std::size_t sample = 0; sample < config.samples; ++sample) {
             const WaveResult result = run_wave(engine, fixture, config.concurrency);
             wave_samples.push_back(result.milliseconds);
             checksum += result.checksum;
+            candidate_ranking = result.candidate_ranking;
             if (config.warmups != 0U && result.checksum != reference_checksum) {
                 throw std::runtime_error("CUDA benchmark output changed after warmup");
             }
@@ -343,6 +393,23 @@ int main(int argc, char **argv) {
         const double candidates_per_second = frames_per_second
             * static_cast<double>(config.candidates);
         const auto telemetry = engine.runtime_telemetry();
+        const double analyzed_waves = static_cast<double>(
+            config.samples * config.concurrency);
+        std::optional<getnative::benchmark::Summary> cpu_summary;
+        double cpu_checksum = 0.0;
+        if (config.compare_cpu) {
+            for (std::size_t warmup = 0; warmup < config.warmups; ++warmup) {
+                (void)run_cpu_wave(fixture);
+            }
+            std::vector<double> cpu_samples;
+            cpu_samples.reserve(config.samples);
+            for (std::size_t sample = 0; sample < config.samples; ++sample) {
+                const WaveResult cpu = run_cpu_wave(fixture);
+                cpu_samples.push_back(cpu.milliseconds);
+                cpu_checksum += cpu.checksum;
+            }
+            cpu_summary = getnative::benchmark::summarize(cpu_samples);
+        }
 
         std::cout << '{';
         getnative::benchmark::append_common_metadata(
@@ -358,6 +425,8 @@ int main(int argc, char **argv) {
                   << ",\"filter\":"
                   << getnative::benchmark::json_string(config.filter_id)
                   << ",\"candidates\":" << config.candidates
+                  << ",\"backend\":\"cuda\""
+                  << ",\"p_norm\":" << config.p_norm
                   << ",\"warmups\":" << config.warmups
                   << ",\"samples\":" << config.samples
                   << ",\"concurrency\":" << config.concurrency
@@ -375,6 +444,23 @@ int main(int argc, char **argv) {
                   << ",\"fps\":" << frames_per_second
                   << ",\"candidates_per_second\":" << candidates_per_second
                   << ",\"checksum\":" << checksum
+                  << ",\"candidate_ranking\":[";
+        for (std::size_t index = 0; index < candidate_ranking.size(); ++index) {
+            if (index != 0U) std::cout << ',';
+            std::cout << getnative::benchmark::json_string(candidate_ranking[index]);
+        }
+        std::cout << "]"
+                  << ",\"timing_ms\":{\"wall_median\":" << frame_ms
+                  << ",\"kernel_mean\":" << telemetry.kernel_ms / analyzed_waves
+                  << ",\"metric_mean\":" << telemetry.metric_ms / analyzed_waves << '}';
+        if (cpu_summary) {
+            std::cout << ",\"cpu_comparison\":{\"wave_ms\":";
+            getnative::benchmark::append_summary(std::cout, *cpu_summary);
+            std::cout << ",\"checksum\":" << cpu_checksum
+                      << ",\"cuda_speedup\":"
+                      << cpu_summary->median / frame_ms << '}';
+        }
+        std::cout
                   << ",\"memory\":{\"peak_workspace_elements\":"
                   << engine.peak_workspace_elements()
                   << ",\"peak_working_set_bytes\":"

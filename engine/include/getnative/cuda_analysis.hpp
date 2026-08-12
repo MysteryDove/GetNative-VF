@@ -13,6 +13,9 @@
 
 namespace getnative {
 
+inline constexpr std::uint32_t cuda_minimum_p_norm = 1U;
+inline constexpr std::uint32_t cuda_maximum_p_norm = 4U;
+
 struct CudaDeviceInfo {
     std::int32_t ordinal = -1;
     std::string name;
@@ -44,7 +47,7 @@ struct CudaRuntimeProbe {
     std::vector<CudaDeviceInfo> devices;
 };
 
-// The first implementation deliberately exposes only one executable variant.
+// The implementation deliberately exposes only one executable variant.
 // The other names remain reserved so a future specialization cannot silently
 // change the baseline selected by existing callers.
 enum class CudaKernelVariant : std::uint8_t {
@@ -84,9 +87,16 @@ struct CudaRuntimeTelemetry {
     std::size_t buffer_allocation_count = 0;
     std::size_t plan_cache_hits = 0;
     std::size_t plan_cache_misses = 0;
+    std::size_t host_plan_cache_hits = 0;
+    std::size_t host_plan_cache_misses = 0;
+    std::size_t host_plan_cache_bytes = 0;
     std::size_t source_cache_hits = 0;
     std::size_t source_cache_misses = 0;
     std::size_t source_upload_bytes = 0;
+    std::size_t source_upload_count = 0;
+    std::size_t source_conversion_bytes = 0;
+    std::size_t source_conversion_count = 0;
+    std::size_t source_transpose_count = 0;
     std::size_t plan_upload_bytes = 0;
     std::size_t result_readback_bytes = 0;
     std::size_t workspace_bytes = 0;
@@ -103,6 +113,7 @@ struct CudaRuntimeTelemetry {
     double source_staging_ms = 0.0;
     // Transfer and kernel fields below are measured with CUDA events.
     double source_upload_ms = 0.0;
+    double source_conversion_ms = 0.0;
     double plan_upload_ms = 0.0;
     double source_transpose_ms = 0.0;
     double horizontal_fused_ms = 0.0;
@@ -141,6 +152,34 @@ struct CudaAnalysisOptions {
     CudaLaunchPolicy launch_policy = cuda_default_launch_policy;
 };
 
+enum class CudaLumaFormat : std::uint8_t {
+    nv12,
+    p010,
+    p016,
+    yuv444p8,
+    yuv444p16,
+};
+
+enum class CudaColorRange : std::uint8_t {
+    limited,
+    full,
+};
+
+// Opaque CUDA handles keep the public API independent of CUDA headers while
+// still making ownership and synchronization explicit. The producer context
+// must be the exact context returned by native_context().
+struct CudaLumaFrameView {
+    std::uintptr_t device_pointer = 0U;
+    std::size_t pitch_bytes = 0U;
+    std::int32_t width = 0;
+    std::int32_t height = 0;
+    CudaLumaFormat format = CudaLumaFormat::nv12;
+    std::int32_t bit_depth = 8;
+    CudaColorRange range = CudaColorRange::limited;
+    std::uintptr_t context = 0U;
+    std::uintptr_t producer_stream = 0U;
+};
+
 [[nodiscard]] CudaRuntimeProbe cuda_runtime_probe() noexcept;
 [[nodiscard]] bool cuda_backend_available() noexcept;
 [[nodiscard]] std::vector<CudaDeviceInfo> enumerate_cuda_devices();
@@ -163,15 +202,36 @@ public:
     [[nodiscard]] std::size_t peak_working_set_bytes() const noexcept;
     [[nodiscard]] CudaRuntimeTelemetry runtime_telemetry() const;
     void reset_analysis_telemetry();
+    [[nodiscard]] std::uintptr_t native_context() const noexcept;
+    [[nodiscard]] std::uintptr_t native_decode_stream() const noexcept;
+
+    // Validates the complete per-frame device working set for a media task
+    // before decoding starts. This does not submit work or acquire a slot.
+    void preflight_axis_batch(
+        ConstImageView dimensions,
+        std::span<const CandidateAnalysis> candidates,
+        const MetricSpec &metric, std::size_t concurrency) const;
 
     // Generic staged CUDA C++ path. Axis recurrences remain serial only along
     // their dependency direction; candidates and orthogonal rows/columns run
-    // in parallel. Reconstruction is fused into the p=1 metric.
+    // in parallel. Reconstruction is fused into the p=1..4 metric.
     [[nodiscard]] std::vector<CandidateResult> analyze_axis_batch_f32(
         ConstImageView source, std::span<const CandidateAnalysis> candidates,
         const MetricSpec &metric, std::stop_token stop = {});
 
+    // Converts the decoder-owned luma plane directly into the resident F32
+    // source buffer. No frame-sized payload is staged through host memory.
+    [[nodiscard]] std::vector<CandidateResult> analyze_axis_batch_cuda_luma(
+        const CudaLumaFrameView &source,
+        std::span<const CandidateAnalysis> candidates,
+        const MetricSpec &metric, std::stop_token stop = {});
+
 private:
+    [[nodiscard]] std::vector<CandidateResult> analyze_axis_batch_impl(
+        ConstImageView source, const CudaLumaFrameView *cuda_luma,
+        std::span<const CandidateAnalysis> candidates,
+        const MetricSpec &metric, std::stop_token stop);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

@@ -27,6 +27,8 @@ struct DriverApi {
     using FuncGetAttribute = CUresult(CUDAAPI *)(
         int *, CUfunction_attribute, CUfunction);
     using MemGetInfo = CUresult(CUDAAPI *)(std::size_t *, std::size_t *);
+    using PointerGetAttribute = CUresult(CUDAAPI *)(
+        void *, CUpointer_attribute, CUdeviceptr);
     using MemAlloc = CUresult(CUDAAPI *)(CUdeviceptr *, std::size_t);
     using MemFree = CUresult(CUDAAPI *)(CUdeviceptr);
     using MemcpyHtoD = CUresult(CUDAAPI *)(CUdeviceptr, const void *, std::size_t);
@@ -40,6 +42,7 @@ struct DriverApi {
     using StreamCreate = CUresult(CUDAAPI *)(CUstream *, unsigned int);
     using StreamDestroy = CUresult(CUDAAPI *)(CUstream);
     using StreamSynchronize = CUresult(CUDAAPI *)(CUstream);
+    using StreamWaitEvent = CUresult(CUDAAPI *)(CUstream, CUevent, unsigned int);
     using EventCreate = CUresult(CUDAAPI *)(CUevent *, unsigned int);
     using EventDestroy = CUresult(CUDAAPI *)(CUevent);
     using EventRecord = CUresult(CUDAAPI *)(CUevent, CUstream);
@@ -74,6 +77,7 @@ struct DriverApi {
     ModuleGetFunction module_get_function = nullptr;
     FuncGetAttribute func_get_attribute = nullptr;
     MemGetInfo mem_get_info = nullptr;
+    PointerGetAttribute pointer_get_attribute = nullptr;
     MemAlloc mem_alloc = nullptr;
     MemFree mem_free = nullptr;
     MemcpyHtoD memcpy_htod = nullptr;
@@ -85,6 +89,7 @@ struct DriverApi {
     StreamCreate stream_create = nullptr;
     StreamDestroy stream_destroy = nullptr;
     StreamSynchronize stream_synchronize = nullptr;
+    StreamWaitEvent stream_wait_event = nullptr;
     EventCreate event_create = nullptr;
     EventDestroy event_destroy = nullptr;
     EventRecord event_record = nullptr;

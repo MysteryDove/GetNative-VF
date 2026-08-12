@@ -8,6 +8,19 @@ namespace baseline = getnative::cuda_baseline;
 
 namespace {
 
+__device__ __forceinline__ double metric_moment(
+    float difference, std::uint32_t norm) {
+    if (norm == 1U) return static_cast<double>(difference);
+    if (norm == 2U) {
+        return static_cast<double>(difference * difference);
+    }
+    if (norm == 3U) {
+        return static_cast<double>(difference * difference * difference);
+    }
+    const float square = difference * difference;
+    return static_cast<double>(square * square);
+}
+
 __device__ __forceinline__ std::uint32_t minimum(std::uint32_t left,
                                                  std::uint32_t right) {
     return left < right ? left : right;
@@ -810,6 +823,35 @@ __device__ __forceinline__ float forward_point_prefetched(
 
 } // namespace
 
+extern "C" __global__ void getnative_cuda_luma_to_f32(
+    const std::uint8_t *__restrict__ source,
+    unsigned long long source_pitch,
+    std::uint32_t source_width,
+    std::uint32_t source_height,
+    std::uint32_t storage_bytes,
+    std::uint32_t bit_depth,
+    std::uint32_t storage_shift,
+    std::uint32_t limited_range,
+    float *__restrict__ output) {
+    const std::uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= source_width || y >= source_height) return;
+
+    const std::uint8_t *row = source
+        + static_cast<unsigned long long>(y) * source_pitch;
+    std::uint32_t sample = storage_bytes == 1U
+        ? static_cast<std::uint32_t>(row[x])
+        : static_cast<std::uint32_t>(
+            reinterpret_cast<const std::uint16_t *>(row)[x]);
+    sample >>= storage_shift;
+
+    (void)limited_range;
+    const float normalized = static_cast<float>(sample)
+        * static_cast<float>(1U << (16U - bit_depth)) / 65535.0F;
+    output[static_cast<unsigned long long>(y) * source_width + x] =
+        normalized;
+}
+
 extern "C" __global__ void getnative_cuda_transpose_source(
     const float *__restrict__ source,
     std::uint32_t source_width,
@@ -908,6 +950,7 @@ extern "C" __global__ void getnative_cuda_horizontal_fused(
     std::uint32_t crop_right,
     std::uint32_t crop_top,
     std::uint32_t crop_bottom,
+    std::uint32_t norm,
     float threshold,
     double *__restrict__ row_sums) {
     const std::uint32_t candidate_index = blockIdx.y;
@@ -940,7 +983,7 @@ extern "C" __global__ void getnative_cuda_horizontal_fused(
             const float difference = fabsf(
                 transposed_source[column * source_height + row]
                 - reconstructed);
-            if (difference > threshold) sum += static_cast<double>(difference);
+            if (difference > threshold) sum += metric_moment(difference, norm);
         }
     }
     row_sums[candidate_index * source_height + row] = sum;
@@ -1068,6 +1111,7 @@ extern "C" __global__ void getnative_cuda_both_fused_metric(
     std::uint32_t crop_left,
     std::uint32_t crop_right,
     std::uint32_t crop_top,
+    std::uint32_t norm,
     float threshold,
     double *__restrict__ partials) {
     extern __shared__ float staged_vertical[];
@@ -1163,11 +1207,11 @@ extern "C" __global__ void getnative_cuda_both_fused_metric(
         }
         const float difference0 = fabsf(
             source[row * source_width + column0] - reconstructed0);
-        if (difference0 > threshold) sum += static_cast<double>(difference0);
+        if (difference0 > threshold) sum += metric_moment(difference0, norm);
         if (column1 < column_end) {
             const float difference1 = fabsf(
                 source[row * source_width + column1] - reconstructed1);
-            if (difference1 > threshold) sum += static_cast<double>(difference1);
+            if (difference1 > threshold) sum += metric_moment(difference1, norm);
         }
     }
 
@@ -1198,6 +1242,7 @@ extern "C" __global__ void getnative_cuda_metric_partials(
     std::uint32_t crop_right,
     std::uint32_t crop_top,
     std::uint32_t crop_bottom,
+    std::uint32_t norm,
     float threshold,
     double *__restrict__ partials) {
     extern __shared__ double reduction[];
@@ -1226,7 +1271,7 @@ extern "C" __global__ void getnative_cuda_metric_partials(
                     transposed_source[column * source_height + row]
                     - reconstructed);
                 if (difference > threshold) {
-                    sum += static_cast<double>(difference);
+                    sum += metric_moment(difference, norm);
                 }
             }
         }
@@ -1276,7 +1321,7 @@ extern "C" __global__ void getnative_cuda_metric_partials(
         }
         const float difference = fabsf(
             source[row * source_width + column] - reconstructed);
-        if (difference > threshold) sum += static_cast<double>(difference);
+        if (difference > threshold) sum += metric_moment(difference, norm);
     }
 
     reduction[lane] = sum;

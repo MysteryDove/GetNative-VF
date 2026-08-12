@@ -101,6 +101,8 @@ std::shared_ptr<DriverApi> load_cuda_driver() {
         library, "cuFuncGetAttribute");
     api->mem_get_info = required_symbol<DriverApi::MemGetInfo>(
         library, "cuMemGetInfo_v2");
+    api->pointer_get_attribute = required_symbol<DriverApi::PointerGetAttribute>(
+        library, "cuPointerGetAttribute");
     api->mem_alloc = required_symbol<DriverApi::MemAlloc>(library, "cuMemAlloc_v2");
     api->mem_free = required_symbol<DriverApi::MemFree>(library, "cuMemFree_v2");
     api->memcpy_htod = required_symbol<DriverApi::MemcpyHtoD>(
@@ -121,6 +123,8 @@ std::shared_ptr<DriverApi> load_cuda_driver() {
         library, "cuStreamDestroy_v2");
     api->stream_synchronize = required_symbol<DriverApi::StreamSynchronize>(
         library, "cuStreamSynchronize");
+    api->stream_wait_event = required_symbol<DriverApi::StreamWaitEvent>(
+        library, "cuStreamWaitEvent");
     api->event_create = required_symbol<DriverApi::EventCreate>(
         library, "cuEventCreate");
     api->event_destroy = required_symbol<DriverApi::EventDestroy>(
