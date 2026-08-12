@@ -7,11 +7,8 @@ archive="ffmpeg-${ffmpeg_version}.tar.xz"
 url="https://ffmpeg.org/releases/${archive}"
 zlib_version="1.3.1"
 zlib_archive="zlib-${zlib_version}.tar.gz"
-zlib_sha256="9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
-zlib_urls=(
-  "https://zlib.net/fossils/${zlib_archive}"
-  "https://github.com/madler/zlib/releases/download/v${zlib_version}/${zlib_archive}"
-)
+zlib_sha256="17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c"
+zlib_url="https://codeload.github.com/madler/zlib/tar.gz/refs/tags/v${zlib_version}"
 
 if [[ $# -ne 1 ]]; then
   echo "usage: $0 OUTPUT_SDK_DIRECTORY" >&2
@@ -49,21 +46,11 @@ if [[ "$actual_sha256" != "$ffmpeg_sha256" ]]; then
   echo "FFmpeg source checksum mismatch: ${actual_sha256}" >&2
   exit 1
 fi
-zlib_verified=false
-for zlib_url in "${zlib_urls[@]}"; do
-  rm -f "${work_dir}/${zlib_archive}"
-  if curl --fail --location --retry 5 --retry-all-errors \
-      --output "${work_dir}/${zlib_archive}" "$zlib_url"; then
-    actual_zlib_sha256=$(sha256sum "${work_dir}/${zlib_archive}" | awk '{print $1}')
-    if [[ "$actual_zlib_sha256" == "$zlib_sha256" ]]; then
-      zlib_verified=true
-      break
-    fi
-    echo "zlib source checksum mismatch from ${zlib_url}: ${actual_zlib_sha256}" >&2
-  fi
-done
-if [[ "$zlib_verified" != true ]]; then
-  echo "failed to download verified zlib ${zlib_version} source" >&2
+curl --fail --location --retry 5 --retry-all-errors \
+  --output "${work_dir}/${zlib_archive}" "$zlib_url"
+actual_zlib_sha256=$(sha256sum "${work_dir}/${zlib_archive}" | awk '{print $1}')
+if [[ "$actual_zlib_sha256" != "$zlib_sha256" ]]; then
+  echo "zlib source checksum mismatch: ${actual_zlib_sha256}" >&2
   exit 1
 fi
 
