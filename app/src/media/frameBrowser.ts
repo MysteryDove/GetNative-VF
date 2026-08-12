@@ -76,21 +76,3 @@ export function findDuplicateSampleId(
   }
   return null;
 }
-
-/** GUI-2 acceptance scenarios used by tests and manual checklists. */
-export const MEDIA_ACCEPTANCE_SCENARIOS = [
-  "still-only-project",
-  "video-only-project",
-  "mixed-still-and-video",
-  "multi-stream-video",
-  "missing-media-relink",
-  "unsupported-or-decode-error",
-  "vfr-frame-identity",
-  "unknown-frame-count-timestamp-first",
-  "keyboard-frame-step",
-  "duplicate-sample-confirm",
-  "filmstrip-thumbnail-bounded-cache",
-  "no-png-export-required-for-sample",
-] as const;
-
-export type MediaAcceptanceScenario = (typeof MEDIA_ACCEPTANCE_SCENARIOS)[number];

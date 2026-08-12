@@ -92,11 +92,23 @@ export function KernelAnalyzePanel({
   }
 
   // MetricSpec inherits from Height by default; an explicit unlink is visible.
+  // Value-equality guard (mirrors the geometry-mirror effect below) prevents a
+  // render loop: skip the update when the draft already matches.
   useEffect(() => {
-    if (inheritMetric) {
-      onDraftChange((current) => ({ ...current, metric: { ...inheritedMetric } }));
+    if (!inheritMetric) return;
+    const metric = draft.metric;
+    if (
+      metric.cropLeft === inheritedMetric.cropLeft &&
+      metric.cropRight === inheritedMetric.cropRight &&
+      metric.cropTop === inheritedMetric.cropTop &&
+      metric.cropBottom === inheritedMetric.cropBottom &&
+      metric.pixelExclusionThreshold === inheritedMetric.pixelExclusionThreshold &&
+      metric.pNorm === inheritedMetric.pNorm
+    ) {
+      return;
     }
-  }, [inheritMetric, inheritedMetric, onDraftChange]);
+    onDraftChange((current) => ({ ...current, metric: { ...inheritedMetric } }));
+  }, [inheritMetric, inheritedMetric, draft.metric, onDraftChange]);
 
   function patch(partial: Partial<KernelDraft>) {
     onDraftChange((current) => ({ ...current, ...partial }));

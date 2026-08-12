@@ -239,18 +239,6 @@ export function requestFrameWindow(request: {
   });
 }
 
-export function getFrameWindow(request: {
-  path: string;
-  fingerprint?: string | null;
-  streamIndex: number;
-  target: FrameWindowTarget;
-  frameIndex?: number | null;
-  timestampSeconds?: number | null;
-  windowRadius?: number;
-}): Promise<MediaFrameWindow> {
-  return requestFrameWindow(request).promise;
-}
-
 export function requestMediaPreview(request: {
   path: string;
   fingerprint?: string | null;

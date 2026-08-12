@@ -59,16 +59,10 @@ type Listener = (event: WorkerEvent) => void;
 
 function makeFakeWorker(frameErrors: Array<number | null>) {
   const listeners = new Set<Listener>();
-  const sentFrames: number[] = [];
   const worker = {
     subscribe(listener: Listener) {
       listeners.add(listener);
       return () => listeners.delete(listener);
-    },
-    async verifyBegin(_params: unknown, onPrepared?: (job: { requestId: string; jobId: string; runId: string }) => void) {
-      const job = { requestId: "req-1", jobId: "gui-job-1", runId: "gui-run-1" };
-      onPrepared?.(job);
-      return job;
     },
     async verifyMediaBegin(params: unknown, onPrepared?: (job: { requestId: string; jobId: string; runId: string }) => void) {
       mediaParams.push(params);
@@ -100,41 +94,10 @@ function makeFakeWorker(frameErrors: Array<number | null>) {
     async waitAccepted() {
       return { jobId: "engine-job-1", workerCount: 4, suggestedInFlight: 8 };
     },
-    async verifyFrame(input: { seq: number }) {
-      sentFrames.push(input.seq);
-      return undefined;
-    },
-    async verifyEnd() {
-      // On end: emit batched results then the terminal result.
-      const results = frameErrors.map((error, seq) => ({ seq, error }));
-      for (const listener of listeners) {
-        listener({
-          protocolVersion: 1,
-          requestId: "req-1",
-          jobId: "gui-job-1",
-          runId: "gui-run-1",
-          timestampMs: 1,
-          type: "progress",
-          completed: results.length,
-          total: results.length,
-          results,
-        });
-        listener({
-          protocolVersion: 1,
-          requestId: "req-1",
-          jobId: "gui-job-1",
-          runId: "gui-run-1",
-          timestampMs: 2,
-          type: "result",
-          mode: "verify",
-          payload: { mode: "verify", frames_completed: results.length, frames_failed: 0 },
-        });
-      }
-    },
     async cancel() {},
   };
   const mediaParams: unknown[] = [];
-  return { worker, sentFrames, mediaParams };
+  return { worker, mediaParams };
 }
 
 describe("startVerifyRunGroup", () => {

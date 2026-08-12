@@ -42,7 +42,7 @@ const capabilities: EngineEnvelope = {
 };
 
 function draft(): ReturnType<typeof defaultKernelDraft> {
-  return defaultKernelDraft(capabilities, metric, "muf-d278cd3", "raw", "auto");
+  return defaultKernelDraft(metric, "muf-d278cd3", "raw", "auto");
 }
 
 const sample = {

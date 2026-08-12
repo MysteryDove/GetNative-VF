@@ -13,7 +13,6 @@ import { buildCandidateGrid, workEstimate } from "./candidateGrid";
 import { profileFor, profilesFor } from "./profiles";
 
 export const CUDA_MAXIMUM_P_NORM = 4;
-export const VULKAN_MAXIMUM_P_NORM = 1;
 
 export type HeightDraft = {
   subroute: "height" | "kernel";

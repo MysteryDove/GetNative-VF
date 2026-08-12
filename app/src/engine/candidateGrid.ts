@@ -44,14 +44,6 @@ function formatFixed(units: bigint, scale: number): string {
   return negative && units !== 0n ? `-${digits}` : digits;
 }
 
-/** Format without binary float drift for common steps (1, 0.1, 0.25, 0.5). */
-export function formatExactDecimal(value: number, stepText: string): string {
-  const step = stepText.includes(".") ? stepText.split(".")[1]?.length ?? 0 : 0;
-  if (step === 0) return String(Math.round(value));
-  const fixed = value.toFixed(step);
-  return fixed.replace(/\.?0+$/, (match) => (match.startsWith(".") ? "" : match));
-}
-
 export function resolveCandidateSequence(input: {
   start: string;
   stop: string;
@@ -130,48 +122,6 @@ export function buildCandidateGrid(input: {
       preset: input.preset ?? null,
     },
   };
-}
-
-export function integerCoarseGrid(input: {
-  start: number;
-  stop: number;
-  step?: number;
-}): { ok: true; grid: CandidateGridSpec } | { ok: false; reason: string } {
-  const step = input.step ?? 1;
-  if (!Number.isInteger(input.start) || !Number.isInteger(input.stop)) {
-    return { ok: false, reason: "integer_grid_requires_integer_bounds" };
-  }
-  return buildCandidateGrid({
-    axis: "height",
-    start: String(input.start),
-    stop: String(input.stop),
-    step: String(step),
-    endpointRule: "inclusive",
-    preset: "integer_coarse",
-  });
-}
-
-/** Fractional refine around a selected height: selected ± halfSpan with step. */
-export function fractionalRefineGrid(input: {
-  selected: string;
-  halfSpan: string;
-  step: string;
-}): { ok: true; grid: CandidateGridSpec } | { ok: false; reason: string } {
-  const selected = parseDecimal(input.selected);
-  const halfSpan = parseDecimal(input.halfSpan);
-  if (!selected.ok) return selected;
-  if (!halfSpan.ok) return halfSpan;
-  if (halfSpan.n < 0) return { ok: false, reason: "refine_span_negative" };
-  const start = formatExactDecimal(selected.n - halfSpan.n, input.step);
-  const stop = formatExactDecimal(selected.n + halfSpan.n, input.step);
-  return buildCandidateGrid({
-    axis: "height",
-    start,
-    stop,
-    step: input.step,
-    endpointRule: "inclusive",
-    preset: "fractional_refine",
-  });
 }
 
 export function workEstimate(input: {

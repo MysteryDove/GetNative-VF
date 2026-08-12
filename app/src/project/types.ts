@@ -166,7 +166,6 @@ export type ProjectState = {
   runGroupsById: Record<string, RunGroup>;
   runsById: Record<string, Run>;
   verificationReviewsByRunId: Record<string, VerificationReview>;
-  jobsById: Record<string, never>;
   uiStateByRoute: Record<string, unknown>;
 };
 

@@ -40,17 +40,6 @@ button {
   color: inherit;
 }
 
-.app-shell {
-  display: grid;
-  grid-template-rows: 64px minmax(0, 1fr);
-  height: 100vh;
-  background: #151817;
-}
-
-.app-shell.has-error {
-  grid-template-rows: 64px auto minmax(0, 1fr);
-}
-
 .topbar {
   display: grid;
   grid-template-columns: minmax(210px, 1fr) auto minmax(310px, 1fr);
@@ -110,7 +99,6 @@ button {
   line-height: 16px;
 }
 
-.mode-switch,
 .axis-switch {
   display: flex;
   align-items: center;
@@ -120,7 +108,6 @@ button {
   background: #131615;
 }
 
-.mode-switch button,
 .axis-switch button {
   min-height: 30px;
   padding: 0 13px;
@@ -131,13 +118,11 @@ button {
   cursor: pointer;
 }
 
-.mode-switch button:hover,
 .axis-switch button:hover {
   color: #dfe5e2;
   background: #242927;
 }
 
-.mode-switch button.active,
 .axis-switch button.active {
   color: #f0f4f2;
   background: #303734;
@@ -214,25 +199,6 @@ button {
 
 .run-button:hover:not(:disabled) {
   background: #91edbc;
-}
-
-.error-strip {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 34px;
-  padding: 6px 18px;
-  border-bottom: 1px solid #703f3b;
-  color: #ffc2bc;
-  background: #321f1d;
-  font-size: 12px;
-  overflow: hidden;
-}
-
-.error-strip span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .workspace {
@@ -492,11 +458,6 @@ button {
 
 }
 
-.mode-switch button:disabled {
-  color: #59615d;
-  cursor: not-allowed;
-}
-
 .first-field,
 .no-top-margin {
   margin-top: 0;
@@ -733,10 +694,6 @@ button {
 @media (max-width: 900px) {
   .topbar {
     grid-template-columns: minmax(180px, 1fr) auto;
-  }
-
-  .topbar .mode-switch {
-    display: none;
   }
 
   .capability-workspace {
@@ -3386,11 +3343,6 @@ button {
   flex: 0 1 140px;
   min-width: 72px;
   font-size: 11px;
-}
-
-.verify-recipe-select {
-  max-width: 420px;
-  margin-top: 8px;
 }
 
 /* Verify page: compact current-recipe picker + inline summary */

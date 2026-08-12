@@ -386,7 +386,7 @@ describe("startKernelRunGroup", () => {
     const { planKernelRunGroup } = await import("./kernelRunGroup");
     const { defaultKernelDraft } = await import("./kernelDraft");
 
-    const draft = defaultKernelDraft(null, {
+    const draft = defaultKernelDraft({
       cropLeft: 0, cropRight: 0, cropTop: 0, cropBottom: 0,
       pixelExclusionThreshold: 0, pNorm: 1,
     }, "muf-d278cd3", "raw", "auto");

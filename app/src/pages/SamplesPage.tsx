@@ -110,7 +110,10 @@ export function SamplesPage({
         if (cancelled) return;
         const detail = String(reason);
         setPreviewError(detail);
-        if (detail.includes("media_fingerprint_mismatch")) {
+        if (
+          detail.includes("media_fingerprint_mismatch")
+          || detail.includes("media_fingerprint_error")
+        ) {
           onProjectChange((current) => {
             const source = current.sourcesById[focusedSource.id];
             if (!source) return current;

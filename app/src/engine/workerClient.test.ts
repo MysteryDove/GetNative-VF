@@ -136,7 +136,6 @@ describe("EngineWorkerClient", () => {
 
     expect(events.map((event) => event.type)).toEqual(["accepted", "progress", "result"]);
     for (const event of events) {
-      if (event.type === "hello_ok") continue;
       expect(event.jobId).toBe(submitted.jobId);
       expect(event.runId).toBe(submitted.runId);
       expect(event.requestId).toBe(submitted.requestId);

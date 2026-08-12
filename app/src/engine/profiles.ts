@@ -1,4 +1,4 @@
-import type { EngineEnvelope, GridSemantics, ProfileCapability } from "./types";
+import type { EngineEnvelope, ProfileCapability } from "./types";
 
 export const BUILTIN_PROFILES: ProfileCapability[] = [
   {
@@ -54,8 +54,4 @@ export function profileFor(
     profilesFor(capabilities).find((profile) => profile.id === profileId) ??
     BUILTIN_PROFILES[0]
   );
-}
-
-export function gridSemanticsForProfile(profileId: string): GridSemantics {
-  return profileFor(profileId).grid_semantics;
 }

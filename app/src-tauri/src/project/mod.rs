@@ -139,9 +139,6 @@ pub fn project_create(
     } else if request.pick_path.unwrap_or(true) {
         match pick_save_path(name) {
             Ok(path) => Some(path),
-            Err(error) if error.code == ManifestErrorCode::Cancelled => {
-                return Ok(ProjectCommandResult::failure(error));
-            }
             Err(error) => return Ok(ProjectCommandResult::failure(error)),
         }
     } else {
@@ -183,9 +180,6 @@ pub fn project_open(
     } else if request.pick_path.unwrap_or(true) {
         match pick_open_path() {
             Ok(path) => path,
-            Err(error) if error.code == ManifestErrorCode::Cancelled => {
-                return Ok(ProjectCommandResult::failure(error));
-            }
             Err(error) => return Ok(ProjectCommandResult::failure(error)),
         }
     } else {

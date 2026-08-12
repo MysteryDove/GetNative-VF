@@ -32,7 +32,7 @@ pub fn export_artifact(request: ExportArtifactRequest) -> Result<String, String>
         .add_filter(extension.to_uppercase(), &[extension.as_str()])
         .save_file()
         .ok_or_else(|| "cancelled".to_owned())?;
-    std::fs::write(&path, request.content)
+    crate::atomic_file::write_bytes(&path, request.content.as_bytes())
         .map_err(|error| format!("failed to write export: {error}"))?;
     Ok(path.display().to_string())
 }

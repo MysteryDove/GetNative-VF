@@ -277,7 +277,6 @@ export function runPureModuleChecks(): void {
 
   const empty = emptyProjectState({ name: "Empty" });
   assert(Object.keys(empty.sourcesById).length === 0, "empty sources");
-  assert(Object.keys(empty.jobsById).length === 0, "empty jobs");
 
   const untitled = emptyProjectState({
     untitled: true,

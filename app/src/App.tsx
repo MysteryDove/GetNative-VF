@@ -474,7 +474,6 @@ function App() {
         onRemoveRecent={handleRemoveRecent}
         onRecover={handleRecover}
         onDiscardRecovery={handleDiscardRecovery}
-        language={locale}
         onLanguageChange={changeLanguage}
         locale={locale}
       />

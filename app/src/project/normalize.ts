@@ -51,7 +51,6 @@ export function emptyProjectState(partial?: Partial<ProjectState["project"]>): P
     runGroupsById: {},
     runsById: {},
     verificationReviewsByRunId: {},
-    jobsById: {},
     uiStateByRoute: {},
   };
 }
@@ -193,7 +192,6 @@ export function openedToProjectState(opened: OpenedProjectDto): ProjectState {
       acc[review.runId] = review;
       return acc;
     }, {}),
-    jobsById: {},
     uiStateByRoute: manifest.ui_state_by_route ?? {},
   };
 }

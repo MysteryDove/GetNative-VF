@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ChevronDown, ChevronRight, Play, RotateCcw, SlidersHorizontal } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
@@ -93,7 +93,6 @@ export function AnalyzePage({
     if (kernelDraft !== null || !capabilities) return;
     setKernelDraft(
       defaultKernelDraft(
-        capabilities,
         draft.metric,
         draft.profileId,
         draft.mathMode,
@@ -104,6 +103,13 @@ export function AnalyzePage({
     // draft once mounted, so seeding stays profile/metric-only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [capabilities, kernelDraft]);
+
+  // Stable identity: KernelAnalyzePanel effects depend on this callback.
+  const handleKernelDraftChange = useCallback(
+    (updater: (current: KernelDraft) => KernelDraft) =>
+      setKernelDraft((current) => (current ? updater(current) : current)),
+    [],
+  );
 
   const includedSamples = useMemo(
     () =>
@@ -270,7 +276,6 @@ export function AnalyzePage({
         ? t("analyze.runBlocked.invalidGrid")
         : null;
 
-  const canEdit = true;
   const canRun = analyzeAvailable && plan !== null && !submitting;
 
   async function startRun() {
@@ -538,9 +543,7 @@ export function AnalyzePage({
           capabilities={capabilities}
           analyzeAvailable={analyzeAvailable}
           draft={kernelDraft}
-          onDraftChange={(updater) =>
-            setKernelDraft((current) => (current ? updater(current) : current))
-          }
+          onDraftChange={handleKernelDraftChange}
           inheritMetric={kernelInheritMetric}
           onInheritMetricChange={setKernelInheritMetric}
           inheritedMetric={draft.metric}
@@ -860,7 +863,6 @@ export function AnalyzePage({
                   role="radio"
                   aria-checked={draft.preset === "integer_coarse"}
                   className={draft.preset === "integer_coarse" ? "active" : ""}
-                  disabled={!canEdit}
                   onClick={() => setPreset("integer_coarse")}
                 >
                   {t("analyze.preset.integerCoarse")}
@@ -870,7 +872,6 @@ export function AnalyzePage({
                   role="radio"
                   aria-checked={draft.preset === "fractional_refine"}
                   className={draft.preset === "fractional_refine" ? "active" : ""}
-                  disabled={!canEdit}
                   onClick={() => setPreset("fractional_refine")}
                 >
                   {t("analyze.preset.fractionalRefine")}
@@ -894,7 +895,6 @@ export function AnalyzePage({
                     role="radio"
                     aria-checked={draft.axisMode === mode}
                     className={draft.axisMode === mode ? "active" : ""}
-                    disabled={!canEdit}
                     onClick={() => patch({ axisMode: mode })}
                   >
                     {t(key)}
@@ -909,7 +909,6 @@ export function AnalyzePage({
                   <span>{t("analyze.refineSelected")}</span>
                   <input
                     value={draft.refineSelected}
-                    disabled={!canEdit}
                     onChange={(event) => patch({ refineSelected: event.target.value })}
                   />
                 </label>
@@ -917,7 +916,6 @@ export function AnalyzePage({
                   <span>{t("analyze.refineHalfSpan")}</span>
                   <input
                     value={draft.refineHalfSpan}
-                    disabled={!canEdit}
                     onChange={(event) => patch({ refineHalfSpan: event.target.value })}
                   />
                 </label>
@@ -928,7 +926,6 @@ export function AnalyzePage({
                     min="0.01"
                     step="0.01"
                     value={draft.step}
-                    disabled={!canEdit}
                     onChange={(event) => patch({ step: event.target.value })}
                   />
                 </label>
@@ -939,7 +936,6 @@ export function AnalyzePage({
                   <span>{t("analyze.start")}</span>
                   <input
                     value={draft.start}
-                    disabled={!canEdit}
                     onChange={(event) => patch({ start: event.target.value })}
                   />
                 </label>
@@ -947,7 +943,6 @@ export function AnalyzePage({
                   <span>{t("analyze.stop")}</span>
                   <input
                     value={draft.stop}
-                    disabled={!canEdit}
                     onChange={(event) => patch({ stop: event.target.value })}
                   />
                 </label>
@@ -958,7 +953,6 @@ export function AnalyzePage({
                     min="0.01"
                     step="0.01"
                     value={draft.step}
-                    disabled={!canEdit}
                     onChange={(event) => patch({ step: event.target.value })}
                   />
                 </label>
@@ -969,7 +963,6 @@ export function AnalyzePage({
               <span>{t("analyze.endpointRule")}</span>
               <select
                 value={draft.endpointRule}
-                disabled={!canEdit}
                 onChange={(event) =>
                   patch({ endpointRule: event.target.value as HeightDraft["endpointRule"] })
                 }
@@ -983,7 +976,6 @@ export function AnalyzePage({
               <span>{t("analyze.baseHeight")}</span>
               <input
                 value={draft.baseHeight}
-                disabled={!canEdit}
                 onChange={(event) => patch({ baseHeight: event.target.value })}
                 placeholder={t("analyze.optional")}
               />
@@ -992,7 +984,6 @@ export function AnalyzePage({
               <span>{t("analyze.baseWidth")}</span>
               <input
                 value={draft.baseWidth}
-                disabled={!canEdit}
                 onChange={(event) => patch({ baseWidth: event.target.value })}
                 placeholder={t("analyze.optional")}
               />
@@ -1003,7 +994,7 @@ export function AnalyzePage({
               <span>{t("analyze.fixedKernel")}</span>
               <select
                 value={draft.kernelId}
-                disabled={!canEdit || kernelOptions.length === 0}
+                disabled={kernelOptions.length === 0}
                 onChange={(event) => {
                   patch({
                     kernelId: event.target.value,
@@ -1102,7 +1093,6 @@ export function AnalyzePage({
                             <input
                               type="checkbox"
                               checked={checked}
-                              disabled={!canEdit}
                               onChange={(event) =>
                                 patch({
                                   compareKernels: event.target.checked
@@ -1131,7 +1121,6 @@ export function AnalyzePage({
               <span>{t("diagnostics.profile")}</span>
               <select
                 value={draft.profileId}
-                disabled={!canEdit}
                 onChange={(event) => patch({ profileId: event.target.value })}
               >
                 {profileOptions.length === 0 ? (
@@ -1167,7 +1156,6 @@ export function AnalyzePage({
                   draft.metric.pNorm,
                   draft.axisMode,
                 )}
-                disabled={!canEdit}
                 onChange={(event) =>
                   patch({
                     backendPreference: event.target.value as HeightDraft["backendPreference"],
@@ -1206,7 +1194,6 @@ export function AnalyzePage({
                       min={0}
                       step={1}
                       value={draft.metric[key]}
-                      disabled={!canEdit}
                       onChange={(event) =>
                         patch({
                           metric: {
@@ -1226,7 +1213,6 @@ export function AnalyzePage({
                   min={0}
                   step="any"
                   value={draft.metric.pixelExclusionThreshold}
-                  disabled={!canEdit}
                   onChange={(event) =>
                     patch({
                       metric: {
@@ -1245,7 +1231,6 @@ export function AnalyzePage({
                   max={pNormMaximum}
                   step={1}
                   value={draft.metric.pNorm}
-                  disabled={!canEdit}
                   onChange={(event) =>
                     patch({
                       metric: {

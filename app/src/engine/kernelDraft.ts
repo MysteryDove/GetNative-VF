@@ -55,14 +55,12 @@ export type KernelDraft = {
 };
 
 export function defaultKernelDraft(
-  capabilities: EngineEnvelope | null,
   metric: MetricSpec,
   profileId: string,
   mathMode: MathMode,
   backendPreference: BackendPreference,
   base?: { baseHeight?: string; baseWidth?: string },
 ): KernelDraft {
-  void capabilities;
   return {
     // Seed the six preset families so the panel opens runnable; every entry
     // is removable.

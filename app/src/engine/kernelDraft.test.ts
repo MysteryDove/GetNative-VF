@@ -24,7 +24,7 @@ const metric: MetricSpec = {
 };
 
 function draft() {
-  return defaultKernelDraft(null, metric, "muf-d278cd3", "raw", "auto");
+  return defaultKernelDraft(metric, "muf-d278cd3", "raw", "auto");
 }
 
 describe("kernel scan list", () => {
@@ -41,7 +41,7 @@ describe("kernel scan list", () => {
     expect(seeded.baseHeight).toBe("720");
     expect(seeded.baseWidth).toBe("");
 
-    const carried = defaultKernelDraft(null, metric, "muf-d278cd3", "raw", "auto", {
+    const carried = defaultKernelDraft(metric, "muf-d278cd3", "raw", "auto", {
       baseHeight: "810",
       baseWidth: "1440",
     });

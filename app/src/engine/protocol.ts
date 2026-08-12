@@ -151,12 +151,6 @@ export type VerifyRequest = {
 
 export type AnalyzeRequest = HeightAnalyzeRequest | KernelAnalyzeRequest | VerifyRequest;
 
-export type WorkerClientCommand =
-  | { type: "hello"; protocolVersion: ProtocolVersion }
-  | { type: "analyze"; request: AnalyzeRequest }
-  | { type: "cancel"; requestId: RequestId; jobId?: JobId | null }
-  | { type: "shutdown" };
-
 export type WorkerEventBase = {
   protocolVersion: ProtocolVersion;
   requestId: RequestId;
@@ -225,22 +219,7 @@ export type WorkerErrorEvent = WorkerEventBase & {
   retryable: boolean;
 };
 
-export type WorkerHelloEvent = {
-  type: "hello_ok";
-  protocolVersion: ProtocolVersion;
-  engineVersion: string;
-  commands: {
-    analyze: boolean;
-    cancel: boolean;
-    media_index_begin?: boolean;
-    media_frame_window?: boolean;
-    media_preview_begin?: boolean;
-    media_asset_batch_begin?: boolean;
-  };
-};
-
 export type WorkerEvent =
-  | WorkerHelloEvent
   | WorkerAcceptedEvent
   | WorkerProgressEvent
   | WorkerWarningEvent

@@ -319,61 +319,7 @@ export class EngineWorkerClient {
     // Otherwise the cancel is sent as soon as `accepted` arrives.
   }
 
-  /**
-   * Verify mode (protocol v1.1): submit the locked recipe, then stream frames
-   * with verifyFrame and close with verifyEnd. The engine job id arrives in
-   * the `accepted` event — await waitAccepted before streaming.
-   */
-  async verifyBegin(params: {
-    width: number;
-    height: number;
-    axisMode: AxisMode;
-    kernel: { id: string; b?: number; c?: number; taps?: number };
-    candidate: string;
-    metric: HeightJobParams["metric"];
-    backend?: "cpu" | "auto";
-    workerCount?: number;
-    expectedFrames?: number;
-  }, onPrepared?: OnPrepared): Promise<SubmittedJob> {
-    this.sequence += 1;
-    const submitted: SubmittedJob = {
-      requestId: `gui-req-${this.sequence}`,
-      jobId: `gui-job-${this.sequence}`,
-      runId: `gui-run-${this.sequence}`,
-    };
-    const tracked: TrackedJob = {
-      ...submitted,
-      engineJobId: null,
-      preparedAtMs: Date.now(),
-      finished: false,
-      cancelRequested: false,
-    };
-    this.jobsByRequest.set(submitted.requestId, tracked);
-    try {
-      onPrepared?.(submitted);
-      await invoke("engine_worker_verify_begin", {
-        request: {
-          requestId: submitted.requestId,
-          width: params.width,
-          height: params.height,
-          axisMode: params.axisMode,
-          kernel: params.kernel,
-          candidate: params.candidate,
-          metric: params.metric,
-          backend: params.backend ?? "auto",
-          workerCount: params.workerCount,
-          expectedFrames: params.expectedFrames,
-        },
-      });
-    } catch (error) {
-      this.emitSubmissionFailure(tracked, error);
-      this.cleanupTracked(tracked);
-      throw error;
-    }
-    return submitted;
-  }
-
-  /** Engine-owned media decode path. No frame producer or verifyEnd is used. */
+  /** Engine-owned media decode path. */
   async verifyMediaBegin(
     params: VerifyMediaJobParams,
     onPrepared?: OnPrepared,
@@ -437,33 +383,6 @@ export class EngineWorkerClient {
     }
     return new Promise((resolve, reject) => {
       this.acceptedWaiters.set(requestId, { resolve, reject });
-    });
-  }
-
-  async verifyFrame(input: {
-    jobId: string;
-    seq: number;
-    frameAsset: FrameAssetRef;
-  }): Promise<void> {
-    this.sequence += 1;
-    await invoke("engine_worker_verify_frame", {
-      request: {
-        requestId: `gui-req-${this.sequence}`,
-        jobId: input.jobId,
-        seq: input.seq,
-        frameAsset: input.frameAsset,
-      },
-    });
-  }
-
-  async verifyEnd(input: { jobId: string; total: number }): Promise<void> {
-    this.sequence += 1;
-    await invoke("engine_worker_verify_end", {
-      request: {
-        requestId: `gui-req-${this.sequence}`,
-        jobId: input.jobId,
-        total: input.total,
-      },
     });
   }
 

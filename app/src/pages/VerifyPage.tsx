@@ -238,9 +238,6 @@ export function VerifyPage({
         state,
         onProjectChange,
         bridge: executionBridge,
-        verifyFrameRing: capabilities?.payload.features?.verify_frame_ring === true,
-        verifyEngineDecode:
-          capabilities?.payload.features?.verify_engine_decode === true,
         onFrames: (runId, entries) => {
           if (!mounted.current) return;
           setLiveFrames((current) => ({

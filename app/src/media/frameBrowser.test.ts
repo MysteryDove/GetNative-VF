@@ -2,7 +2,6 @@ import { describe, it } from "vitest";
 import {
   findDuplicateSampleId,
   frameStepFromKeyboard,
-  MEDIA_ACCEPTANCE_SCENARIOS,
 } from "./frameBrowser";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -56,14 +55,5 @@ describe("GUI-2 frame browser contracts", () => {
       }) === null,
       "new frame",
     );
-  });
-
-  it("lists the GUI-2 acceptance scenario matrix", () => {
-    assert(MEDIA_ACCEPTANCE_SCENARIOS.includes("keyboard-frame-step"), "keyboard scenario");
-    assert(
-      MEDIA_ACCEPTANCE_SCENARIOS.includes("filmstrip-thumbnail-bounded-cache"),
-      "filmstrip scenario",
-    );
-    assert(MEDIA_ACCEPTANCE_SCENARIOS.length >= 10, "matrix size");
   });
 });

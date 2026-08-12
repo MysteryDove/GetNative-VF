@@ -6,7 +6,7 @@ import type { ProjectRoute, ProjectState } from "../project/types";
 import { countById } from "../project/normalize";
 import { ProjectNavigator } from "./ProjectNavigator";
 import { OverviewPage } from "../pages/OverviewPage";
-import { SettingsPage } from "../pages/BlockedPages";
+import { SettingsPage } from "../pages/SettingsPage";
 import { ResultsPage } from "../pages/ResultsPage";
 import { VerifyPage } from "../pages/VerifyPage";
 import { AnalyzePage } from "../pages/AnalyzePage";

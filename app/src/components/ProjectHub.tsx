@@ -18,7 +18,6 @@ export function ProjectHub({
   onRemoveRecent,
   onRecover,
   onDiscardRecovery,
-  language,
   onLanguageChange,
   locale,
 }: {
@@ -35,7 +34,6 @@ export function ProjectHub({
   onRemoveRecent: (path: string) => void;
   onRecover: () => void;
   onDiscardRecovery: () => void;
-  language: "zh-CN" | "en";
   onLanguageChange: (locale: "zh-CN" | "en") => void;
   locale: "zh-CN" | "en";
 }) {
@@ -67,7 +65,7 @@ export function ProjectHub({
           <label className="language-field">
             <span>{t("language.label")}</span>
             <select
-              value={language}
+              value={locale}
               onChange={(event) => onLanguageChange(event.target.value as "zh-CN" | "en")}
             >
               <option value="zh-CN">{t("language.zhCN")}</option>

@@ -35,9 +35,6 @@ export async function startVerifyRunGroup(input: {
   onProjectChange: (updater: (state: ProjectState) => ProjectState) => void;
   bridge: ExecutionBridge;
   onFrames?: (projectRunId: string, entries: VerifyFrameEntry[]) => void;
-  /** Retained as call-site compatibility flags; engine decode is mandatory. */
-  verifyFrameRing?: boolean;
-  verifyEngineDecode?: boolean;
   deps?: Partial<VerifyOrchestratorDeps>;
 }): Promise<StartVerifyResult> {
   const deps = { ...defaultDeps(), ...input.deps };

@@ -1,12 +1,10 @@
 import { describe, it } from "vitest";
 import {
-  formatExactDecimal,
-  integerCoarseGrid,
+  buildCandidateGrid,
   resolveCandidateSequence,
   workEstimate,
 } from "./candidateGrid";
 import {
-  rejectMixedHeightAndKernel,
   validateHeightShape,
   validateKernelShape,
   validateMetricSpec,
@@ -17,7 +15,6 @@ import {
   queueJob,
   reduceWorkerEvent,
   requestCancel,
-  activeJobs,
   runGroupProgress,
 } from "./runReducer";
 import type { HeightAnalyzeRequest, KernelAnalyzeRequest, VerifyRequest } from "./protocol";
@@ -80,15 +77,19 @@ function sampleHeightRequest(overrides?: Partial<HeightAnalyzeRequest>): HeightA
 
 describe("GUI-3 analysis foundation", () => {
   it("resolves exact candidate grids and work estimates", () => {
-    const integer = integerCoarseGrid({ start: 500, stop: 504, step: 2 });
+    const integer = buildCandidateGrid({
+      axis: "height", start: "500", stop: "504", step: "2", endpointRule: "inclusive",
+    });
     assert(integer.ok, "integer grid ok");
     assert(
       integer.grid.candidates.join(",") === "500,502,504",
       `integer candidates: ${integer.grid.candidates.join(",")}`,
     );
 
-    const hundredths = integerCoarseGrid({ start: 500, stop: 501, step: 0.01 });
-    assert(hundredths.ok, "integer coarse grid accepts a 0.01 step");
+    const hundredths = buildCandidateGrid({
+      axis: "height", start: "500", stop: "501", step: "0.01", endpointRule: "inclusive",
+    });
+    assert(hundredths.ok, "coarse grid accepts a 0.01 step");
     assert(hundredths.grid.step === "0.01", `hundredths step: ${hundredths.grid.step}`);
     assert(hundredths.grid.candidates.length === 101, "0.01 step candidate count");
     assert(
@@ -98,8 +99,10 @@ describe("GUI-3 analysis foundation", () => {
     );
 
     // App-side cap matches the worker protocol (100k): 500-800 @ 0.01 must pass.
-    const wide = integerCoarseGrid({ start: 500, stop: 800, step: 0.01 });
-    assert(wide.ok, "integer coarse grid accepts 500-800 @ 0.01");
+    const wide = buildCandidateGrid({
+      axis: "height", start: "500", stop: "800", step: "0.01", endpointRule: "inclusive",
+    });
+    assert(wide.ok, "coarse grid accepts 500-800 @ 0.01");
     assert(wide.grid.candidates.length === 30001, `wide count: ${wide.grid.candidates.length}`);
 
     const tenths = resolveCandidateSequence({
@@ -111,7 +114,6 @@ describe("GUI-3 analysis foundation", () => {
     assert(tenths.ok, "fractional grid ok");
     assert(tenths.candidates.join(",") === "719.5,720,720.5", tenths.candidates.join(","));
 
-    assert(formatExactDecimal(720, "1") === "720", "integer format");
     assert(workEstimate({ sampleCount: 2, fixedKernelCount: 3, candidateCount: 10 }) === 60, "work");
 
     const empty = resolveCandidateSequence({
@@ -363,8 +365,6 @@ describe("GUI-3 analysis foundation", () => {
       "every_n invalid",
     );
 
-    assert(!rejectMixedHeightAndKernel({ heightCandidateCount: 3, kernelCandidateCount: 2 }).ok, "mixed");
-    assert(rejectMixedHeightAndKernel({ heightCandidateCount: 3, kernelCandidateCount: 1 }).ok, "height ok");
     assert(!validateMetricSpec({ ...sampleHeightRequest().metric, pNorm: 0 }).ok, "p-norm");
   });
 
@@ -380,7 +380,6 @@ describe("GUI-3 analysis foundation", () => {
       inputSnapshotKey: "snap_1",
       nowMs: 1,
     });
-    assert(activeJobs(state).length === 1, "queued is active");
 
     state = reduceWorkerEvent(state, {
       type: "accepted",

@@ -267,10 +267,6 @@ function terminalRate(
  * Does not invent results: `result` events must carry engine payload.
  */
 export function reduceWorkerEvent(state: ExecutionState, event: WorkerEvent): ExecutionState {
-  if (event.type === "hello_ok") {
-    return state;
-  }
-
   switch (event.type) {
     case "accepted": {
       const job = state.jobsById[event.jobId];
@@ -301,7 +297,7 @@ export function reduceWorkerEvent(state: ExecutionState, event: WorkerEvent): Ex
         phaseChanged ? 0 : job.completed,
         event.completed,
       );
-      let fpsCurrent = job?.fpsCurrent ?? null;
+      let fpsCurrent = job.fpsCurrent ?? null;
       let lastProgressAtMs = phaseChanged ? undefined : job.lastProgressAtMs;
       let lastProgressCompleted = phaseChanged ? 0 : previousCompleted;
       if (lastProgressAtMs != null) {
@@ -325,7 +321,7 @@ export function reduceWorkerEvent(state: ExecutionState, event: WorkerEvent): Ex
       const fpsAvg =
         elapsedSeconds > 0 && monotonicCompleted > 0
           ? monotonicCompleted / elapsedSeconds
-          : (job?.fpsAvg ?? null);
+          : (job.fpsAvg ?? null);
       return patchJobAndRun(state, event, {
         phase: "running",
         completed: monotonicCompleted,
@@ -371,18 +367,6 @@ export function reduceWorkerEvent(state: ExecutionState, event: WorkerEvent): Ex
     default:
       return state;
   }
-}
-
-export function activeJobs(state: ExecutionState): JobRecord[] {
-  return Object.values(state.jobsById)
-    .filter((job) => job.phase === "queued" || job.phase === "running")
-    .sort((a, b) => a.updatedAtMs - b.updatedAtMs);
-}
-
-export function recentJobs(state: ExecutionState, limit = 8): JobRecord[] {
-  return Object.values(state.jobsById)
-    .sort((a, b) => b.updatedAtMs - a.updatedAtMs)
-    .slice(0, limit);
 }
 
 /** Aggregated per-RunGroup progress: users track the command, not member tasks. */

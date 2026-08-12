@@ -140,17 +140,3 @@ export function validateVerifyShape(request: VerifyRequest): ShapeGuardResult {
   if (!metric.ok) return metric;
   return { ok: true };
 }
-
-/** Reject shapes that mix many heights with many kernels in one Run. */
-export function rejectMixedHeightAndKernel(input: {
-  heightCandidateCount: number;
-  kernelCandidateCount: number;
-}): ShapeGuardResult {
-  if (input.heightCandidateCount > 1 && input.kernelCandidateCount > 1) {
-    return fail(
-      "mixed_height_kernel",
-      "One engine Run cannot combine multiple heights with multiple kernels",
-    );
-  }
-  return { ok: true };
-}
