@@ -108,6 +108,17 @@ fi
 make -j "${NUMBER_OF_PROCESSORS:-4}"
 make install
 
+# FFmpeg's MSVC install rule places import libraries beside the DLLs. Keep
+# the public SDK layout conventional so CMake can resolve them from lib/.
+mkdir -p "${sdk_dir}/lib"
+for component in avformat avcodec avutil swscale; do
+  test -f "${sdk_dir}/bin/${component}.lib" || {
+    echo "FFmpeg SDK is missing ${component}.lib" >&2
+    exit 1
+  }
+  cp "${sdk_dir}/bin/${component}.lib" "${sdk_dir}/lib/${component}.lib"
+done
+
 legal_dir="${sdk_dir}/share/ffmpeg"
 mkdir -p "${legal_dir}/source"
 cp "${work_dir}/${archive}" "${legal_dir}/source/${archive}"

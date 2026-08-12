@@ -62,13 +62,24 @@ jobs:
       - name: Install JavaScript dependencies
         working-directory: app
         run: pnpm install --frozen-lockfile
-      - name: Build deb and AppImage
+      - name: Build deb
         working-directory: app
         env:
           GETNATIVE_LINUX_BACKENDS: cpu
           GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}/.deps/ffmpeg-linux-x64
           GETNATIVE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/.deps/ffmpeg-linux-x64/lib
-        run: pnpm tauri build --bundles deb,appimage
+        run: pnpm tauri build --bundles deb
+      - name: Build AppImage
+        working-directory: app
+        env:
+          GETNATIVE_LINUX_BACKENDS: cpu
+          GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}/.deps/ffmpeg-linux-x64
+          GETNATIVE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/.deps/ffmpeg-linux-x64/lib
+        run: |
+          for attempt in 1 2 3; do
+            pnpm tauri build --bundles appimage && exit 0
+            if [ "$attempt" -eq 3 ]; then exit 1; fi
+          done
       - name: Verify package media runtime
         shell: bash
         run: |
