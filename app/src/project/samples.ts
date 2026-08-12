@@ -38,6 +38,41 @@ export function applySourceError(
   };
 }
 
+/**
+ * Returns a NEW ProjectState with the given Source marked `state: "missing"`
+ * (on top of the applySourceError patch). Missing source, or one already
+ * marked missing, returns the input state unchanged.
+ */
+export function applySourceMissing(
+  state: ProjectState,
+  sourceId: string,
+  error: { code: string; detail: string },
+): ProjectState {
+  const source = state.sourcesById[sourceId];
+  if (!source || source.state === "missing") return state;
+  const next = applySourceError(state, sourceId, error);
+  const patched = next.sourcesById[sourceId];
+  return {
+    ...next,
+    sourcesById: {
+      ...next.sourcesById,
+      [sourceId]: { ...patched, state: "missing" },
+    },
+  };
+}
+
+/** Returns a NEW ProjectState with the Sample inserted (replaces same id). */
+export function withSample(state: ProjectState, sample: Sample): ProjectState {
+  return { ...state, samplesById: { ...state.samplesById, [sample.id]: sample } };
+}
+
+/** Returns a NEW ProjectState without the given Sample. */
+export function withoutSample(state: ProjectState, sampleId: string): ProjectState {
+  const samplesById = { ...state.samplesById };
+  delete samplesById[sampleId];
+  return { ...state, samplesById };
+}
+
 /** Next `order` value for a new Sample: max existing order + 1 (0 when empty). */
 export function nextSampleOrder(samplesById: Record<string, Sample>): number {
   return Math.max(-1, ...Object.values(samplesById).map((sample) => sample.order)) + 1;

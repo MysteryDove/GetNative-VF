@@ -188,8 +188,45 @@ export function indexedVideoProbe(probe: MediaProbeResult, index: MediaIndexResu
   };
 }
 
-function mediaErrorCode(error: unknown): string {
-  const detail = String(error).replace(/^Error:\s*/, "");
+/**
+ * Relink flow (Media page): after a successful re-probe, replace the Source
+ * record and, for videos still probing, run the media index and swap in the
+ * indexed record. `onIndexProgress` reports decoded-frame counts.
+ */
+export async function applyRelinkedProbe(input: {
+  sourceId: string;
+  probe: MediaProbeResult;
+  label?: string | null;
+  onProjectChange: ProjectUpdater;
+  onIndexProgress?: (sourceId: string, decodedFrames: number) => void;
+}): Promise<void> {
+  const { sourceId, probe, label, onProjectChange } = input;
+  onProjectChange((current) => ({
+    ...current,
+    sourcesById: {
+      ...current.sourcesById,
+      [sourceId]: sourceFromProbe(sourceId, probe, label),
+    },
+  }));
+  if (probe.kind !== "video" || probe.state !== "probing") return;
+  const task = beginSourceMediaIndex(
+    sourceId,
+    { path: probe.path, fingerprint: probe.fingerprint },
+    (progress) => input.onIndexProgress?.(sourceId, progress.completed),
+  );
+  const indexed = indexedVideoProbe(probe, await task.promise);
+  onProjectChange((current) => current.sourcesById[sourceId]
+    ? {
+        ...current,
+        sourcesById: {
+          ...current.sourcesById,
+          [sourceId]: sourceFromProbe(sourceId, indexed, label),
+        },
+      }
+    : current);
+}
+
+function mediaErrorCode(error: unknown): string {  const detail = String(error).replace(/^Error:\s*/, "");
   const match = detail.match(/^([a-z][a-z0-9_]+):/);
   const code = match?.[1] ?? "media_index_error";
   return code === "media_fingerprint_error"

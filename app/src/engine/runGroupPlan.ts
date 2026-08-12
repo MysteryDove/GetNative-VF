@@ -8,7 +8,9 @@ import {
 } from "./heightDraft";
 import { validateHeightShape } from "./shapeGuards";
 import type { HeightAnalyzeRequest } from "./protocol";
-import type { Run, RunGroup } from "../project/types";
+import type { ProjectState, Run, RunGroup } from "../project/types";
+import type { Translator } from "../i18n";
+import { kernelDisplayName } from "./displayNames";
 
 export type HeightRunGroupType =
   | "single_height"
@@ -324,4 +326,88 @@ export function extractHeightSeries(result: unknown): HeightSeriesPoint[] | null
     points.push({ height: String(height), metric: metricNumber });
   }
   return points.length ? points : null;
+}
+
+export type SeriesTableRow = {
+  runId: string;
+  height: string;
+  metric: number;
+  sampleLabel: string;
+  kernelId: string;
+  /** Kernel identity including parameter variant, e.g. "lanczos@3". */
+  kernelKey: string;
+};
+
+/** Per-run series metadata (one entry per run contributing plot points). */
+export type SeriesMeta = {
+  runId: string;
+  sampleId: string;
+  sampleLabel: string;
+  kernelId: string;
+  kernelTaps: number | null;
+  kernelKey: string;
+};
+
+export type SeriesTable = {
+  rows: SeriesTableRow[];
+  incompatibleCount: number;
+  seriesMeta: SeriesMeta[];
+};
+
+export function buildSeriesTable(
+  runs: Run[],
+  state: ProjectState,
+  hiddenSampleIds: Set<string>,
+  activeMetricKey: string,
+): SeriesTable {
+  const rows: SeriesTableRow[] = [];
+  const seriesMeta: SeriesMeta[] = [];
+  let incompatibleCount = 0;
+  for (const run of runs) {
+    if (run.sampleId && hiddenSampleIds.has(run.sampleId)) continue;
+    const snapshot = run.inputSnapshot as
+      | { metric?: { cropLeft: number; cropRight: number; cropTop: number; cropBottom: number; pixelExclusionThreshold: number; pNorm: number }; kernel?: { id: string; parameters?: Record<string, string | number | boolean> } }
+      | null;
+    if (snapshot?.metric) {
+      if (metricCompatibilityKey(snapshot.metric) !== activeMetricKey) {
+        incompatibleCount += 1;
+        continue;
+      }
+    }
+    const series = extractHeightSeries(run.result);
+    if (!series) continue;
+    const sample = run.sampleId ? state.samplesById[run.sampleId] : null;
+    const kernelId = snapshot?.kernel?.id ?? "—";
+    const rawTaps = Number(snapshot?.kernel?.parameters?.taps);
+    const kernelTaps = Number.isFinite(rawTaps) ? rawTaps : null;
+    const kernelKey = kernelTaps != null ? `${kernelId}@${kernelTaps}` : kernelId;
+    const sampleLabel = sample?.label ?? run.sampleId ?? "—";
+    seriesMeta.push({
+      runId: run.id,
+      sampleId: run.sampleId ?? "",
+      sampleLabel,
+      kernelId,
+      kernelTaps,
+      kernelKey,
+    });
+    for (const point of series) {
+      rows.push({
+        runId: run.id,
+        height: point.height,
+        metric: point.metric,
+        sampleLabel,
+        kernelId,
+        kernelKey,
+      });
+    }
+  }
+  return { rows, incompatibleCount, seriesMeta };
+}
+
+export function kernelMetaLabel(
+  t: Translator,
+  meta: { kernelId: string; kernelTaps: number | null },
+): string {
+  const name = kernelDisplayName(t, meta.kernelId);
+  return meta.kernelTaps != null ? `${name} ${meta.kernelTaps}` : name;
 }

@@ -11,6 +11,15 @@ export type ErrorPlotDatum = {
   label?: string;
 };
 
+/*
+ * Canvas cannot read CSS custom properties, so these literals duplicate the
+ * App.css :root palette. Correspondence (keep in sync with App.css):
+ *   AXIS_COLOR      #4a514d  ~ --border-strong family (single-use literal)
+ *   GRID_COLOR      #232826  ~ --border-faint family (single-use literal)
+ *   THRESHOLD_COLOR #c9a24b  ~ --warning family (muted amber, single-use)
+ *   SELECTED_COLOR  #6ea8fe  ~ accent-blue, no CSS equivalent (canvas-only)
+ *   DEFAULT_SERIES_COLOR / SERIES_PALETTE: categorical series hues, canvas-only.
+ */
 const AXIS_COLOR = "#4a514d";
 
 /** Fallback series color when a datum carries no explicit color. */

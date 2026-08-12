@@ -1,51 +1,29 @@
-import { useEffect, useMemo, useState } from "react";
+import { useState } from "react";
 import { SlidersHorizontal } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
-import { kernelDisplayName, profileDisplayName } from "../engine/displayNames";
-import { activeRecipe } from "../project/recipe";
+import { profileDisplayName } from "../engine/displayNames";
 import type {
   BackendPreference,
   KernelRef,
   MetricSpec,
 } from "../engine/protocol";
-import {
-  addBicubicGridToScanList,
-  addKernelToScanList,
-  bicubicRefFromDraft,
-  estimateKernelWork,
-  geometryGroupKey,
-  lanczosRefsFromDraft,
-  lanczosTapsRange,
-  removeKernelFromScanList,
-  resolveKernelCandidates,
-  KERNEL_FAMILY_ORDER,
-  type KernelDraft,
-  type ResolvedGeometryMap,
-} from "../engine/kernelDraft";
-import { extractKernelResultRows, planKernelRunGroup } from "../engine/kernelRunGroup";
-import { metricCompatibilityKey } from "../engine/runGroupPlan";
+import type { KernelDraft } from "../engine/kernelDraft";
 import { profileFor } from "../engine/profiles";
-import {
-  kernelSignature,
-  resolveBackendPreference,
-  selectableBackends,
-  validateBackendPNorm,
-} from "../engine/heightDraft";
+import { kernelSignature, selectableBackends } from "../engine/heightDraft";
 import { startKernelRunGroup, type ExecutionBridge } from "../engine/executeRunGroup";
 import { applyPayloadToCurrentRecipe } from "../project/recipeApply";
-import { includedSamples as selectIncludedSamples } from "../project/samples";
 import { useRunGroupSubmit } from "../hooks/useRunGroupSubmit";
-import type { ProjectState, Run } from "../project/types";
+import { useKernelPlan } from "../hooks/useKernelPlan";
+import type { ProjectState } from "../project/types";
 import { BlockedState } from "../components/BlockedState";
+import { KernelScanList, KernelScanListBuilder } from "../components/KernelScanList";
 import { MetricEditor } from "../components/MetricEditor";
 import { ResultMetricTable } from "../components/ResultMetricTable";
 import { RunGroupPlanCard } from "../components/RunGroupPlanCard";
 import { RunLaunchButton } from "../components/RunLaunchButton";
-import { backendOptionLabel, pNormMaximumForBackend } from "../engine/backendSelection";
+import { backendOptionLabel } from "../engine/backendSelection";
 import { toggleSetValue } from "../utils/collections";
-
-type SampleDims = { width: number; height: number };
 
 export function KernelAnalyzePanel({
   t,
@@ -77,7 +55,6 @@ export function KernelAnalyzePanel({
 }) {
   // Selection is by signature, not index: entries can be removed mid-list.
   const [selectedSignature, setSelectedSignature] = useState<string | null>(null);
-  const [addNotice, setAddNotice] = useState("");
   const [applyNotice, setApplyNotice] = useState("");
   const { submitting, notice: submitNotice, submit: submitRunGroup } = useRunGroupSubmit();
   /** Samples excluded from the kernel test (default: every included sample). */
@@ -91,247 +68,41 @@ export function KernelAnalyzePanel({
     setExcludedSampleIds((current) => toggleSetValue(current, sampleId));
   }
 
-  // MetricSpec inherits from Height by default; an explicit unlink is visible.
-  // Value-equality guard (mirrors the geometry-mirror effect below) prevents a
-  // render loop: skip the update when the draft already matches.
-  useEffect(() => {
-    if (!inheritMetric) return;
-    const metric = draft.metric;
-    if (
-      metric.cropLeft === inheritedMetric.cropLeft &&
-      metric.cropRight === inheritedMetric.cropRight &&
-      metric.cropTop === inheritedMetric.cropTop &&
-      metric.cropBottom === inheritedMetric.cropBottom &&
-      metric.pixelExclusionThreshold === inheritedMetric.pixelExclusionThreshold &&
-      metric.pNorm === inheritedMetric.pNorm
-    ) {
-      return;
-    }
-    onDraftChange((current) => ({ ...current, metric: { ...inheritedMetric } }));
-  }, [inheritMetric, inheritedMetric, draft.metric, onDraftChange]);
-
   function patch(partial: Partial<KernelDraft>) {
     onDraftChange((current) => ({ ...current, ...partial }));
   }
 
-  const includedSamples = useMemo(
-    () => selectIncludedSamples(state),
-    [state.samplesById],
-  );
-
-  const sampleDims = useMemo(() => {
-    const map: Record<string, SampleDims | null> = {};
-    for (const sample of includedSamples) {
-      const source = state.sourcesById[sample.sourceId];
-      map[sample.id] =
-        source?.width && source?.height
-          ? { width: source.width, height: source.height }
-          : null;
-    }
-    return map;
-  }, [includedSamples, state.sourcesById]);
-
-  /** The samples the kernel test actually runs on. */
-  const testSamples = useMemo(
-    () => includedSamples.filter((sample) => !excludedSampleIds.has(sample.id)),
-    [includedSamples, excludedSampleIds],
-  );
-
-  /** Distinct source shapes whose fixed geometry must be resolved. */
-  const geometryGroups = useMemo(() => {
-    const groups = new Map<string, { key: string; dims: SampleDims; sampleCount: number }>();
-    for (const sample of includedSamples) {
-      const dims = sampleDims[sample.id];
-      if (!dims) continue;
-      const key = geometryGroupKey({
-        sourceWidth: dims.width,
-        sourceHeight: dims.height,
-        baseHeight: draft.baseHeight,
-        baseWidth: draft.baseWidth,
-        profileId: draft.profileId,
-      });
-      const existing = groups.get(key);
-      if (existing) existing.sampleCount += 1;
-      else groups.set(key, { key, dims, sampleCount: 1 });
-    }
-    return [...groups.values()];
-  }, [includedSamples, sampleDims, draft.baseHeight, draft.baseWidth, draft.profileId]);
-
-  /** The kernel test is pinned to the current Recipe's geometry. */
-  const currentRecipe = activeRecipe(state);
-  const recipeGeometry = currentRecipe?.geometry ?? null;
-  const recipeProfileId = currentRecipe?.profileId ?? null;
-
-  // Mirror the Recipe geometry's base size (and profile) into the draft so
-  // per-source-shape group keys line up with the plan's key derivation.
-  useEffect(() => {
-    if (!recipeGeometry) return;
-    const baseHeight = String(recipeGeometry.baseHeight);
-    const baseWidth =
-      recipeGeometry.baseWidth != null ? String(recipeGeometry.baseWidth) : "";
-    if (
-      draft.baseHeight === baseHeight &&
-      draft.baseWidth === baseWidth &&
-      (!recipeProfileId || draft.profileId === recipeProfileId)
-    ) {
-      return;
-    }
-    onDraftChange((current) => ({
-      ...current,
-      baseHeight,
-      baseWidth,
-      ...(recipeProfileId ? { profileId: recipeProfileId } : {}),
-    }));
-  }, [recipeGeometry, recipeProfileId, draft.baseHeight, draft.baseWidth, draft.profileId, onDraftChange]);
-
-  /** Every source shape resolves to the same Recipe geometry. */
-  const geometries = useMemo<ResolvedGeometryMap>(() => {
-    if (!recipeGeometry) return {};
-    return Object.fromEntries(geometryGroups.map((group) => [group.key, recipeGeometry]));
-  }, [geometryGroups, recipeGeometry]);
-
-  const candidates = useMemo(
-    () => resolveKernelCandidates(draft, capabilities),
-    [draft, capabilities],
-  );
-
-  const plan = useMemo(() => {
-    const result = planKernelRunGroup({
-      draft,
-      samples: testSamples,
-      sourcesById: state.sourcesById,
-      geometries,
-      capabilities,
-    });
-    return result.ok ? result.plan : null;
-  }, [draft, testSamples, state.sourcesById, geometries, capabilities]);
-  const kernelAxisMode = profileFor(draft.profileId, capabilities).default_axis_mode;
-  const resolvedBackend = resolveBackendPreference(
-    capabilities,
-    draft.backendPreference,
-    draft.metric.pNorm,
+  const {
+    currentRecipe,
+    recipeGeometry,
+    includedSamples,
+    sampleDims,
+    testSamples,
+    candidates,
+    plan,
     kernelAxisMode,
-  );
-  const pNormMaximum = pNormMaximumForBackend(capabilities, resolvedBackend);
-  const pNormSupported = validateBackendPNorm(
+    resolvedBackend,
+    pNormMaximum,
+    pNormSupported,
+    work,
+    resultRows,
+    resultSamples,
+    visibleTableRows,
+  } = useKernelPlan({
+    state,
     capabilities,
-    draft.backendPreference,
-    draft.metric.pNorm,
-    kernelAxisMode,
-  ).ok;
-
-  const kernelRuns = useMemo(
-    () =>
-      Object.values(state.runsById)
-        .filter((run) => run.runType === "kernel")
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
-    [state.runsById],
-  );
-  const activeMetricKey = metricCompatibilityKey(draft.metric);
-  const resultRows = useMemo(
-    () => buildKernelResultRows(kernelRuns, state, activeMetricKey),
-    [kernelRuns, state, activeMetricKey],
-  );
-  const kernelTableRows = useMemo(
-    () =>
-      resultRows.rows.map((row) => {
-        const key = `${row.runId}-${row.kernelLabel}`;
-        return {
-          key,
-          metric: row.metric,
-          sampleId: row.sampleId,
-          cells: [row.kernelLabel, row.sampleLabel, row.runId.slice(0, 10)],
-          selected: selectedResultKey === key,
-          onSelect: () =>
-            setSelectedResultKey((current) => (current === key ? null : key)),
-        };
-      }),
-    [resultRows, selectedResultKey],
-  );
-  /** Distinct samples present in the result rows, for the table switch. */
-  const resultSamples = useMemo(() => {
-    const seen = new Map<string, string>();
-    for (const row of resultRows.rows) {
-      if (!seen.has(row.sampleId)) seen.set(row.sampleId, row.sampleLabel);
-    }
-    return [...seen.entries()].map(([id, label]) => ({ id, label }));
-  }, [resultRows]);
-  const visibleTableRows = useMemo(
-    () =>
-      sampleFilter
-        ? kernelTableRows.filter((row) => row.sampleId === sampleFilter)
-        : kernelTableRows,
-    [kernelTableRows, sampleFilter],
-  );
-
-  const work = candidates.ok
-    ? estimateKernelWork({
-        sampleCount: testSamples.length,
-        candidateCount: candidates.candidates.length,
-      })
-    : 0;
+    draft,
+    onDraftChange,
+    inheritMetric,
+    inheritedMetric,
+    excludedSampleIds,
+    selectedResultKey,
+    sampleFilter,
+    onSelectResultKey: setSelectedResultKey,
+  });
 
   const selectedKernel =
     draft.scanList.find((kernel) => kernelSignature(kernel) === selectedSignature) ?? null;
-
-  function handleAddKernels(refs: KernelRef[]) {
-    if (!refs.length) {
-      setAddNotice(t("analyze.k.scanList.invalidParams"));
-      return;
-    }
-    let addedAny = false;
-    onDraftChange((current) => {
-      let next = current;
-      for (const ref of refs) {
-        const result = addKernelToScanList(next, ref);
-        next = result.draft;
-        addedAny = addedAny || result.added;
-      }
-      return next;
-    });
-    setAddNotice(addedAny ? "" : t("analyze.k.scanList.duplicate"));
-  }
-
-  function handleAddFamily() {
-    if (draft.addFamily === "bicubic") {
-      const ref = bicubicRefFromDraft(draft);
-      if (!ref) {
-        setAddNotice(t("analyze.k.scanList.invalidParams"));
-        return;
-      }
-      handleAddKernels([ref]);
-      return;
-    }
-    if (draft.addFamily === "lanczos") {
-      const refs = lanczosRefsFromDraft(draft);
-      if (!refs.length) {
-        setAddNotice(t("analyze.k.scanList.invalidParams"));
-        return;
-      }
-      handleAddKernels(refs);
-      return;
-    }
-    handleAddKernels([{ id: draft.addFamily, parameters: {} }]);
-  }
-
-  function handleAddBicubicGrid() {
-    const result = addBicubicGridToScanList(draft);
-    if (!result.ok) {
-      setAddNotice(t("analyze.k.scanList.invalidParams"));
-      return;
-    }
-    onDraftChange(() => result.draft);
-    setAddNotice(
-      t("analyze.k.scanList.gridAdded", {
-        added: String(result.added),
-        skipped: String(result.skipped),
-      }),
-    );
-  }
-
-  function handleRemoveKernel(index: number) {
-    onDraftChange((current) => removeKernelFromScanList(current, index));
-  }
 
   /** Apply a kernel (id + parameters) to the current Recipe (its geometry is already there). */
   function applyKernelRefToCurrentRecipe(kernel: KernelRef | null, includeDivergedMetric: boolean) {
@@ -382,14 +153,14 @@ export function KernelAnalyzePanel({
         : testSamples.length === 0
           ? t("analyze.k.noneSelected")
           : draft.scanList.length === 0
-          ? t("analyze.k.scanList.empty")
-          : !candidates.ok
-            ? t("analyze.k.candidatesInvalid")
-            : candidates.candidates.length < 2
-              ? t("analyze.k.tooFewCandidates")
-              : !plan
-                ? t("analyze.k.planInvalid")
-                : null;
+            ? t("analyze.k.scanList.empty")
+            : !candidates.ok
+              ? t("analyze.k.candidatesInvalid")
+              : candidates.candidates.length < 2
+                ? t("analyze.k.tooFewCandidates")
+                : !plan
+                  ? t("analyze.k.planInvalid")
+                  : null;
 
   const canRun = analyzeAvailable && recipeGeometry !== null && plan !== null && !submitting;
 
@@ -494,74 +265,18 @@ export function KernelAnalyzePanel({
           )}
         </div>
 
-        <div className="analyze-table-host">
-          <h3>{t("analyze.k.scanList.title")}</h3>
-          {draft.scanList.length ? (
-            <div className="candidate-preview" role="table" aria-label={t("analyze.k.scanList.title")}>
-              <div className="candidate-preview-meta">
-                {t("analyze.k.candidateCount", { count: String(draft.scanList.length) })}
-                {work > 0 ? ` · ${t("analyze.workEstimate", { count: String(work) })}` : ""}
-              </div>
-              <div className="candidate-chips">
-                {draft.scanList.map((kernel, index) => {
-                  const signature = kernelSignature(kernel);
-                  return (
-                    <button
-                      type="button"
-                      className={`candidate-chip ${selectedSignature === signature ? "selected" : ""}`}
-                      key={signature}
-                      onClick={() =>
-                        setSelectedSignature((current) =>
-                          current === signature ? null : signature,
-                        )
-                      }
-                    >
-                      {kernelChipLabel(t, kernel)}
-                      <span
-                        className="chip-remove"
-                        role="button"
-                        aria-label={t("analyze.k.scanList.remove")}
-                        title={t("analyze.k.scanList.remove")}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          handleRemoveKernel(index);
-                        }}
-                      >
-                        ×
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-              <p className="help-copy">{t("analyze.k.sequenceExact")}</p>
-              <div className="analyze-table-toolbar">
-                <button
-                  className="secondary-button"
-                  type="button"
-                  disabled={!selectedKernel}
-                  onClick={() => applyKernelRefToCurrentRecipe(selectedKernel, false)}
-                >
-                  {t("analyze.k.applyToRecipe")}
-                </button>
-                {!inheritMetric ? (
-                  <button
-                    className="secondary-button"
-                    type="button"
-                    disabled={!selectedKernel}
-                    onClick={() => applyKernelRefToCurrentRecipe(selectedKernel, true)}
-                  >
-                    {t("analyze.k.applyWithDivergedMetric")}
-                  </button>
-                ) : null}
-                {applyNotice || submitNotice ? (
-                  <span className="help-copy">{applyNotice || submitNotice}</span>
-                ) : null}
-              </div>
-            </div>
-          ) : (
-            <p className="empty-copy">{t("analyze.k.scanList.empty")}</p>
-          )}
-        </div>
+        <KernelScanList
+          t={t}
+          draft={draft}
+          work={work}
+          selectedSignature={selectedSignature}
+          onSelectSignature={setSelectedSignature}
+          onDraftChange={onDraftChange}
+          selectedKernel={selectedKernel}
+          inheritMetric={inheritMetric}
+          onApplyKernel={applyKernelRefToCurrentRecipe}
+          notice={applyNotice || submitNotice}
+        />
 
         <div className="analyze-table-host">
           <div className="analyze-table-toolbar">
@@ -645,131 +360,12 @@ export function KernelAnalyzePanel({
           {t("analyze.paramsTitle")}
         </h3>
 
-        <fieldset className="metric-fieldset">
-          <legend>{t("analyze.k.scanList.addSection")}</legend>
-          <div className="kernel-group-chips">
-            {KERNEL_FAMILY_ORDER.map((family) => (
-              <button
-                key={family}
-                type="button"
-                className={`candidate-chip ${draft.addFamily === family ? "selected" : ""}`}
-                onClick={() => patch({ addFamily: family })}
-              >
-                {kernelDisplayName(t, family)}
-              </button>
-            ))}
-          </div>
-
-          {draft.addFamily === "bicubic" ? (
-            <>
-              <div className="metric-grid">
-                <label className="block">
-                  <span>b</span>
-                  <input
-                    value={draft.bicubicB}
-                    onChange={(event) => patch({ bicubicB: event.target.value })}
-                  />
-                </label>
-                <label className="block">
-                  <span>c</span>
-                  <input
-                    value={draft.bicubicC}
-                    onChange={(event) => patch({ bicubicC: event.target.value })}
-                  />
-                </label>
-              </div>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={handleAddFamily}
-              >
-                {t("analyze.k.scanList.add")}
-              </button>
-              <details className="grid-range">
-                <summary>{t("analyze.k.scanList.gridRanges")}</summary>
-                <div className="grid-range-body">
-                  {(["b", "c"] as const).map((axis) => (
-                    <div className="grid-range-row" key={axis}>
-                      <span className="grid-range-axis">{axis}</span>
-                      {(
-                        [
-                          [`${axis}Start`, t("analyze.start")],
-                          [`${axis}Stop`, t("analyze.stop")],
-                          [`${axis}Step`, t("analyze.step")],
-                        ] as const
-                      ).map(([key, label]) => (
-                        <label key={key}>
-                          <span>{label}</span>
-                          <input
-                            value={draft[key]}
-                            onChange={(event) => patch({ [key]: event.target.value })}
-                          />
-                        </label>
-                      ))}
-                    </div>
-                  ))}
-                  <p className="help-copy">{t("analyze.k.gridEndpoints")}</p>
-                  <button
-                    className="secondary-button"
-                    type="button"
-                    onClick={handleAddBicubicGrid}
-                  >
-                    {t("analyze.k.scanList.addGrid")}
-                  </button>
-                </div>
-              </details>
-            </>
-          ) : null}
-
-          {draft.addFamily === "lanczos" ? (
-            <>
-              <span className="block-label">{t("analyze.k.lanczosTaps")}</span>
-              <div className="kernel-group-chips">
-                {Array.from(
-                  {
-                    length:
-                      lanczosTapsRange(capabilities).max - lanczosTapsRange(capabilities).min + 1,
-                  },
-                  (_, i) => lanczosTapsRange(capabilities).min + i,
-                ).map((taps) => (
-                  <button
-                    key={taps}
-                    type="button"
-                    className={`candidate-chip ${draft.lanczosTapsSelection.includes(taps) ? "selected" : ""}`}
-                    onClick={() =>
-                      patch({
-                        lanczosTapsSelection: draft.lanczosTapsSelection.includes(taps)
-                          ? draft.lanczosTapsSelection.filter((value) => value !== taps)
-                          : [...draft.lanczosTapsSelection, taps],
-                      })
-                    }
-                  >
-                    {taps}
-                  </button>
-                ))}
-              </div>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={handleAddFamily}
-              >
-                {t("analyze.k.scanList.add")}
-              </button>
-            </>
-          ) : null}
-
-          {draft.addFamily !== "bicubic" && draft.addFamily !== "lanczos" ? (
-            <button
-              className="secondary-button"
-              type="button"
-              onClick={handleAddFamily}
-            >
-              {t("analyze.k.scanList.add")}
-            </button>
-          ) : null}
-
-          {addNotice ? <p className="help-copy warning-copy">{addNotice}</p> : null}
-        </fieldset>
+        <KernelScanListBuilder
+          t={t}
+          draft={draft}
+          capabilities={capabilities}
+          onDraftChange={onDraftChange}
+        />
 
         <fieldset className="metric-fieldset">
           <legend>{t("analyze.k.geometryParams")}</legend>
@@ -861,58 +457,4 @@ export function KernelAnalyzePanel({
       </aside>
     </div>
   );
-}
-
-function kernelChipLabel(t: Translator, kernel: KernelRef): string {
-  const name = kernelDisplayName(t, kernel.id);
-  const params = Object.entries(kernel.parameters);
-  if (!params.length) return name;
-  return `${name} (${params.map(([key, value]) => `${key}=${value}`).join(", ")})`;
-}
-
-type KernelResultRow = {
-  runId: string;
-  sampleId: string;
-  kernelId: string;
-  parameters: KernelRef["parameters"];
-  kernelLabel: string;
-  metric: number;
-  sampleLabel: string;
-};
-
-function buildKernelResultRows(
-  runs: Run[],
-  state: ProjectState,
-  activeMetricKey: string,
-): { rows: KernelResultRow[]; incompatibleCount: number } {
-  const rows: KernelResultRow[] = [];
-  let incompatibleCount = 0;
-  for (const run of runs) {
-    const snapshot = run.inputSnapshot as {
-      metric?: MetricSpec;
-    } | null;
-    if (snapshot?.metric && metricCompatibilityKey(snapshot.metric) !== activeMetricKey) {
-      incompatibleCount += 1;
-      continue;
-    }
-    const extracted = extractKernelResultRows(run.result);
-    if (!extracted) continue;
-    const sample = run.sampleId ? state.samplesById[run.sampleId] : null;
-    for (const row of extracted) {
-      const params = Object.entries(row.parameters);
-      rows.push({
-        runId: run.id,
-        sampleId: run.sampleId ?? "",
-        kernelId: row.kernelId,
-        // Engine echoes the parameters we sent (string | number | boolean).
-        parameters: { ...row.parameters } as KernelRef["parameters"],
-        kernelLabel: params.length
-          ? `${row.kernelId} (${params.map(([key, value]) => `${key}=${value}`).join(", ")})`
-          : row.kernelId,
-        metric: row.metric,
-        sampleLabel: sample?.label ?? run.sampleId ?? "—",
-      });
-    }
-  }
-  return { rows, incompatibleCount };
 }

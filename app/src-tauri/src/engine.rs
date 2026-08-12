@@ -61,7 +61,8 @@ struct PNormRange {
     maximum: u64,
 }
 
-const CUDA_MAXIMUM_P_NORM: u64 = 4;
+/// CUDA p_norm ceiling, shared with `worker::protocol` backend validation.
+pub(crate) const CUDA_MAXIMUM_P_NORM: u64 = 4;
 
 #[derive(Deserialize)]
 struct BackendCapability {

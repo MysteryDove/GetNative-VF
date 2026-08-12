@@ -9,9 +9,9 @@ import {
   type ResolvedGeometryMap,
 } from "./kernelDraft";
 import { validateKernelShape } from "./shapeGuards";
-import type { KernelAnalyzeRequest, GeometrySnapshot } from "./protocol";
-import type { PlanSample, PlanSource } from "./runGroupPlan";
-import type { Run, RunGroup } from "../project/types";
+import type { KernelAnalyzeRequest, GeometrySnapshot, MetricSpec } from "./protocol";
+import { metricCompatibilityKey, type PlanSample, type PlanSource } from "./runGroupPlan";
+import type { ProjectState, Run, RunGroup } from "../project/types";
 
 export type KernelRunGroupType = "single_kernel" | "multi_sample_kernel";
 
@@ -196,6 +196,57 @@ export function extractKernelResultRows(result: unknown): KernelResultEntry[] | 
     });
   }
   return extracted.length ? extracted : null;
+}
+
+export type KernelResultRow = {
+  runId: string;
+  sampleId: string;
+  kernelId: string;
+  parameters: KernelRef["parameters"];
+  kernelLabel: string;
+  metric: number;
+  sampleLabel: string;
+};
+
+/**
+ * Flatten kernel runs into result-table rows, hiding runs whose snapshot
+ * metric is incompatible with the currently drafted metric.
+ */
+export function buildKernelResultRows(
+  runs: Run[],
+  state: ProjectState,
+  activeMetricKey: string,
+): { rows: KernelResultRow[]; incompatibleCount: number } {
+  const rows: KernelResultRow[] = [];
+  let incompatibleCount = 0;
+  for (const run of runs) {
+    const snapshot = run.inputSnapshot as {
+      metric?: MetricSpec;
+    } | null;
+    if (snapshot?.metric && metricCompatibilityKey(snapshot.metric) !== activeMetricKey) {
+      incompatibleCount += 1;
+      continue;
+    }
+    const extracted = extractKernelResultRows(run.result);
+    if (!extracted) continue;
+    const sample = run.sampleId ? state.samplesById[run.sampleId] : null;
+    for (const row of extracted) {
+      const params = Object.entries(row.parameters);
+      rows.push({
+        runId: run.id,
+        sampleId: run.sampleId ?? "",
+        kernelId: row.kernelId,
+        // Engine echoes the parameters we sent (string | number | boolean).
+        parameters: { ...row.parameters } as KernelRef["parameters"],
+        kernelLabel: params.length
+          ? `${row.kernelId} (${params.map(([key, value]) => `${key}=${value}`).join(", ")})`
+          : row.kernelId,
+        metric: row.metric,
+        sampleLabel: sample?.label ?? run.sampleId ?? "—",
+      });
+    }
+  }
+  return { rows, incompatibleCount };
 }
 
 /** Materialize a kernel plan into immutable Project Run/RunGroup records. */
