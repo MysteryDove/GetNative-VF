@@ -1,5 +1,6 @@
 #include "getnative/candidate_grid.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <iomanip>
