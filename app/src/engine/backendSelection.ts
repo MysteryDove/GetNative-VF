@@ -100,6 +100,22 @@ export function validateBackendPNorm(
     : { ok: false, reason: "backend_p_norm_unsupported" };
 }
 
+/**
+ * pNorm upper bound for the resolved backend: the engine-reported maximum when
+ * known, else the same fallback table validateBackendPNorm uses
+ * (cuda → 4, vulkan → 1, cpu/auto/unknown → 4_294_967_295).
+ */
+export function pNormMaximumForBackend(
+  capabilities: EngineEnvelope | null,
+  resolvedBackend: string,
+): number {
+  return (
+    capabilities?.payload.backends.find((backend) => backend.id === resolvedBackend)
+      ?.p_norms?.maximum ??
+    (resolvedBackend === "cuda" ? 4 : resolvedBackend === "vulkan" ? 1 : 4_294_967_295)
+  );
+}
+
 export function backendOptionLabel(
   t: Translator,
   backend: BackendPreference,

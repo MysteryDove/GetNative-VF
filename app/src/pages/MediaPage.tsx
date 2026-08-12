@@ -40,6 +40,8 @@ import {
   sourceFromProbe,
 } from "../media/importSources";
 import { useFileDrop } from "../media/useFileDrop";
+import { dimensionText, formatSeconds } from "../media/format";
+import { applySourceError } from "../project/samples";
 
 type ProjectUpdater = (updater: (state: ProjectState) => ProjectState) => void;
 
@@ -127,22 +129,12 @@ export function MediaPage({
 
   const markSourceChanged = useCallback(
     (sourceId: string, detail: string) => {
-      onProjectChange((current) => {
-        const source = current.sourcesById[sourceId];
-        if (!source) return current;
-        return {
-          ...current,
-          sourcesById: {
-            ...current.sourcesById,
-            [sourceId]: {
-              ...source,
-              state: "error",
-              errorCode: "media_fingerprint_mismatch",
-              errorDetail: detail,
-            },
-          },
-        };
-      });
+      onProjectChange((current) =>
+        applySourceError(current, sourceId, {
+          code: "media_fingerprint_mismatch",
+          detail,
+        }),
+      );
     },
     [onProjectChange],
   );
@@ -152,16 +144,16 @@ export function MediaPage({
       onProjectChange((current) => {
         const source = current.sourcesById[sourceId];
         if (!source || source.state === "missing") return current;
+        const next = applySourceError(current, sourceId, {
+          code: "media_missing",
+          detail,
+        });
+        const patched = next.sourcesById[sourceId];
         return {
-          ...current,
+          ...next,
           sourcesById: {
-            ...current.sourcesById,
-            [sourceId]: {
-              ...source,
-              state: "missing",
-              errorCode: "media_missing",
-              errorDetail: detail,
-            },
+            ...next.sourcesById,
+            [sourceId]: { ...patched, state: "missing" },
           },
         };
       });
@@ -873,7 +865,7 @@ export function MediaPage({
               ) : null}
 
               <div className="source-metadata">
-                <span>{t("media.dimensions")} <strong>{dimensionText(selectedSource)}</strong></span>
+                <span>{t("media.dimensions")} <strong>{dimensionText(selectedSource?.width, selectedSource?.height)}</strong></span>
                 <span>{t("media.type")} <strong>{t(`media.kind.${selectedSource.kind}`)}</strong></span>
                 <span>{t("media.decoder")} <strong>{selectedSource.decoder ?? "-"}</strong></span>
                 {selectedSource.kind === "video" ? <span>{t("media.duration")} <strong>{formatSeconds(selectedSource.durationSeconds)}</strong></span> : null}
@@ -918,7 +910,7 @@ export function MediaPage({
               <div className="selected-sample-row" key={sample.id}>
                 <div>
                   <strong>{sample.label}</strong>
-                  <span>{sample.frameIndex == null ? dimensionText(selectedSource) : `${t("media.frameNumber")} ${sample.frameIndex} · ${formatSeconds(sample.timestampSeconds)}`}</span>
+                  <span>{sample.frameIndex == null ? dimensionText(selectedSource?.width, selectedSource?.height) : `${t("media.frameNumber")} ${sample.frameIndex} · ${formatSeconds(sample.timestampSeconds)}`}</span>
                 </div>
                 <button className="icon-button" type="button" title={t("samples.remove")} aria-label={t("samples.remove")} disabled={state.project.readOnly} onClick={() => removeSample(sample.id)}>
                   <Trash2 size={14} />
@@ -965,20 +957,12 @@ function mediaViewState(state: ProjectState): { selectedSourceId?: string } {
     : {};
 }
 
-function dimensionText(source?: Source | null): string {
-  return source?.width && source.height ? `${source.width} x ${source.height}` : "-";
-}
-
-function formatSeconds(value?: number | null): string {
-  return value == null ? "-" : `${value.toFixed(3)} s`;
-}
-
 function sourceSummary(source: Source, t: Translator): string {
   if (source.state === "probing") return t("media.state.probing");
   if (source.state === "missing") return t("media.state.missing");
   if (source.state === "unsupported") return t("media.state.unsupported");
   if (source.state === "error") return t("media.state.error");
-  return dimensionText(source);
+  return dimensionText(source.width, source.height);
 }
 
 function previewMessage(

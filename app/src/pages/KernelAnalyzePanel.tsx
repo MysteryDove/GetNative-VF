@@ -27,7 +27,6 @@ import { extractKernelResultRows, planKernelRunGroup } from "../engine/kernelRun
 import { metricCompatibilityKey } from "../engine/runGroupPlan";
 import { profileFor } from "../engine/profiles";
 import {
-  CUDA_MAXIMUM_P_NORM,
   kernelSignature,
   resolveBackendPreference,
   selectableBackends,
@@ -35,10 +34,13 @@ import {
 } from "../engine/heightDraft";
 import { startKernelRunGroup, type ExecutionBridge } from "../engine/executeRunGroup";
 import { applyPayloadToCurrentRecipe } from "../project/recipeApply";
+import { includedSamples as selectIncludedSamples } from "../project/samples";
 import type { ProjectState, Run } from "../project/types";
 import { BlockedState } from "../components/BlockedState";
+import { MetricEditor } from "../components/MetricEditor";
 import { ResultMetricTable } from "../components/ResultMetricTable";
-import { backendOptionLabel } from "../engine/backendSelection";
+import { backendOptionLabel, pNormMaximumForBackend } from "../engine/backendSelection";
+import { toggleSetValue } from "../utils/collections";
 
 type SampleDims = { width: number; height: number };
 
@@ -83,12 +85,7 @@ export function KernelAnalyzePanel({
   const [selectedResultKey, setSelectedResultKey] = useState<string | null>(null);
 
   function toggleSampleExcluded(sampleId: string) {
-    setExcludedSampleIds((current) => {
-      const next = new Set(current);
-      if (next.has(sampleId)) next.delete(sampleId);
-      else next.add(sampleId);
-      return next;
-    });
+    setExcludedSampleIds((current) => toggleSetValue(current, sampleId));
   }
 
   // MetricSpec inherits from Height by default; an explicit unlink is visible.
@@ -115,10 +112,7 @@ export function KernelAnalyzePanel({
   }
 
   const includedSamples = useMemo(
-    () =>
-      Object.values(state.samplesById)
-        .filter((sample) => sample.included)
-        .sort((a, b) => a.order - b.order),
+    () => selectIncludedSamples(state),
     [state.samplesById],
   );
 
@@ -215,11 +209,7 @@ export function KernelAnalyzePanel({
     draft.metric.pNorm,
     kernelAxisMode,
   );
-  const pNormMaximum = capabilities?.payload.backends.find(
-    (backend) => backend.id === resolvedBackend,
-  )?.p_norms?.maximum ?? (resolvedBackend === "cuda"
-    ? CUDA_MAXIMUM_P_NORM
-    : resolvedBackend === "vulkan" ? 1 : 4_294_967_295);
+  const pNormMaximum = pNormMaximumForBackend(capabilities, resolvedBackend);
   const pNormSupported = validateBackendPNorm(
     capabilities,
     draft.backendPreference,
@@ -878,69 +868,6 @@ export function KernelAnalyzePanel({
         </div>
       </aside>
     </div>
-  );
-}
-
-function MetricEditor({
-  t,
-  metric,
-  pNormMaximum,
-  onChange,
-}: {
-  t: Translator;
-  metric: MetricSpec;
-  pNormMaximum: number;
-  onChange: (metric: MetricSpec) => void;
-}) {
-  return (
-    <>
-      <div className="metric-grid">
-        {(
-          [
-            ["cropLeft", t("analyze.cropLeft")],
-            ["cropRight", t("analyze.cropRight")],
-            ["cropTop", t("analyze.cropTop")],
-            ["cropBottom", t("analyze.cropBottom")],
-          ] as const
-        ).map(([key, label]) => (
-          <label key={key} className="block">
-            <span>{label}</span>
-            <input
-              type="number"
-              min={0}
-              step={1}
-              value={metric[key]}
-              onChange={(event) =>
-                onChange({ ...metric, [key]: Number(event.target.value) })
-              }
-            />
-          </label>
-        ))}
-      </div>
-      <label className="block">
-        <span>{t("analyze.pixelExclusion")}</span>
-        <input
-          type="number"
-          min={0}
-          step="any"
-          value={metric.pixelExclusionThreshold}
-          onChange={(event) =>
-            onChange({ ...metric, pixelExclusionThreshold: Number(event.target.value) })
-          }
-        />
-      </label>
-      <label className="block">
-        <span>{t("analyze.pNorm")}</span>
-        <input
-          type="number"
-          min={1}
-          max={pNormMaximum}
-          step={1}
-          value={metric.pNorm}
-          onChange={(event) => onChange({ ...metric, pNorm: Number(event.target.value) })}
-        />
-      </label>
-    </>
   );
 }
 

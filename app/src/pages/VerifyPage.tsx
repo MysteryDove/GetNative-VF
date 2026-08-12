@@ -3,9 +3,10 @@ import { ChevronDown, ChevronRight, Play } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
 import type { BackendPreference } from "../engine/protocol";
-import { activateRecipeInState, activeRecipe, recipeReadiness } from "../project/recipe";
+import { activateRecipeInState, activeRecipe, recipeReadiness, recipesByUpdatedAt } from "../project/recipe";
 import { RecipeSummaryStrip } from "../components/RecipeSummaryStrip";
-import { ErrorLinePlot, plotSeriesColor, type ErrorPlotDatum } from "../components/ErrorLinePlot";
+import { DEFAULT_SERIES_COLOR, ErrorLinePlot, plotSeriesColor, type ErrorPlotDatum } from "../components/ErrorLinePlot";
+import { toggleSetValue } from "../utils/collections";
 import { PERFECTLY_DESCALE_THRESHOLD } from "../components/ResultMetricTable";
 import { missingFieldLabels } from "../components/RecipeReviewDialog";
 import { backendOptionLabel, verifySelectableBackends } from "../engine/backendSelection";
@@ -78,21 +79,11 @@ export function VerifyPage({
   const [expandedRunIds, setExpandedRunIds] = useState<Set<string>>(new Set());
 
   function toggleRunExpanded(runId: string) {
-    setExpandedRunIds((current) => {
-      const next = new Set(current);
-      if (next.has(runId)) next.delete(runId);
-      else next.add(runId);
-      return next;
-    });
+    setExpandedRunIds((current) => toggleSetValue(current, runId));
   }
 
   function toggleRunVisible(runId: string) {
-    setHiddenRunIds((current) => {
-      const next = new Set(current);
-      if (next.has(runId)) next.delete(runId);
-      else next.add(runId);
-      return next;
-    });
+    setHiddenRunIds((current) => toggleSetValue(current, runId));
   }
   const mounted = useRef(true);
   useEffect(() => {
@@ -103,13 +94,7 @@ export function VerifyPage({
   }, []);
 
   const recipe = activeRecipe(state);
-  const recipeOptions = useMemo(
-    () =>
-      Object.values(state.recipesById).sort((a, b) =>
-        b.updatedAt.localeCompare(a.updatedAt),
-      ),
-    [state.recipesById],
-  );
+  const recipeOptions = useMemo(() => recipesByUpdatedAt(state), [state.recipesById]);
   const recipeGaps = recipe ? recipeReadiness(recipe) : null;
   const readyVideos = useMemo(
     () =>
@@ -167,7 +152,7 @@ export function VerifyPage({
               runId: run.id,
               x: String(frame.frameIndex),
               metric: frame.error as number,
-              color: runColorById.get(run.id) ?? "#3b82f6",
+              color: runColorById.get(run.id) ?? DEFAULT_SERIES_COLOR,
               label: runLabelById.get(run.id),
             })),
         ),

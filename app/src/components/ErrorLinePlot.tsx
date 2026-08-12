@@ -13,8 +13,11 @@ export type ErrorPlotDatum = {
 
 const AXIS_COLOR = "#4a514d";
 
+/** Fallback series color when a datum carries no explicit color. */
+export const DEFAULT_SERIES_COLOR = "#3b82f6";
+
 /** Shared plot series palette (analyze plot, verify plot, sample swatches). */
-const SERIES_PALETTE = ["#3b82f6", "#22c55e", "#f59e0b", "#a855f7", "#ef4444", "#06b6d4"];
+const SERIES_PALETTE = [DEFAULT_SERIES_COLOR, "#22c55e", "#f59e0b", "#a855f7", "#ef4444", "#06b6d4"];
 
 export function plotSeriesColor(index: number): string {
   return SERIES_PALETTE[index % SERIES_PALETTE.length];
@@ -382,7 +385,7 @@ export function ErrorLinePlot({
           ) : null}
 
           {series.map(({ runId, points }) => {
-            const color = points[0]?.color ?? "#3b82f6";
+            const color = points[0]?.color ?? DEFAULT_SERIES_COLOR;
             const pathPoints = decimateMinMax(
               points,
               (point) => yValue(point.metric),

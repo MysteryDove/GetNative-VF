@@ -9,13 +9,13 @@ import {
   setRecipeNameSuffix,
 } from "../project/recipeApply";
 import { activeRecipe, activateRecipeInState, createRecipe } from "../project/recipe";
+import { includedSamples as selectIncludedSamples } from "../project/samples";
 import { startHeightRunGroup, type ExecutionBridge } from "../engine/executeRunGroup";
 import { KernelAnalyzePanel } from "./KernelAnalyzePanel";
 import { defaultKernelDraft, type KernelDraft } from "../engine/kernelDraft";
 import {
   applyPreset,
   applyProfileDefaults,
-  CUDA_MAXIMUM_P_NORM,
   defaultHeightDraft,
   estimateHeightWork,
   fixedKernelsForDraft,
@@ -38,13 +38,15 @@ import {
   ApplyGeometryDialog,
   type ApplyGeometryValues,
 } from "../components/ApplyGeometryDialog";
-import { ErrorLinePlot, plotSeriesColor, type ErrorPlotDatum } from "../components/ErrorLinePlot";
+import { ErrorLinePlot, plotSeriesColor, DEFAULT_SERIES_COLOR, type ErrorPlotDatum } from "../components/ErrorLinePlot";
+import { MetricEditor } from "../components/MetricEditor";
 import { RecipeSummaryStrip } from "../components/RecipeSummaryStrip";
 import {
   PERFECTLY_DESCALE_THRESHOLD,
   ResultMetricTable,
 } from "../components/ResultMetricTable";
-import { backendOptionLabel } from "../engine/backendSelection";
+import { backendOptionLabel, pNormMaximumForBackend } from "../engine/backendSelection";
+import { toggleSetValue } from "../utils/collections";
 
 export function AnalyzePage({
   t,
@@ -112,10 +114,7 @@ export function AnalyzePage({
   );
 
   const includedSamples = useMemo(
-    () =>
-      Object.values(state.samplesById)
-        .filter((sample) => sample.included)
-        .sort((a, b) => a.order - b.order),
+    () => selectIncludedSamples(state),
     [state.samplesById],
   );
 
@@ -137,11 +136,7 @@ export function AnalyzePage({
     draft.metric.pNorm,
     draft.axisMode,
   );
-  const pNormMaximum = capabilities?.payload.backends.find(
-    (backend) => backend.id === resolvedBackend,
-  )?.p_norms?.maximum ?? (resolvedBackend === "cuda"
-    ? CUDA_MAXIMUM_P_NORM
-    : resolvedBackend === "vulkan" ? 1 : 4_294_967_295);
+  const pNormMaximum = pNormMaximumForBackend(capabilities, resolvedBackend);
 
   const planResult = useMemo(() => {
     if (draft.subroute !== "height") return null;
@@ -207,7 +202,7 @@ export function AnalyzePage({
           runId: point.runId,
           x: point.height,
           metric: point.metric,
-          color: runColorById.get(point.runId) ?? "#3b82f6",
+          color: runColorById.get(point.runId) ?? DEFAULT_SERIES_COLOR,
           label: runLabelById.get(point.runId),
         })),
     [seriesRows, hiddenRunIds, runColorById, runLabelById],
@@ -316,21 +311,11 @@ export function AnalyzePage({
   }
 
   function toggleSampleVisibility(sampleId: string) {
-    setHiddenSampleIds((current) => {
-      const next = new Set(current);
-      if (next.has(sampleId)) next.delete(sampleId);
-      else next.add(sampleId);
-      return next;
-    });
+    setHiddenSampleIds((current) => toggleSetValue(current, sampleId));
   }
 
   function toggleRunVisibility(runId: string) {
-    setHiddenRunIds((current) => {
-      const next = new Set(current);
-      if (next.has(runId)) next.delete(runId);
-      else next.add(runId);
-      return next;
-    });
+    setHiddenRunIds((current) => toggleSetValue(current, runId));
   }
 
   function applyRefineFromSelection() {
@@ -1178,74 +1163,17 @@ export function AnalyzePage({
 
             <fieldset className="metric-fieldset">
               <legend>{t("analyze.metricSpec")}</legend>
-              <div className="metric-grid">
-                {(
-                  [
-                    ["cropLeft", t("analyze.cropLeft")],
-                    ["cropRight", t("analyze.cropRight")],
-                    ["cropTop", t("analyze.cropTop")],
-                    ["cropBottom", t("analyze.cropBottom")],
-                  ] as const
-                ).map(([key, label]) => (
-                  <label key={key} className="block">
-                    <span>{label}</span>
-                    <input
-                      type="number"
-                      min={0}
-                      step={1}
-                      value={draft.metric[key]}
-                      onChange={(event) =>
-                        patch({
-                          metric: {
-                            ...draft.metric,
-                            [key]: Number(event.target.value),
-                          },
-                        })
-                      }
-                    />
-                  </label>
-                ))}
-              </div>
-              <label className="block">
-                <span>{t("analyze.pixelExclusion")}</span>
-                <input
-                  type="number"
-                  min={0}
-                  step="any"
-                  value={draft.metric.pixelExclusionThreshold}
-                  onChange={(event) =>
-                    patch({
-                      metric: {
-                        ...draft.metric,
-                        pixelExclusionThreshold: Number(event.target.value),
-                      },
-                    })
-                  }
-                />
-              </label>
-              <label className="block">
-                <span>{t("analyze.pNorm")}</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={pNormMaximum}
-                  step={1}
-                  value={draft.metric.pNorm}
-                  onChange={(event) =>
-                    patch({
-                      metric: {
-                        ...draft.metric,
-                        pNorm: Number(event.target.value),
-                      },
-                    })
-                  }
-                />
-                {draft.metric.pNorm > pNormMaximum ? (
-                  <span className="help-copy warning-copy">
-                    {t("analyze.pNormUnsupported", { backend: resolvedBackend })}
-                  </span>
-                ) : null}
-              </label>
+              <MetricEditor
+                t={t}
+                metric={draft.metric}
+                pNormMaximum={pNormMaximum}
+                onChange={(metric) => patch({ metric })}
+              />
+              {draft.metric.pNorm > pNormMaximum ? (
+                <span className="help-copy warning-copy">
+                  {t("analyze.pNormUnsupported", { backend: resolvedBackend })}
+                </span>
+              ) : null}
             </fieldset>
 
             <div className="analyze-run-block">

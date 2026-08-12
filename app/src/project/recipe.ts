@@ -170,3 +170,10 @@ export function activeRecipe(state: ProjectState): Recipe | null {
   const id = state.project.activeRecipeId;
   return id ? (state.recipesById[id] ?? null) : null;
 }
+
+/** All Recipes sorted by `updatedAt` descending (most recently touched first). */
+export function recipesByUpdatedAt(state: ProjectState): Recipe[] {
+  return Object.values(state.recipesById).sort((a, b) =>
+    b.updatedAt.localeCompare(a.updatedAt),
+  );
+}

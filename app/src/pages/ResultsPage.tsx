@@ -11,6 +11,8 @@ import {
   saveArtifact,
 } from "../project/export";
 import type { ProjectState, Run, RunGroup } from "../project/types";
+import { runStatusLabel, runTypeLabel } from "../project/labels";
+import { toggleSetValue } from "../utils/collections";
 import { actualBackendLabel } from "../engine/backendSelection";
 import type { ActualBackend } from "../engine/protocol";
 
@@ -128,21 +130,11 @@ export function ResultsPage({
   }, [selectedRuns, state, state.runsById]);
 
   function toggleGroup(groupId: string) {
-    setExpandedGroups((current) => {
-      const next = new Set(current);
-      if (next.has(groupId)) next.delete(groupId);
-      else next.add(groupId);
-      return next;
-    });
+    setExpandedGroups((current) => toggleSetValue(current, groupId));
   }
 
   function toggleRun(runId: string) {
-    setSelectedRuns((current) => {
-      const next = new Set(current);
-      if (next.has(runId)) next.delete(runId);
-      else next.add(runId);
-      return next;
-    });
+    setSelectedRuns((current) => toggleSetValue(current, runId));
   }
 
   function groupActive(group: RunGroup): boolean {
@@ -490,21 +482,4 @@ function runLabel(run: Run, state: ProjectState): string {
   const source = run.sourceId ? state.sourcesById[run.sourceId] : null;
   if (source) return source.label || source.path;
   return run.id.slice(0, 14);
-}
-
-function runTypeLabel(value: string, t: Translator): string {
-  if (value === "height" || value === "height_analysis") return t("overview.run.resolution");
-  if (value === "kernel" || value === "kernel_analysis") return t("overview.run.algorithm");
-  if (value === "verification" || value === "verify") return t("overview.run.check");
-  return t("overview.run.unknown");
-}
-
-function runStatusLabel(value: string, t: Translator): string {
-  if (value === "queued") return t("overview.runStatus.queued");
-  if (value === "running") return t("overview.runStatus.running");
-  if (value === "completed") return t("overview.runStatus.completed");
-  if (value === "failed") return t("overview.runStatus.failed");
-  if (value === "cancelled") return t("overview.runStatus.cancelled");
-  if (value === "partial") return t("overview.runStatus.partial");
-  return t("overview.runStatus.unknown");
 }

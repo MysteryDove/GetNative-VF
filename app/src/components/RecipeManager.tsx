@@ -4,6 +4,7 @@ import {
   activateRecipeInState,
   createRecipe,
   recipeReadiness,
+  recipesByUpdatedAt,
   removeRecipeInState,
 } from "../project/recipe";
 import type { ProjectState } from "../project/types";
@@ -28,9 +29,7 @@ export function RecipeManager({
   const [reviewingId, setReviewingId] = useState<string | null>(null);
   const [actionError, setActionError] = useState("");
 
-  const recipes = Object.values(state.recipesById).sort((a, b) =>
-    b.updatedAt.localeCompare(a.updatedAt),
-  );
+  const recipes = recipesByUpdatedAt(state);
   const reviewing = reviewingId ? (state.recipesById[reviewingId] ?? null) : null;
 
   function run(op: (current: ProjectState) => { ok: boolean; state?: ProjectState; reason?: string }) {

@@ -15,6 +15,9 @@ import type { Translator } from "../i18n";
 import { getMediaPreview } from "../media/service";
 import { importMediaPaths } from "../media/importSources";
 import { useFileDrop } from "../media/useFileDrop";
+import { dimensionText, formatSeconds } from "../media/format";
+import { applySourceError } from "../project/samples";
+import { toggleSetValue } from "../utils/collections";
 import type { ProjectState, Sample } from "../project/types";
 
 type ProjectUpdater = (updater: (state: ProjectState) => ProjectState) => void;
@@ -114,22 +117,12 @@ export function SamplesPage({
           detail.includes("media_fingerprint_mismatch")
           || detail.includes("media_fingerprint_error")
         ) {
-          onProjectChange((current) => {
-            const source = current.sourcesById[focusedSource.id];
-            if (!source) return current;
-            return {
-              ...current,
-              sourcesById: {
-                ...current.sourcesById,
-                [source.id]: {
-                  ...source,
-                  state: "error",
-                  errorCode: "media_fingerprint_mismatch",
-                  errorDetail: detail,
-                },
-              },
-            };
-          });
+          onProjectChange((current) =>
+            applySourceError(current, focusedSource.id, {
+              code: "media_fingerprint_mismatch",
+              detail,
+            }),
+          );
         }
       })
       .finally(() => {
@@ -148,12 +141,7 @@ export function SamplesPage({
   );
 
   function toggleSelected(id: string) {
-    setSelectedIds((current) => {
-      const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+    setSelectedIds((current) => toggleSetValue(current, id));
   }
 
   function updateSelected(transform: (sample: Sample) => Sample) {
@@ -416,14 +404,6 @@ function normalizeOrder(samples: Record<string, Sample>): Record<string, Sample>
       .sort((a, b) => a.order - b.order)
       .map((sample, order) => [sample.id, { ...sample, order }]),
   );
-}
-
-function dimensionText(width?: number | null, height?: number | null): string {
-  return width && height ? `${width} x ${height}` : "-";
-}
-
-function formatSeconds(value?: number | null): string {
-  return value == null ? "-" : `${value.toFixed(3)} s`;
 }
 
 function sampleSourceChanged(
