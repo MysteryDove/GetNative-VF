@@ -70,6 +70,10 @@ fi
 tar -xf "${work_dir}/${archive}" -C "$work_dir"
 tar -xf "${work_dir}/${zlib_archive}" -C "$work_dir"
 zlib_dir="${work_dir}/zlib-${zlib_version}"
+# FFmpeg's Windows config defines HAVE_UNISTD_H to 0. zconf.h tests only
+# whether it is defined, so make that test honor the value before MSVC uses it.
+sed -i 's/^#ifdef HAVE_UNISTD_H/#if defined(HAVE_UNISTD_H) \&\& HAVE_UNISTD_H/' \
+  "${zlib_dir}/zconf.h"
 (
   cd "$zlib_dir"
   nmake.exe -f win32/Makefile.msc zlib.lib CFLAGS="-nologo -MT -W3 -O2 -Oy-"
@@ -125,7 +129,7 @@ cp ffbuild/config.mak "${legal_dir}/BUILD_INFO.txt"
 mkdir -p "${legal_dir}/zlib/source"
 cp "${work_dir}/${zlib_archive}" "${legal_dir}/zlib/source/${zlib_archive}"
 cp "${zlib_dir}/LICENSE" "${legal_dir}/zlib/LICENSE"
-printf 'zlib_version=%s\nzlib_sha256=%s\n' \
+printf 'zlib_version=%s\nzlib_sha256=%s\npatch=zconf HAVE_UNISTD_H value check\n' \
   "$zlib_version" "$zlib_sha256" > "${legal_dir}/zlib/BUILD_INFO.txt"
 
 for library in avformat-62.dll avcodec-62.dll avutil-60.dll swscale-9.dll; do
