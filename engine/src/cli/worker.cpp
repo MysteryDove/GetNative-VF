@@ -913,7 +913,8 @@ std::filesystem::path executable_directory() {
             nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
         if (length == 0U) break;
         if (static_cast<std::size_t>(length) < buffer.size()) {
-            executable.assign(buffer.data(), static_cast<std::size_t>(length));
+            executable = std::filesystem::path{
+                std::wstring_view{buffer.data(), static_cast<std::size_t>(length)}};
             break;
         }
         buffer.resize(buffer.size() * 2U);
