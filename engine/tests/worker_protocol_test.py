@@ -9,11 +9,13 @@ error paths, and shutdown semantics. See docs/worker-protocol-v1.md.
 import json
 import mmap
 import os
+import queue
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 
 ENGINE = sys.argv[1]
 FAILURES = []
@@ -64,7 +66,19 @@ class Worker:
             stderr=subprocess.DEVNULL,
             env=env,
         )
-        self._stdout_buffer = b""
+        self._stdout_lines = queue.Queue()
+
+        def read_stdout():
+            try:
+                for line in self.process.stdout:
+                    self._stdout_lines.put(line)
+            except BaseException as error:
+                self._stdout_lines.put(error)
+            finally:
+                self._stdout_lines.put(None)
+
+        self._stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+        self._stdout_thread.start()
 
     def send(self, **command):
         self.process.stdin.write(json.dumps(command).encode() + b"\n")
@@ -75,18 +89,14 @@ class Worker:
         self.process.stdin.flush()
 
     def read_event(self, timeout=30.0):
-        import selectors
-
-        while b"\n" not in self._stdout_buffer:
-            selector = selectors.DefaultSelector()
-            selector.register(self.process.stdout, selectors.EVENT_READ)
-            if not selector.select(timeout):
-                raise TimeoutError("worker did not emit an event in time")
-            chunk = os.read(self.process.stdout.fileno(), 65536)
-            if not chunk:
-                raise EOFError("worker stdout closed unexpectedly")
-            self._stdout_buffer += chunk
-        line, self._stdout_buffer = self._stdout_buffer.split(b"\n", 1)
+        try:
+            line = self._stdout_lines.get(timeout=timeout)
+        except queue.Empty as error:
+            raise TimeoutError("worker did not emit an event in time") from error
+        if line is None:
+            raise EOFError("worker stdout closed unexpectedly")
+        if isinstance(line, BaseException):
+            raise line
         return json.loads(line)
 
     def wait_exit(self, timeout=10.0):

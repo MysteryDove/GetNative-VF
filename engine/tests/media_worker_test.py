@@ -2,13 +2,13 @@
 """Integration coverage for the in-process FFmpeg worker commands."""
 
 import json
-import os
 import pathlib
-import selectors
+import queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from array import array
 
 ENGINE = sys.argv[1]
@@ -19,7 +19,19 @@ class Worker:
         self.process = subprocess.Popen(
             [ENGINE, "worker"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=False)
-        self.buffer = b""
+        self.stdout_lines = queue.Queue()
+
+        def read_stdout():
+            try:
+                for line in self.process.stdout:
+                    self.stdout_lines.put(line)
+            except BaseException as error:
+                self.stdout_lines.put(error)
+            finally:
+                self.stdout_lines.put(None)
+
+        self.stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+        self.stdout_thread.start()
 
     def send(self, **payload):
         line = {"protocol_version": 1, **payload}
@@ -27,16 +39,14 @@ class Worker:
         self.process.stdin.flush()
 
     def event(self, timeout=60):
-        while b"\n" not in self.buffer:
-            selector = selectors.DefaultSelector()
-            selector.register(self.process.stdout, selectors.EVENT_READ)
-            if not selector.select(timeout):
-                raise TimeoutError("media worker event timed out")
-            chunk = os.read(self.process.stdout.fileno(), 65536)
-            if not chunk:
-                raise RuntimeError(self.process.stderr.read().decode(errors="replace"))
-            self.buffer += chunk
-        line, self.buffer = self.buffer.split(b"\n", 1)
+        try:
+            line = self.stdout_lines.get(timeout=timeout)
+        except queue.Empty as error:
+            raise TimeoutError("media worker event timed out") from error
+        if line is None:
+            raise RuntimeError(self.process.stderr.read().decode(errors="replace"))
+        if isinstance(line, BaseException):
+            raise line
         return json.loads(line)
 
     def terminal(self, request_id, timeout=60):

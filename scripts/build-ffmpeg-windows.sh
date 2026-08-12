@@ -8,7 +8,10 @@ url="https://ffmpeg.org/releases/${archive}"
 zlib_version="1.3.1"
 zlib_archive="zlib-${zlib_version}.tar.gz"
 zlib_sha256="9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
-zlib_url="https://zlib.net/fossils/${zlib_archive}"
+zlib_urls=(
+  "https://zlib.net/fossils/${zlib_archive}"
+  "https://github.com/madler/zlib/releases/download/v${zlib_version}/${zlib_archive}"
+)
 
 if [[ $# -ne 1 ]]; then
   echo "usage: $0 OUTPUT_SDK_DIRECTORY" >&2
@@ -22,6 +25,10 @@ if ! command -v nmake.exe >/dev/null 2>&1; then
   echo "build-ffmpeg-windows.sh requires nmake.exe" >&2
   exit 1
 fi
+
+# FFmpeg passes native MSVC switches through MSYS2. Do not rewrite /MT, /I,
+# or /LIBPATH arguments as if they were Unix paths.
+export MSYS2_ARG_CONV_EXCL='*'
 
 mkdir -p "$(cygpath -u "$1")"
 sdk_dir=$(CDPATH= cd -- "$(cygpath -u "$1")" && pwd)
@@ -42,11 +49,21 @@ if [[ "$actual_sha256" != "$ffmpeg_sha256" ]]; then
   echo "FFmpeg source checksum mismatch: ${actual_sha256}" >&2
   exit 1
 fi
-curl --fail --location --retry 5 --retry-all-errors \
-  --output "${work_dir}/${zlib_archive}" "$zlib_url"
-actual_zlib_sha256=$(sha256sum "${work_dir}/${zlib_archive}" | awk '{print $1}')
-if [[ "$actual_zlib_sha256" != "$zlib_sha256" ]]; then
-  echo "zlib source checksum mismatch: ${actual_zlib_sha256}" >&2
+zlib_verified=false
+for zlib_url in "${zlib_urls[@]}"; do
+  rm -f "${work_dir}/${zlib_archive}"
+  if curl --fail --location --retry 5 --retry-all-errors \
+      --output "${work_dir}/${zlib_archive}" "$zlib_url"; then
+    actual_zlib_sha256=$(sha256sum "${work_dir}/${zlib_archive}" | awk '{print $1}')
+    if [[ "$actual_zlib_sha256" == "$zlib_sha256" ]]; then
+      zlib_verified=true
+      break
+    fi
+    echo "zlib source checksum mismatch from ${zlib_url}: ${actual_zlib_sha256}" >&2
+  fi
+done
+if [[ "$zlib_verified" != true ]]; then
+  echo "failed to download verified zlib ${zlib_version} source" >&2
   exit 1
 fi
 
@@ -89,7 +106,7 @@ if ! ./configure \
   --extra-cflags="/MT /I${zlib_windows}" \
   --extra-ldflags="/LIBPATH:${zlib_windows}" \
   --enable-protocol=file,pipe \
-  --enable-demuxer=avi,flv,matroska,mov,mpegps,mpegts,mpegvideo,ogg,rawvideo \
+  --enable-demuxer=avi,flv,h264,matroska,mov,mpegps,mpegts,mpegvideo,ogg,rawvideo \
   --enable-decoder=av1,bmp,ffv1,gif,h264,hevc,huffyuv,mjpeg,mpeg1video,mpeg2video,mpeg4,png,prores,qtrle,rawvideo,theora,tiff,v210,vc1,vp8,vp9,webp,wmv3 \
   --enable-parser=av1,h264,hevc,mjpeg,mpeg4video,mpegvideo,png,vp8,vp9 \
   --enable-encoder=png; then
