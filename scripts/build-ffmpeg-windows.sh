@@ -58,9 +58,10 @@ zlib_dir="${work_dir}/zlib-${zlib_version}"
   nmake.exe -f win32/Makefile.msc zlib.lib CFLAGS="-nologo -MT -W3 -O2 -Oy-"
 )
 zlib_windows=$(cygpath -m "$zlib_dir")
+export LIB="${zlib_windows};${LIB:-}"
 
 cd "${work_dir}/ffmpeg-${ffmpeg_version}"
-./configure \
+if ! ./configure \
   --prefix="$sdk_windows" \
   --toolchain=msvc \
   --arch=x86_64 \
@@ -85,13 +86,16 @@ cd "${work_dir}/ffmpeg-${ffmpeg_version}"
   --enable-avutil \
   --enable-swscale \
   --enable-zlib \
-  --extra-cflags="-MT -I${zlib_windows}" \
-  --extra-ldflags="-L${zlib_windows}" \
+  --extra-cflags="/MT /I${zlib_windows}" \
+  --extra-ldflags="/LIBPATH:${zlib_windows}" \
   --enable-protocol=file,pipe \
   --enable-demuxer=avi,flv,matroska,mov,mpegps,mpegts,mpegvideo,ogg,rawvideo \
   --enable-decoder=av1,bmp,ffv1,gif,h264,hevc,huffyuv,mjpeg,mpeg1video,mpeg2video,mpeg4,png,prores,qtrle,rawvideo,theora,tiff,v210,vc1,vp8,vp9,webp,wmv3 \
   --enable-parser=av1,h264,hevc,mjpeg,mpeg4video,mpegvideo,png,vp8,vp9 \
-  --enable-encoder=png
+  --enable-encoder=png; then
+  tail -200 ffbuild/config.log >&2
+  exit 1
+fi
 
 make -j "${NUMBER_OF_PROCESSORS:-4}"
 make install
