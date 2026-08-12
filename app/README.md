@@ -29,20 +29,20 @@ those typed commands.
 
 ## Development
 
-### Media sidecar on macOS
+### Media runtime on macOS
 
-Video probing and frame browsing require the bundled FFmpeg sidecar. Build and
-stage the pinned LGPL-only configuration with:
+Video probing and frame browsing use the engine's in-process FFmpeg libraries.
+Build and stage the pinned LGPL-only configuration with:
 
 ```sh
 npm run stage:ffmpeg:macos
 ```
 
 The command verifies the source SHA-256, rejects non-system dynamic
-dependencies, and stages `ffmpeg`, `ffprobe`, licenses, build information, and
-the corresponding source archive under the ignored `src-tauri/bundle-stage/`
-directory. Debug builds may use `GETNATIVE_FFMPEG_PATH` and
-`GETNATIVE_FFPROBE_PATH` for explicit development overrides.
+dependencies, and stages the required `libavformat`, `libavcodec`, `libavutil`,
+and `libswscale` libraries together with licenses, build information, and the
+corresponding source archive. It does not stage the `ffmpeg` or `ffprobe`
+programs.
 
 After staging, exercise the application probe/index/preview path with a
 generated two-stream VFR fixture. Set `GETNATIVE_FIXTURE_FFMPEG` to a full

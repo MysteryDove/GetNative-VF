@@ -1,0 +1,112 @@
+name: CI Media
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-media-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FFMPEG_VERSION: 8.1.2
+
+jobs:
+  linux-media:
+    name: Linux x64 media integration
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and test dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          build-essential ninja-build nasm patchelf pkg-config zlib1g-dev ffmpeg
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: actions/cache@v4
+        id: ffmpeg-cache
+        with:
+          path: .deps/ffmpeg-linux-x64
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-linux-x64-${{ hashFiles('scripts/build-ffmpeg-linux.sh') }}
+      - name: Build pinned FFmpeg SDK
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: scripts/build-ffmpeg-linux.sh .deps/ffmpeg-linux-x64
+      - name: Build and test release engine
+        working-directory: app
+        env:
+          GETNATIVE_LINUX_BACKENDS: cpu
+          GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}/.deps/ffmpeg-linux-x64
+          GETNATIVE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/.deps/ffmpeg-linux-x64/lib
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build:engine
+      - name: Verify staged dependency closure
+        run: |
+          stage_bin=app/src-tauri/bundle-stage/bin
+          dependencies=$(ldd "$stage_bin/getnative-engine")
+          test -z "$(printf '%s\n' "$dependencies" | sed -n '/not found/p')"
+          for library in libavformat.so.62 libavcodec.so.62 libavutil.so.60 libswscale.so.9; do
+            printf '%s\n' "$dependencies" | grep -F "$stage_bin/$library"
+            test "$(patchelf --print-rpath "$stage_bin/$library")" = '$ORIGIN'
+          done
+          ! find app/src-tauri/bundle-stage/bin -maxdepth 1 -type f -name 'ffmpeg*' | grep -q .
+          app/src-tauri/bundle-stage/bin/getnative-engine capabilities | grep -q '"ffmpeg_abi":"62.62.60.9"'
+
+  windows-media:
+    name: Windows x64 media integration
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          update: true
+          path-type: inherit
+          install: diffutils make nasm pkgconf
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: actions/cache@v4
+        id: ffmpeg-cache
+        with:
+          path: .deps/ffmpeg-windows-x64
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-windows-x64-msvc-${{ hashFiles('scripts/build-ffmpeg-windows.sh') }}
+      - name: Build pinned FFmpeg SDK
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: scripts/build-ffmpeg-windows.sh .deps/ffmpeg-windows-x64
+      - name: Install test-only FFmpeg CLI
+        run: choco install ffmpeg -y --no-progress
+      - name: Build and test release engine
+        working-directory: app
+        env:
+          GETNATIVE_WINDOWS_BACKENDS: cpu
+          GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}\.deps\ffmpeg-windows-x64
+          GETNATIVE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}\.deps\ffmpeg-windows-x64\bin
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build:engine
+      - name: Verify staged runtime
+        shell: pwsh
+        run: |
+          if (Test-Path app/src-tauri/bundle-stage/bin/ffmpeg.exe) { throw "ffmpeg.exe entered the product bundle" }
+          $capabilities = app/src-tauri/bundle-stage/bin/getnative-engine.exe capabilities | ConvertFrom-Json
+          if ($capabilities.media.ffmpeg_abi -ne "62.62.60.9") { throw "unexpected FFmpeg ABI" }

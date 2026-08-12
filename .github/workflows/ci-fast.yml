@@ -1,0 +1,84 @@
+name: CI Fast
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-fast-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  engine:
+    name: Engine CPU (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - name: Configure
+        run: >-
+          cmake -S engine -B build/ci-fast -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DGETNATIVE_ENABLE_MEDIA=OFF
+          -DGETNATIVE_ENABLE_CUDA=OFF
+          -DGETNATIVE_ENABLE_VULKAN=OFF
+      - name: Build
+        run: cmake --build build/ci-fast --parallel
+      - name: Test
+        run: ctest --test-dir build/ci-fast --output-on-failure
+
+  app:
+    name: Frontend and Tauri checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          build-essential ninja-build pkg-config
+          libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+          libxdo-dev libssl-dev
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+      - name: Install JavaScript dependencies
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+      - name: Stage debug CPU engine
+        working-directory: app
+        env:
+          GETNATIVE_LINUX_BACKENDS: cpu
+        run: pnpm build:engine:debug
+      - name: Frontend checks
+        working-directory: app
+        run: |
+          pnpm test
+          pnpm test:locale
+          pnpm build
+      - name: Rust checks
+        working-directory: app
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings

@@ -13,6 +13,8 @@ option(GETNATIVE_ENABLE_VULKAN
        "Build the Vulkan 1.2 compute analysis backend on Windows or Linux" OFF)
 option(GETNATIVE_ENABLE_MEDIA
        "Build in-process FFmpeg 8 media indexing and decode support" ON)
+set(GETNATIVE_FFMPEG_ROOT "" CACHE PATH
+    "Root of a self-contained FFmpeg SDK (include/, lib/, and runtime libraries)")
 option(GETNATIVE_BUILD_CUDA_AUTOTUNER
        "Build the standalone distributable CUDA launch-policy autotuner" OFF)
 set(GETNATIVE_PLANNER_FP_MODE "fast" CACHE STRING
@@ -86,13 +88,58 @@ if(GETNATIVE_BUILD_CUDA_AUTOTUNER AND NOT GETNATIVE_ENABLE_CUDA)
 endif()
 
 if(GETNATIVE_ENABLE_MEDIA)
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(GETNATIVE_FFMPEG QUIET IMPORTED_TARGET
-            libavformat>=62 libavformat<63
-            libavcodec>=62 libavcodec<63
-            libavutil>=60 libavutil<61
-            libswscale>=9 libswscale<10)
+    if(GETNATIVE_FFMPEG_ROOT)
+        find_path(GETNATIVE_FFMPEG_INCLUDE_DIR
+            NAMES libavformat/avformat.h
+            PATHS "${GETNATIVE_FFMPEG_ROOT}/include"
+            NO_DEFAULT_PATH REQUIRED)
+        foreach(GETNATIVE_FFMPEG_VERSION_CHECK IN ITEMS
+                "libavformat/version_major.h;LIBAVFORMAT_VERSION_MAJOR;62"
+                "libavcodec/version_major.h;LIBAVCODEC_VERSION_MAJOR;62"
+                "libavutil/version.h;LIBAVUTIL_VERSION_MAJOR;60"
+                "libswscale/version_major.h;LIBSWSCALE_VERSION_MAJOR;9")
+            list(GET GETNATIVE_FFMPEG_VERSION_CHECK 0 GETNATIVE_FFMPEG_VERSION_HEADER)
+            list(GET GETNATIVE_FFMPEG_VERSION_CHECK 1 GETNATIVE_FFMPEG_VERSION_MACRO)
+            list(GET GETNATIVE_FFMPEG_VERSION_CHECK 2 GETNATIVE_FFMPEG_VERSION_EXPECTED)
+            file(STRINGS
+                "${GETNATIVE_FFMPEG_INCLUDE_DIR}/${GETNATIVE_FFMPEG_VERSION_HEADER}"
+                GETNATIVE_FFMPEG_VERSION_LINE
+                REGEX "^#define[ \t]+${GETNATIVE_FFMPEG_VERSION_MACRO}[ \t]+[0-9]+")
+            if(NOT GETNATIVE_FFMPEG_VERSION_LINE MATCHES
+               "[ \t]${GETNATIVE_FFMPEG_VERSION_EXPECTED}$")
+                message(FATAL_ERROR
+                    "${GETNATIVE_FFMPEG_VERSION_MACRO} must be ${GETNATIVE_FFMPEG_VERSION_EXPECTED}; found '${GETNATIVE_FFMPEG_VERSION_LINE}'")
+            endif()
+        endforeach()
+        foreach(GETNATIVE_FFMPEG_COMPONENT avformat avcodec avutil swscale)
+            string(TOUPPER "${GETNATIVE_FFMPEG_COMPONENT}"
+                   GETNATIVE_FFMPEG_COMPONENT_UPPER)
+            find_library(GETNATIVE_FFMPEG_${GETNATIVE_FFMPEG_COMPONENT_UPPER}_LIBRARY
+                NAMES ${GETNATIVE_FFMPEG_COMPONENT} lib${GETNATIVE_FFMPEG_COMPONENT}
+                PATHS "${GETNATIVE_FFMPEG_ROOT}/lib"
+                NO_DEFAULT_PATH REQUIRED)
+            list(APPEND GETNATIVE_FFMPEG_LIBRARIES
+                "${GETNATIVE_FFMPEG_${GETNATIVE_FFMPEG_COMPONENT_UPPER}_LIBRARY}")
+        endforeach()
+        add_library(getnative_ffmpeg INTERFACE)
+        target_include_directories(getnative_ffmpeg INTERFACE
+            "${GETNATIVE_FFMPEG_INCLUDE_DIR}")
+        target_link_libraries(getnative_ffmpeg INTERFACE
+            ${GETNATIVE_FFMPEG_LIBRARIES})
+        set(GETNATIVE_FFMPEG_TARGET getnative_ffmpeg)
+        set(GETNATIVE_FFMPEG_FOUND ON)
+    else()
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(GETNATIVE_FFMPEG QUIET IMPORTED_TARGET
+                libavformat>=62 libavformat<63
+                libavcodec>=62 libavcodec<63
+                libavutil>=60 libavutil<61
+                libswscale>=9 libswscale<10)
+        endif()
+        if(GETNATIVE_FFMPEG_FOUND)
+            set(GETNATIVE_FFMPEG_TARGET PkgConfig::GETNATIVE_FFMPEG)
+        endif()
     endif()
     if(NOT GETNATIVE_FFMPEG_FOUND)
         message(WARNING
@@ -691,7 +738,7 @@ if(GETNATIVE_ENABLE_MEDIA)
         src/media/media_index.cpp)
     target_compile_features(getnative_media PUBLIC cxx_std_23)
     target_include_directories(getnative_media PUBLIC include)
-    target_link_libraries(getnative_media PUBLIC PkgConfig::GETNATIVE_FFMPEG)
+    target_link_libraries(getnative_media PUBLIC ${GETNATIVE_FFMPEG_TARGET})
     if(GETNATIVE_ENABLE_CUDA)
         target_include_directories(getnative_media PRIVATE "${GETNATIVE_CUDA_INCLUDE_DIR}")
         target_compile_definitions(getnative_media PRIVATE GETNATIVE_HAS_CUDA=1)

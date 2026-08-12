@@ -1,0 +1,238 @@
+name: Package
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FFMPEG_VERSION: 8.1.2
+
+jobs:
+  version:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check synchronized versions
+        run: node scripts/check-release-version.mjs "${{ github.event_name == 'push' && github.ref_name || '' }}"
+
+  linux-package:
+    name: Linux x64 package
+    needs: version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and bundle dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          build-essential ninja-build nasm pkg-config zlib1g-dev
+          libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+          libxdo-dev libssl-dev patchelf libfuse2 desktop-file-utils
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+      - uses: actions/cache@v4
+        id: ffmpeg-cache
+        with:
+          path: .deps/ffmpeg-linux-x64
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-ubuntu-22.04-x64-${{ hashFiles('scripts/build-ffmpeg-linux.sh') }}
+      - name: Build pinned FFmpeg SDK
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: scripts/build-ffmpeg-linux.sh .deps/ffmpeg-linux-x64
+      - name: Install JavaScript dependencies
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+      - name: Build deb and AppImage
+        working-directory: app
+        env:
+          GETNATIVE_LINUX_BACKENDS: cpu
+          GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}/.deps/ffmpeg-linux-x64
+          GETNATIVE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/.deps/ffmpeg-linux-x64/lib
+        run: pnpm tauri build --bundles deb,appimage
+      - name: Verify package media runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_root=app/src-tauri/target/release/bundle
+          deb=$(find "$bundle_root/deb" -maxdepth 1 -type f -name '*.deb' -print -quit)
+          appimage=$(find "$bundle_root/appimage" -maxdepth 1 -type f -name '*.AppImage' -print -quit)
+          test -n "$deb"
+          test -n "$appimage"
+
+          check_root=$(mktemp -d)
+          trap 'rm -rf -- "$check_root"' EXIT
+          mkdir -p "$check_root/deb" "$check_root/appimage"
+          dpkg-deb -x "$deb" "$check_root/deb"
+          (
+            cd "$check_root/appimage"
+            "$GITHUB_WORKSPACE/$appimage" --appimage-extract >/dev/null
+          )
+
+          for package_root in "$check_root/deb" "$check_root/appimage/squashfs-root"; do
+            test -z "$(find "$package_root" -type f \( \
+              -name ffmpeg -o -name ffprobe -o \
+              -name ffmpeg.exe -o -name ffprobe.exe -o \
+              -name 'libavfilter.so*' -o -name 'libavdevice.so*' -o \
+              -name 'libswresample.so*' \) -print)"
+            for library in libavformat.so.62 libavcodec.so.62 libavutil.so.60 libswscale.so.9; do
+              expected=$(sha256sum ".deps/ffmpeg-linux-x64/lib/$library" | cut -d' ' -f1)
+              matches=$(find "$package_root" -type f -name "$library" -print)
+              test -n "$matches"
+              while IFS= read -r packaged_library; do
+                test "$(sha256sum "$packaged_library" | cut -d' ' -f1)" = "$expected"
+              done <<< "$matches"
+            done
+          done
+      - name: Package checksums
+        shell: bash
+        run: |
+          mkdir -p artifacts/linux-x64
+          find app/src-tauri/target/release/bundle -type f \( -name '*.deb' -o -name '*.AppImage' \) -exec cp {} artifacts/linux-x64/ \;
+          test "$(find artifacts/linux-x64 -type f | wc -l)" -eq 2
+          cd artifacts/linux-x64 && sha256sum * > SHA256SUMS-linux-x64.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: getnative-vf-linux-x64
+          path: artifacts/linux-x64
+          if-no-files-found: error
+
+  windows-package:
+    name: Windows x64 package
+    needs: version
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          update: true
+          path-type: inherit
+          install: diffutils make nasm pkgconf
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+      - uses: actions/cache@v4
+        id: ffmpeg-cache
+        with:
+          path: .deps/ffmpeg-windows-x64
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-windows-x64-msvc-${{ hashFiles('scripts/build-ffmpeg-windows.sh') }}
+      - name: Build pinned FFmpeg SDK
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: scripts/build-ffmpeg-windows.sh .deps/ffmpeg-windows-x64
+      - name: Install JavaScript dependencies
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+      - name: Build NSIS installer
+        working-directory: app
+        env:
+          GETNATIVE_WINDOWS_BACKENDS: cpu
+          GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}\.deps\ffmpeg-windows-x64
+          GETNATIVE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}\.deps\ffmpeg-windows-x64\bin
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: pnpm tauri build --bundles nsis
+      - name: Verify package media runtime
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem app/src-tauri/target/release/bundle/nsis -Filter *.exe
+          if ($installer.Count -ne 1) { throw "expected one NSIS installer, found $($installer.Count)" }
+
+          $checkRoot = Join-Path $env:RUNNER_TEMP "getnative-nsis-check"
+          New-Item -ItemType Directory -Force $checkRoot | Out-Null
+          & 7z x $installer.FullName "-o$checkRoot" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "failed to extract the NSIS installer" }
+
+          $forbidden = @(
+            "ffmpeg.exe", "ffprobe.exe",
+            "avfilter-11.dll", "avdevice-62.dll", "swresample-6.dll"
+          )
+          foreach ($name in $forbidden) {
+            if (Get-ChildItem $checkRoot -Recurse -File -Filter $name) {
+              throw "$name entered the NSIS installer"
+            }
+          }
+          foreach ($library in @("avformat-62.dll", "avcodec-62.dll", "avutil-60.dll", "swscale-9.dll")) {
+            $expectedPath = Join-Path ".deps/ffmpeg-windows-x64/bin" $library
+            $expected = (Get-FileHash $expectedPath -Algorithm SHA256).Hash
+            $matches = Get-ChildItem $checkRoot -Recurse -File -Filter $library
+            if (-not $matches) { throw "$library is missing from the NSIS installer" }
+            foreach ($match in $matches) {
+              if ((Get-FileHash $match.FullName -Algorithm SHA256).Hash -ne $expected) {
+                throw "$library in the NSIS installer does not match the pinned SDK"
+              }
+            }
+          }
+          if (-not (Get-ChildItem $checkRoot -Recurse -File -Filter "zlib-1.3.1.tar.gz")) {
+            throw "zlib source archive is missing from the NSIS installer"
+          }
+          if (-not (Get-ChildItem $checkRoot -Recurse -File -Filter "LICENSE" |
+              Where-Object { $_.FullName -match "[\\/]ffmpeg[\\/]zlib[\\/]LICENSE$" })) {
+            throw "zlib license is missing from the NSIS installer"
+          }
+      - name: Package checksums
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts/windows-x64 | Out-Null
+          $installers = Get-ChildItem app/src-tauri/target/release/bundle/nsis -Filter *.exe
+          if ($installers.Count -ne 1) { throw "expected one NSIS installer, found $($installers.Count)" }
+          Copy-Item $installers.FullName artifacts/windows-x64/
+          Get-ChildItem artifacts/windows-x64/*.exe | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
+          } | Set-Content artifacts/windows-x64/SHA256SUMS-windows-x64.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: getnative-vf-windows-x64
+          path: artifacts/windows-x64
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push'
+    needs: [linux-package, windows-package]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: getnative-vf-*
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/**/*

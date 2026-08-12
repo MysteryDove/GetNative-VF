@@ -51,20 +51,39 @@ Source: https://github.com/sekrit-twc/zimg
 
 ## FFmpeg
 
-The desktop application may distribute `ffmpeg`, `ffprobe`, and the FFmpeg
-8.1.2 shared libraries used by the in-engine media layer. They are built
-without GPL or nonfree components and are licensed under the GNU Lesser
-General Public License, version 2.1 or later. Development builds may link a
-compatible system FFmpeg 8 installation; release artifacts use the pinned
-build described below.
+The desktop application distributes the FFmpeg 8.1.2 shared libraries used by
+the in-engine media layer. It does not distribute or launch the `ffmpeg` or
+`ffprobe` command-line programs. The libraries are built without GPL or
+nonfree components and are licensed under the GNU Lesser General Public
+License, version 2.1 or later. Development builds may link a compatible system
+FFmpeg 8 installation; release artifacts use the pinned build described below.
 
 The packaged `share/ffmpeg/` directory contains the corresponding unmodified
 source archive, license text, and exact build configuration. The reproducible
-staging command is:
+platform build commands are:
 
 ```text
+scripts/build-ffmpeg-linux.sh OUTPUT_SDK_DIRECTORY
+scripts/build-ffmpeg-windows.sh OUTPUT_SDK_DIRECTORY
 npm run stage:ffmpeg:macos
 ```
 
 Source: https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
 SHA-256: 464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
+
+### zlib
+
+The pinned FFmpeg libraries use zlib 1.3.1 for PNG compression and
+decompression. Windows builds link it statically; Linux and macOS builds use
+the platform zlib. The Windows package includes its unmodified source archive
+and license under `share/ffmpeg/zlib/`.
+
+Copyright (C) 1995-2022 Jean-loup Gailly and Mark Adler
+
+This software is provided 'as-is', without any express or implied warranty.
+Permission is granted to anyone to use this software for any purpose, including
+commercial applications, and to alter it and redistribute it freely, subject
+to the restrictions in the included zlib license.
+
+Source: https://zlib.net/fossils/zlib-1.3.1.tar.gz
+SHA-256: 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23

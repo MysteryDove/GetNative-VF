@@ -204,3 +204,23 @@ the native and PTX lists. `GETNATIVE_VSDEVCMD`, `CMAKE`, and `CTEST` can
 override tool locations. The build script configures the requested backend
 set, builds it, runs CTest, installs that exact engine, and writes its SHA-256
 and complete CUDA target provenance into the package resources.
+
+## Continuous Integration and Packaging
+
+GitHub Actions has three validation and packaging layers:
+
+- `CI Fast` runs CPU-only CMake/CTest on Linux and Windows plus frontend and
+  Tauri Rust checks on every pull request and `main` push.
+- `CI Media` builds the pinned minimal FFmpeg 8.1.2 SDK, runs the complete
+  in-process media tests, and verifies that no `ffmpeg` or `ffprobe` executable
+  enters the product stage.
+- `Package` builds Linux x64 `deb`/AppImage and a Windows x64 NSIS installer.
+  A `v*` tag publishes the artifacts to GitHub Releases. `workflow_dispatch`
+  performs the same complete builds and uploads Actions artifacts without
+  publishing a release.
+
+Release packages are explicitly CPU builds so their contents do not depend on
+runner hardware. CUDA/Vulkan correctness and performance remain separate
+hardware-runner gates. The bundled media runtime contains only the pinned
+`libavformat`, `libavcodec`, `libavutil`, and `libswscale` shared libraries;
+the command-line FFmpeg programs are test tools only.

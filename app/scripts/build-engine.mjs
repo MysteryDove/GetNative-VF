@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  cpSync,
   copyFileSync,
   existsSync,
   readFileSync,
@@ -8,7 +9,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
@@ -116,6 +117,31 @@ function stageFfmpegRuntime() {
   const entries = directoryEntries
     .filter((name) => ffmpegRuntimePatterns.some((pattern) => pattern.test(name)))
     .sort();
+  const legalDirectory = resolve(process.env.GETNATIVE_FFMPEG_LEGAL_DIR
+    || (resolved === resolve(defaultFfmpegRuntimeDirectory)
+      ? join(stageDirectory, "share", "ffmpeg")
+      : join(resolved, "..", "share", "ffmpeg")));
+  if (!existsSync(legalDirectory) || !statSync(legalDirectory).isDirectory()) {
+    fail(`FFmpeg legal materials were not found: ${legalDirectory}`);
+  }
+  const buildInfo = join(legalDirectory, "BUILD_INFO.txt");
+  if (!existsSync(buildInfo)) fail(`FFmpeg build information was not found: ${buildInfo}`);
+  const configuration = readFileSync(buildInfo, "utf8");
+  for (const required of ["--disable-gpl", "--disable-nonfree", "--disable-programs"]) {
+    if (!configuration.includes(required)) {
+      fail(`FFmpeg build information is missing ${required}`);
+    }
+  }
+  for (const forbidden of ["--enable-gpl", "--enable-nonfree"]) {
+    if (configuration.includes(forbidden)) {
+      fail(`FFmpeg runtime was built with forbidden option ${forbidden}`);
+    }
+  }
+  const stagedLegalDirectory = resolve(stageDirectory, "share", "ffmpeg");
+  if (legalDirectory !== stagedLegalDirectory) {
+    rmSync(stagedLegalDirectory, { recursive: true, force: true });
+    cpSync(legalDirectory, stagedLegalDirectory, { recursive: true });
+  }
   return entries.map((name) => {
     const source = join(resolved, name);
     const destination = join(stageDirectory, "bin", name);
@@ -162,6 +188,25 @@ function visualStudioEnvironment(baseEnvironment) {
 }
 
 let environment = { ...process.env };
+if (process.env.GETNATIVE_FFMPEG_RUNTIME_DIR) {
+  const runtimeDirectory = resolve(process.env.GETNATIVE_FFMPEG_RUNTIME_DIR);
+  if (process.platform === "win32") {
+    replaceEnvironmentEntry(
+      environment,
+      "PATH",
+      `${runtimeDirectory}${delimiter}${environment.PATH || ""}`,
+    );
+  } else {
+    const loaderVariable = process.platform === "darwin"
+      ? "DYLD_LIBRARY_PATH"
+      : "LD_LIBRARY_PATH";
+    replaceEnvironmentEntry(
+      environment,
+      loaderVariable,
+      `${runtimeDirectory}${delimiter}${environment[loaderVariable] || ""}`,
+    );
+  }
+}
 let cmake = process.env.CMAKE || "cmake";
 let ctest = process.env.CTEST || "ctest";
 const configureArguments = [
@@ -171,6 +216,11 @@ const configureArguments = [
   buildDirectory,
   `-DCMAKE_BUILD_TYPE=${buildType}`,
 ];
+if (process.env.GETNATIVE_FFMPEG_ROOT) {
+  configureArguments.push(
+    `-DGETNATIVE_FFMPEG_ROOT=${resolve(process.env.GETNATIVE_FFMPEG_ROOT)}`,
+  );
+}
 
 let windowsBackends = "not-applicable";
 let linuxBackends = "not-applicable";
@@ -180,7 +230,7 @@ let cudaArchitectures = "not-applicable";
 let cudaMinimumArchitecture = "not-applicable";
 let cudaPtxArchitectures = "not-applicable";
 if (process.platform === "win32") {
-  environment = visualStudioEnvironment(environment);
+  if (!process.env.VSCMD_VER) environment = visualStudioEnvironment(environment);
   const visualStudioCMakeRoot =
     "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake";
   const bundledCmake = join(visualStudioCMakeRoot, "CMake", "bin", "cmake.exe");
@@ -207,6 +257,7 @@ if (process.platform === "win32") {
   cudaPtxArchitectures = process.env.GETNATIVE_CUDA_PTX_ARCHITECTURES || "75;121";
   configureArguments.push(
     "-DGETNATIVE_ENABLE_METAL=OFF",
+    "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>",
     "-DGETNATIVE_ENABLE_X86_SIMD=ON",
     "-DGETNATIVE_ENABLE_X86_AVX512=ON",
     `-DGETNATIVE_ENABLE_CUDA=${cudaEnabled ? "ON" : "OFF"}`,
