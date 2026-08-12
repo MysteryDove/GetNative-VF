@@ -576,7 +576,14 @@ export function VerifyPage({
             >
               {verifySelectableBackends(capabilities).map((backend) => (
                 <option key={backend} value={backend}>
-                  {backendOptionLabel(t, backend, capabilities, 1, undefined, true)}
+                  {backendOptionLabel(
+                    t,
+                    backend,
+                    capabilities,
+                    recipe?.metric?.pNorm ?? 1,
+                    undefined,
+                    capabilities?.payload.features?.verify_engine_decode !== true,
+                  )}
                 </option>
               ))}
             </select>

@@ -1966,7 +1966,11 @@ button {
 
 .error-plot {
   flex: 1;
-  min-height: 0;
+  /* The host is display:flex with align-items:center; without stretch this
+     div's cross size collapses to its (initially empty) content height of 0,
+     and the plot's ResizeObserver never sees a nonzero height to render into. */
+  align-self: stretch;
+  min-height: 220px;
   width: 100%;
   position: relative;
 }
