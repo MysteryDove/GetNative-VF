@@ -1,7 +1,8 @@
 # Cold (Persistent) Plan Cache Evaluation
 
 - Status: **Implemented** (E4, 2026-08-08) — L1 single-flight LRU
-  default-on; L2 pack store now defaults to the `getnative-engine` directory
+  default-on; L2 pack store now defaults to the per-user XDG cache on Linux and
+  the `getnative-engine` directory on other platforms
   (`GETNATIVE_PLAN_CACHE_DIR` overrides it and `GETNATIVE_PLAN_CACHE=off`
   disables it). Outcome, final numbers, and the
   keep/reject split: `docs/performance/e4-cold-plan-store-20260808.md`.

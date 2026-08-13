@@ -9,8 +9,9 @@
   fusion adopted; large-taps CUDA per-kernel rewrite rejected — headroom
   is candidate-batched merged solves, D1.2;
   `docs/performance/e3-kernel-increments-20260808.md`), E4 (L1
-  single-flight LRU default + L2 pack store default beside the engine
-  executable (overrideable in Settings),
+  single-flight LRU default + L2 pack store default in the per-user cache on
+  Linux and beside the engine executable on other platforms (overrideable in
+  Settings),
   `docs/performance/e4-cold-plan-store-20260808.md` — hit-rate criterion
   met; the historical throughput result remains recorded, D1.2
   (register-ring inverse +77-95% wide taps, 2-deep

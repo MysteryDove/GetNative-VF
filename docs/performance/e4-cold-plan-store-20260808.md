@@ -7,9 +7,9 @@
 - Decision at evaluation time: **ADOPT** the L1 single-flight LRU (default,
   zero cost); adopt the L2 pack store as opt-in because parallel batch build
   won on this host class. Current product policy supersedes that default: L2
-  is enabled and stores packs beside `getnative-engine` unless
-  `GETNATIVE_PLAN_CACHE_DIR` overrides the directory or
-  `GETNATIVE_PLAN_CACHE=off` disables it.
+  is enabled and stores packs in the per-user XDG cache on Linux (beside
+  `getnative-engine` on other platforms) unless `GETNATIVE_PLAN_CACHE_DIR`
+  overrides the directory or `GETNATIVE_PLAN_CACHE=off` disables it.
 
 ## 1. What landed
 

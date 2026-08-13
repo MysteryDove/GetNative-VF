@@ -10,6 +10,14 @@ use tauri::{AppHandle, Manager};
 
 const MAX_CACHED_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
 
+#[cfg(target_os = "linux")]
+pub(crate) fn axis_plan_cache_directory(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_cache_dir()
+        .map(|directory| directory.join("axis-plans"))
+        .map_err(|error| format!("plan_cache_error: {error}"))
+}
+
 pub(crate) fn media_cache_directory(app: &AppHandle) -> Result<PathBuf, String> {
     let app_cache = app
         .path()

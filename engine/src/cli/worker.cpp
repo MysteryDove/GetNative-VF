@@ -954,16 +954,35 @@ std::filesystem::path executable_directory() {
     return error ? std::filesystem::path{"."} : current;
 }
 
-// The L2 store defaults to the executable directory so a portable install
-// carries its cache with it. An explicit directory overrides that location;
-// GETNATIVE_PLAN_CACHE=off disables persistence while leaving L1 enabled.
+std::filesystem::path default_plan_store_dir() {
+#if defined(__linux__)
+    if (const char *xdg_cache = std::getenv("XDG_CACHE_HOME")) {
+        const std::filesystem::path base{xdg_cache};
+        if (!base.empty() && base.is_absolute()) {
+            return base / "io.getnative.vf" / "axis-plans";
+        }
+    }
+    if (const char *home = std::getenv("HOME")) {
+        const std::filesystem::path base{home};
+        if (!base.empty() && base.is_absolute()) {
+            return base / ".cache" / "io.getnative.vf" / "axis-plans";
+        }
+    }
+#endif
+    return executable_directory();
+}
+
+// Linux uses the per-user XDG cache so installed and AppImage builds always
+// have a stable writable store. Other platforms retain the portable default.
+// An explicit directory overrides either location; GETNATIVE_PLAN_CACHE=off
+// disables persistence while leaving L1 enabled.
 std::optional<std::filesystem::path> resolve_plan_store_dir() {
     const char *toggle = std::getenv("GETNATIVE_PLAN_CACHE");
     if (toggle != nullptr && std::string_view{toggle} == "off") return std::nullopt;
     if (const char *explicit_dir = std::getenv("GETNATIVE_PLAN_CACHE_DIR")) {
         if (*explicit_dir != '\0') return std::filesystem::path{explicit_dir};
     }
-    return executable_directory();
+    return default_plan_store_dir();
 }
 
 void load_frame_into(const FrameAsset &asset, float *destination) {

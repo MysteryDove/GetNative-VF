@@ -552,10 +552,12 @@ their locked recipe (a recipe already scanned in the session starts with
 `plan_cache_hits=1`). Cache residency is reported in
 `telemetry`.
 
-The persistent L2 plan store is enabled by default and writes `.gnpk` packs
-directly into the directory containing `getnative-engine`. This keeps a
-portable distribution and its cache together regardless of the process
-working directory. `GETNATIVE_PLAN_CACHE_DIR=<dir>` overrides the location;
+The persistent L2 plan store is enabled by default and writes `.gnpk` packs to
+the per-user cache on Linux: `$XDG_CACHE_HOME/io.getnative.vf/axis-plans`, or
+`$HOME/.cache/io.getnative.vf/axis-plans` when `XDG_CACHE_HOME` is unset. The
+Tauri app passes its equivalent `app_cache_dir()/axis-plans` path explicitly.
+Other platforms default to the directory containing `getnative-engine`.
+`GETNATIVE_PLAN_CACHE_DIR=<dir>` overrides the location;
 `GETNATIVE_PLAN_CACHE=off` disables L2 persistence without disabling the L1
 session cache. Store creation, read, or write failures degrade to plan rebuilds
 and do not fail a job.

@@ -38,7 +38,8 @@ def write_frame(path, width, height, seed=0):
 
 
 class Worker:
-    def __init__(self, store_dir=None, engine=ENGINE, use_default_store=False):
+    def __init__(self, store_dir=None, engine=ENGINE, use_default_store=False,
+                 xdg_cache_home=None):
         # stdout stays binary: events are framed with an internal byte buffer
         # (select + buffered readline loses events that arrive in one chunk).
         # Each worker gets an isolated plan-store dir: the persistent cache
@@ -52,6 +53,8 @@ class Worker:
             env = dict(os.environ)
             env.pop("GETNATIVE_PLAN_CACHE", None)
             env.pop("GETNATIVE_PLAN_CACHE_DIR", None)
+            if xdg_cache_home is not None:
+                env["XDG_CACHE_HOME"] = xdg_cache_home
         else:
             env = dict(os.environ)
             env["GETNATIVE_PLAN_CACHE"] = "off"
@@ -1262,13 +1265,18 @@ def main():
             pass
         worker_b.wait_exit()
 
-        # With no cache environment variables, packs live directly beside the
-        # executable even when the worker is launched from another directory.
+        # Linux follows XDG; other platforms retain the portable
+        # executable-directory default.
         portable_dir = os.path.join(scratch, "portable-engine")
         os.makedirs(portable_dir)
         portable_engine = os.path.join(portable_dir, os.path.basename(ENGINE))
         shutil.copy2(ENGINE, portable_engine)
-        portable_worker = Worker(engine=portable_engine, use_default_store=True)
+        default_cache_root = os.path.join(scratch, "xdg-cache")
+        portable_worker = Worker(
+            engine=portable_engine,
+            use_default_store=True,
+            xdg_cache_home=default_cache_root,
+        )
         portable_worker.send(**{
             "protocol_version": 1, "type": "hello", "request_id": "s5e"})
         portable_worker.read_event()
@@ -1279,8 +1287,15 @@ def main():
         while portable_worker.read_event()["type"] != "shutdown":
             pass
         portable_worker.wait_exit()
-        portable_packs = glob.glob(os.path.join(portable_dir, "*.gnpk"))
-        check("store-defaults-to-executable-directory",
+        if sys.platform.startswith("linux"):
+            expected_store = os.path.join(
+                default_cache_root, "io.getnative.vf", "axis-plans")
+            default_name = "store-defaults-to-xdg-cache-directory"
+        else:
+            expected_store = portable_dir
+            default_name = "store-defaults-to-executable-directory"
+        portable_packs = glob.glob(os.path.join(expected_store, "*.gnpk"))
+        check(default_name,
               portable_result["type"] == "result" and len(portable_packs) == 1,
               json.dumps(portable_packs))
 

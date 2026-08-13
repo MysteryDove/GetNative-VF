@@ -23,6 +23,8 @@ pub(crate) mod session;
 pub(crate) use assets::migrate_legacy_media_cache;
 
 use crate::engine::{find_engine, validate_capabilities};
+#[cfg(target_os = "linux")]
+use assets::axis_plan_cache_directory;
 use assets::media_cache_directory;
 use protocol::{
     analyze_command, validate_analyze, validate_verify_media_begin, verify_media_begin_command,
@@ -102,7 +104,16 @@ pub async fn engine_worker_start(
         let configured_cache_dir = crate::prefs::load_preferences(&app)
             .ok()
             .and_then(|prefs| prefs.axis_plan_cache_dir.map(PathBuf::from));
-        let mut session = spawn_session(&path, tauri_sink(&app), configured_cache_dir.as_deref())?;
+        #[cfg(target_os = "linux")]
+        let default_cache_dir = Some(axis_plan_cache_directory(&app)?);
+        #[cfg(not(target_os = "linux"))]
+        let default_cache_dir: Option<PathBuf> = None;
+        let mut session = spawn_session(
+            &path,
+            tauri_sink(&app),
+            configured_cache_dir.as_deref(),
+            default_cache_dir.as_deref(),
+        )?;
         let hello = session.roundtrip(json!({
             "protocol_version": PROTOCOL_VERSION,
             "type": "hello",

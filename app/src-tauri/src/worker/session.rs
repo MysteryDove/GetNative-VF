@@ -138,13 +138,15 @@ pub(crate) fn spawn_session(
     engine_path: &Path,
     sink: WorkerSink,
     configured_cache_dir: Option<&Path>,
+    platform_default_cache_dir: Option<&Path>,
 ) -> Result<WorkerSession, String> {
-    // Keep the L2 cache enabled for packaged engines, including older staged
-    // binaries that predate the engine-side executable-directory default.
-    // The preference path is explicit so the GUI and CLI use one location.
-    let cache_dir = configured_cache_dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| engine_path.parent().unwrap_or(Path::new(".")).to_path_buf());
+    // Keep L2 enabled for packaged engines. Linux passes the writable Tauri
+    // app-cache path; other platforms retain the executable-directory default.
+    let cache_dir = worker_plan_cache_directory(
+        engine_path,
+        configured_cache_dir,
+        platform_default_cache_dir,
+    );
     let mut command = Command::new(engine_path);
     command
         .arg("worker")
@@ -230,6 +232,17 @@ pub(crate) fn spawn_session(
     })
 }
 
+fn worker_plan_cache_directory(
+    engine_path: &Path,
+    configured_cache_dir: Option<&Path>,
+    platform_default_cache_dir: Option<&Path>,
+) -> PathBuf {
+    configured_cache_dir
+        .or(platform_default_cache_dir)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| engine_path.parent().unwrap_or(Path::new(".")).to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +251,29 @@ mod tests {
         analyze_command, default_endpoint_rule, default_profile_id, validate_analyze,
         FrameAssetRef, KernelCommand, MetricCommand, WorkerAnalyzeRequest,
     };
+
+    #[test]
+    fn configured_plan_cache_directory_overrides_platform_default() {
+        let selected = worker_plan_cache_directory(
+            Path::new("/opt/getnative/bin/getnative-engine"),
+            Some(Path::new("/custom/plans")),
+            Some(Path::new("/home/user/.cache/io.getnative.vf/axis-plans")),
+        );
+        assert_eq!(selected, PathBuf::from("/custom/plans"));
+    }
+
+    #[test]
+    fn platform_plan_cache_directory_overrides_engine_directory() {
+        let selected = worker_plan_cache_directory(
+            Path::new("/tmp/.mount_getnative/usr/lib/GetNative VF/bin/getnative-engine"),
+            None,
+            Some(Path::new("/home/user/.cache/io.getnative.vf/axis-plans")),
+        );
+        assert_eq!(
+            selected,
+            PathBuf::from("/home/user/.cache/io.getnative.vf/axis-plans")
+        );
+    }
 
     #[test]
     fn dispatch_routes_pending_requests_and_forwards_job_events() {
@@ -288,7 +324,7 @@ mod tests {
         let sink: WorkerSink = Arc::new(move |output| {
             let _ = tx.send(output);
         });
-        let mut session = spawn_session(&engine, sink, None).unwrap();
+        let mut session = spawn_session(&engine, sink, None, None).unwrap();
 
         let hello = session
             .roundtrip(json!({"protocol_version": 1, "type": "hello"}))
@@ -455,7 +491,7 @@ mod tests {
         let sink: WorkerSink = Arc::new(move |output| {
             let _ = tx.send(output);
         });
-        let mut session = spawn_session(&engine, sink, None).unwrap();
+        let mut session = spawn_session(&engine, sink, None, None).unwrap();
         session
             .roundtrip(json!({"protocol_version": 1, "type": "hello"}))
             .unwrap();
@@ -558,7 +594,7 @@ mod tests {
         let sink: WorkerSink = Arc::new(move |output| {
             let _ = tx.send(output);
         });
-        let mut session = spawn_session(&engine, sink, None).unwrap();
+        let mut session = spawn_session(&engine, sink, None, None).unwrap();
         session
             .roundtrip(json!({"protocol_version": 1, "type": "hello"}))
             .unwrap();
@@ -673,7 +709,7 @@ mod tests {
             let _ = tx.send(output);
         });
         // spawn_session appends the "worker" argument; the script ignores it.
-        let mut session = spawn_session(&script, sink, None).unwrap();
+        let mut session = spawn_session(&script, sink, None, None).unwrap();
         let hello = session
             .roundtrip(json!({"protocol_version": 1, "type": "hello"}))
             .unwrap();
@@ -707,7 +743,7 @@ mod tests {
         let sink: WorkerSink = Arc::new(move |output| {
             let _ = tx.send(output);
         });
-        let mut session = spawn_session(&script, sink, None).unwrap();
+        let mut session = spawn_session(&script, sink, None, None).unwrap();
         match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
             WorkerOutput::Event(value) => {
                 assert_eq!(value["type"], json!("error"));
