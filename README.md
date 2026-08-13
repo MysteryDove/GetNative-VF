@@ -1,60 +1,17 @@
 # GetNative VF
 
-Standalone native-resolution analysis project. The product does not load or
-require VapourSynth, Python, plugins, or `.vpy` scripts at runtime.
+GetNative VF is a standalone desktop app for finding a video's native
+resolution and checking the result across the full video. It runs without
+VapourSynth, Python, plugins, or `.vpy` scripts.
 
 ## Current Status
 
-- `getnative-engine` is a C++23 CLI with compatibility profiles, candidate-grid
-  semantics, Python-compatible rounding, and fractional crop geometry.
-- `getnative_core` now implements Bilinear, Bicubic, Lanczos, Spline16/36/64,
-  direct banded `A^T A` planning, Float32 descale/forward execution, fused
-  thresholded p-norm metrics, single-axis analysis, and deterministic parallel
-  candidate batches.
-- CPU planner coefficients, sparse topology, and LDLT factors are bitwise
-  conformant with the pinned descale inverse and zimg forward references in the
-  optional upstream conformance suite. Final CPU outputs are numerically
-  equivalent under a strict absolute/relative tolerance; production FMA/SIMD
-  paths may be more accurate than the unfused scalar reference. The product
-  runtime does not link either reference implementation.
-- `getnative_metal` supports horizontal, vertical, and combined-axis strict p=1
-  analysis. It dispatches specialized B3/B7 kernels plus a generic path through
-  half-bandwidth 15 / forward width 16, batches mixed plan shapes in stable
-  order, reuses one bounded two-axis arena, and fuses the final reconstruction
-  axis into metric reduction.
-- On the Apple M4 Max verification host, the 1920x1080/1000-candidate vertical
-  bicubic benchmark has a five-run Metal median of 125.409 ms, stays within the
-  strict CPU metric bound at 5.61e-8 maximum error, selects the same valley, and
-  uses 168.750 MiB peak arena workspace and 252.230 MiB across all explicit
-  Metal buffers.
-- `getnative_cuda` is a rebuilt Driver-API backend for horizontal, vertical,
-  and combined-axis p=1..4 analysis. It uses persistent execution slots, pinned
-  staging, resident plan caches, candidate tiling, axis-specific kernels,
-  source/tile transposes, and fused reconstruction/metric passes. The public
-  variant remains `cpp-generic`; unsupported specialization and inline-PTX
-  variants fail closed.
-- `verify_media_begin` indexes and decodes video inside the engine through the
-  FFmpeg 8 shared-library ABI. CPU uses software decode. CUDA shares the
-  analysis `CUcontext` with FFmpeg for direct NVDEC NV12/P010-to-F32 input;
-  Vulkan shares one `VkInstance`/`VkDevice`, queues, and timeline semaphore
-  state with FFmpeg for Vulkan Video decode. Unsupported hardware decode emits
-  one structured fallback warning and continues with software decode plus the
-  selected compute backend.
-- On the RTX 5080 verification host, the 1920x1080 -> 1280x720, 64-candidate
-  benchmark has five-run medians of 4.025 ms vertical, 5.028 ms horizontal, and
-  9.676 ms combined at concurrency one. At concurrency 16 it reaches 17.45k,
-  15.55k, and 8.41k candidates/s respectively. The combined path uses one
-  562.5 MiB workspace tile under the 640 MiB default limit.
-- `getnative-gui` is a Tauri 2 + React/TypeScript workbench. Rust owns the
-  fixed engine process boundary; the webview has no general shell permission.
-- macOS development and `.app` packaging automatically build and include the
-  engine under `Contents/Resources/bin`.
-- The GUI exposes the real geometry command and validates capability schema v2.
-  It reports compile, device, and analysis-command availability separately and
-  does not display placeholder curves, valleys, or analysis controls while the
-  `analyze` command is unavailable. Windows builds can embed the optional CUDA
-  backend without adding a driver import to CPU-only startup. The legacy
-  FFmpeg/mmap verify ring remains available when engine media decode is absent.
+- The desktop workflow now works end to end: open a video, scan candidate
+  resolutions, choose a result, and verify it across the whole video.
+- On an RTX 5080, it reaches about **3,600 candidates/s** during resolution
+  scans and **1,600 fps** during whole-video scans.
+- CPU, CUDA, Metal, and Vulkan backends are available. The project remains in
+  active development, and performance varies by source and scan settings.
 
 The accepted architecture and implementation sequence are documented in
 `docs/architecture.md` and `.omx/plans/standalone-getnative.md`.
