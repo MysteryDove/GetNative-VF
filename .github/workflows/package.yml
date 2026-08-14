@@ -41,11 +41,30 @@ jobs:
           build-essential ninja-build nasm pkg-config zlib1g-dev
           libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
           libxdo-dev libssl-dev patchelf libfuse2 desktop-file-utils
-          libvulkan-dev glslang-tools spirv-tools
-      - name: Verify Vulkan shader tools
+          libvulkan1
+      - uses: actions/cache@v4
+        id: vulkan-sdk-cache
+        with:
+          path: .deps/vulkan-sdk
+          key: vulkan-sdk-linux-${{ env.VULKAN_SDK_VERSION }}
+      - name: Install Vulkan SDK
+        if: steps.vulkan-sdk-cache.outputs.cache-hit != 'true'
         run: |
-          command -v glslangValidator
-          command -v spirv-val
+          set -euo pipefail
+          mkdir -p .deps/vulkan-sdk
+          archive=/tmp/vulkansdk-linux-x86_64-${VULKAN_SDK_VERSION}.tar.xz
+          curl -fL --retry 5 --retry-all-errors -o "$archive" \
+            "https://sdk.lunarg.com/sdk/download/${VULKAN_SDK_VERSION}/linux/vulkansdk-linux-x86_64-${VULKAN_SDK_VERSION}.tar.xz"
+          tar -C .deps/vulkan-sdk -xf "$archive"
+      - name: Export Vulkan SDK
+        run: |
+          set -euo pipefail
+          sdk="${GITHUB_WORKSPACE}/.deps/vulkan-sdk/${VULKAN_SDK_VERSION}/x86_64"
+          test -f "$sdk/include/vulkan/vulkan.h"
+          test -x "$sdk/bin/glslangValidator" || test -x "$sdk/bin/glslc"
+          test -x "$sdk/bin/spirv-val"
+          echo "VULKAN_SDK=$sdk" >> "$GITHUB_ENV"
+          echo "$sdk/bin" >> "$GITHUB_PATH"
       - uses: Jimver/cuda-toolkit@v0.2.26
         with:
           cuda: ${{ env.CUDA_TOOLKIT_VERSION }}
@@ -88,11 +107,13 @@ jobs:
           GETNATIVE_LINUX_BACKENDS: cuda-vulkan
           GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}/.deps/ffmpeg-linux-x64
           GETNATIVE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/.deps/ffmpeg-linux-x64/lib
+          VULKAN_SDK: ${{ github.workspace }}/.deps/vulkan-sdk/${{ env.VULKAN_SDK_VERSION }}/x86_64
         run: pnpm tauri build --bundles deb
       - name: Build AppImage
         working-directory: app
         env:
           GETNATIVE_LINUX_BACKENDS: cuda-vulkan
+          VULKAN_SDK: ${{ github.workspace }}/.deps/vulkan-sdk/${{ env.VULKAN_SDK_VERSION }}/x86_64
           GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}/.deps/ffmpeg-linux-x64
           GETNATIVE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/.deps/ffmpeg-linux-x64/lib
         run: |
@@ -170,21 +191,40 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
-      - uses: Jimver/cuda-toolkit@v0.2.26
+      - name: Cache CUDA toolkit
+        id: cuda-toolkit-cache
+        uses: actions/cache@v4
         with:
-          cuda: ${{ env.CUDA_TOOLKIT_VERSION }}
-          method: network
-          sub-packages: '["nvcc","cudart","cuobjdump","visual_studio_integration"]'
-          use-github-cache: false
-          use-local-cache: false
-      - name: Verify CUDA toolkit
+          path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8
+          key: cuda-toolkit-windows-${{ env.CUDA_TOOLKIT_VERSION }}-nvcc-cudart
+      - name: Install CUDA toolkit
+        if: steps.cuda-toolkit-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          if (-not (Get-Command nvcc -ErrorAction SilentlyContinue)) { throw "nvcc is not on PATH" }
-          if (-not (Get-Command cuobjdump -ErrorAction SilentlyContinue)) { throw "cuobjdump is not on PATH" }
-          $header = Join-Path $env:CUDA_PATH "include\cuda.h"
-          if (-not (Test-Path $header)) { throw "cuda.h was not found at $header" }
-          nvcc --version
+          $version = $env:CUDA_TOOLKIT_VERSION
+          $installer = Join-Path $env:RUNNER_TEMP "cuda_${version}_windows_network.exe"
+          $url = "https://developer.download.nvidia.com/compute/cuda/$version/network_installers/cuda_${version}_windows_network.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $install = Start-Process -FilePath $installer -ArgumentList @(
+            "-s", "nvcc_12.8", "cudart_12.8", "cuobjdump_12.8",
+            "visual_studio_integration_12.8"
+          ) -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            throw "CUDA toolkit installer exited $($install.ExitCode)"
+          }
+      - name: Export CUDA toolkit
+        shell: pwsh
+        run: |
+          $root = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+          foreach ($required in @("bin\nvcc.exe", "bin\cuobjdump.exe", "include\cuda.h")) {
+            if (-not (Test-Path (Join-Path $root $required))) {
+              throw "CUDA toolkit is missing $required"
+            }
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "CUDA_PATH=$root"
+          Add-Content -Path $env:GITHUB_ENV -Value "CUDAToolkit_ROOT=$root"
+          Add-Content -Path $env:GITHUB_PATH -Value "$root\bin"
+          & "$root\bin\nvcc.exe" --version
       - name: Cache Vulkan SDK
         id: vulkan-sdk-cache
         uses: actions/cache@v4
