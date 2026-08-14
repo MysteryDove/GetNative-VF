@@ -225,42 +225,11 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "CUDAToolkit_ROOT=$root"
           Add-Content -Path $env:GITHUB_PATH -Value "$root\bin"
           & "$root\bin\nvcc.exe" --version
-      - name: Cache Vulkan SDK
-        id: vulkan-sdk-cache
-        uses: actions/cache@v4
-        with:
-          path: C:\VulkanSDK\${{ env.VULKAN_SDK_VERSION }}
-          key: vulkan-sdk-windows-${{ env.VULKAN_SDK_VERSION }}
       - name: Install Vulkan SDK
-        if: steps.vulkan-sdk-cache.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          $version = $env:VULKAN_SDK_VERSION
-          $installer = Join-Path $env:RUNNER_TEMP "VulkanSDK-$version-Installer.exe"
-          $url = "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe"
-          Invoke-WebRequest -Uri $url -OutFile $installer
-          $install = Start-Process -FilePath $installer -ArgumentList @(
-            "--accept-licenses", "--default-answer", "--confirm-command", "install"
-          ) -Wait -PassThru
-          if ($install.ExitCode -ne 0) {
-            throw "Vulkan SDK installer exited $($install.ExitCode)"
-          }
-      - name: Export Vulkan SDK
-        shell: pwsh
-        run: |
-          $sdk = "C:\VulkanSDK\$env:VULKAN_SDK_VERSION"
-          if (-not (Test-Path (Join-Path $sdk "Include\vulkan\vulkan.h"))) {
-            throw "Vulkan headers were not found at $sdk"
-          }
-          if (-not (Test-Path (Join-Path $sdk "Bin\glslc.exe")) -and
-              -not (Test-Path (Join-Path $sdk "Bin\glslangValidator.exe"))) {
-            throw "Vulkan shader compiler was not found at $sdk\Bin"
-          }
-          if (-not (Test-Path (Join-Path $sdk "Bin\spirv-val.exe"))) {
-            throw "spirv-val was not found at $sdk\Bin"
-          }
-          Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=$sdk"
-          Add-Content -Path $env:GITHUB_PATH -Value "$sdk\Bin"
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: ${{ env.VULKAN_SDK_VERSION }}
+          cache: true
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MSYS
