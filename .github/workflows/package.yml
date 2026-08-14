@@ -41,11 +41,17 @@ jobs:
           build-essential ninja-build nasm pkg-config zlib1g-dev
           libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
           libxdo-dev libssl-dev patchelf libfuse2 desktop-file-utils
-          libvulkan-dev glslc glslang-tools spirv-tools
+          libvulkan-dev glslang-tools spirv-tools
+      - name: Verify Vulkan shader tools
+        run: |
+          command -v glslangValidator
+          command -v spirv-val
       - uses: Jimver/cuda-toolkit@v0.2.26
         with:
           cuda: ${{ env.CUDA_TOOLKIT_VERSION }}
           method: network
+          use-github-cache: false
+          use-local-cache: false
       - name: Verify CUDA toolkit
         run: |
           command -v nvcc
@@ -169,6 +175,8 @@ jobs:
           cuda: ${{ env.CUDA_TOOLKIT_VERSION }}
           method: network
           sub-packages: '["nvcc","cudart","cuobjdump","visual_studio_integration"]'
+          use-github-cache: false
+          use-local-cache: false
       - name: Verify CUDA toolkit
         shell: pwsh
         run: |

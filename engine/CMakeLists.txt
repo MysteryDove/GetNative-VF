@@ -590,13 +590,17 @@ if(GETNATIVE_ENABLE_VULKAN)
     endif()
     set(GETNATIVE_VULKAN_SHADER_COMPILER "" CACHE FILEPATH
         "Path to glslc or glslangValidator used for Vulkan compute shaders")
-    if(NOT GETNATIVE_VULKAN_SHADER_COMPILER AND Vulkan_GLSLC_EXECUTABLE)
-        set(GETNATIVE_VULKAN_SHADER_COMPILER "${Vulkan_GLSLC_EXECUTABLE}")
-    endif()
-    if(NOT GETNATIVE_VULKAN_SHADER_COMPILER)
-        find_program(GETNATIVE_VULKAN_SHADER_COMPILER
-            NAMES glslc.exe glslc glslangValidator.exe glslangValidator
-            HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    if(GETNATIVE_VULKAN_SHADER_COMPILER STREQUAL "")
+        unset(GETNATIVE_VULKAN_SHADER_COMPILER CACHE)
+        if(Vulkan_GLSLC_EXECUTABLE)
+            set(GETNATIVE_VULKAN_SHADER_COMPILER "${Vulkan_GLSLC_EXECUTABLE}"
+                CACHE FILEPATH
+                "Path to glslc or glslangValidator used for Vulkan compute shaders")
+        else()
+            find_program(GETNATIVE_VULKAN_SHADER_COMPILER
+                NAMES glslc.exe glslc glslangValidator.exe glslangValidator glslang
+                HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+        endif()
     endif()
     if(NOT GETNATIVE_VULKAN_SHADER_COMPILER)
         message(FATAL_ERROR
