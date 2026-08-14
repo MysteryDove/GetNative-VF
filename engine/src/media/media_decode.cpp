@@ -212,8 +212,10 @@ template <class Handle>
         return VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR;
     case AV_CODEC_ID_AV1:
         return VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR;
+#if defined(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME)
     case AV_CODEC_ID_VP9:
         return VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR;
+#endif
     default:
         return VK_VIDEO_CODEC_OPERATION_NONE_KHR;
     }
