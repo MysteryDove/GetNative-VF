@@ -139,8 +139,8 @@ The Windows engine has three explicit CMake switches:
   AVX-512 tier; runtime CPUID/XCR0 checks still decide whether it is available.
 - `GETNATIVE_ENABLE_CUDA` embeds the profiled `cpp-generic` CUDA C++ backend in
   a multi-architecture fatbin. The default package contains native code for
-  SM75, 80, 86, 87, 88, 89, 90, 100, 103, 110, 120, and 121, plus compute_75
-  and compute_121 PTX fallbacks. `GETNATIVE_CUDA_MIN_ARCHITECTURE`,
+  consumer SM75, 86, 89, and 120, plus compute_75 and compute_120 PTX
+  fallbacks. `GETNATIVE_CUDA_MIN_ARCHITECTURE`,
   `GETNATIVE_CUDA_ARCHITECTURES`, and `GETNATIVE_CUDA_PTX_ARCHITECTURES`
   configure those three independent boundaries.
   Common B3/B5 and F6 shapes have local compile-time specializations inside
@@ -171,13 +171,15 @@ GitHub Actions has three validation and packaging layers:
 - `CI Media` builds the pinned minimal FFmpeg 8.1.2 SDK, runs the complete
   in-process media tests, and verifies that no `ffmpeg` or `ffprobe` executable
   enters the product stage.
-- `Package` builds Linux x64 `deb`/AppImage and a Windows x64 NSIS installer.
+- `Package` builds Linux x64 `deb`/AppImage and a Windows x64 portable ZIP.
   A `v*` tag publishes the artifacts to GitHub Releases. `workflow_dispatch`
   performs the same complete builds and uploads Actions artifacts without
   publishing a release.
 
-Release packages are explicitly CPU builds so their contents do not depend on
-runner hardware. CUDA/Vulkan correctness and performance remain separate
-hardware-runner gates. The bundled media runtime contains only the pinned
+Release packages compile the consumer CUDA matrix (SM75/86/89/120) and the
+Vulkan compute backend. GitHub-hosted runners have no GPU, so device tests
+skip and the packaged engine still starts without an NVIDIA driver or Vulkan
+device. Hardware-runner gates remain the place for CUDA/Vulkan correctness
+and performance. The bundled media runtime contains only the pinned
 `libavformat`, `libavcodec`, `libavutil`, and `libswscale` shared libraries;
 the command-line FFmpeg programs are test tools only.

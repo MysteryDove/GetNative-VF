@@ -203,8 +203,20 @@ pub(crate) fn find_engine(app: &AppHandle) -> Result<PathBuf, String> {
         })
 }
 
+/// Launch the console engine without allocating a visible Windows console.
+pub(crate) fn engine_command(path: &Path) -> Command {
+    let mut command = Command::new(path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 fn run_engine(path: &Path, args: &[String]) -> Result<Value, String> {
-    let output = Command::new(path)
+    let output = engine_command(path)
         .args(args)
         .output()
         .map_err(|error| format!("failed to start getnative-engine: {error}"))?;

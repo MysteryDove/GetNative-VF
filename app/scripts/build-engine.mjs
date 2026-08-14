@@ -263,8 +263,8 @@ if (process.platform === "win32") {
   cudaMinimumArchitecture = process.env.GETNATIVE_CUDA_MIN_ARCHITECTURE || "75";
   cudaArchitectures =
     process.env.GETNATIVE_CUDA_ARCHITECTURES ||
-    "75;80;86;87;88;89;90;100;103;110;120;121";
-  cudaPtxArchitectures = process.env.GETNATIVE_CUDA_PTX_ARCHITECTURES || "75;121";
+    "75;86;89;120";
+  cudaPtxArchitectures = process.env.GETNATIVE_CUDA_PTX_ARCHITECTURES || "75;120";
   configureArguments.push(
     "-DGETNATIVE_ENABLE_METAL=OFF",
     "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>",
@@ -289,8 +289,8 @@ if (process.platform === "win32") {
     || linuxBackends === "cuda-vulkan";
   cudaMinimumArchitecture = process.env.GETNATIVE_CUDA_MIN_ARCHITECTURE || "75";
   cudaArchitectures = process.env.GETNATIVE_CUDA_ARCHITECTURES
-    || "75;80;86;87;88;89;90;100;103;110;120;121";
-  cudaPtxArchitectures = process.env.GETNATIVE_CUDA_PTX_ARCHITECTURES || "75;121";
+    || "75;86;89;120";
+  cudaPtxArchitectures = process.env.GETNATIVE_CUDA_PTX_ARCHITECTURES || "75;120";
   configureArguments.push(
     `-DGETNATIVE_ENABLE_CUDA=${cudaEnabled ? "ON" : "OFF"}`,
     `-DGETNATIVE_ENABLE_VULKAN=${vulkanEnabled ? "ON" : "OFF"}`,

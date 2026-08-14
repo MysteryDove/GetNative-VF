@@ -294,8 +294,8 @@ The CUDA dataflow is axis-specific:
 
 The host dynamically loads the CUDA Driver API, creates a dedicated context,
 and embeds one nvcc-generated multi-architecture fatbin. The default CUDA 13.3
-matrix contains native SM75 through SM121 targets and compute_75/compute_121
-PTX fallbacks. Runtime compatibility has an independent SM75 floor; device
+matrix contains native consumer SM75, 86, 89, and 120 targets and
+compute_75/compute_120 PTX fallbacks. Runtime compatibility has an independent SM75 floor; device
 probing reports GPUs below that floor as incompatible. Compiler-generated PTX
 is portability output, not a PTX optimization stage. Every configured cubin
 and PTX entry is checked by CTest, and all native kernels must retain zero

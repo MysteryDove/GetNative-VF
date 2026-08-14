@@ -1,5 +1,9 @@
 #include "getnative/media_decode.hpp"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <algorithm>
 #include <array>
 #include <chrono>

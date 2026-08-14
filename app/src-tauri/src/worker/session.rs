@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -147,7 +147,7 @@ pub(crate) fn spawn_session(
         configured_cache_dir,
         platform_default_cache_dir,
     );
-    let mut command = Command::new(engine_path);
+    let mut command = crate::engine::engine_command(engine_path);
     command
         .arg("worker")
         .env("GETNATIVE_PLAN_CACHE", "on")

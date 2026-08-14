@@ -66,9 +66,9 @@ endif()
 set(GETNATIVE_CUDA_MIN_ARCHITECTURE "75" CACHE STRING
     "Minimum compute capability accepted by the CUDA backend")
 set(GETNATIVE_CUDA_ARCHITECTURES
-    "75;80;86;87;88;89;90;100;103;110;120;121" CACHE STRING
+    "75;86;89;120" CACHE STRING
     "Native SM targets embedded in the CUDA fatbin")
-set(GETNATIVE_CUDA_PTX_ARCHITECTURES "75;121" CACHE STRING
+set(GETNATIVE_CUDA_PTX_ARCHITECTURES "75;120" CACHE STRING
     "Virtual compute targets embedded as CUDA PTX fallbacks")
 set(GETNATIVE_CUDA_ROOT "" CACHE PATH
     "CUDA Toolkit root (auto-detected from common environment variables and install paths when empty)")
@@ -204,7 +204,8 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              ${GETNATIVE_BENCHMARK_ID_FILES})
 
 if(MSVC)
-    set(GETNATIVE_WARNING_OPTIONS /W4 /permissive-)
+    set(GETNATIVE_WARNING_OPTIONS /W4 /permissive- /utf-8)
+    add_compile_definitions(NOMINMAX)
     set(GETNATIVE_STRICT_FP_OPTIONS /fp:strict)
     set(GETNATIVE_PRECISE_PLANNER_FP_OPTIONS /fp:precise /fp:contract-)
     set(GETNATIVE_FAST_PLANNER_FP_OPTIONS /fp:fast)
