@@ -205,14 +205,18 @@ pub(crate) fn find_engine(app: &AppHandle) -> Result<PathBuf, String> {
 
 /// Launch the console engine without allocating a visible Windows console.
 pub(crate) fn engine_command(path: &Path) -> Command {
-    let mut command = Command::new(path);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut command = Command::new(path);
         command.creation_flags(CREATE_NO_WINDOW);
+        command
     }
-    command
+    #[cfg(not(windows))]
+    {
+        Command::new(path)
+    }
 }
 
 fn run_engine(path: &Path, args: &[String]) -> Result<Value, String> {
