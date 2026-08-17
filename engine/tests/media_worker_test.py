@@ -105,12 +105,16 @@ def main():
                            decoder="software")
         index_path = pathlib.Path(indexed["index_path"])
         assert indexed["frame_count"] == 120 and indexed["rebuilt"] is True
-        assert index_path.read_bytes()[:8] == b"GNVFLWI\0"
+        assert index_path.name.endswith(".vf.lwi")
+        assert index_path.read_bytes().startswith(b"<LSMASHWorksIndexVersion")
+        assert indexed["index_mode"] == "packet_rebuilt"
+        assert indexed["selective_decodes"] == 0
+        assert indexed["packet_count"] == 120
         cached, _ = begin(worker, "index-2", "media_index_begin", media, cache,
                           decoder="software")
         assert cached["rebuilt"] is False
 
-        index_path.write_bytes(b"GNVFLWI\0corrupt")
+        index_path.write_bytes(b"<LSMASHWorksIndexVersion=broken")
         rebuilt, _ = begin(worker, "corrupt", "media_index_begin", media, cache,
                            decoder="software")
         assert rebuilt["rebuilt"] is True and index_path.stat().st_size > 1000
@@ -129,6 +133,13 @@ def main():
         png = pathlib.Path(preview["asset"]["path"]).read_bytes()
         assert png[:8] == b"\x89PNG\r\n\x1a\n" and png[25] == 2
         assert preview["decoded_frames"] <= 30
+
+        cached_preview, _ = begin(
+            worker, "preview-cache-hit", "media_preview_begin", media, cache,
+            stream_index=indexed["stream_index"], frame_index=119,
+            maximum_dimension=96)
+        assert cached_preview["asset"]["from_cache"] is True
+        assert cached_preview["decoded_frames"] == 0
 
         checksums, _ = begin(
             worker, "pixel-check", "media_asset_batch_begin", media, cache,
@@ -157,6 +168,14 @@ def main():
             assets=[{"item_id": f"thumb-{frame}", "frame_index": frame,
                      "format": "png", "maximum_dimension": 80} for frame in frames])
         assert len(batch["assets"]) == 25 and batch["decoded_frames"] <= 48
+
+        cached_batch, _ = begin(
+            worker, "batch-cache-hit", "media_asset_batch_begin", media, cache,
+            stream_index=indexed["stream_index"],
+            assets=[{"item_id": f"thumb-{frame}", "frame_index": frame,
+                     "format": "png", "maximum_dimension": 80} for frame in frames])
+        assert all(asset["from_cache"] is True for asset in cached_batch["assets"])
+        assert cached_batch["decoded_frames"] == 0
 
         worker.send(
             type="media_asset_batch_begin", request_id="duplicate", path=str(media),
@@ -244,7 +263,7 @@ def main():
         blocked.mkdir()
         blocked_media = blocked / "blocked.mp4"
         shutil.copy2(media, blocked_media)
-        pathlib.Path(f"{blocked_media}.gnvf.lwi").mkdir()
+        pathlib.Path(f"{blocked_media}.vf.lwi").mkdir()
         fallback_cache = root / "fallback-cache"
         fallback, _ = begin(worker, "blocked", "media_index_begin",
                             blocked_media, fallback_cache, decoder="software")

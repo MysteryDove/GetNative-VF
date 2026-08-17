@@ -72,7 +72,7 @@ export async function getMediaCapabilities(): Promise<MediaCapabilities> {
     video_decode_available: media?.available === true,
     ffmpeg_abi: media?.ffmpeg_abi ?? null,
     index_version: media?.index_version ?? null,
-    index_format: media?.index_format ?? "gnvf.lwi",
+    index_format: media?.index_format ?? "lwi/vf.lwi",
     decoder_backends: envelope.payload.decode_backends ?? [],
   };
 }

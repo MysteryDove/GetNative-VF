@@ -111,7 +111,7 @@ void write_capabilities_impl(
         vulkan_video_reason = error.what();
     }
 #endif
-    output << "{\"schema_version\":2,\"engine\":\"getnative-engine\",\"version\":\"0.1.2\","
+    output << "{\"schema_version\":2,\"engine\":\"getnative-engine\",\"version\":\"0.1.4\","
               "\"commands\":{\"capabilities\":true,\"geometry\":true,\"analyze\":"
            << available;
 #if defined(GETNATIVE_HAS_MEDIA)
@@ -181,10 +181,10 @@ void write_capabilities_impl(
     output << "\"available\":true,\"ffmpeg_abi\":"
            << json_string(getnative::media::runtime_version())
            << ",\"index_version\":" << getnative::media::MediaIndex::format_version
-           << ",\"index_format\":\"gnvf.lwi\"},";
+           << ",\"index_format\":\"lwi/vf.lwi\"},";
 #else
     output << "\"available\":false,\"ffmpeg_abi\":null,"
-              "\"index_version\":null,\"index_format\":\"gnvf.lwi\"},";
+              "\"index_version\":null,\"index_format\":\"lwi/vf.lwi\"},";
 #endif
     output << "\"backends\":["
               "{\"id\":\"cpu\",\"compiled\":true,\"device_available\":true,"

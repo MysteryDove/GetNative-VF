@@ -1306,7 +1306,7 @@ dependencies = [
 
 [[package]]
 name = "getnative-gui"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "atomicwrites",
  "image",

@@ -12,6 +12,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <set>
 #include <stdexcept>
 #include <type_traits>
@@ -19,6 +20,7 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/hash.h>
@@ -75,6 +77,16 @@ struct FrameCloser {
 struct PacketCloser {
     void operator()(AVPacket *packet) const noexcept { av_packet_free(&packet); }
 };
+struct ParserCloser {
+    void operator()(AVCodecParserContext *parser) const noexcept {
+        if (parser != nullptr) av_parser_close(parser);
+    }
+};
+struct BsfCloser {
+    void operator()(AVBSFContext *context) const noexcept {
+        av_bsf_free(&context);
+    }
+};
 struct BufferCloser {
     void operator()(AVBufferRef *buffer) const noexcept { av_buffer_unref(&buffer); }
 };
@@ -89,12 +101,14 @@ using FormatPtr = std::unique_ptr<AVFormatContext, FormatCloser>;
 using CodecPtr = std::unique_ptr<AVCodecContext, CodecCloser>;
 using FramePtr = std::unique_ptr<AVFrame, FrameCloser>;
 using PacketPtr = std::unique_ptr<AVPacket, PacketCloser>;
+using ParserPtr = std::unique_ptr<AVCodecParserContext, ParserCloser>;
+using BsfPtr = std::unique_ptr<AVBSFContext, BsfCloser>;
 using BufferPtr = std::unique_ptr<AVBufferRef, BufferCloser>;
 using SwsPtr = std::unique_ptr<SwsContext, SwsCloser>;
 using HashPtr = std::unique_ptr<AVHashContext, HashCloser>;
 
-[[nodiscard]] std::shared_ptr<void> retain_frame(const AVFrame &source,
-                                                 std::string_view operation) {
+[[maybe_unused, nodiscard]] std::shared_ptr<void> retain_frame(const AVFrame &source,
+                                                              std::string_view operation) {
     AVFrame *frame = av_frame_clone(&source);
     if (frame == nullptr) {
         throw std::runtime_error(std::string{operation} + " failed");
@@ -534,33 +548,6 @@ struct VulkanFrameLease {
     return value == AV_NOPTS_VALUE ? std::nullopt : std::optional{value};
 }
 
-[[nodiscard]] FrameIdentity identity_for(const AVFrame &frame, const AVStream &stream,
-                                         std::uint64_t index) {
-    const auto pts = timestamp_value(frame.pts);
-    const auto best_effort = timestamp_value(frame.best_effort_timestamp);
-    const auto clock = best_effort.value_or(frame.pts);
-    std::optional<double> seconds;
-    if (clock != AV_NOPTS_VALUE) {
-        const double value = static_cast<double>(clock) * av_q2d(stream.time_base);
-        if (std::isfinite(value)) seconds = value;
-    }
-    std::optional<std::string> picture;
-    if (frame.pict_type != AV_PICTURE_TYPE_NONE) {
-        const char *name = av_get_picture_type_char(frame.pict_type) == 'I' ? "I"
-            : av_get_picture_type_char(frame.pict_type) == 'P' ? "P"
-            : av_get_picture_type_char(frame.pict_type) == 'B' ? "B" : "other";
-        picture = std::string{name};
-    }
-    FrameIdentity result;
-    result.frame_index = index;
-    result.pts = pts;
-    result.best_effort_timestamp = best_effort;
-    result.timestamp_seconds = seconds;
-    result.key_frame = (frame.flags & AV_FRAME_FLAG_KEY) != 0;
-    result.picture_type = std::move(picture);
-    return result;
-}
-
 template <class Callback>
 void receive_frames(AVCodecContext &codec, std::stop_token stop,
                     Callback &&callback) {
@@ -576,50 +563,12 @@ void receive_frames(AVCodecContext &codec, std::stop_token stop,
     }
 }
 
-[[nodiscard]] int frame_bit_depth(const AVFrame &frame, const AVCodecParameters &parameters) {
-    AVPixelFormat format = static_cast<AVPixelFormat>(frame.format);
-    if ((format == AV_PIX_FMT_CUDA || format == AV_PIX_FMT_VULKAN)
-        && frame.hw_frames_ctx != nullptr) {
-        const auto *frames = reinterpret_cast<const AVHWFramesContext *>(
-            frame.hw_frames_ctx->data);
-        format = frames->sw_format;
-    }
-    const AVPixFmtDescriptor *descriptor = av_pix_fmt_desc_get(format);
-    if (descriptor != nullptr && descriptor->comp[0].depth > 0) return descriptor->comp[0].depth;
-    return parameters.bits_per_raw_sample > 0 ? parameters.bits_per_raw_sample : 8;
-}
-
-[[nodiscard]] std::string frame_range(const AVFrame &frame) {
+[[maybe_unused, nodiscard]] std::string frame_range(const AVFrame &frame) {
     switch (frame.color_range) {
     case AVCOL_RANGE_MPEG: return "limited";
     case AVCOL_RANGE_JPEG: return "full";
     default: return "unknown";
     }
-}
-
-void fill_stream_metadata(MediaIndex &result, const AVCodecContext &codec,
-                          const AVStream &stream, const AVFrame &frame) {
-    result.width = frame.width;
-    result.height = frame.height;
-    AVPixelFormat format = static_cast<AVPixelFormat>(frame.format);
-    if ((format == AV_PIX_FMT_CUDA || format == AV_PIX_FMT_VULKAN)
-        && frame.hw_frames_ctx != nullptr) {
-        const auto *frames = reinterpret_cast<const AVHWFramesContext *>(
-            frame.hw_frames_ctx->data);
-        format = frames->sw_format;
-    }
-    result.pixel_format = av_get_pix_fmt_name(format);
-    result.bit_depth = frame_bit_depth(frame, *stream.codecpar);
-    result.range = frame_range(frame);
-    result.codec = codec.codec_descriptor != nullptr
-        ? codec.codec_descriptor->name : avcodec_get_name(codec.codec_id);
-    if (codec.profile != AV_PROFILE_UNKNOWN) {
-        const char *profile = avcodec_profile_name(codec.codec_id, codec.profile);
-        if (profile != nullptr) result.profile = profile;
-    }
-    result.duration_ticks = stream.duration;
-    result.time_base_num = stream.time_base.num;
-    result.time_base_den = stream.time_base.den;
 }
 
 [[nodiscard]] bool selected(const FrameIdentity &frame, const ScanScope &scope) {
@@ -754,81 +703,393 @@ std::uint32_t default_video_stream(const std::string &path) {
     FormatPtr format{raw_format};
     check_ffmpeg(avformat_find_stream_info(format.get(), nullptr),
                  "avformat_find_stream_info");
+    std::optional<std::uint32_t> attached;
     for (std::uint32_t index = 0U; index < format->nb_streams; ++index) {
-        if (format->streams[index]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            return index;
+        AVStream *stream = format->streams[index];
+        if (stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) continue;
+        if ((stream->disposition & AV_DISPOSITION_ATTACHED_PIC) != 0) {
+            if (!attached) attached = index;
+            continue;
         }
+        return index;
     }
+    if (attached) return *attached;
     throw std::runtime_error("media contains no video stream");
+}
+
+[[nodiscard]] std::optional<std::string> parser_picture_name(int value) {
+    if (value == AV_PICTURE_TYPE_NONE) return std::nullopt;
+    const char type = av_get_picture_type_char(static_cast<AVPictureType>(value));
+    if (type == 'I') return "I";
+    if (type == 'P') return "P";
+    if (type == 'B') return "B";
+    return "other";
+}
+
+[[nodiscard]] std::string parser_field_order(enum AVFieldOrder order) {
+    switch (order) {
+    case AV_FIELD_TT: return "tt";
+    case AV_FIELD_BB: return "bb";
+    case AV_FIELD_TB: return "tb";
+    case AV_FIELD_BT: return "bt";
+    case AV_FIELD_PROGRESSIVE: return "progressive";
+    default: return "unknown";
+    }
+}
+
+[[nodiscard]] bool monotonic_positions(const std::vector<FrameIdentity> &frames,
+                                       bool dts) {
+    std::optional<std::int64_t> previous;
+    for (const FrameIdentity &frame : frames) {
+        const auto value = dts ? frame.dts : frame.file_position;
+        if (!value) continue;
+        if (previous && *value <= *previous) return false;
+        previous = *value;
+    }
+    return previous.has_value();
 }
 
 [[nodiscard]] MediaIndex index_media_impl(
     const std::string &path, std::uint32_t stream_index,
-    const DecoderOptions *options, std::stop_token stop,
-    IndexProgress progress) {
+    const DecoderOptions *, const IndexOptions &index_options,
+    std::stop_token stop, IndexProgress progress) {
+    (void)index_options;
+    const auto index_start = Clock::now();
     MediaIndex result;
     result.fingerprint = quick_fingerprint(path);
+    result.source_path = path;
     result.stream_index = stream_index;
-    OpenedDecoder opened = open_decoder(path, stream_index, options);
-    AVPacket *packet_raw = av_packet_alloc();
-    if (!packet_raw) throw std::runtime_error("av_packet_alloc failed");
-    PacketPtr packet{packet_raw};
-    std::uint64_t keyframe_anchor = 0U;
-    std::optional<std::int64_t> keyframe_timestamp;
-    auto append = [&](AVFrame &frame) {
-        if (result.frames.empty()) {
-            fill_stream_metadata(result, *opened.codec, *opened.stream, frame);
-        } else if (frame.width != result.width || frame.height != result.height) {
-            throw std::runtime_error("media resolution changed during decode");
-        }
-        FrameIdentity identity = identity_for(frame, *opened.stream, result.frames.size());
-        if (identity.key_frame || result.frames.empty()) {
-            keyframe_anchor = identity.frame_index;
-            keyframe_timestamp = identity.best_effort_timestamp
-                ? identity.best_effort_timestamp : identity.pts;
-        }
-        identity.keyframe_anchor = keyframe_anchor;
-        identity.keyframe_timestamp = keyframe_timestamp;
-        result.frames.push_back(std::move(identity));
-        if (progress) progress(result.frames.size());
-    };
-    while (av_read_frame(opened.format.get(), packet.get()) >= 0) {
-        if (stop.stop_requested()) throw std::runtime_error("cancelled");
-        if (packet->stream_index == static_cast<int>(stream_index)) {
-            check_ffmpeg(avcodec_send_packet(opened.codec.get(), packet.get()),
-                         "avcodec_send_packet");
-            receive_frames(*opened.codec, stop, append);
-        }
-        av_packet_unref(packet.get());
+
+    AVFormatContext *format_raw = nullptr;
+    check_ffmpeg(avformat_open_input(&format_raw, path.c_str(), nullptr, nullptr),
+                 "avformat_open_input");
+    FormatPtr format{format_raw};
+    check_ffmpeg(avformat_find_stream_info(format.get(), nullptr),
+                 "avformat_find_stream_info");
+    if (stream_index >= format->nb_streams
+        || format->streams[stream_index]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) {
+        throw std::runtime_error("requested stream is not a video stream");
     }
-    check_ffmpeg(avcodec_send_packet(opened.codec.get(), nullptr), "avcodec_send_packet(flush)");
-    receive_frames(*opened.codec, stop, append);
-    if (result.frames.empty()) throw std::runtime_error("media contains no decoded video frames");
-    result.duration_ticks = opened.stream->duration;
-    result.time_base_num = opened.stream->time_base.num;
-    result.time_base_den = opened.stream->time_base.den;
+    AVStream &stream = *format->streams[stream_index];
+    const AVCodecParameters &parameters = *stream.codecpar;
+    result.duration_ticks = stream.duration;
+    result.time_base_num = stream.time_base.num;
+    result.time_base_den = stream.time_base.den;
     result.source_size = std::filesystem::file_size(path);
     result.source_mtime_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::filesystem::last_write_time(path).time_since_epoch()).count();
-    result.decoder = options == nullptr
-        || options->backend == DecoderOptions::Backend::software
-        ? "software"
-        : options->backend == DecoderOptions::Backend::cuda
-            ? "nvdec" : "vulkan_video";
+    result.format_name = format->iformat != nullptr && format->iformat->name != nullptr
+        ? format->iformat->name : "";
+    result.format_flags = format->flags;
+    result.raw_demuxer = result.format_name == "h264" || result.format_name == "hevc"
+        || result.format_name == "mpegvideo" || result.format_name == "vc1";
+    result.width = parameters.width;
+    result.height = parameters.height;
+    result.codec = avcodec_get_name(parameters.codec_id);
+    if (parameters.profile != AV_PROFILE_UNKNOWN) {
+        const char *profile = avcodec_profile_name(parameters.codec_id, parameters.profile);
+        if (profile != nullptr) result.profile = profile;
+    }
+    if (parameters.format >= 0) {
+        const char *name = av_get_pix_fmt_name(static_cast<AVPixelFormat>(parameters.format));
+        if (name != nullptr) result.pixel_format = name;
+    }
+    if (parameters.bits_per_raw_sample > 0) {
+        result.bit_depth = parameters.bits_per_raw_sample;
+    } else if (parameters.format >= 0) {
+        const AVPixFmtDescriptor *descriptor = av_pix_fmt_desc_get(
+            static_cast<AVPixelFormat>(parameters.format));
+        result.bit_depth = descriptor != nullptr && descriptor->comp[0].depth > 0
+            ? descriptor->comp[0].depth : 8;
+    } else {
+        result.bit_depth = 8;
+    }
+    switch (parameters.color_range) {
+    case AVCOL_RANGE_MPEG: result.range = "limited"; break;
+    case AVCOL_RANGE_JPEG: result.range = "full"; break;
+    default: break;
+    }
+    if (parameters.extradata != nullptr && parameters.extradata_size > 0) {
+        ExtraDataInfo extra;
+        extra.codec_id = static_cast<std::uint32_t>(parameters.codec_id);
+        extra.width = parameters.width;
+        extra.height = parameters.height;
+        extra.pixel_format = result.pixel_format;
+        extra.bit_rate = static_cast<std::uint32_t>(std::min<std::int64_t>(
+            parameters.bit_rate, std::numeric_limits<std::uint32_t>::max()));
+        extra.data.assign(parameters.extradata,
+                          parameters.extradata + parameters.extradata_size);
+        result.extradata.push_back(std::move(extra));
+    }
+    const int index_entry_count = avformat_index_get_entries_count(&stream);
+    for (int index = 0; index < index_entry_count; ++index) {
+        const AVIndexEntry *entry_ptr = avformat_index_get_entry(&stream, index);
+        if (entry_ptr == nullptr) continue;
+        const AVIndexEntry &entry = *entry_ptr;
+        result.stream_index_entries.push_back({entry.pos, entry.timestamp,
+                                                static_cast<std::uint32_t>(entry.flags),
+                                                static_cast<std::uint32_t>(entry.size),
+                                                static_cast<std::uint32_t>(entry.min_distance)});
+    }
+
+    AVCodecParserContext *parser_raw = av_parser_init(parameters.codec_id);
+    ParserPtr parser{parser_raw};
+    CodecPtr parser_codec{avcodec_alloc_context3(nullptr)};
+    if (parser_codec) check_ffmpeg(avcodec_parameters_to_context(parser_codec.get(), &parameters),
+                                   "avcodec_parameters_to_context(parser)");
+    if (parser) parser->flags |= PARSER_FLAG_COMPLETE_FRAMES | PARSER_FLAG_FETCHED_OFFSET;
+
+    BsfPtr bitstream_filter;
+    const char *bitstream_filter_name = nullptr;
+    if (parameters.codec_id == AV_CODEC_ID_H264 && !result.raw_demuxer
+        && parameters.extradata_size > 0) {
+        bitstream_filter_name = "h264_mp4toannexb";
+    } else if (parameters.codec_id == AV_CODEC_ID_MPEG4
+               && !result.raw_demuxer) {
+        bitstream_filter_name = "mpeg4_unpack_bframes";
+    }
+    if (bitstream_filter_name != nullptr) {
+        const AVBitStreamFilter *filter = av_bsf_get_by_name(bitstream_filter_name);
+        if (filter != nullptr) {
+            AVBSFContext *filter_raw = nullptr;
+            check_ffmpeg(av_bsf_alloc(filter, &filter_raw), "av_bsf_alloc");
+            bitstream_filter.reset(filter_raw);
+            check_ffmpeg(avcodec_parameters_copy(bitstream_filter->par_in, &parameters),
+                         "avcodec_parameters_copy(bitstream filter)");
+            bitstream_filter->time_base_in = stream.time_base;
+            check_ffmpeg(av_bsf_init(bitstream_filter.get()), "av_bsf_init");
+            if (parser_codec && bitstream_filter->par_out != nullptr) {
+                check_ffmpeg(avcodec_parameters_to_context(parser_codec.get(),
+                                                            bitstream_filter->par_out),
+                             "avcodec_parameters_to_context(bitstream filter output)");
+            }
+        }
+    }
+
+    AVPacket *packet_raw = av_packet_alloc();
+    if (!packet_raw) throw std::runtime_error("av_packet_alloc failed");
+    PacketPtr packet{packet_raw};
+    std::uint32_t current_extradata_index = result.extradata.empty()
+        ? 0U : result.extradata.front().index;
+    auto append_record = [&](const AVPacket *source, const std::uint8_t *data,
+                             int size, bool flushed) {
+        FrameIdentity identity;
+        identity.decode_index = result.frames.size();
+        const std::int64_t packet_pts = source != nullptr ? source->pts : AV_NOPTS_VALUE;
+        const std::int64_t packet_dts = source != nullptr ? source->dts : AV_NOPTS_VALUE;
+        const std::int64_t packet_pos = source != nullptr ? source->pos : -1;
+        bool parser_key_known = false;
+        if (parser) {
+            identity.pts = timestamp_value(parser->pts);
+            identity.dts = timestamp_value(parser->dts);
+            identity.file_position = parser->pos >= 0 ? std::optional{parser->pos}
+                                                       : (packet_pos >= 0 ? std::optional{packet_pos} : std::nullopt);
+            identity.picture_type = parser_picture_name(parser->pict_type);
+            identity.poc = parser->output_picture_number >= 0
+                ? std::optional{parser->output_picture_number} : std::nullopt;
+            identity.repeat_pict = parser->repeat_pict;
+            identity.field_order = parser_field_order(parser->field_order);
+            parser_key_known = parser->key_frame >= 0;
+            identity.key_frame = parser->key_frame == 1
+                || (parser->key_frame < 0 && identity.picture_type == std::optional<std::string>{"I"});
+        }
+        if (!identity.pts) identity.pts = timestamp_value(packet_pts);
+        if (!identity.dts) identity.dts = timestamp_value(packet_dts);
+        if (!identity.file_position && packet_pos >= 0) identity.file_position = packet_pos;
+        identity.packet_size = static_cast<std::uint32_t>(std::max(0, size));
+        identity.extradata_index = current_extradata_index;
+        if (!parser_key_known && source != nullptr && (source->flags & AV_PKT_FLAG_KEY) != 0) {
+            identity.key_frame = true;
+        }
+        identity.rap = identity.key_frame || identity.picture_type == std::optional<std::string>{"I"};
+        const std::uint8_t *packet_data = source != nullptr && source->data != nullptr
+            ? source->data : data;
+        const int packet_data_size = source != nullptr ? source->size : size;
+        if (parameters.codec_id == AV_CODEC_ID_VP9 && packet_data != nullptr && packet_data_size > 0) {
+            const std::uint8_t marker = packet_data[packet_data_size - 1];
+            identity.vp9_superframe = (marker & 0xe0U) == 0xc0U;
+        }
+        if (parameters.codec_id == AV_CODEC_ID_VP8 && packet_data != nullptr && packet_data_size > 0) {
+            identity.vp8_invisible_frame = (packet_data[0] & 1U) == 0U;
+        }
+        if (flushed && identity.packet_size == 0U) identity.packet_size = 0U;
+        result.frames.push_back(std::move(identity));
+        if (progress) progress(result.frames.size());
+    };
+
+    auto parse_packet = [&](AVPacket *input_packet) {
+        std::size_t side_data_size = 0U;
+        const std::uint8_t *side_data = av_packet_get_side_data(
+            input_packet, AV_PKT_DATA_NEW_EXTRADATA, &side_data_size);
+        if (side_data != nullptr && side_data_size > 0U) {
+            const bool changed = result.extradata.empty()
+                || result.extradata.back().data.size() != side_data_size
+                || !std::equal(result.extradata.back().data.begin(), result.extradata.back().data.end(), side_data);
+            if (changed) {
+                ExtraDataInfo extra;
+                extra.index = static_cast<std::uint32_t>(result.extradata.size());
+                extra.codec_id = static_cast<std::uint32_t>(parameters.codec_id);
+                extra.width = parameters.width;
+                extra.height = parameters.height;
+                extra.pixel_format = result.pixel_format;
+                extra.data.assign(side_data, side_data + side_data_size);
+                result.extradata.push_back(std::move(extra));
+                current_extradata_index = result.extradata.back().index;
+            }
+        }
+        bool emitted = false;
+        if (parser && parser_codec) {
+            const std::uint8_t *input = input_packet->data;
+            int remaining = input_packet->size;
+            while (remaining > 0) {
+                std::uint8_t *output = nullptr;
+                int output_size = 0;
+                const int consumed = av_parser_parse2(
+                    parser.get(), parser_codec.get(), &output, &output_size,
+                    input, remaining, input_packet->pts, input_packet->dts, input_packet->pos);
+                if (consumed < 0) throw std::runtime_error("media parser failed");
+                if (output_size > 0) {
+                    append_record(input_packet, output, output_size, false);
+                    emitted = true;
+                }
+                if (consumed == 0) break;
+                input += consumed;
+                remaining -= consumed;
+            }
+        }
+        if (!parser && input_packet->size > 0) {
+            append_record(input_packet, input_packet->data, input_packet->size, false);
+            emitted = true;
+        }
+        return emitted;
+    };
+    PacketPtr filtered_packet{av_packet_alloc()};
+    if (!filtered_packet) throw std::runtime_error("av_packet_alloc failed");
+    while (av_read_frame(format.get(), packet.get()) >= 0) {
+        if (stop.stop_requested()) throw std::runtime_error("cancelled");
+        if (packet->stream_index == static_cast<int>(stream_index)) {
+            ++result.packet_count;
+            if (bitstream_filter) {
+                check_ffmpeg(av_bsf_send_packet(bitstream_filter.get(), packet.get()),
+                             "av_bsf_send_packet");
+                for (;;) {
+                    const int filtered = av_bsf_receive_packet(bitstream_filter.get(), filtered_packet.get());
+                    if (filtered == AVERROR(EAGAIN) || filtered == AVERROR_EOF) break;
+                    check_ffmpeg(filtered, "av_bsf_receive_packet");
+                    parse_packet(filtered_packet.get());
+                    av_packet_unref(filtered_packet.get());
+                }
+            } else {
+                parse_packet(packet.get());
+            }
+        }
+        av_packet_unref(packet.get());
+    }
+    if (bitstream_filter) {
+        check_ffmpeg(av_bsf_send_packet(bitstream_filter.get(), nullptr), "av_bsf_send_packet(flush)");
+        for (;;) {
+            const int filtered = av_bsf_receive_packet(bitstream_filter.get(), filtered_packet.get());
+            if (filtered == AVERROR(EAGAIN) || filtered == AVERROR_EOF) break;
+            check_ffmpeg(filtered, "av_bsf_receive_packet");
+            parse_packet(filtered_packet.get());
+            av_packet_unref(filtered_packet.get());
+        }
+    }
+    if (parser && parser_codec) {
+        for (;;) {
+            std::uint8_t *output = nullptr;
+            int output_size = 0;
+            av_parser_parse2(parser.get(), parser_codec.get(), &output, &output_size,
+                             nullptr, 0, AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
+            if (output_size <= 0) break;
+            append_record(nullptr, output, output_size, true);
+        }
+    }
+    if (result.frames.empty()) throw std::runtime_error("media contains no indexed video frames");
+
+    bool unique_pts = true;
+    std::vector<std::int64_t> seen_pts;
+    for (const FrameIdentity &frame : result.frames) {
+        if (!frame.pts || std::find(seen_pts.begin(), seen_pts.end(), *frame.pts) != seen_pts.end()) {
+            unique_pts = false;
+            break;
+        }
+        seen_pts.push_back(*frame.pts);
+    }
+    std::vector<std::size_t> order(result.frames.size());
+    std::iota(order.begin(), order.end(), 0U);
+    if (unique_pts) {
+        std::stable_sort(order.begin(), order.end(), [&](std::size_t left, std::size_t right) {
+            return result.frames[left].pts.value() < result.frames[right].pts.value();
+        });
+    }
+    std::vector<FrameIdentity> presentation;
+    presentation.reserve(order.size());
+    result.decode_to_presentation.resize(order.size());
+    result.presentation_to_decode.resize(order.size());
+    for (std::size_t presentation_index = 0; presentation_index < order.size(); ++presentation_index) {
+        FrameIdentity frame = std::move(result.frames[order[presentation_index]]);
+        result.decode_to_presentation[frame.decode_index] = presentation_index;
+        result.presentation_to_decode[presentation_index] = frame.decode_index;
+        frame.frame_index = presentation_index;
+        if (frame.pts && result.time_base_den != 0) {
+            frame.timestamp_seconds = static_cast<double>(*frame.pts)
+                * static_cast<double>(result.time_base_num) / result.time_base_den;
+        }
+        presentation.push_back(std::move(frame));
+    }
+    result.frames = std::move(presentation);
+    for (FrameIdentity &frame : result.frames) {
+        std::size_t anchor = 0U;
+        std::uint64_t best_decode = 0U;
+        bool found = false;
+        for (const FrameIdentity &candidate : result.frames) {
+            if (!candidate.rap || candidate.decode_index > frame.decode_index) continue;
+            if (!found || candidate.decode_index >= best_decode) {
+                found = true;
+                best_decode = candidate.decode_index;
+                anchor = candidate.frame_index;
+            }
+        }
+        frame.keyframe_anchor = anchor;
+        frame.leading_frame = frame.frame_index < anchor;
+        frame.keyframe_timestamp = result.frames[anchor].pts;
+    }
+    if (unique_pts) result.seek_method = "pts";
+    else if (monotonic_positions(result.frames, true)) result.seek_method = "dts";
+    else if (monotonic_positions(result.frames, false)) result.seek_method = "file_position";
+    else result.seek_method = "sample_order";
+    result.index_mode = "packet_rebuilt";
+    result.decoder = "software";
+    result.index_ms = std::chrono::duration<double, std::milli>(Clock::now() - index_start).count();
     return result;
 }
 
 MediaIndex index_media(const std::string &path, std::uint32_t stream_index,
                        std::stop_token stop, IndexProgress progress) {
     return index_media_impl(
-        path, stream_index, nullptr, stop, std::move(progress));
+        path, stream_index, nullptr, {}, stop, std::move(progress));
 }
 
 MediaIndex index_media(const std::string &path, std::uint32_t stream_index,
                        const DecoderOptions &options, std::stop_token stop,
                        IndexProgress progress) {
     return index_media_impl(
-        path, stream_index, &options, stop, std::move(progress));
+        path, stream_index, &options, {}, stop, std::move(progress));
+}
+
+MediaIndex index_media(const std::string &path, std::uint32_t stream_index,
+                       const IndexOptions &index_options, std::stop_token stop,
+                       IndexProgress progress) {
+    return index_media_impl(path, stream_index, nullptr, index_options,
+                            stop, std::move(progress));
+}
+
+MediaIndex index_media(const std::string &path, std::uint32_t stream_index,
+                       const DecoderOptions &options, const IndexOptions &index_options,
+                       std::stop_token stop, IndexProgress progress) {
+    return index_media_impl(path, stream_index, &options, index_options,
+                            stop, std::move(progress));
 }
 
 std::vector<FrameIdentity> select_frames(const MediaIndex &index, const ScanScope &scope) {
@@ -964,7 +1225,9 @@ void decode_selected_indexed(const std::string &path, const MediaIndex &index,
         const std::uint64_t last_target = selected_frames[selected_end - 1U].frame_index;
         OpenedDecoder opened = open_decoder(path, index.stream_index);
         std::uint64_t frame_cursor = 0U;
-        if (anchor < index.frames.size()
+        const bool leading_target = selected_frames[selected_begin].leading_frame
+            || selected_frames[selected_begin].frame_index < anchor;
+        if (!leading_target && anchor < index.frames.size()
             && index.frames[anchor].keyframe_timestamp) {
             const std::int64_t timestamp = *index.frames[anchor].keyframe_timestamp;
             check_ffmpeg(avformat_seek_file(opened.format.get(),
@@ -990,8 +1253,14 @@ void decode_selected_indexed(const std::string &path, const MediaIndex &index,
                 finished = true;
                 return;
             }
-            if (selected_cursor < selected_end
-                && frame_cursor == selected_frames[selected_cursor].frame_index) {
+            std::size_t matching_target = selected_end;
+            for (std::size_t target = selected_begin; target < selected_end; ++target) {
+                if (selected_frames[target].frame_index == frame_cursor) {
+                    matching_target = target;
+                    break;
+                }
+            }
+            if (matching_target < selected_end) {
                 if (!scaler) {
                     scaler.reset(sws_getContext(
                         source.width, source.height,
@@ -1008,8 +1277,8 @@ void decode_selected_indexed(const std::string &path, const MediaIndex &index,
                         0, 1 << 16, 1 << 16);
                 }
                 HostFrame output;
-                output.seq = selected_cursor;
-                output.identity = selected_frames[selected_cursor];
+                output.seq = selected_cursor++;
+                output.identity = selected_frames[matching_target];
                 output.width = source.width;
                 output.height = source.height;
                 output.pixels.resize(static_cast<std::size_t>(source.width)
@@ -1058,7 +1327,6 @@ void decode_selected_indexed(const std::string &path, const MediaIndex &index,
                 consumer(std::move(output));
                 consumer_ms += std::chrono::duration<double, std::milli>(
                     Clock::now() - consumer_start).count();
-                ++selected_cursor;
             }
             ++frame_cursor;
             finished = selected_cursor == selected_end || frame_cursor > last_target;

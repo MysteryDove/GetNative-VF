@@ -28,19 +28,51 @@ struct ScanScope {
 
 struct FrameIdentity {
     std::uint64_t frame_index = 0U;
+    std::uint64_t decode_index = 0U;
+    std::optional<std::int64_t> dts;
     std::optional<std::int64_t> pts;
     std::optional<std::int64_t> best_effort_timestamp;
     std::optional<double> timestamp_seconds;
+    std::optional<std::int64_t> file_position;
+    std::uint32_t packet_size = 0U;
     bool key_frame = false;
+    bool rap = false;
+    bool leading_frame = false;
     std::optional<std::string> picture_type;
+    std::optional<std::int32_t> poc;
+    std::int32_t repeat_pict = 0;
+    std::string field_order = "unknown";
+    bool vp8_invisible_frame = false;
+    bool vp9_superframe = false;
+    std::uint32_t extradata_index = 0U;
     std::uint64_t keyframe_anchor = 0U;
     std::optional<std::int64_t> keyframe_timestamp;
 };
 
+struct StreamIndexEntry {
+    std::int64_t file_position = -1;
+    std::int64_t timestamp = 0;
+    std::uint32_t flags = 0U;
+    std::uint32_t size = 0U;
+    std::uint32_t distance = 0U;
+};
+
+struct ExtraDataInfo {
+    std::uint32_t index = 0U;
+    std::uint32_t codec_id = 0U;
+    std::uint32_t fourcc = 0U;
+    std::int32_t width = 0;
+    std::int32_t height = 0;
+    std::string pixel_format;
+    std::uint32_t bit_rate = 0U;
+    std::vector<std::uint8_t> data;
+};
+
 struct MediaIndex {
-    static constexpr std::uint32_t format_version = 1U;
+    static constexpr std::uint32_t format_version = 2U;
 
     std::string fingerprint;
+    std::string source_path;
     std::uint64_t source_size = 0U;
     std::int64_t source_mtime_ns = 0;
     std::uint32_t stream_index = 0U;
@@ -55,7 +87,25 @@ struct MediaIndex {
     std::int32_t time_base_num = 0;
     std::int32_t time_base_den = 1;
     std::string decoder = "software";
+    std::string format_name;
+    std::int64_t format_flags = 0;
+    bool raw_demuxer = false;
+    std::string index_mode = "packet_rebuilt";
+    std::string seek_method = "sample_order";
+    std::uint64_t packet_count = 0U;
+    std::uint64_t selective_decodes = 0U;
+    double index_ms = 0.0;
+    std::vector<StreamIndexEntry> stream_index_entries;
+    std::vector<ExtraDataInfo> extradata;
+    std::vector<std::uint64_t> decode_to_presentation;
+    std::vector<std::uint64_t> presentation_to_decode;
     std::vector<FrameIdentity> frames;
+};
+
+struct IndexOptions {
+    bool rap_verification = false;
+    bool allow_lwi = true;
+    bool generate_compat_lwi = true;
 };
 
 struct IndexedMedia {
@@ -172,7 +222,7 @@ struct DecoderOptions {
     std::size_t frame_concurrency = 2U;
 };
 
-using IndexProgress = std::function<void(std::uint64_t decoded_frames)>;
+using IndexProgress = std::function<void(std::uint64_t indexed_records)>;
 using FrameConsumer = std::function<void(HostFrame frame)>;
 using CudaFrameConsumer = std::function<void(CudaFrame frame)>;
 using VulkanFrameConsumer = std::function<void(VulkanFrame frame)>;
@@ -193,6 +243,17 @@ using VulkanFrameConsumer = std::function<void(VulkanFrame frame)>;
                                      const DecoderOptions &options,
                                      std::stop_token stop = {},
                                      IndexProgress progress = {});
+[[nodiscard]] MediaIndex index_media(const std::string &path,
+                                     std::uint32_t stream_index,
+                                     const IndexOptions &index_options,
+                                     std::stop_token stop = {},
+                                     IndexProgress progress = {});
+[[nodiscard]] MediaIndex index_media(const std::string &path,
+                                     std::uint32_t stream_index,
+                                     const DecoderOptions &options,
+                                     const IndexOptions &index_options,
+                                     std::stop_token stop = {},
+                                     IndexProgress progress = {});
 [[nodiscard]] std::string preferred_index_path(const std::string &path,
                                                std::uint32_t stream_index,
                                                std::uint32_t default_stream_index);
@@ -206,6 +267,11 @@ void write_index_atomic(const std::string &index_path, const MediaIndex &index,
     const std::string &path, std::optional<std::uint32_t> stream_index,
     const std::string &cache_directory, const DecoderOptions &options = {},
     std::stop_token stop = {}, IndexProgress progress = {});
+[[nodiscard]] IndexedMedia ensure_index(
+    const std::string &path, std::optional<std::uint32_t> stream_index,
+    const std::string &cache_directory, const DecoderOptions &options,
+    const IndexOptions &index_options, std::stop_token stop = {},
+    IndexProgress progress = {});
 [[nodiscard]] std::vector<FrameIdentity> select_frames(const MediaIndex &index,
                                                         const ScanScope &scope);
 [[nodiscard]] std::vector<FrameIdentity> frame_window(

@@ -156,39 +156,56 @@ export function useMediaPreview({
         activeMediaTask.current = windowTask;
         const window = await windowTask.promise;
         if (previewRequestId.current !== requestId) return;
-        const batchTask = requestMediaPreviewBatch({
+        const mainTask = requestMediaPreviewBatch({
           path: source.path,
           fingerprint: source.fingerprint,
           streamIndex,
-          frames: [
-            { itemId: "main", frameIndex: window.selected.frame_index, maxDimension: 1600 },
-            ...window.frames.slice(0, 25).map((frame) => ({
-              itemId: `thumb-${frame.frame_index}`,
-              frameIndex: frame.frame_index,
-              maxDimension: 160,
-            })),
-          ],
+          frames: [{ itemId: "main", frameIndex: window.selected.frame_index, maxDimension: 1600 }],
         });
-        activeMediaTask.current = batchTask;
-        const batch = await batchTask.promise;
+        activeMediaTask.current = mainTask;
+        const mainBatch = await mainTask.promise;
         if (previewRequestId.current !== requestId) {
-          for (const asset of batch.assets) URL.revokeObjectURL(asset.url);
+          for (const asset of mainBatch.assets) URL.revokeObjectURL(asset.url);
           return;
         }
-        const main = batch.assets.find((asset) => asset.itemId === "main");
+        const main = mainBatch.assets.find((asset) => asset.itemId === "main");
         if (!main) throw new Error("media_decode_error: preview batch omitted the main frame");
-        const thumbnails = Object.fromEntries(
-          batch.assets
-            .filter((asset) => asset.itemId.startsWith("thumb-"))
-            .map((asset) => [asset.frameIndex, asset.url]),
-        );
         setFrameWindowState({ sourceKey: sourceStreamKey(source), window });
         setFrameInput(String(window.selected.frame_index));
         setScrubFrame(window.selected.frame_index);
         setTimeInput((window.selected.timestamp_seconds ?? 0).toFixed(3));
         swapPreviewUrl(main.url);
-        swapThumbnailUrls(thumbnails);
         setError("");
+
+        // The main image is the interactive seek result. Filmstrip thumbnails
+        // continue in the background so they cannot delay the first visible
+        // frame; a later seek cancels this task through activeMediaTask.
+        setPreviewBusy(false);
+        const thumbnailTask = requestMediaPreviewBatch({
+          path: source.path,
+          fingerprint: source.fingerprint,
+          streamIndex,
+          frames: window.frames.slice(0, 25).map((frame) => ({
+            itemId: `thumb-${frame.frame_index}`,
+            frameIndex: frame.frame_index,
+            maxDimension: 160,
+          })),
+        });
+        activeMediaTask.current = thumbnailTask;
+        void thumbnailTask.promise.then((batch) => {
+          if (previewRequestId.current !== requestId) {
+            for (const asset of batch.assets) URL.revokeObjectURL(asset.url);
+            return;
+          }
+          swapThumbnailUrls(Object.fromEntries(
+            batch.assets.map((asset) => [asset.frameIndex, asset.url]),
+          ));
+        }).catch((reason) => {
+          if (previewRequestId.current !== requestId) return;
+          const detail = String(reason);
+          if (!detail.includes("cancelled:")) setError(detail);
+          if (isFingerprintError(detail)) onSourceChanged(source.id, detail);
+        });
       } catch (reason) {
         if (previewRequestId.current === requestId) {
           const detail = String(reason);

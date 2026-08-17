@@ -5,6 +5,7 @@
 #include <bit>
 #include <chrono>
 #include <cctype>
+#include <cstdio>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -14,10 +15,20 @@
 #include <mutex>
 #include <stdexcept>
 #include <string_view>
+#include <sstream>
 #include <system_error>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+}
+
+#if defined(GETNATIVE_USE_XXHASH) && __has_include(<xxhash.h>)
+#include <xxhash.h>
+#define GETNATIVE_HAS_XXHASH 1
+#endif
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -122,6 +133,26 @@ std::uint8_t picture_code(const std::optional<std::string> &value) {
     return 4U;
 }
 
+std::uint8_t field_code(std::string_view value) {
+    if (value == "tt") return 1U;
+    if (value == "bb") return 2U;
+    if (value == "tb") return 3U;
+    if (value == "bt") return 4U;
+    if (value == "progressive") return 5U;
+    return 0U;
+}
+
+std::string field_name(std::uint8_t value) {
+    switch (value) {
+    case 1U: return "tt";
+    case 2U: return "bb";
+    case 3U: return "tb";
+    case 4U: return "bt";
+    case 5U: return "progressive";
+    default: return "unknown";
+    }
+}
+
 std::optional<std::string> picture_name(std::uint8_t value) {
     switch (value) {
     case 0U: return std::nullopt;
@@ -146,6 +177,21 @@ std::vector<std::uint8_t> frame_payload(const MediaIndex &index) {
         output.integer(static_cast<std::uint16_t>(0U));
         output.integer(frame.keyframe_anchor);
         output.integer(frame.keyframe_timestamp.value_or(kMissingTimestamp));
+        output.integer(frame.decode_index);
+        output.integer(frame.dts.value_or(kMissingTimestamp));
+        output.integer(frame.file_position.value_or(-1));
+        output.integer(frame.packet_size);
+        std::uint8_t flags = 0U;
+        if (frame.rap) flags |= 1U;
+        if (frame.leading_frame) flags |= 2U;
+        if (frame.vp8_invisible_frame) flags |= 4U;
+        if (frame.vp9_superframe) flags |= 8U;
+        output.integer(flags);
+        output.integer(field_code(frame.field_order));
+        output.integer(frame.poc.value_or(std::numeric_limits<std::int32_t>::min()));
+        output.integer(frame.repeat_pict);
+        output.integer(frame.extradata_index);
+        output.integer(static_cast<std::uint16_t>(0U));
     }
     return std::move(output.data);
 }
@@ -173,6 +219,33 @@ std::vector<std::uint8_t> serialize(const MediaIndex &index) {
     output.string(index.pixel_format);
     output.string(index.range);
     output.string(index.decoder);
+    output.string(index.format_name);
+    output.string(index.index_mode);
+    output.string(index.seek_method);
+    output.integer(index.format_flags);
+    output.integer(static_cast<std::uint8_t>(index.raw_demuxer ? 1U : 0U));
+    output.integer(index.packet_count);
+    output.integer(index.selective_decodes);
+    output.integer(static_cast<std::uint64_t>(index.stream_index_entries.size()));
+    for (const StreamIndexEntry &entry : index.stream_index_entries) {
+        output.integer(entry.file_position);
+        output.integer(entry.timestamp);
+        output.integer(entry.flags);
+        output.integer(entry.size);
+        output.integer(entry.distance);
+    }
+    output.integer(static_cast<std::uint64_t>(index.extradata.size()));
+    for (const ExtraDataInfo &extra : index.extradata) {
+        output.integer(extra.index);
+        output.integer(extra.codec_id);
+        output.integer(extra.fourcc);
+        output.integer(extra.width);
+        output.integer(extra.height);
+        output.string(extra.pixel_format);
+        output.integer(extra.bit_rate);
+        output.integer(static_cast<std::uint64_t>(extra.data.size()));
+        output.data.insert(output.data.end(), extra.data.begin(), extra.data.end());
+    }
     output.data.insert(output.data.end(), payload.begin(), payload.end());
     return std::move(output.data);
 }
@@ -204,8 +277,354 @@ std::string cache_index_path(const std::string &cache_directory,
                     [](unsigned char value) { return !std::isalnum(value); }, '_');
     if (key.size() > 96U) key.resize(96U);
     return (std::filesystem::path{cache_directory}
-            / (key + ".stream-" + std::to_string(index.stream_index) + ".gnvf.lwi"))
+            / (key + ".stream-" + std::to_string(index.stream_index) + ".vf.lwi"))
         .string();
+}
+
+std::string lwi_hash(const std::filesystem::path &path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("failed to open media for LWI hash");
+    const std::uint64_t size = std::filesystem::file_size(path);
+    constexpr std::size_t edge = 1024U * 1024U;
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(std::min<std::uint64_t>(size, edge)));
+    input.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (size > edge) {
+        input.clear();
+        input.seekg(-static_cast<std::streamoff>(edge), std::ios::end);
+        const std::size_t old = bytes.size();
+        bytes.resize(old + edge);
+        input.read(reinterpret_cast<char *>(bytes.data() + old), static_cast<std::streamsize>(edge));
+    }
+#if defined(GETNATIVE_HAS_XXHASH)
+    return "0x" + [&] {
+        char buffer[17]{};
+        std::snprintf(buffer, sizeof(buffer), "%016llx",
+                      static_cast<unsigned long long>(XXH3_64bits(bytes.data(), bytes.size())));
+        return std::string{buffer};
+    }();
+#else
+    // Keep a deterministic fallback for builds without xxHash. Such builds
+    // still read generated .vf.lwi files, but reject external hashes.
+    return {};
+#endif
+}
+
+std::string trim(std::string value) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return {};
+    const auto last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1U);
+}
+
+std::unordered_map<std::string, std::string> comma_fields(std::string_view value) {
+    std::unordered_map<std::string, std::string> fields;
+    std::size_t begin = 0U;
+    while (begin <= value.size()) {
+        const std::size_t end = value.find(',', begin);
+        std::string part{value.substr(begin, end == std::string_view::npos
+                                               ? value.size() - begin : end - begin)};
+        const std::size_t equals = part.find('=');
+        if (equals != std::string::npos) {
+            fields[trim(part.substr(0U, equals))] = trim(part.substr(equals + 1U));
+        } else if (!trim(part).empty()) {
+            fields["_"] = trim(part);
+        }
+        if (end == std::string_view::npos) break;
+        begin = end + 1U;
+    }
+    return fields;
+}
+
+std::int64_t parse_integer(std::string_view value, std::int64_t fallback = 0) {
+    try {
+        std::string text{trim(std::string{value})};
+        std::size_t consumed = 0U;
+        const std::int64_t result = std::stoll(text, &consumed, 0);
+        return consumed == text.size() ? result : fallback;
+    } catch (...) {
+        return fallback;
+    }
+}
+
+std::optional<std::string> tag_value(std::string_view source, std::string_view name) {
+    const std::string open = "<" + std::string{name} + ">";
+    const std::string close = "</" + std::string{name} + ">";
+    const std::size_t begin = source.find(open);
+    if (begin == std::string_view::npos) return std::nullopt;
+    const std::size_t value_begin = begin + open.size();
+    const std::size_t end = source.find(close, value_begin);
+    if (end == std::string_view::npos) return std::nullopt;
+    return std::string{source.substr(value_begin, end - value_begin)};
+}
+
+MediaIndex read_lwi_text(const std::string &index_path, const std::string &media_path,
+                         std::optional<std::string_view> expected_fingerprint,
+                         std::optional<std::uint32_t> expected_stream) {
+    std::ifstream input(index_path, std::ios::binary);
+    if (!input) throw std::runtime_error("LWI index does not exist");
+    const std::string text{std::istreambuf_iterator<char>{input}, {}};
+    if (text.find("LSMASHWorksIndexVersion") == std::string::npos
+        || text.find("LibavReaderIndexFile") == std::string::npos
+        || text.find("</LibavReaderIndexFile>") == std::string::npos
+        || text.find("</LibavReaderIndex>") == std::string::npos) {
+        throw std::runtime_error("LWI header is invalid");
+    }
+    const std::size_t file_tag = text.find("<LibavReaderIndexFile=");
+    if (file_tag == std::string::npos) {
+        throw std::runtime_error("LWI index version is missing");
+    }
+    {
+        const std::size_t value_begin = file_tag + std::string_view{"<LibavReaderIndexFile="}.size();
+        const std::size_t value_end = text.find('>', value_begin);
+        if (value_end == std::string::npos) throw std::runtime_error("truncated LWI header");
+        const auto version = parse_integer(text.substr(value_begin, value_end - value_begin), 0);
+        if (version < 1 || version > 19) throw std::runtime_error("unsupported LWI index version");
+    }
+    MediaIndex result;
+    result.source_path = media_path;
+    const auto scalar = [&](std::string_view key) -> std::optional<std::string> {
+        return tag_value(text, key);
+    };
+    if (!scalar("FileSize") || !scalar("FileLastModificationTime")
+        || !scalar("ActiveVideoStreamIndex")
+        || text.find("<StreamInfo=") == std::string::npos) {
+        throw std::runtime_error("LWI is missing required stream metadata");
+    }
+    result.source_size = scalar("FileSize").has_value()
+        ? static_cast<std::uint64_t>(parse_integer(*scalar("FileSize"))) : 0U;
+    result.source_mtime_ns = scalar("FileLastModificationTime").has_value()
+        ? parse_integer(*scalar("FileLastModificationTime")) * 1000000000LL : 0LL;
+    result.stream_index = scalar("ActiveVideoStreamIndex").has_value()
+        ? static_cast<std::uint32_t>(std::max<std::int64_t>(0, parse_integer(*scalar("ActiveVideoStreamIndex")))) : 0U;
+    const std::size_t duration_tag = text.find("<StreamDuration=");
+    if (duration_tag != std::string::npos) {
+        const std::size_t value_begin = text.find('>', duration_tag);
+        const std::size_t value_end = text.find("</StreamDuration>", value_begin);
+        if (value_begin != std::string::npos && value_end != std::string::npos) {
+            result.duration_ticks = parse_integer(text.substr(value_begin + 1U,
+                                                              value_end - value_begin - 1U),
+                                                  AV_NOPTS_VALUE);
+        }
+    }
+    const std::size_t reader_tag = text.find("<LibavReaderIndex=");
+    if (reader_tag != std::string::npos) {
+        const std::size_t value_begin = text.find('>', reader_tag);
+        if (value_begin != std::string::npos) {
+            const std::string value = text.substr(reader_tag, value_begin - reader_tag);
+            const std::size_t comma = value.rfind(',');
+            if (comma != std::string::npos) result.format_name = value.substr(comma + 1U);
+        }
+    }
+    if (expected_stream && result.stream_index != *expected_stream) {
+        throw std::runtime_error("LWI active video stream does not match request");
+    }
+    {
+        const std::size_t info_begin = text.find("<StreamInfo=");
+        const std::size_t info_end = info_begin == std::string::npos
+            ? std::string::npos : text.find("</StreamInfo>", info_begin);
+        const std::string info_body = info_end == std::string::npos ? std::string{}
+            : text.substr(info_begin, info_end - info_begin);
+        const std::size_t newline = info_body.find('\n');
+        const auto fields = newline == std::string::npos
+            ? std::unordered_map<std::string, std::string>{}
+            : comma_fields(info_body.substr(newline + 1U));
+        if (fields.count("Codec")) {
+            const auto codec_id = parse_integer(fields.at("Codec"), -1);
+            result.codec = codec_id >= 0 ? avcodec_get_name(static_cast<AVCodecID>(codec_id)) : fields.at("Codec");
+        }
+        if (fields.count("TimeBase")) {
+            const std::string &base = fields.at("TimeBase");
+            const std::size_t slash = base.find('/');
+            if (slash != std::string::npos) {
+                result.time_base_num = static_cast<std::int32_t>(parse_integer(base.substr(0U, slash)));
+                result.time_base_den = static_cast<std::int32_t>(parse_integer(base.substr(slash + 1U), 1));
+            }
+        }
+        if (fields.count("Width")) result.width = static_cast<std::int32_t>(parse_integer(fields.at("Width")));
+        if (fields.count("Height")) result.height = static_cast<std::int32_t>(parse_integer(fields.at("Height")));
+        if (fields.count("Format")) {
+            result.pixel_format = fields.at("Format");
+            if (result.pixel_format.find("p016") != std::string::npos) result.bit_depth = 16;
+            else if (result.pixel_format.find("p010") != std::string::npos
+                     || result.pixel_format.find("10") != std::string::npos) result.bit_depth = 10;
+        }
+        result.index_mode = "lwi_external";
+    }
+    std::istringstream lines{text};
+    std::string line;
+    FrameIdentity pending;
+    bool have_pending = false;
+    bool in_stream_entries = false;
+    bool in_extra = false;
+    while (std::getline(lines, line)) {
+        line = trim(line);
+        if (line == "</StreamIndexEntries>") { in_stream_entries = false; continue; }
+        if (line == "</ExtraDataList>") { in_extra = false; continue; }
+        if (line.rfind("<StreamIndexEntries", 0U) == 0U) { in_stream_entries = true; continue; }
+        if (line.rfind("<ExtraDataList", 0U) == 0U) { in_extra = true; continue; }
+        if (line.rfind("Index=", 0U) == 0U) {
+            if (have_pending) result.frames.push_back(pending);
+            pending = FrameIdentity{};
+            pending.decode_index = result.frames.size();
+            const auto fields = comma_fields(line.substr(6U));
+            if (fields.count("_") && parse_integer(fields.at("_"), result.stream_index)
+                    != static_cast<std::int64_t>(result.stream_index)) {
+                have_pending = false;
+                continue;
+            }
+            if (fields.count("POS") && parse_integer(fields.at("POS"), -1) >= 0) pending.file_position = parse_integer(fields.at("POS"));
+            if (fields.count("PTS") && parse_integer(fields.at("PTS"), AV_NOPTS_VALUE) != AV_NOPTS_VALUE) pending.pts = parse_integer(fields.at("PTS"));
+            if (fields.count("DTS") && parse_integer(fields.at("DTS"), AV_NOPTS_VALUE) != AV_NOPTS_VALUE) pending.dts = parse_integer(fields.at("DTS"));
+            if (fields.count("EDI")) pending.extradata_index = static_cast<std::uint32_t>(std::max<std::int64_t>(0, parse_integer(fields.at("EDI"))));
+            have_pending = true;
+            continue;
+        }
+        if (line.rfind("Key=", 0U) == 0U && have_pending) {
+            const auto fields = comma_fields(line.substr(4U));
+            const std::size_t comma = line.find(',');
+            pending.key_frame = parse_integer(comma == std::string::npos
+                                                  ? line.substr(4U) : line.substr(4U, comma - 4U)) != 0;
+            if (fields.count("Pic")) {
+                const auto pic = parse_integer(fields.at("Pic"));
+                if (pic == 1) pending.picture_type = "I";
+                else if (pic == 2) pending.picture_type = "P";
+                else if (pic == 3) pending.picture_type = "B";
+            }
+            if (fields.count("POC")) pending.poc = parse_integer(fields.at("POC"));
+            if (fields.count("Repeat")) pending.repeat_pict = static_cast<std::int32_t>(parse_integer(fields.at("Repeat")));
+            if (fields.count("Super")) pending.vp9_superframe = parse_integer(fields.at("Super")) != 0;
+            pending.rap = pending.key_frame;
+            continue;
+        }
+        if (in_stream_entries && line.rfind("POS=", 0U) == 0U) {
+            const auto fields = comma_fields(line.substr(4U));
+            StreamIndexEntry entry;
+            const std::size_t comma = line.find(',');
+            entry.file_position = parse_integer(comma == std::string::npos
+                                                    ? line.substr(4U) : line.substr(4U, comma - 4U), -1);
+            entry.timestamp = parse_integer(fields.count("TS") ? fields.at("TS") : "0");
+            entry.flags = static_cast<std::uint32_t>(parse_integer(fields.count("Flags") ? fields.at("Flags") : "0"));
+            entry.size = static_cast<std::uint32_t>(parse_integer(fields.count("Size") ? fields.at("Size") : "0"));
+            entry.distance = static_cast<std::uint32_t>(parse_integer(fields.count("Distance") ? fields.at("Distance") : "0"));
+            result.stream_index_entries.push_back(entry);
+        }
+        if (in_extra && line.rfind("Size=", 0U) == 0U) {
+            const auto fields = comma_fields(line);
+            ExtraDataInfo extra;
+            extra.index = static_cast<std::uint32_t>(result.extradata.size());
+            extra.codec_id = static_cast<std::uint32_t>(std::max<std::int64_t>(
+                0, parse_integer(fields.count("Codec") ? fields.at("Codec") : "0")));
+            extra.width = static_cast<std::int32_t>(parse_integer(fields.count("Width") ? fields.at("Width") : "0"));
+            extra.height = static_cast<std::int32_t>(parse_integer(fields.count("Height") ? fields.at("Height") : "0"));
+            extra.pixel_format = fields.count("Format") ? fields.at("Format") : "";
+            extra.bit_rate = static_cast<std::uint32_t>(std::max<std::int64_t>(
+                0, parse_integer(fields.count("BPS") ? fields.at("BPS") : "0")));
+            result.extradata.push_back(std::move(extra));
+        }
+    }
+    if (have_pending) result.frames.push_back(pending);
+    if (result.frames.empty()) throw std::runtime_error("LWI contains no video index records");
+    for (std::size_t index = 0; index < result.frames.size(); ++index) {
+        result.frames[index].frame_index = index;
+        result.frames[index].keyframe_anchor = result.frames[index].rap ? index
+            : (index == 0U ? 0U : result.frames[index - 1U].keyframe_anchor);
+        result.frames[index].keyframe_timestamp = result.frames[result.frames[index].keyframe_anchor].pts;
+        if (result.frames[index].pts && result.time_base_den != 0) {
+            result.frames[index].timestamp_seconds = static_cast<double>(*result.frames[index].pts)
+                * result.time_base_num / result.time_base_den;
+        }
+    }
+    result.source_size = result.source_size != 0U ? result.source_size : std::filesystem::file_size(media_path);
+    const std::uint64_t actual_size = std::filesystem::file_size(media_path);
+    if (result.source_size != actual_size) throw std::runtime_error("LWI source size mismatch");
+    const std::int64_t actual_mtime = file_mtime_ns(media_path);
+    if (result.source_mtime_ns != 0LL && result.source_mtime_ns / 1000000000LL != actual_mtime / 1000000000LL) {
+        throw std::runtime_error("LWI source mtime mismatch");
+    }
+    if (const auto hash = scalar("FileHash"); hash && !hash->empty()) {
+        std::string expected_hash = *hash;
+        std::string actual_hash = lwi_hash(media_path);
+        std::transform(expected_hash.begin(), expected_hash.end(), expected_hash.begin(),
+                       [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+        std::transform(actual_hash.begin(), actual_hash.end(), actual_hash.begin(),
+                       [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+        if (actual_hash.empty() || expected_hash != actual_hash) {
+            throw std::runtime_error("LWI source hash mismatch");
+        }
+    }
+    result.fingerprint = quick_fingerprint(media_path);
+    if (expected_fingerprint && result.fingerprint != *expected_fingerprint) {
+        throw std::runtime_error("media fingerprint does not match the LWI");
+    }
+    result.index_mode = "lwi_external";
+    result.seek_method = "pts";
+    result.packet_count = result.frames.size();
+    result.decoder = "software";
+    result.decode_to_presentation.resize(result.frames.size());
+    result.presentation_to_decode.resize(result.frames.size());
+    for (std::size_t i = 0; i < result.frames.size(); ++i) {
+        result.decode_to_presentation[result.frames[i].decode_index] = i;
+        result.presentation_to_decode[i] = result.frames[i].decode_index;
+    }
+    return result;
+}
+
+std::string serialize_lwi(const MediaIndex &index, const std::string &media_path) {
+    std::ostringstream output;
+    const AVCodec *codec = avcodec_find_decoder_by_name(index.codec.c_str());
+    const int codec_id = codec != nullptr ? static_cast<int>(codec->id) : 0;
+    output << "<LSMASHWorksIndexVersion=0.0.3.0>\n<LibavReaderIndexFile=19>\n";
+    output << "<InputFilePath>" << media_path << "</InputFilePath>\n";
+    output << "<FileSize>" << index.source_size << "</FileSize>\n";
+    output << "<FileLastModificationTime>" << index.source_mtime_ns / 1000000000LL << "</FileLastModificationTime>\n";
+    output << "<FileHash>" << lwi_hash(media_path) << "</FileHash>\n";
+    const std::size_t format_separator = index.format_name.find(',');
+    const std::string format_name = format_separator == std::string::npos
+        ? index.format_name : index.format_name.substr(0U, format_separator);
+    output << "<LibavReaderIndex=0x00000100,0," << format_name << ">\n";
+    output << "<ActiveVideoStreamIndex>+" << index.stream_index << "</ActiveVideoStreamIndex>\n";
+    output << "<ActiveAudioStreamIndex>-0000000002</ActiveAudioStreamIndex>\n<DefaultAudioStreamIndex>-0000000001</DefaultAudioStreamIndex>\n";
+    output << "<StreamInfo=" << index.stream_index << ",0>\nCodec=" << codec_id
+           << ",TimeBase=" << index.time_base_num << "/" << index.time_base_den
+           << ",Width=" << index.width << ",Height=" << index.height
+           << ",Format=" << index.pixel_format << ",ColorSpace=0\n</StreamInfo>\n";
+    for (const FrameIdentity &frame : index.frames) {
+        output << "Index=" << index.stream_index << ",POS=" << frame.file_position.value_or(0)
+               << ",PTS=" << frame.pts.value_or(AV_NOPTS_VALUE) << ",DTS=" << frame.dts.value_or(AV_NOPTS_VALUE)
+               << ",EDI=" << frame.extradata_index << "\nKey=" << (frame.key_frame ? 1 : 0)
+               << ",Pic=" << static_cast<int>(picture_code(frame.picture_type)) << ",POC=" << frame.poc.value_or(0)
+               << ",Repeat=" << frame.repeat_pict << ",Field=0,Super=" << (frame.vp9_superframe ? 1 : 0) << "\n";
+    }
+    output << "</LibavReaderIndex>\n<StreamIndexEntries=" << index.stream_index << ",0," << index.stream_index_entries.size() << ">\n";
+    for (const StreamIndexEntry &entry : index.stream_index_entries) {
+        output << "POS=" << entry.file_position << ",TS=" << entry.timestamp << ",Flags=" << entry.flags
+               << ",Size=" << entry.size << ",Distance=" << entry.distance << "\n";
+    }
+    output << "</StreamIndexEntries>\n<ExtraDataList=" << index.stream_index << ",0," << index.extradata.size() << ">\n";
+    for (const ExtraDataInfo &extra : index.extradata) {
+        output << "Size=" << extra.data.size() << ",Codec=" << extra.codec_id << ",4CC=0x0,Width="
+               << extra.width << ",Height=" << extra.height << ",Format=" << extra.pixel_format << ",BPS=" << extra.bit_rate << "\n\n";
+    }
+    output << "</ExtraDataList>\n</LibavReaderIndexFile>\n";
+    return output.str();
+}
+
+std::string external_lwi_path(const std::string &path, std::uint32_t stream_index,
+                              std::uint32_t default_stream_index) {
+    if (stream_index == default_stream_index) return path + ".lwi";
+    return path + ".stream-" + std::to_string(stream_index) + ".lwi";
+}
+
+std::string generated_lwi_path(const std::string &path, std::uint32_t stream_index,
+                               std::uint32_t default_stream_index) {
+    if (stream_index == default_stream_index) return path + ".vf.lwi";
+    return path + ".stream-" + std::to_string(stream_index) + ".vf.lwi";
+}
+
+std::string legacy_lwi_path(const std::string &path, std::uint32_t stream_index,
+                            std::uint32_t default_stream_index) {
+    return path + (stream_index == default_stream_index
+        ? ".gnvf.lwi" : ".stream-" + std::to_string(stream_index) + ".lwi");
 }
 
 std::shared_ptr<std::mutex> build_lock(const std::string &key) {
@@ -225,9 +644,7 @@ std::shared_ptr<std::mutex> build_lock(const std::string &key) {
 std::string preferred_index_path(const std::string &path,
                                  std::uint32_t stream_index,
                                  std::uint32_t default_stream_index) {
-    return path + (stream_index == default_stream_index
-        ? ".gnvf.lwi"
-        : ".stream-" + std::to_string(stream_index) + ".lwi");
+    return generated_lwi_path(path, stream_index, default_stream_index);
 }
 
 MediaIndex load_index(const std::string &index_path, const std::string &media_path,
@@ -243,6 +660,9 @@ MediaIndex load_index(const std::string &index_path, const std::string &media_pa
     input.seekg(0);
     input.read(reinterpret_cast<char *>(bytes.data()), raw_size);
     if (!input) throw std::runtime_error("failed to read media index");
+    if (bytes.size() >= 1U && bytes.front() == static_cast<std::uint8_t>('<')) {
+        return read_lwi_text(index_path, media_path, expected_fingerprint, expected_stream);
+    }
     Reader reader(bytes);
     for (const std::uint8_t byte : kMagic) {
         if (reader.integer<std::uint8_t>() != byte) {
@@ -250,11 +670,12 @@ MediaIndex load_index(const std::string &index_path, const std::string &media_pa
         }
     }
     const std::uint32_t version = reader.integer<std::uint32_t>();
-    if (version != MediaIndex::format_version) {
+    if (version != 1U && version != MediaIndex::format_version) {
         throw std::runtime_error("media index version is incompatible");
     }
     (void)reader.integer<std::uint32_t>();
     MediaIndex index;
+    index.source_path = media_path;
     index.source_size = reader.integer<std::uint64_t>();
     index.source_mtime_ns = reader.integer<std::int64_t>();
     index.stream_index = reader.integer<std::uint32_t>();
@@ -272,7 +693,49 @@ MediaIndex load_index(const std::string &index_path, const std::string &media_pa
     index.pixel_format = reader.string();
     index.range = reader.string();
     index.decoder = reader.string();
-    constexpr std::size_t frame_bytes = 52U;
+    if (version >= 2U) {
+        index.format_name = reader.string();
+        index.index_mode = reader.string();
+        index.seek_method = reader.string();
+        index.format_flags = reader.integer<std::int64_t>();
+        index.raw_demuxer = reader.integer<std::uint8_t>() != 0U;
+        index.packet_count = reader.integer<std::uint64_t>();
+        index.selective_decodes = reader.integer<std::uint64_t>();
+        const std::uint64_t entry_count = reader.integer<std::uint64_t>();
+        if (entry_count > 100000000U) throw std::runtime_error("media index entry table is invalid");
+        index.stream_index_entries.reserve(static_cast<std::size_t>(entry_count));
+        for (std::uint64_t ordinal = 0; ordinal < entry_count; ++ordinal) {
+            StreamIndexEntry entry;
+            entry.file_position = reader.integer<std::int64_t>();
+            entry.timestamp = reader.integer<std::int64_t>();
+            entry.flags = reader.integer<std::uint32_t>();
+            entry.size = reader.integer<std::uint32_t>();
+            entry.distance = reader.integer<std::uint32_t>();
+            index.stream_index_entries.push_back(entry);
+        }
+        const std::uint64_t extra_count = reader.integer<std::uint64_t>();
+        if (extra_count > 100000U) throw std::runtime_error("media index extradata table is invalid");
+        index.extradata.reserve(static_cast<std::size_t>(extra_count));
+        for (std::uint64_t ordinal = 0; ordinal < extra_count; ++ordinal) {
+            ExtraDataInfo extra;
+            extra.index = reader.integer<std::uint32_t>();
+            extra.codec_id = reader.integer<std::uint32_t>();
+            extra.fourcc = reader.integer<std::uint32_t>();
+            extra.width = reader.integer<std::int32_t>();
+            extra.height = reader.integer<std::int32_t>();
+            extra.pixel_format = reader.string();
+            extra.bit_rate = reader.integer<std::uint32_t>();
+            const std::uint64_t data_size = reader.integer<std::uint64_t>();
+            if (data_size > reader.remaining()) throw std::runtime_error("media index extradata is truncated");
+            extra.data.resize(static_cast<std::size_t>(data_size));
+            for (std::uint8_t &value : extra.data) value = reader.integer<std::uint8_t>();
+            index.extradata.push_back(std::move(extra));
+        }
+    }
+    if (version == 1U) index.index_mode = "legacy_native";
+    constexpr std::size_t old_frame_bytes = 52U;
+    constexpr std::size_t new_frame_bytes = 96U;
+    const std::size_t frame_bytes = version >= 2U ? new_frame_bytes : old_frame_bytes;
     if (frame_count == 0U || frame_count > 1000000000ULL
         || reader.remaining() != frame_count * frame_bytes) {
         throw std::runtime_error("media index frame table size is invalid");
@@ -299,6 +762,29 @@ MediaIndex load_index(const std::string &index_path, const std::string &media_pa
         if (std::isfinite(seconds)) frame.timestamp_seconds = seconds;
         if (anchor_timestamp != kMissingTimestamp) {
             frame.keyframe_timestamp = anchor_timestamp;
+        }
+        if (version >= 2U) {
+            frame.decode_index = reader.integer<std::uint64_t>();
+            const auto dts = reader.integer<std::int64_t>();
+            const auto position = reader.integer<std::int64_t>();
+            frame.packet_size = reader.integer<std::uint32_t>();
+            const auto flags = reader.integer<std::uint8_t>();
+            frame.rap = (flags & 1U) != 0U;
+            frame.leading_frame = (flags & 2U) != 0U;
+            frame.vp8_invisible_frame = (flags & 4U) != 0U;
+            frame.vp9_superframe = (flags & 8U) != 0U;
+            frame.field_order = field_name(reader.integer<std::uint8_t>());
+            const auto poc = reader.integer<std::int32_t>();
+            frame.repeat_pict = reader.integer<std::int32_t>();
+            frame.extradata_index = reader.integer<std::uint32_t>();
+            (void)reader.integer<std::uint16_t>();
+            if (dts != kMissingTimestamp) frame.dts = dts;
+            if (position >= 0) frame.file_position = position;
+            if (!frame.rap) frame.rap = frame.key_frame;
+            if (poc != std::numeric_limits<std::int32_t>::min()) frame.poc = poc;
+        } else {
+            frame.decode_index = ordinal;
+            frame.rap = frame.key_frame;
         }
         if (frame.frame_index != ordinal || frame.keyframe_anchor > frame.frame_index) {
             throw std::runtime_error("media index frame identity is invalid");
@@ -331,7 +817,14 @@ void write_index_atomic(const std::string &index_path, const MediaIndex &index,
     std::error_code cleanup_error;
     std::filesystem::remove(temporary, cleanup_error);
     try {
-        const std::vector<std::uint8_t> bytes = serialize(index);
+        std::vector<std::uint8_t> bytes;
+        const std::string filename = destination.filename().string();
+        if (filename.size() >= 7U && filename.ends_with(".vf.lwi")) {
+            const std::string text = serialize_lwi(index, index.source_path);
+            bytes.assign(text.begin(), text.end());
+        } else {
+            bytes = serialize(index);
+        }
         if (stop.stop_requested()) throw std::runtime_error("cancelled");
         std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
         if (!output) throw std::runtime_error("failed to create media index temporary file");
@@ -361,10 +854,27 @@ IndexedMedia ensure_index(const std::string &path,
                           const std::string &cache_directory,
                           const DecoderOptions &options, std::stop_token stop,
                           IndexProgress progress) {
+    return ensure_index(path, requested_stream, cache_directory, options, {},
+                        stop, std::move(progress));
+}
+
+IndexedMedia ensure_index(const std::string &path,
+                          std::optional<std::uint32_t> requested_stream,
+                          const std::string &cache_directory,
+                          const DecoderOptions &options,
+                          const IndexOptions &index_options, std::stop_token stop,
+                          IndexProgress progress) {
     const std::uint32_t default_stream = default_video_stream(path);
     const std::uint32_t stream = requested_stream.value_or(default_stream);
     const std::string fingerprint = quick_fingerprint(path);
     const std::string preferred = preferred_index_path(path, stream, default_stream);
+    const std::string external = external_lwi_path(path, stream, default_stream);
+    const std::filesystem::path source_path{path};
+    const std::filesystem::path source_stem = source_path.parent_path() / source_path.stem();
+    const std::string stem_external = stream == default_stream
+        ? source_stem.string() + ".lwi"
+        : source_stem.string() + ".stream-" + std::to_string(stream) + ".lwi";
+    const std::string legacy = legacy_lwi_path(path, stream, default_stream);
     MediaIndex shell;
     shell.fingerprint = fingerprint;
     shell.stream_index = stream;
@@ -373,20 +883,27 @@ IndexedMedia ensure_index(const std::string &path,
     const std::shared_ptr<std::mutex> request_lock = build_lock(lock_key);
     const std::scoped_lock lock(*request_lock);
 
-    for (const std::string *candidate : {&preferred, &fallback}) {
+    const std::vector<const std::string *> candidates = index_options.allow_lwi
+        ? std::vector<const std::string *>{&external, &stem_external, &legacy, &preferred, &fallback}
+        : std::vector<const std::string *>{&legacy, &preferred, &fallback};
+    for (const std::string *candidate : candidates) {
         try {
-            return {load_index(*candidate, path, fingerprint, stream), *candidate, false};
+            MediaIndex loaded = load_index(*candidate, path, fingerprint, stream);
+            if (loaded.index_mode == "legacy_native") continue;
+            return {std::move(loaded), *candidate, false};
         } catch (const std::exception &) {
         }
     }
     if (stop.stop_requested()) throw std::runtime_error("cancelled");
-    MediaIndex index = index_media(path, stream, options, stop, std::move(progress));
+    MediaIndex index = index_media(path, stream, options, index_options, stop, std::move(progress));
     index.source_size = std::filesystem::file_size(path);
     index.source_mtime_ns = file_mtime_ns(path);
     std::string written_path;
     try {
-        write_index_atomic(preferred, index, stop);
-        written_path = preferred;
+        index.source_path = path;
+        const std::string destination = index_options.generate_compat_lwi ? preferred : fallback;
+        write_index_atomic(destination, index, stop);
+        written_path = destination;
     } catch (const std::exception &) {
         if (stop.stop_requested()) throw;
         write_index_atomic(fallback, index, stop);

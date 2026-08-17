@@ -1569,7 +1569,7 @@ public:
             {"type", JsonValue::string("hello_ok")},
             {"request_id", JsonValue::string(request_id)},
             {"timestamp_ms", JsonValue::integer(timestamp_ms())},
-            {"engine_version", JsonValue::string("0.1.2")},
+            {"engine_version", JsonValue::string("0.1.4")},
             {"commands", JsonValue::object({
                 {"analyze", JsonValue::boolean(true)},
                 {"cancel", JsonValue::boolean(true)},
@@ -2893,6 +2893,13 @@ private:
             {"time_base_num", JsonValue::integer(index.time_base_num)},
             {"time_base_den", JsonValue::integer(index.time_base_den)},
             {"decoder", JsonValue::string(index.decoder)},
+            {"index_mode", JsonValue::string(index.index_mode)},
+            {"seek_method", JsonValue::string(index.seek_method)},
+            {"selective_decodes", JsonValue::integer(
+                static_cast<std::int64_t>(index.selective_decodes))},
+            {"packet_count", JsonValue::integer(
+                static_cast<std::int64_t>(index.packet_count))},
+            {"index_ms", JsonValue::number(index.index_ms)},
             {"index_path", JsonValue::string(indexed.index_path)},
             {"index_version", JsonValue::integer(media::MediaIndex::format_version)},
             {"rebuilt", JsonValue::boolean(indexed.rebuilt)},
@@ -2976,86 +2983,134 @@ private:
                 throw WorkerError("bad_request", "requested frame is outside the media index");
             }
         }
-        std::vector<media::FrameIdentity> selected;
-        for (const MediaAssetSpec &asset : assets) {
-            if (selected.empty() || selected.back().frame_index != asset.frame_index) {
-                selected.push_back(indexed.index.frames[asset.frame_index]);
-            }
-        }
         const std::filesystem::path output_directory =
             std::filesystem::path{job.cache_directory} / "media-assets";
-        std::vector<JsonValue> output_items;
+
+        struct PreparedAsset {
+            std::filesystem::path output_path;
+            std::int32_t width = 0;
+            std::int32_t height = 0;
+            bool needs_decode = false;
+        };
+        std::vector<PreparedAsset> prepared;
+        prepared.reserve(assets.size());
+        const std::int32_t source_width = indexed.index.width;
+        const std::int32_t source_height = indexed.index.height;
+        if (job.kind == MediaJobKind::asset_batch
+            && ((job.expected_width != 0 && job.expected_width != source_width)
+                || (job.expected_height != 0 && job.expected_height != source_height))) {
+            throw WorkerError(
+                "media_decode_error",
+                "indexed frame geometry does not match the requested asset geometry");
+        }
+        for (const MediaAssetSpec &asset : assets) {
+            PreparedAsset item;
+            if (asset.format == "png") {
+                item.output_path = output_directory / media_cache_stem(
+                    indexed.index, asset.frame_index,
+                    "-d" + std::to_string(asset.maximum_dimension) + ".png");
+                const double scale = std::min(
+                    1.0, static_cast<double>(asset.maximum_dimension)
+                        / static_cast<double>(std::max(source_width, source_height)));
+                item.width = std::max(
+                    1, static_cast<std::int32_t>(std::llround(source_width * scale)));
+                item.height = std::max(
+                    1, static_cast<std::int32_t>(std::llround(source_height * scale)));
+            } else {
+                item.width = job.expected_width != 0 ? job.expected_width : source_width;
+                item.height = job.expected_height != 0 ? job.expected_height : source_height;
+                item.output_path = output_directory / media_cache_stem(
+                    indexed.index, asset.frame_index,
+                    "-" + std::to_string(item.width) + "x"
+                        + std::to_string(item.height) + ".f32le");
+            }
+            item.needs_decode = !std::filesystem::is_regular_file(item.output_path);
+            prepared.push_back(std::move(item));
+        }
+
+        std::vector<media::FrameIdentity> selected;
+        for (std::size_t i = 0; i < assets.size(); ++i) {
+            if (!prepared[i].needs_decode) continue;
+            if (selected.empty() || selected.back().frame_index != assets[i].frame_index) {
+                selected.push_back(indexed.index.frames[assets[i].frame_index]);
+            }
+        }
         media::DecodeTelemetry telemetry;
         media::DecoderOptions software;
-        software.output_rgb = std::any_of(
-            assets.begin(), assets.end(), [](const MediaAssetSpec &asset) {
-                return asset.format == "png";
-            });
-        std::size_t produced = 0U;
-        media::decode_selected_indexed(
-            job.path, indexed.index, selected, software,
-            job.stop_source.get_token(), [&](const media::HostFrame &frame) {
-                for (const MediaAssetSpec &asset : assets) {
-                    if (asset.frame_index != frame.identity.frame_index) continue;
-                    std::filesystem::path output_path;
-                    std::int32_t output_width = frame.width;
-                    std::int32_t output_height = frame.height;
-                    bool from_cache = false;
-                    if (asset.format == "png") {
-                        output_path = output_directory / media_cache_stem(
-                            indexed.index, asset.frame_index,
-                            "-d" + std::to_string(asset.maximum_dimension) + ".png");
-                        from_cache = std::filesystem::is_regular_file(output_path);
-                        const double scale = std::min(
-                            1.0, static_cast<double>(asset.maximum_dimension)
-                                / static_cast<double>(std::max(frame.width, frame.height)));
-                        output_width = std::max(
-                            1, static_cast<std::int32_t>(std::llround(frame.width * scale)));
-                        output_height = std::max(
-                            1, static_cast<std::int32_t>(std::llround(frame.height * scale)));
-                        if (!from_cache) {
-                            media::PreviewImage preview = media::encode_preview_png(
-                                frame, asset.maximum_dimension);
-                            output_width = preview.width;
-                            output_height = preview.height;
-                            write_media_asset(output_path, preview.png);
+        for (std::size_t i = 0; i < assets.size(); ++i) {
+            if (prepared[i].needs_decode && assets[i].format == "png") {
+                software.output_rgb = true;
+                break;
+            }
+        }
+        std::vector<bool> produced(assets.size(), false);
+        if (!selected.empty()) {
+            media::decode_selected_indexed(
+                job.path, indexed.index, selected, software,
+                job.stop_source.get_token(), [&](const media::HostFrame &frame) {
+                    for (std::size_t i = 0; i < assets.size(); ++i) {
+                        const MediaAssetSpec &asset = assets[i];
+                        PreparedAsset &item = prepared[i];
+                        if (asset.frame_index != frame.identity.frame_index) continue;
+                        if (asset.format == "png") {
+                            item.width = frame.width;
+                            item.height = frame.height;
+                            const double scale = std::min(
+                                1.0, static_cast<double>(asset.maximum_dimension)
+                                    / static_cast<double>(std::max(frame.width, frame.height)));
+                            item.width = std::max(
+                                1, static_cast<std::int32_t>(std::llround(frame.width * scale)));
+                            item.height = std::max(
+                                1, static_cast<std::int32_t>(std::llround(frame.height * scale)));
+                            if (!std::filesystem::is_regular_file(item.output_path)) {
+                                media::PreviewImage preview = media::encode_preview_png(
+                                    frame, asset.maximum_dimension);
+                                item.width = preview.width;
+                                item.height = preview.height;
+                                write_media_asset(item.output_path, preview.png);
+                            }
+                        } else {
+                            if ((job.expected_width != 0 && job.expected_width != frame.width)
+                                || (job.expected_height != 0 && job.expected_height != frame.height)) {
+                                throw WorkerError(
+                                    "media_decode_error",
+                                    "decoded frame geometry does not match the requested asset geometry");
+                            }
+                            item.width = frame.width;
+                            item.height = frame.height;
+                            if (!std::filesystem::is_regular_file(item.output_path)) {
+                                const std::span<const std::uint8_t> bytes{
+                                    reinterpret_cast<const std::uint8_t *>(frame.pixels.data()),
+                                    frame.pixels.size() * sizeof(float)};
+                                write_media_asset(item.output_path, bytes);
+                            }
                         }
-                    } else {
-                        if ((job.expected_width != 0 && job.expected_width != frame.width)
-                            || (job.expected_height != 0 && job.expected_height != frame.height)) {
-                            throw WorkerError(
-                                "media_decode_error",
-                                "decoded frame geometry does not match the requested asset geometry");
-                        }
-                        output_path = output_directory / media_cache_stem(
-                            indexed.index, asset.frame_index,
-                            "-" + std::to_string(frame.width) + "x"
-                                + std::to_string(frame.height) + ".f32le");
-                        from_cache = std::filesystem::is_regular_file(output_path);
-                        if (!from_cache) {
-                            const std::span<const std::uint8_t> bytes{
-                                reinterpret_cast<const std::uint8_t *>(frame.pixels.data()),
-                                frame.pixels.size() * sizeof(float)};
-                            write_media_asset(output_path, bytes);
+                        produced[i] = true;
+                        const std::size_t completed = static_cast<std::size_t>(
+                            std::count(produced.begin(), produced.end(), true));
+                        for (const std::string &request_id : media_subscriber_snapshot(job)) {
+                            emit_progress(request_id, job.job_id, media_mode(job.kind),
+                                          "decode", completed, assets.size(), JsonValue::array());
                         }
                     }
-                    output_items.push_back(JsonValue::object({
-                        {"item_id", JsonValue::string(asset.item_id)},
-                        {"frame_index", JsonValue::integer(
-                            static_cast<std::int64_t>(asset.frame_index))},
-                        {"path", JsonValue::string(output_path.string())},
-                        {"format", JsonValue::string(asset.format)},
-                        {"width", JsonValue::integer(output_width)},
-                        {"height", JsonValue::integer(output_height)},
-                        {"from_cache", JsonValue::boolean(from_cache)},
-                    }));
-                    ++produced;
-                    for (const std::string &request_id : media_subscriber_snapshot(job)) {
-                        emit_progress(request_id, job.job_id, media_mode(job.kind),
-                                      "decode", produced, assets.size(), JsonValue::array());
-                    }
-                }
-            }, &telemetry);
+                }, &telemetry);
+        }
+        std::vector<JsonValue> output_items;
+        output_items.reserve(assets.size());
+        for (std::size_t i = 0; i < assets.size(); ++i) {
+            const MediaAssetSpec &asset = assets[i];
+            const PreparedAsset &item = prepared[i];
+            output_items.push_back(JsonValue::object({
+                {"item_id", JsonValue::string(asset.item_id)},
+                {"frame_index", JsonValue::integer(
+                    static_cast<std::int64_t>(asset.frame_index))},
+                {"path", JsonValue::string(item.output_path.string())},
+                {"format", JsonValue::string(asset.format)},
+                {"width", JsonValue::integer(item.width)},
+                {"height", JsonValue::integer(item.height)},
+                {"from_cache", JsonValue::boolean(!item.needs_decode)},
+            }));
+        }
         JsonValue payload = JsonValue::object({
             {"assets", JsonValue::array(std::move(output_items))},
             {"decoded_frames", JsonValue::integer(
