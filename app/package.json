@@ -8,6 +8,7 @@
     "dev": "vite",
     "build:engine:debug": "node scripts/build-engine.mjs --debug",
     "build:engine": "node scripts/build-engine.mjs --release",
+    "build:dist-test": "bash ../scripts/build-dist-test.sh",
     "stage:ffmpeg:macos": "sh scripts/stage_ffmpeg_macos.sh",
     "test:media:smoke:macos": "sh scripts/smoke_media_macos.sh",
     "build": "tsc && vite build",

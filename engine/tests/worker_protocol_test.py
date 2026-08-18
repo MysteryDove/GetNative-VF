@@ -1264,6 +1264,34 @@ def main():
                                       "telemetry": late_telemetry,
                                       "warnings": late_warnings})[:1000])
 
+                    worker.send(**verify_media_command(
+                        f"vm-{backend}-i-pictures", media_path, backend,
+                        concurrency=4,
+                        scan_scope={"selection": "decoded_i_picture"}))
+                    accelerator_i_terminal, accelerator_i_results, \
+                        accelerator_i_warnings = collect_verify(worker)
+                    accelerator_i_payload = accelerator_i_terminal.get("payload", {})
+                    accelerator_i_provenance = accelerator_i_payload.get(
+                        "provenance", {})
+                    accelerator_i_telemetry = accelerator_i_payload.get(
+                        "telemetry", {})
+                    accelerator_i_close = (
+                        accelerator_i_results.keys() == i_results.keys()
+                        and all(abs(accelerator_i_results[seq] - i_results[seq]) <= 2e-6
+                                for seq in i_results)
+                    )
+                    check(f"verify-media-{decoder}-i-picture-indexed",
+                          accelerator_i_terminal["type"] == "result"
+                          and accelerator_i_close and not accelerator_i_warnings
+                          and accelerator_i_terminal.get("coverage") == i_coverage
+                          and accelerator_i_provenance.get("decoder") == decoder
+                          and accelerator_i_provenance.get("zero_copy") is True
+                          and accelerator_i_telemetry.get("decoded_frames", 1000) <= 20
+                          and accelerator_i_telemetry.get("requested_concurrency") == 4
+                          and accelerator_i_telemetry.get("effective_concurrency") == 4,
+                          json.dumps({"terminal": accelerator_i_terminal,
+                                      "warnings": accelerator_i_warnings})[:1000])
+
                 hevc_accelerators = [
                     (backend, decoder)
                     for backend, decoder in accelerators

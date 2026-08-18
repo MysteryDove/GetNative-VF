@@ -2788,17 +2788,17 @@ void decode_selected_hardware_indexed(
     const std::vector<IndexedDecodeRun> runs =
         plan_indexed_decode_runs(index, selected_frames);
     const IndexedIdentityLookup identity_lookup{index};
-    const std::size_t worker_count = std::min(
-        std::max<std::size_t>(1U, options.frame_concurrency), runs.size());
+    // Keep one hardware decoder alive across indexed RAP seeks. Multiple
+    // demux/decode slices each pay a separate NVDEC/Vulkan session startup and
+    // cannot reuse codec state across their boundary; analysis still uses the
+    // caller's requested frame_concurrency in the downstream pipeline.
+    constexpr std::size_t worker_count = 1U;
     std::vector<DecodeTelemetry> worker_telemetry(worker_count);
     std::vector<double> worker_consumer_ms(worker_count, 0.0);
     std::mutex failure_mutex;
     std::atomic_bool failed{false};
     std::exception_ptr failure;
 
-    // Each worker receives one contiguous slice of the ordered LWI runs. This
-    // keeps per-handle reads moving forward on remote files while still issuing
-    // independent seeks from multiple demuxers.
     const auto decode_slice = [&](std::size_t worker_index) {
         try {
             const std::size_t run_begin = worker_index * runs.size() / worker_count;
@@ -2818,13 +2818,14 @@ void decode_selected_hardware_indexed(
             double &consumer_ms = worker_consumer_ms[worker_index];
             constexpr std::size_t maximum_decode_attempts = 3U;
 
-            const auto configure_decoder = [&](std::uint64_t decode_anchor) {
+            const auto configure_decoder = [&](std::uint64_t decode_anchor,
+                                               bool force_flush) {
                 const std::optional<std::uint32_t> required_extradata =
                     decode_anchor < index.frames.size()
                         ? std::optional{index.frames[decode_anchor].extradata_index}
                         : std::nullopt;
                 if (current_extradata_index == required_extradata) {
-                    avcodec_flush_buffers(opened.codec.get());
+                    if (force_flush) avcodec_flush_buffers(opened.codec.get());
                     return;
                 }
                 BuiltDecoder built = build_decoder(
@@ -2841,9 +2842,14 @@ void decode_selected_hardware_indexed(
                 const IndexedDecodeRun &run = runs[run_index];
                 std::uint64_t decode_anchor = run.decode_anchor;
                 for (std::size_t attempt = 0U;; ++attempt) {
-                    configure_decoder(decode_anchor);
+                    // Every normal run starts at an indexed RAP. Feeding the next
+                    // RAP resets codec reference state without avcodec_flush_buffers(),
+                    // which would tear down and recreate FFmpeg's H.264/HEVC
+                    // hardware context for every selected I-picture. A retry can
+                    // start before the requested RAP, so reset explicitly there.
+                    configure_decoder(decode_anchor, attempt != 0U);
                     std::uint64_t presentation_cursor = 0U;
-                    if (decode_anchor != 0U && decode_anchor < index.frames.size()
+                    if (decode_anchor < index.frames.size()
                         && seek_to_keyframe(*opened.format, index,
                                             index.frames[decode_anchor], true)) {
                         presentation_cursor = decode_anchor;

@@ -21,6 +21,7 @@ const buildDirectory = join(repositoryDirectory, "build", "engine");
 const stageDirectory = join(appDirectory, "src-tauri", "bundle-stage");
 const defaultFfmpegRuntimeDirectory = join(appDirectory, "src-tauri", "ffmpeg-runtime");
 const debug = process.argv.includes("--debug");
+const skipTests = process.argv.includes("--skip-tests");
 const buildType = debug ? "Debug" : "Release";
 const ffmpegRuntimePatterns = process.platform === "win32"
   ? [/^avformat-62\.dll$/iu, /^avcodec-62\.dll$/iu,
@@ -304,7 +305,9 @@ if (process.platform === "win32") {
 
 run(cmake, configureArguments, environment);
 run(cmake, ["--build", buildDirectory, "--parallel"], environment);
-run(ctest, ["--test-dir", buildDirectory, "--output-on-failure"], environment);
+if (!skipTests) {
+  run(ctest, ["--test-dir", buildDirectory, "--output-on-failure"], environment);
+}
 cleanManagedStageFiles();
 run(cmake, ["--install", buildDirectory, "--prefix", stageDirectory], environment);
 const ffmpegRuntime = stageFfmpegRuntime();
@@ -364,7 +367,7 @@ writeFileSync(
       cuda_ptx_architectures: cudaPtxArchitectures,
       engine_sha256: sha256,
       ffmpeg_runtime: ffmpegRuntime,
-      ctest_passed: true,
+      ctest_passed: !skipTests,
     },
     null,
     2,

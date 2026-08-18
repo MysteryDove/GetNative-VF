@@ -26,6 +26,21 @@ npm run tauri dev
 
 The dev command builds and stages the C++ engine before starting Tauri.
 
+To build the engine and a runnable Linux Tauri test distribution:
+
+```sh
+cd app
+npm run build:dist-test
+./dist-test/getnative-gui
+```
+
+The command writes the self-contained resource layout to `app/dist-test` and
+builds the CUDA and Vulkan backends by default. Set
+`GETNATIVE_LINUX_BACKENDS=cpu`, `cuda`, or `vulkan` to request a smaller build.
+It uses the same CUDA, Vulkan, and FFmpeg runtime environment variables as
+`npm run build:engine`, and skips CTest; use `npm run build:engine` when a
+test-gated engine build is required.
+
 ## Publication Status
 
 GetNative VF is licensed under the MIT License. See `LICENSE` for details.

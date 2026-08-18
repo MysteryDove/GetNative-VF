@@ -77,6 +77,38 @@ def encode(ffmpeg, output, frames=120, size="160x90"):
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
 
+def lwi_ascii_lines(index_path):
+    """Yield LWI record lines without decoding ExtraData blobs as text."""
+    data = index_path.read_bytes()
+    offset = 0
+    in_extra_data = False
+    while offset < len(data):
+        line_end = data.find(b"\n", offset)
+        if line_end < 0:
+            break
+        raw_line = data[offset:line_end].rstrip(b"\r")
+        offset = line_end + 1
+        line = raw_line.decode("ascii", errors="replace")
+        yield line
+        if line.startswith("<ExtraDataList="):
+            in_extra_data = True
+            continue
+        if line == "</ExtraDataList>":
+            in_extra_data = False
+            continue
+        if not in_extra_data or not line.startswith("Size="):
+            continue
+        fields = dict(part.split("=", 1) for part in line.split(",") if "=" in part)
+        blob_size = int(fields.get("Size", "0"))
+        if blob_size < 0 or offset + blob_size > len(data):
+            raise AssertionError("truncated LWI ExtraData blob")
+        offset += blob_size
+        if data[offset:offset + 2] == b"\r\n":
+            offset += 2
+        elif data[offset:offset + 1] in (b"\r", b"\n"):
+            offset += 1
+
+
 def begin(worker, request_id, kind, media, cache, **fields):
     worker.send(type=kind, request_id=request_id, path=str(media),
                 cache_directory=str(cache), **fields)
@@ -236,7 +268,7 @@ def main():
         stat = ts_media.stat()
         records = []
         current = None
-        for line in pathlib.Path(ts_indexed["index_path"]).read_text().splitlines():
+        for line in lwi_ascii_lines(pathlib.Path(ts_indexed["index_path"])):
             if line.startswith("Index="):
                 fields = dict(p.split("=", 1) for p in line[6:].split(",") if "=" in p)
                 current = {"pos": int(fields["POS"]), "pts": int(fields["PTS"])}
