@@ -342,7 +342,7 @@ if (!debug) {
   ];
   if (!capabilities?.media?.available
       || capabilities.media.ffmpeg_abi !== "62.62.60.9"
-      || capabilities.media.index_version !== 1
+      || capabilities.media.index_version !== 3
       || mediaCommands.some((command) => commands[command] !== true)) {
     fail("release engine is missing required in-process media capabilities");
   }

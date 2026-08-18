@@ -162,6 +162,20 @@ override tool locations. The build script configures the requested backend
 set, builds it, runs CTest, installs that exact engine, and writes its SHA-256
 and complete CUDA target provenance into the package resources.
 
+## Local Windows portable package
+
+On a machine that already has VS 2026, CUDA, the Vulkan SDK, Rust, pnpm,
+and the pinned FFmpeg 8.1.2 SDK under `.deps/ffmpeg-windows-x64`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/package-windows-portable.ps1
+```
+
+The script builds a `cuda-vulkan` engine, the Tauri GUI, and assembles
+`artifacts/windows-x64/GetNative VF_<version>_x64-portable/` plus a ZIP
+with the same layout as the GitHub Package portable artifact: `getnative-gui.exe`,
+`bin/getnative-engine.exe`, the FFmpeg 8 runtime DLLs, and provenance.
+
 ## Continuous Integration and Packaging
 
 GitHub Actions has three validation and packaging layers:

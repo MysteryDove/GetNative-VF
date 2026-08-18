@@ -3,6 +3,7 @@ import {
   defaultVerifyDraft,
   extractVerifyFrames,
   planVerifyRunGroup,
+  reconcileReadyVideoSourceIds,
   resolveScanScope,
 } from "./verifyPlan";
 import type { Recipe, Source } from "../project/types";
@@ -55,6 +56,27 @@ const video: Source = {
   width: 1920,
   height: 1080,
 };
+
+describe("reconcileReadyVideoSourceIds", () => {
+  it("automatically selects the sole ready video", () => {
+    expect(reconcileReadyVideoSourceIds([], ["src_1"])).toEqual(["src_1"]);
+  });
+
+  it("preserves an already-valid selection without allocating a new array", () => {
+    const selected = ["src_1"];
+    expect(reconcileReadyVideoSourceIds(selected, ["src_1", "src_2"])).toBe(selected);
+  });
+
+  it("removes sources that are no longer ready", () => {
+    expect(reconcileReadyVideoSourceIds(["src_1", "src_2"], ["src_2"])).toEqual([
+      "src_2",
+    ]);
+  });
+
+  it("does not automatically select multiple ready videos", () => {
+    expect(reconcileReadyVideoSourceIds([], ["src_1", "src_2"])).toEqual([]);
+  });
+});
 
 describe("resolveScanScope", () => {
   it("defaults media verification concurrency to two", () => {

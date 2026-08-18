@@ -10,7 +10,6 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  requestFrameWindow,
   requestMediaPreview,
   requestMediaPreviewBatch,
   type FrameWindowTarget,
@@ -25,6 +24,13 @@ export type SelectVideoFrame = (
   frameIndex?: number,
   timestampSeconds?: number,
 ) => Promise<void>;
+
+/** Draft-preview cadence while the progress slider is being dragged. */
+const SCRUB_INTERVAL_MS = 120;
+
+function revokeObjectUrl(url: string | null): void {
+  if (url?.startsWith("blob:")) URL.revokeObjectURL(url);
+}
 
 /**
  * Decoded-frame progress per source id, kept only while the source stays in
@@ -69,6 +75,7 @@ export function useMediaPreview({
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [thumbnailUrls, setThumbnailUrls] = useState<Record<number, string>>({});
   const [previewBusy, setPreviewBusy] = useState(false);
+  const [previewDecoder, setPreviewDecoder] = useState<string | null>(null);
   const [indexBusy, setIndexBusy] = useState(false);
   const [frameInput, setFrameInput] = useState("0");
   const [timeInput, setTimeInput] = useState("0.000");
@@ -82,17 +89,29 @@ export function useMediaPreview({
   const previewKeyRef = useRef("");
   const previewUrlRef = useRef<string | null>(null);
   const thumbnailUrlsRef = useRef<Record<number, string>>({});
+  /** Throttled drag state: latest slider frame awaiting a draft decode. */
+  const scrubTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scrubPending = useRef<{ source: Source; frameIndex: number } | null>(null);
+  const scrubLastFire = useRef(0);
+
+  const cancelPendingScrub = useCallback(() => {
+    scrubPending.current = null;
+    if (scrubTimer.current !== null) {
+      clearTimeout(scrubTimer.current);
+      scrubTimer.current = null;
+    }
+  }, []);
 
   /** Atomic preview swap: the old image stays visible until its replacement exists. */
   const swapPreviewUrl = useCallback((next: string | null) => {
     const previous = previewUrlRef.current;
     previewUrlRef.current = next;
     setPreviewUrl(next);
-    if (previous && previous !== next) URL.revokeObjectURL(previous);
+    if (previous !== next) revokeObjectUrl(previous);
   }, []);
 
   const swapThumbnailUrls = useCallback((next: Record<number, string>) => {
-    for (const url of Object.values(thumbnailUrlsRef.current)) URL.revokeObjectURL(url);
+    for (const url of Object.values(thumbnailUrlsRef.current)) revokeObjectUrl(url);
     thumbnailUrlsRef.current = next;
     setThumbnailUrls(next);
   }, []);
@@ -108,16 +127,18 @@ export function useMediaPreview({
   ) => {
     const requestId = ++previewRequestId.current;
     await activeMediaTask.current?.cancel().catch(() => undefined);
+    if (previewRequestId.current !== requestId) return;
     const task = requestMediaPreview(request);
     activeMediaTask.current = task;
     setPreviewBusy(true);
     try {
-      const nextUrl = await task.promise;
+      const { url: nextUrl, decoder } = await task.promise;
       if (previewRequestId.current !== requestId) {
-        URL.revokeObjectURL(nextUrl);
+        revokeObjectUrl(nextUrl);
         return;
       }
       swapPreviewUrl(nextUrl);
+      setPreviewDecoder(decoder);
       setError("");
     } catch (reason) {
       // Keep the last good preview on screen; the error banner carries the detail.
@@ -140,41 +161,36 @@ export function useMediaPreview({
     async (source, target, frameIndex, timestampSeconds) => {
       const streamIndex = source.selectedStreamIndex ?? source.videoStreams[0]?.index;
       if (streamIndex === undefined) return;
+      cancelPendingScrub();
       const requestId = ++previewRequestId.current;
       await activeMediaTask.current?.cancel().catch(() => undefined);
+      if (previewRequestId.current !== requestId) return;
       setPreviewBusy(true);
       try {
-        const windowTask = requestFrameWindow({
+        // One round trip per seek: the rail's frame window rides along with
+        // the preview PNG in the worker reply.
+        const mainTask = requestMediaPreview({
           path: source.path,
           fingerprint: source.fingerprint,
           streamIndex,
           target,
           frameIndex,
           timestampSeconds,
+          maxDimension: 1600,
           windowRadius: 12,
         });
-        activeMediaTask.current = windowTask;
-        const window = await windowTask.promise;
-        if (previewRequestId.current !== requestId) return;
-        const mainTask = requestMediaPreviewBatch({
-          path: source.path,
-          fingerprint: source.fingerprint,
-          streamIndex,
-          frames: [{ itemId: "main", frameIndex: window.selected.frame_index, maxDimension: 1600 }],
-        });
         activeMediaTask.current = mainTask;
-        const mainBatch = await mainTask.promise;
-        if (previewRequestId.current !== requestId) {
-          for (const asset of mainBatch.assets) URL.revokeObjectURL(asset.url);
-          return;
+        const { url, window, decoder } = await mainTask.promise;
+        if (previewRequestId.current !== requestId) return;
+        if (!window) {
+          throw new Error("media_decode_error: preview reply omitted the frame window");
         }
-        const main = mainBatch.assets.find((asset) => asset.itemId === "main");
-        if (!main) throw new Error("media_decode_error: preview batch omitted the main frame");
         setFrameWindowState({ sourceKey: sourceStreamKey(source), window });
         setFrameInput(String(window.selected.frame_index));
         setScrubFrame(window.selected.frame_index);
         setTimeInput((window.selected.timestamp_seconds ?? 0).toFixed(3));
-        swapPreviewUrl(main.url);
+        swapPreviewUrl(url);
+        setPreviewDecoder(decoder);
         setError("");
 
         // The main image is the interactive seek result. Filmstrip thumbnails
@@ -193,10 +209,7 @@ export function useMediaPreview({
         });
         activeMediaTask.current = thumbnailTask;
         void thumbnailTask.promise.then((batch) => {
-          if (previewRequestId.current !== requestId) {
-            for (const asset of batch.assets) URL.revokeObjectURL(asset.url);
-            return;
-          }
+          if (previewRequestId.current !== requestId) return;
           swapThumbnailUrls(Object.fromEntries(
             batch.assets.map((asset) => [asset.frameIndex, asset.url]),
           ));
@@ -218,8 +231,52 @@ export function useMediaPreview({
         if (previewRequestId.current === requestId) setPreviewBusy(false);
       }
     },
-    [onSourceChanged, setError, swapPreviewUrl, swapThumbnailUrls],
+    [cancelPendingScrub, onSourceChanged, setError, swapPreviewUrl, swapThumbnailUrls],
   );
+
+  const fireScrub = useCallback(() => {
+    const pending = scrubPending.current;
+    if (!pending) return;
+    scrubPending.current = null;
+    scrubLastFire.current = Date.now();
+    const { source, frameIndex } = pending;
+    const streamIndex = source.selectedStreamIndex ?? source.videoStreams[0]?.index;
+    if (streamIndex === undefined) return;
+    const requestId = ++previewRequestId.current;
+    void activeMediaTask.current?.cancel().catch(() => undefined);
+    // Draft frames decode at the release resolution, so the follow-up request
+    // fired on pointer-up hits the worker's on-disk PNG cache and only has to
+    // serve the file.
+    const task = requestMediaPreview({
+      path: source.path,
+      fingerprint: source.fingerprint,
+      streamIndex,
+      frameIndex,
+      maxDimension: 1600,
+      windowRadius: 0,
+    });
+    activeMediaTask.current = task;
+    void task.promise.then(({ url, decoder }) => {
+      if (previewRequestId.current !== requestId) return;
+      swapPreviewUrl(url);
+      setPreviewDecoder(decoder);
+    }).catch(() => undefined);
+  }, [swapPreviewUrl]);
+
+  const scrubVideoFrame = useCallback((source: Source, frameIndex: number) => {
+    setScrubFrame(frameIndex);
+    scrubPending.current = { source, frameIndex };
+    if (scrubTimer.current !== null) return;
+    const elapsed = Date.now() - scrubLastFire.current;
+    if (elapsed >= SCRUB_INTERVAL_MS) {
+      fireScrub();
+    } else {
+      scrubTimer.current = setTimeout(() => {
+        scrubTimer.current = null;
+        fireScrub();
+      }, SCRUB_INTERVAL_MS - elapsed);
+    }
+  }, [fireScrub]);
 
   const initializeVideoSource = useCallback(
     async (source: Source, sessionId: number) => {
@@ -256,7 +313,9 @@ export function useMediaPreview({
     // fresh identities): keep the preview instead of reloading it.
     if (previewKeyRef.current === selectedPreviewKey && previewUrlRef.current) return;
     previewKeyRef.current = selectedPreviewKey;
+    cancelPendingScrub();
     setFrameWindowState(null);
+    setPreviewDecoder(null);
     setIndexBusy(false);
     setZoom(1);
     setPixelPosition(null);
@@ -276,23 +335,25 @@ export function useMediaPreview({
       );
     }
     // selectedSource is read from the render that produced selectedPreviewKey.
-  }, [initializeVideoSource, videoDecodeAvailable, selectedPreviewKey, showPreview, swapPreviewUrl, swapThumbnailUrls]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [initializeVideoSource, videoDecodeAvailable, selectedPreviewKey, showPreview, swapPreviewUrl, swapThumbnailUrls, cancelPendingScrub]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Revoke the live object URL only on unmount; in-flight swaps own their URLs.
   useEffect(
     () => () => {
       previewRequestId.current += 1;
+      cancelPendingScrub();
       void activeMediaTask.current?.cancel().catch(() => undefined);
-      if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
-      for (const url of Object.values(thumbnailUrlsRef.current)) URL.revokeObjectURL(url);
+      revokeObjectUrl(previewUrlRef.current);
+      for (const url of Object.values(thumbnailUrlsRef.current)) revokeObjectUrl(url);
     },
-    [],
+    [cancelPendingScrub],
   );
 
   return {
     previewUrl,
     thumbnailUrls,
     previewBusy,
+    previewDecoder,
     indexBusy,
     frameWindow,
     frameInput,
@@ -306,5 +367,6 @@ export function useMediaPreview({
     pixelPosition,
     setPixelPosition,
     selectVideoFrame,
+    scrubVideoFrame,
   };
 }

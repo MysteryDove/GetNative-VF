@@ -181,6 +181,15 @@ export type VerifyFrameResult = {
   timestampSeconds?: number | null;
 };
 
+/** Exact media verification coverage, available after presentation-order indexing. */
+export type VerifyCoverage = {
+  selection: ScanScope["selection"];
+  eligibleFrames: number;
+  selectedFrames: number;
+  processedFrames: number;
+  failedFrames: number;
+};
+
 export type WorkerProgressEvent = WorkerEventBase & {
   type: "progress";
   completed: number;
@@ -188,6 +197,7 @@ export type WorkerProgressEvent = WorkerEventBase & {
   detail?: string | null;
   /** Verify mode: batched per-frame results, possibly out of order. */
   results?: VerifyFrameResult[];
+  coverage?: VerifyCoverage;
 };
 
 export type WorkerWarningEvent = WorkerEventBase & {
@@ -205,11 +215,13 @@ export type WorkerResultEvent = WorkerEventBase & {
   type: "result";
   mode: ComputationMode;
   payload: unknown;
+  coverage?: VerifyCoverage;
 };
 
 export type WorkerCancelledEvent = WorkerEventBase & {
   type: "cancelled";
   partial: boolean;
+  coverage?: VerifyCoverage;
 };
 
 export type WorkerErrorEvent = WorkerEventBase & {

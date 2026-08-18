@@ -35,6 +35,7 @@ struct FrameIdentity {
     std::optional<double> timestamp_seconds;
     std::optional<std::int64_t> file_position;
     std::uint32_t packet_size = 0U;
+    std::optional<std::int64_t> packet_duration;
     bool key_frame = false;
     bool rap = false;
     bool leading_frame = false;
@@ -42,6 +43,11 @@ struct FrameIdentity {
     std::optional<std::int32_t> poc;
     std::int32_t repeat_pict = 0;
     std::string field_order = "unknown";
+    std::int32_t color_range = 0;
+    std::int32_t color_space = 2;
+    std::int32_t color_primaries = 2;
+    std::int32_t color_transfer = 2;
+    std::int32_t chroma_location = 0;
     bool vp8_invisible_frame = false;
     bool vp9_superframe = false;
     std::uint32_t extradata_index = 0U;
@@ -69,7 +75,7 @@ struct ExtraDataInfo {
 };
 
 struct MediaIndex {
-    static constexpr std::uint32_t format_version = 2U;
+    static constexpr std::uint32_t format_version = 3U;
 
     std::string fingerprint;
     std::string source_path;
@@ -83,6 +89,11 @@ struct MediaIndex {
     std::string pixel_format;
     std::int32_t bit_depth = 8;
     std::string range = "unknown";
+    std::int32_t color_range = 0;
+    std::int32_t color_space = 2;
+    std::int32_t color_primaries = 2;
+    std::int32_t color_transfer = 2;
+    std::int32_t chroma_location = 0;
     std::int64_t duration_ticks = 0;
     std::int32_t time_base_num = 0;
     std::int32_t time_base_den = 1;
@@ -90,7 +101,7 @@ struct MediaIndex {
     std::string format_name;
     std::int64_t format_flags = 0;
     bool raw_demuxer = false;
-    std::string index_mode = "packet_rebuilt";
+    std::string index_mode = "packet_fast";
     std::string seek_method = "sample_order";
     std::uint64_t packet_count = 0U;
     std::uint64_t selective_decodes = 0U;
@@ -117,6 +128,11 @@ struct IndexedMedia {
 struct DecodeTelemetry {
     std::uint64_t decoded_frames = 0U;
     std::uint64_t selected_frames = 0U;
+    std::uint64_t decode_retries = 0U;
+    // Packets the decoder rejected with AVERROR_INVALIDDATA and dropped
+    // (corrupted broadcast captures, damaged sectors). Decoding continues
+    // past them; delivered frames are still timestamp-verified.
+    std::uint64_t discarded_packets = 0U;
     std::uint64_t host_frame_bytes = 0U;
     std::uint64_t conversion_bytes = 0U;
     double index_ms = 0.0;
@@ -218,6 +234,12 @@ struct DecoderOptions {
     void (*unlock_native_queue)(void *opaque) = nullptr;
     std::int32_t expected_bit_depth = 0;
     bool output_rgb = false;
+    // Pure preview sessions convert directly from the decoded pixel format to
+    // this bounding dimension. Zero keeps the source dimensions.
+    std::int32_t preview_maximum_dimension = 0;
+    // Decode luma into HostFrame::pixels. PNG-only preview callers can
+    // disable this to skip the full-resolution float conversion.
+    bool output_luma = true;
     // Number of decoded frames the caller may retain concurrently.
     std::size_t frame_concurrency = 2U;
 };
@@ -285,6 +307,34 @@ void decode_selected_indexed(const std::string &path, const MediaIndex &index,
                              const DecoderOptions &options, std::stop_token stop,
                              const FrameConsumer &consumer,
                              DecodeTelemetry *telemetry = nullptr);
+
+// Unix-epoch mtime of a media file in nanoseconds; matches the value stored
+// in MediaIndex::source_mtime_ns. Cheap stat used to validate cached indexes.
+[[nodiscard]] std::int64_t source_mtime_unix_ns(const std::string &path);
+
+// Persistent indexed-decode session. Holds the demuxer and decoder open
+// across requests so that a later seek only pays avformat_seek_file +
+// avcodec_flush_buffers, and forward motion within one GOP continues
+// decoding without any seek at all. The session owns a reference to the
+// index; cancelling a decode leaves the session consistent (the next decode
+// simply repositions).
+class IndexedDecodeSession {
+public:
+    IndexedDecodeSession(const std::string &path,
+                         std::shared_ptr<const MediaIndex> index,
+                         const DecoderOptions &options);
+    ~IndexedDecodeSession();
+    IndexedDecodeSession(const IndexedDecodeSession &) = delete;
+    IndexedDecodeSession &operator=(const IndexedDecodeSession &) = delete;
+
+    [[nodiscard]] DecoderOptions::Backend backend() const;
+    void decode(std::span<const FrameIdentity> selected, std::stop_token stop,
+                const FrameConsumer &consumer, DecodeTelemetry *telemetry = nullptr);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 [[nodiscard]] PreviewImage encode_preview_png(const HostFrame &frame,
                                               std::int32_t maximum_dimension);
 void decode_selected_cuda(const std::string &path, const MediaIndex &index,

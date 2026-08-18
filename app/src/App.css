@@ -1278,6 +1278,12 @@ button {
 .project-content {
   display: grid;
   grid-template-rows: minmax(0, 1fr) 42px;
+  /* Pin the single column. Without this the implicit auto column sizes to
+     content: once the jobs tray accumulates long unbreakable entries (raw
+     rgrp_* id labels after their RunGroups leave project state), the column
+     grows past the container and overflow:hidden clips the page's right
+     edge. The tray's own overflow-hidden list is built to clip instead. */
+  grid-template-columns: minmax(0, 1fr);
   min-height: 0;
   overflow: hidden;
 }
@@ -2544,6 +2550,11 @@ button {
   background: var(--surface-deep);
 }
 
+.media-inspector > .workspace-empty {
+  grid-row: 1 / -1;
+  min-height: 0;
+}
+
 .inspector-toolbar {
   display: flex;
   align-items: center;
@@ -3362,7 +3373,61 @@ button {
 }
 
 .sample-check {
+  width: 14px;
+  height: 14px;
   margin-top: 3px;
+  accent-color: var(--accent);
+}
+
+.analyze-sample-list.verify-source-list {
+  gap: 4px;
+}
+
+.analyze-sample-list.verify-source-list li {
+  display: block;
+}
+
+.verify-source-option {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  min-height: 44px;
+  padding: 7px 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.verify-source-option:hover {
+  background: var(--surface-control);
+}
+
+.verify-source-option:focus-within {
+  border-color: var(--accent-dim);
+  box-shadow: 0 0 0 2px rgba(121, 227, 173, 0.08);
+}
+
+.verify-source-list li.selected .verify-source-option {
+  border-color: #37674f;
+  background: rgba(121, 227, 173, 0.08);
+}
+
+.verify-source-copy {
+  min-width: 0;
+}
+
+.verify-source-copy strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.verify-source-count {
+  margin-left: auto;
+  color: var(--text-placeholder);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
 }
 
 .sample-tag {
@@ -3552,11 +3617,89 @@ button {
 }
 
 /* Verify review */
+.verify-review-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  min-height: 28px;
+}
+
+.analyze-layout .verify-review-toolbar h3 {
+  margin: 0;
+}
+
+.verify-review-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
+.verify-review-empty {
+  flex: 1;
+  min-height: 220px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--text-disabled);
+}
+
+.verify-review-empty svg {
+  width: 24px;
+  height: 24px;
+  stroke-width: 1.5;
+}
+
+.verify-review-empty p {
+  margin: 0;
+  font-size: 12px;
+}
+
 .verify-run-block {
   border-top: 1px solid var(--border);
   padding: 10px 0;
   display: grid;
   gap: 8px;
+}
+
+.verify-run-block .analyze-table-toggle {
+  flex-wrap: wrap;
+}
+
+.verify-run-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.verify-run-block .analyze-table-toggle > .help-copy {
+  flex: 1 1 280px;
+  padding: 0;
+}
+
+.verify-metrics-warning {
+  flex-basis: 100%;
+  padding-left: 20px;
+  color: var(--warning) !important;
+  font-size: 11px;
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+
+.run-row {
+  flex-wrap: wrap;
+}
+
+.run-row .checkbox-row {
+  min-width: 0;
+  margin: 4px 0;
+}
+
+.run-row .checkbox-row strong {
+  overflow-wrap: anywhere;
 }
 
 .verify-filter {

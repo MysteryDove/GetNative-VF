@@ -297,7 +297,7 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
         if media.index_format != "lwi/vf.lwi"
             || (media.available
                 && (media.ffmpeg_abi.as_deref().is_none_or(str::is_empty)
-                    || media.index_version != Some(2)))
+                    || media.index_version != Some(3)))
             || (!media.available
                 && (media.ffmpeg_abi.is_some() || media.index_version.is_some()))
         {

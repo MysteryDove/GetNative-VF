@@ -3,7 +3,7 @@ import { materializeVerifyRunGroup, type VerifyRunGroupPlan } from "./verifyPlan
 import { kernelParamsForWire, type ExecutionBridge } from "./executeRunGroup";
 import { isTerminalPhase } from "./runReducer";
 import type { ProjectState, Recipe, Run } from "../project/types";
-import type { WorkerEvent } from "./protocol";
+import type { VerifyCoverage, WorkerEvent } from "./protocol";
 
 export type VerifyFrameEntry = {
   seq: number;
@@ -36,6 +36,7 @@ export async function startVerifyRunGroup(input: {
   onProjectChange: (updater: (state: ProjectState) => ProjectState) => void;
   bridge: ExecutionBridge;
   onFrames?: (projectRunId: string, entries: VerifyFrameEntry[]) => void;
+  onTerminal?: (projectRunId: string) => void;
   deps?: Partial<VerifyOrchestratorDeps>;
 }): Promise<StartVerifyResult> {
   const deps = { ...defaultDeps(), ...input.deps };
@@ -101,14 +102,6 @@ export async function startVerifyRunGroup(input: {
 type Member = VerifyRunGroupPlan["members"][number];
 type TerminalEvent = Extract<WorkerEvent, { type: "result" | "cancelled" | "error" }>;
 
-/**
- * Cap on frame entries retained in memory for the terminal result write.
- * A full-video scan can exceed 100k frames; live batches are already
- * streamed to the caller via onFrames, so the stored result keeps only the
- * most recent entries while `framesSeen` still counts every frame.
- */
-export const VERIFY_RESULT_FRAMES_CAP = 10_000;
-
 async function runEngineMediaVerifyMember(
   member: Member,
   projectRunId: string,
@@ -120,12 +113,14 @@ async function runEngineMediaVerifyMember(
     onProjectChange: (updater: (state: ProjectState) => ProjectState) => void;
     bridge: ExecutionBridge;
     onFrames?: (projectRunId: string, entries: VerifyFrameEntry[]) => void;
+    onTerminal?: (projectRunId: string) => void;
   },
   deps: VerifyOrchestratorDeps,
 ): Promise<void> {
   const frames: VerifyFrameEntry[] = [];
   let framesSeen = 0;
   let exactTotal = 0;
+  let latestCoverage: VerifyCoverage | undefined;
   let myRunId: string | null = null;
   let resolveTerminal!: (event: TerminalEvent) => void;
   const terminal = new Promise<TerminalEvent>((resolve) => {
@@ -134,6 +129,7 @@ async function runEngineMediaVerifyMember(
   const unlisten = deps.worker.subscribe((event) => {
     if (!myRunId || !("runId" in event) || event.runId !== myRunId) return;
     if (event.type === "progress") {
+      if (event.coverage) latestCoverage = event.coverage;
       if (event.total > 0 && event.total !== exactTotal) {
         exactTotal = event.total;
         input.onProjectChange((current) => {
@@ -158,9 +154,6 @@ async function runEngineMediaVerifyMember(
         }));
         framesSeen += batch.length;
         frames.push(...batch);
-        if (frames.length > VERIFY_RESULT_FRAMES_CAP) {
-          frames.splice(0, frames.length - VERIFY_RESULT_FRAMES_CAP);
-        }
         input.onFrames?.(projectRunId, batch);
       }
       return;
@@ -223,6 +216,7 @@ async function runEngineMediaVerifyMember(
     await (acceptedPromise ?? deps.worker.waitAccepted(submitted.requestId));
     const event = await terminal;
     const sorted = [...frames].sort((left, right) => left.seq - right.seq);
+    const coverage = "coverage" in event ? event.coverage ?? latestCoverage : latestCoverage;
     const nowIso = new Date(deps.nowMs()).toISOString();
     input.onProjectChange((current) => {
       const run = current.runsById[projectRunId];
@@ -240,20 +234,35 @@ async function runEngineMediaVerifyMember(
         next.result = {
           ...((event.payload ?? {}) as Record<string, unknown>),
           frames: sorted,
+          ...(coverage ? { coverage } : {}),
         };
       } else if (event.type === "cancelled") {
         next.status = event.partial ? "partial" : "cancelled";
-        if (sorted.length) next.result = { mode: "verify", frames: sorted };
+        if (sorted.length || coverage) {
+          next.result = {
+            mode: "verify",
+            frames: sorted,
+            ...(coverage ? { coverage } : {}),
+          };
+        }
       } else {
         next.status = "failed";
         next.errorCode = event.code;
         next.errorMessage = event.message;
+        if (sorted.length || coverage) {
+          next.result = {
+            mode: "verify",
+            frames: sorted,
+            ...(coverage ? { coverage } : {}),
+          };
+        }
       }
       return {
         ...current,
         runsById: { ...current.runsById, [projectRunId]: next },
       };
     });
+    input.onTerminal?.(projectRunId);
   } finally {
     unlisten();
   }

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { ChevronDown, ChevronRight, ScanSearch } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
 import type { BackendPreference } from "../engine/protocol";
@@ -20,34 +20,22 @@ import { backendOptionLabel, verifySelectableBackends } from "../engine/backendS
 import {
   defaultVerifyDraft,
   planVerifyRunGroup,
+  reconcileReadyVideoSourceIds,
   verificationRuns,
   validVerifyConcurrency,
   type VerifyDraft,
 } from "../engine/verifyPlan";
 import { startVerifyRunGroup, type VerifyFrameEntry } from "../engine/executeVerify";
+import { VerifyLiveFrameBuffer } from "../engine/verifyLiveFrames";
+import {
+  reviewVerifyFrames,
+  storedVerifyFrames,
+  verificationRunLabel,
+  verifyCoverageDisplay,
+  worstVerifyFrameInRange,
+} from "../engine/verifyResults";
 import type { ExecutionBridge } from "../engine/executeRunGroup";
 import type { ProjectRoute, ProjectState, Run } from "../project/types";
-
-/** Stored verify result shape: engine payload + orchestrator-merged frames. */
-export function storedVerifyFrames(run: Run): VerifyFrameEntry[] | null {
-  if (!run.result || typeof run.result !== "object") return null;
-  const frames = (run.result as Record<string, unknown>).frames;
-  if (!Array.isArray(frames)) return null;
-  const rows: VerifyFrameEntry[] = [];
-  for (const item of frames) {
-    if (!item || typeof item !== "object") continue;
-    const row = item as Record<string, unknown>;
-    if (typeof row.frameIndex !== "number") continue;
-    rows.push({
-      seq: typeof row.seq === "number" ? row.seq : row.frameIndex,
-      frameIndex: row.frameIndex,
-      pts: typeof row.pts === "number" ? row.pts : null,
-      timestampSeconds: typeof row.timestampSeconds === "number" ? row.timestampSeconds : null,
-      error: typeof row.error === "number" ? row.error : null,
-    });
-  }
-  return rows.length ? rows : null;
-}
 
 /**
  * Whole-video Verification: setup (sources, scope, range, backend) plus the
@@ -74,7 +62,7 @@ export function VerifyPage({
   const [draft, setDraft] = useState<VerifyDraft>(() => defaultVerifyDraft());
   const { submitting, notice: submitNotice, submit: submitRunGroup } = useRunGroupSubmit();
   const [notice, setNotice] = useState("");
-  const [liveFrames, setLiveFrames] = useState<Record<string, VerifyFrameEntry[]>>({});
+  const [liveFrameRevision, setLiveFrameRevision] = useState(0);
   const [reviewThreshold, setReviewThreshold] = useState("");
   const [topN, setTopN] = useState("20");
   const [logDisplay, setLogDisplay] = useState(true);
@@ -84,6 +72,13 @@ export function VerifyPage({
   const [zoomRange, setZoomRange] = useState<{ xMin: number; xMax: number } | null>(null);
   /** Result tables default to collapsed; the plot owns the main area. */
   const [expandedRunIds, setExpandedRunIds] = useState<Set<string>>(new Set());
+  const mounted = useRef(true);
+  const liveFrameBuffer = useRef<VerifyLiveFrameBuffer | null>(null);
+  if (liveFrameBuffer.current === null) {
+    liveFrameBuffer.current = new VerifyLiveFrameBuffer(() => {
+      if (mounted.current) setLiveFrameRevision((current) => current + 1);
+    });
+  }
 
   function toggleRunExpanded(runId: string) {
     setExpandedRunIds((current) => toggleSetValue(current, runId));
@@ -92,13 +87,18 @@ export function VerifyPage({
   function toggleRunVisible(runId: string) {
     setHiddenRunIds((current) => toggleSetValue(current, runId));
   }
-  const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
+      liveFrameBuffer.current?.dispose();
     };
   }, []);
+
+  const liveFrames = useMemo(
+    () => liveFrameBuffer.current?.snapshotAll() ?? {},
+    [liveFrameRevision],
+  );
 
   const recipe = activeRecipe(state);
   const recipeOptions = useMemo(() => recipesByUpdatedAt(state), [state.recipesById]);
@@ -110,6 +110,21 @@ export function VerifyPage({
       ),
     [state.sourcesById],
   );
+  const readyVideoIds = useMemo(
+    () => readyVideos.map((source) => source.id),
+    [readyVideos],
+  );
+  const readyVideoIdsKey = useMemo(
+    () => [...readyVideoIds].sort().join("\u0000"),
+    [readyVideoIds],
+  );
+
+  useEffect(() => {
+    setDraft((current) => {
+      const sourceIds = reconcileReadyVideoSourceIds(current.sourceIds, readyVideoIds);
+      return sourceIds === current.sourceIds ? current : { ...current, sourceIds };
+    });
+  }, [readyVideoIdsKey]);
 
   const plan = useMemo(() => {
     if (!recipe) return null;
@@ -136,16 +151,10 @@ export function VerifyPage({
     () =>
       new Map(
         runs.map((run) => {
-          const source = run.sourceId ? state.sourcesById[run.sourceId] : null;
-          const snapshot = run.inputSnapshot as { recipeId?: string } | null;
-          const recipeName = snapshot?.recipeId
-            ? state.recipesById[snapshot.recipeId]?.name
-            : null;
-          const sourceLabel = source?.label || source?.path || run.sourceId || run.id;
-          return [run.id, recipeName ? `${sourceLabel} · ${recipeName}` : sourceLabel];
+          return [run.id, verificationRunLabel(run, state, t)];
         }),
       ),
-    [runs, state.sourcesById, state.recipesById],
+    [runs, state.sourcesById, state.recipesById, t],
   );
   const plotData = useMemo<ErrorPlotDatum[]>(
     () =>
@@ -172,10 +181,12 @@ export function VerifyPage({
     let worst: { run: Run; frame: VerifyFrameEntry } | null = null;
     for (const run of runs) {
       if (hiddenRunIds.has(run.id)) continue;
-      for (const frame of storedVerifyFrames(run) ?? liveFrames[run.id] ?? []) {
-        if (frame.error === null) continue;
-        if (frame.frameIndex < zoomRange.xMin || frame.frameIndex > zoomRange.xMax) continue;
-        if (!worst || frame.error > (worst.frame.error as number)) worst = { run, frame };
+      const frame = worstVerifyFrameInRange(
+        storedVerifyFrames(run) ?? liveFrames[run.id] ?? [],
+        zoomRange,
+      );
+      if (frame && (!worst || (frame.error as number) > (worst.frame.error as number))) {
+        worst = { run, frame };
       }
     }
     return worst;
@@ -229,11 +240,9 @@ export function VerifyPage({
           bridge: executionBridge,
           onFrames: (runId, entries) => {
             if (!mounted.current) return;
-            setLiveFrames((current) => ({
-              ...current,
-              [runId]: [...(current[runId] ?? []), ...entries],
-            }));
+            liveFrameBuffer.current?.append(runId, entries);
           },
+          onTerminal: (runId) => liveFrameBuffer.current?.clear(runId),
         }),
       {
         submitted: (result) =>
@@ -282,7 +291,7 @@ export function VerifyPage({
   }
 
   return (
-    <div className="page-panel">
+    <div className="page-panel analyze-page">
       <div className="page-header">
         <h2>{t("verify.title")}</h2>
       </div>
@@ -322,35 +331,52 @@ export function VerifyPage({
 
       <div className="analyze-layout">
         <aside className="analyze-samples pane">
-          <h3>{t("verify.sourcesTitle")}</h3>
+          <h3>
+            <span>{t("verify.sourcesTitle")}</span>
+            {readyVideos.length > 0 ? (
+              <span
+                className="verify-source-count"
+                aria-label={t("verify.sourcesSelected", {
+                  selected: String(draft.sourceIds.length),
+                  total: String(readyVideos.length),
+                })}
+              >
+                {draft.sourceIds.length}/{readyVideos.length}
+              </span>
+            ) : null}
+          </h3>
           {readyVideos.length === 0 ? (
             <EmptyInlineAction label={t("nav.media")} onClick={() => onNavigate("media")}>
               <p>{t("verify.noVideos")}</p>
             </EmptyInlineAction>
           ) : (
-            <ul className="analyze-sample-list">
-              {readyVideos.map((source) => (
-                <li key={source.id}>
-                  <input
-                    type="checkbox"
-                    className="sample-check"
-                    checked={draft.sourceIds.includes(source.id)}
-                    aria-label={source.label || source.path}
-                    onChange={() => toggleSource(source.id)}
-                  />
-                  <div>
-                    <strong>{source.label || source.path}</strong>
-                    <span>
-                      {source.width && source.height
-                        ? `${source.width}×${source.height}`
-                        : ""}
-                      {source.durationSeconds != null
-                        ? ` · ${source.durationSeconds.toFixed(1)}s`
-                        : ""}
-                    </span>
-                  </div>
-                </li>
-              ))}
+            <ul className="analyze-sample-list verify-source-list">
+              {readyVideos.map((source) => {
+                const selected = draft.sourceIds.includes(source.id);
+                return (
+                  <li key={source.id} className={selected ? "selected" : ""}>
+                    <label className="verify-source-option">
+                      <input
+                        type="checkbox"
+                        className="sample-check"
+                        checked={selected}
+                        onChange={() => toggleSource(source.id)}
+                      />
+                      <div className="verify-source-copy">
+                        <strong>{source.label || source.path}</strong>
+                        <span>
+                          {source.width && source.height
+                            ? `${source.width}×${source.height}`
+                            : ""}
+                          {source.durationSeconds != null
+                            ? ` · ${source.durationSeconds.toFixed(1)}s`
+                            : ""}
+                        </span>
+                      </div>
+                    </label>
+                  </li>
+                );
+              })}
             </ul>
           )}
 
@@ -373,31 +399,35 @@ export function VerifyPage({
         </aside>
 
         <section className="analyze-plot pane">
-          <div className="analyze-table-toolbar">
+          <div className="verify-review-toolbar">
             <h3>{t("verify.reviewTitle")}</h3>
-            <label className="series-visibility">
-              <input
-                type="checkbox"
-                checked={logDisplay}
-                onChange={(event) => setLogDisplay(event.target.checked)}
-              />
-              <span>{t("analyze.logDisplay")}</span>
-            </label>
-            <label className="block verify-filter">
-              <span>{t("verify.reviewThreshold")}</span>
-              <input
-                value={reviewThreshold}
-                placeholder={t("verify.thresholdOff")}
-                onChange={(event) => setReviewThreshold(event.target.value)}
-              />
-            </label>
-            <label className="block verify-filter">
-              <span>{t("verify.topN")}</span>
-              <input
-                value={topN}
-                onChange={(event) => setTopN(event.target.value)}
-              />
-            </label>
+            {runs.length > 0 ? (
+              <div className="verify-review-filters">
+                <label className="series-visibility">
+                  <input
+                    type="checkbox"
+                    checked={logDisplay}
+                    onChange={(event) => setLogDisplay(event.target.checked)}
+                  />
+                  <span>{t("analyze.logDisplay")}</span>
+                </label>
+                <label className="block verify-filter">
+                  <span>{t("verify.reviewThreshold")}</span>
+                  <input
+                    value={reviewThreshold}
+                    placeholder={t("verify.thresholdOff")}
+                    onChange={(event) => setReviewThreshold(event.target.value)}
+                  />
+                </label>
+                <label className="block verify-filter">
+                  <span>{t("verify.topN")}</span>
+                  <input
+                    value={topN}
+                    onChange={(event) => setTopN(event.target.value)}
+                  />
+                </label>
+              </div>
+            ) : null}
           </div>
           {runs.length > 1 ? (
             <div className="plot-legend">
@@ -415,7 +445,10 @@ export function VerifyPage({
             </div>
           ) : null}
           {runs.length === 0 ? (
-            <p className="empty-copy">{t("verify.noRuns")}</p>
+            <div className="verify-review-empty">
+              <ScanSearch aria-hidden="true" />
+              <p>{t("verify.noRuns")}</p>
+            </div>
           ) : (
             <div className="analyze-plot-host">
               {plotData.length ? (
@@ -460,7 +493,9 @@ export function VerifyPage({
               ) : null}
             </div>
           ) : null}
-          <p className="help-copy">{t("verify.reviewFilterHint")}</p>
+          {runs.length > 0 ? (
+            <p className="help-copy">{t("verify.reviewFilterHint")}</p>
+          ) : null}
           {notice || submitNotice ? (
             <p className="help-copy">{notice || submitNotice}</p>
           ) : null}
@@ -649,21 +684,18 @@ function VerifyRunReview({
 }) {
   const stored = useMemo(() => storedVerifyFrames(run), [run]);
   const frames = stored ?? live ?? [];
-  const source = run.sourceId ? state.sourcesById[run.sourceId] : null;
 
   const filtered = useMemo(() => {
     const thresholdValue = threshold.trim() ? Number(threshold.trim()) : null;
     const limit = Math.max(1, Number(topN) || 20);
-    const valid = frames.filter((frame) => frame.error !== null);
-    const above =
-      thresholdValue !== null && Number.isFinite(thresholdValue)
-        ? valid.filter((frame) => (frame.error as number) > thresholdValue)
-        : valid;
-    return [...above].sort((a, b) => (b.error as number) - (a.error as number)).slice(0, limit);
+    return reviewVerifyFrames(
+      frames,
+      thresholdValue !== null && Number.isFinite(thresholdValue) ? thresholdValue : null,
+      limit,
+    );
   }, [frames, threshold, topN]);
 
-  const coverage =
-    run.total > 0 ? `${Math.min(run.completed, run.total)}/${run.total}` : `${run.completed}`;
+  const coverage = verifyCoverageDisplay(run);
   const concurrency = verifyRunConcurrency(run);
 
   return (
@@ -675,12 +707,17 @@ function VerifyRunReview({
         onClick={onToggleExpanded}
       >
         {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-        <span>{source?.label || source?.path || run.sourceId || "—"}</span>
+        <span className="verify-run-label">{verificationRunLabel(run, state, t)}</span>
         <span className="analyze-table-count">{filtered.length}</span>
         <span className="help-copy">
           {run.status}
           {" · "}
-          {t("verify.col.coverage")} {coverage}
+          {t("verify.col.coverage")} {coverage.text}
+          {coverage.badge
+            ? ` · ${t(coverage.badge === "partial"
+                ? "verify.coveragePartial"
+                : "verify.coverageIncomplete")}`
+            : ""}
           {frames.length ? ` · ${t("verify.frameMetrics", { count: String(frames.length) })}` : ""}
           {concurrency
             ? ` · ${t("verify.concurrencyTelemetry", {
@@ -691,6 +728,9 @@ function VerifyRunReview({
               })}`
             : ""}
         </span>
+        {coverage.metricsIncomplete ? (
+          <span className="verify-metrics-warning">{t("verify.metricsIncomplete")}</span>
+        ) : null}
       </button>
 
       {expanded ? (

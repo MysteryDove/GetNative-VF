@@ -15,6 +15,7 @@ import { runStatusLabel, runTypeLabel } from "../project/labels";
 import { toggleSetValue } from "../utils/collections";
 import { actualBackendLabel } from "../engine/backendSelection";
 import type { ActualBackend } from "../engine/protocol";
+import { verificationRunLabel, verifyCoverageDisplay } from "../engine/verifyResults";
 
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
 
@@ -120,14 +121,14 @@ export function ResultsPage({
       const best = data.reduce((a, b) => (b.metric < a.metric ? b : a));
       rows.push({
         runId: run.id,
-        label: runLabel(run, state),
+        label: runLabel(run, state, t),
         points: data.length,
         bestKey: best.seriesKey,
         bestMetric: best.metric,
       });
     }
     return rows;
-  }, [selectedRuns, state, state.runsById]);
+  }, [selectedRuns, state, state.runsById, t]);
 
   function toggleGroup(groupId: string) {
     setExpandedGroups((current) => toggleSetValue(current, groupId));
@@ -424,6 +425,8 @@ function RunRow({
   const rows = extractRunRows(run);
   const actualBackend = runActualBackend(run);
   const decode = runDecodeProvenance(run);
+  const verification = run.runType === "verification" || run.runType === "verify";
+  const coverage = verification ? verifyCoverageDisplay(run) : null;
   return (
     <div className={`dense-row run-row ${indented ? "indented" : ""}`}>
       <label className="checkbox-row">
@@ -440,13 +443,20 @@ function RunRow({
           }
           onChange={onToggle}
         />
-        <strong>{runLabel(run, state)}</strong>
+        <strong>{runLabel(run, state, t)}</strong>
       </label>
       <span>
         {runTypeLabel(run.runType, t)}
         {" · "}
         {runStatusLabel(run.status, t)}
-        {run.total > 0 ? ` · ${run.completed}/${run.total}` : ""}
+        {coverage
+          ? ` · ${t("verify.col.coverage")} ${coverage.text}`
+          : run.total > 0 ? ` · ${run.completed}/${run.total}` : ""}
+        {coverage?.badge
+          ? ` · ${t(coverage.badge === "partial"
+              ? "verify.coveragePartial"
+              : "verify.coverageIncomplete")}`
+          : ""}
         {rows.length ? ` · ${t("results.points", { count: String(rows.length) })}` : ""}
         {actualBackend
           ? ` · ${t("results.actualBackend", {
@@ -461,6 +471,9 @@ function RunRow({
               : ""}`
           : ""}
       </span>
+      {coverage?.metricsIncomplete ? (
+        <span className="verify-metrics-warning">{t("verify.metricsIncomplete")}</span>
+      ) : null}
       {onDelete ? (
         <button
           className="icon-button danger"
@@ -476,7 +489,10 @@ function RunRow({
   );
 }
 
-function runLabel(run: Run, state: ProjectState): string {
+function runLabel(run: Run, state: ProjectState, t: Translator): string {
+  if (run.runType === "verification" || run.runType === "verify") {
+    return verificationRunLabel(run, state, t);
+  }
   const sample = run.sampleId ? state.samplesById[run.sampleId] : null;
   if (sample) return sample.label || sample.id;
   const source = run.sourceId ? state.sourcesById[run.sourceId] : null;

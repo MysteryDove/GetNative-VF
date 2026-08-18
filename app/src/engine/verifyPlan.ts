@@ -39,6 +39,24 @@ export function defaultVerifyDraft(backendPreference: BackendPreference = "auto"
   };
 }
 
+/** Keep the draft selection valid as the set of indexed video sources changes. */
+export function reconcileReadyVideoSourceIds(
+  selectedSourceIds: string[],
+  readyVideoSourceIds: string[],
+): string[] {
+  const ready = new Set(readyVideoSourceIds);
+  const retained = selectedSourceIds.filter((sourceId) => ready.has(sourceId));
+  const next =
+    retained.length === 0 && readyVideoSourceIds.length === 1
+      ? [readyVideoSourceIds[0]]
+      : retained;
+
+  return next.length === selectedSourceIds.length &&
+    next.every((sourceId, index) => sourceId === selectedSourceIds[index])
+    ? selectedSourceIds
+    : next;
+}
+
 export type VerifyRunGroupPlan = {
   groupType: "multi_source_verification" | "single_verification";
   label: string;

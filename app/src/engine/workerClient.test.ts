@@ -122,6 +122,13 @@ describe("EngineWorkerClient", () => {
       completed: 5,
       total: 21,
       phase: "candidates",
+      coverage: {
+        selection: "every_n",
+        eligible_frames: 100,
+        selected_frames: 21,
+        processed_frames: 5,
+        failed_frames: 0,
+      },
       timestamp_ms: 11,
     });
     emitWire({
@@ -131,6 +138,13 @@ describe("EngineWorkerClient", () => {
       job_id: "job-1",
       mode: "height",
       payload: { candidates: [{ id: "230", error: 12.5 }] },
+      coverage: {
+        selection: "every_n",
+        eligible_frames: 100,
+        selected_frames: 21,
+        processed_frames: 21,
+        failed_frames: 0,
+      },
       timestamp_ms: 12,
     });
 
@@ -143,6 +157,13 @@ describe("EngineWorkerClient", () => {
     const progress = events[1];
     expect(progress.type === "progress" && progress.completed).toBe(5);
     expect(progress.type === "progress" && progress.detail).toBe("candidates");
+    expect(progress.type === "progress" && progress.coverage).toEqual({
+      selection: "every_n",
+      eligibleFrames: 100,
+      selectedFrames: 21,
+      processedFrames: 5,
+      failedFrames: 0,
+    });
     const result = events[2];
     const accepted = events[0];
     expect(accepted.type === "accepted" && accepted.backend).toBe("cuda");
@@ -152,6 +173,7 @@ describe("EngineWorkerClient", () => {
       result.type === "result" &&
         (result.payload as { candidates: unknown[] }).candidates.length,
     ).toBe(1);
+    expect(result.type === "result" && result.coverage?.processedFrames).toBe(21);
   });
 
   it("prepares local identity before invoke and survives accepted/result before invoke resolves", async () => {
@@ -211,7 +233,19 @@ describe("EngineWorkerClient", () => {
       mode: "height",
       timestamp_ms: 1,
     });
-    emitWire({ type: "cancelled", job_id: "job-7", partial: true, timestamp_ms: 2 });
+    emitWire({
+      type: "cancelled",
+      job_id: "job-7",
+      partial: true,
+      timestamp_ms: 2,
+      coverage: {
+        selection: "decoded_i_picture",
+        eligible_frames: 240,
+        selected_frames: 10,
+        processed_frames: 3,
+        failed_frames: 1,
+      },
+    });
 
     const cancelled = events[events.length - 1];
     expect(cancelled?.type).toBe("cancelled");
@@ -219,6 +253,11 @@ describe("EngineWorkerClient", () => {
       expect(cancelled.jobId).toBe(submitted.jobId);
       expect(cancelled.runId).toBe(submitted.runId);
       expect(cancelled.partial).toBe(true);
+      expect(cancelled.coverage).toMatchObject({
+        eligibleFrames: 240,
+        processedFrames: 3,
+        failedFrames: 1,
+      });
     }
   });
 

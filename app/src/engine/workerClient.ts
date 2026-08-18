@@ -23,6 +23,7 @@ import type {
   JobId,
   RequestId,
   RunId,
+  VerifyCoverage,
   WorkerEvent,
   EndpointRule,
 } from "./protocol";
@@ -146,6 +147,13 @@ type WireEvent = {
   to?: string;
   reason?: string;
   frame_seq?: number;
+  coverage?: {
+    selection?: string;
+    eligible_frames?: number;
+    selected_frames?: number;
+    processed_frames?: number;
+    failed_frames?: number;
+  };
   results?: Array<{
     seq?: number;
     error?: number | null;
@@ -154,6 +162,33 @@ type WireEvent = {
     timestamp_seconds?: number | null;
   }>;
 };
+
+function wireCoverage(value: WireEvent["coverage"]): VerifyCoverage | undefined {
+  if (!value) return undefined;
+  if (
+    value.selection !== "all" &&
+    value.selection !== "decoded_i_picture" &&
+    value.selection !== "every_n"
+  ) {
+    return undefined;
+  }
+  const counts = [
+    value.eligible_frames,
+    value.selected_frames,
+    value.processed_frames,
+    value.failed_frames,
+  ];
+  if (!counts.every((count) => Number.isSafeInteger(count) && (count as number) >= 0)) {
+    return undefined;
+  }
+  return {
+    selection: value.selection,
+    eligibleFrames: value.eligible_frames as number,
+    selectedFrames: value.selected_frames as number,
+    processedFrames: value.processed_frames as number,
+    failedFrames: value.failed_frames as number,
+  };
+}
 
 type TrackedJob = {
   requestId: RequestId;
@@ -513,6 +548,7 @@ export class EngineWorkerClient {
           completed: wire.completed ?? 0,
           total: wire.total ?? 0,
           detail: wire.phase ?? null,
+          coverage: wireCoverage(wire.coverage),
           results: Array.isArray(wire.results)
             ? wire.results
                 .filter((entry) => typeof entry?.seq === "number")
@@ -548,6 +584,7 @@ export class EngineWorkerClient {
           ...base,
           type: "result",
           mode: wireMode(wire.mode),
+          coverage: wireCoverage(wire.coverage),
           payload: enrichFrontendTelemetry(
             wire.payload,
             tracked?.frontendQueueMs
@@ -556,7 +593,12 @@ export class EngineWorkerClient {
         });
         break;
       case "cancelled":
-        this.emit({ ...base, type: "cancelled", partial: wire.partial ?? false });
+        this.emit({
+          ...base,
+          type: "cancelled",
+          partial: wire.partial ?? false,
+          coverage: wireCoverage(wire.coverage),
+        });
         break;
       case "error":
         this.emit({

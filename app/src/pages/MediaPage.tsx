@@ -118,6 +118,7 @@ export function MediaPage({
     previewUrl,
     thumbnailUrls,
     previewBusy,
+    previewDecoder,
     indexBusy,
     frameWindow,
     frameInput,
@@ -125,12 +126,12 @@ export function MediaPage({
     timeInput,
     setTimeInput,
     scrubFrame,
-    setScrubFrame,
     zoom,
     setZoom,
     pixelPosition,
     setPixelPosition,
     selectVideoFrame,
+    scrubVideoFrame,
   } = useMediaPreview({
     selectedSource,
     videoDecodeAvailable: mediaCapabilities?.video_decode_available,
@@ -425,7 +426,7 @@ export function MediaPage({
                   sourceSamples={sourceSamples}
                   onFrameInputChange={setFrameInput}
                   onTimeInputChange={setTimeInput}
-                  onScrubFrameChange={setScrubFrame}
+                  onScrubFrameChange={(frameIndex) => scrubVideoFrame(selectedSource, frameIndex)}
                   selectVideoFrame={selectVideoFrame}
                   onKeyDown={(event) => handleFrameBrowserKeyDown(event, selectedSource)}
                 />
@@ -434,7 +435,14 @@ export function MediaPage({
               <div className="source-metadata">
                 <span>{t("media.dimensions")} <strong>{dimensionText(selectedSource?.width, selectedSource?.height)}</strong></span>
                 <span>{t("media.type")} <strong>{t(`media.kind.${selectedSource.kind}`)}</strong></span>
-                <span>{t("media.decoder")} <strong>{selectedSource.decoder ?? "-"}</strong></span>
+                <span>
+                  {t(selectedSource.kind === "video" ? "media.previewDecoder" : "media.decoder")} {" "}
+                  <strong>
+                    {selectedSource.kind === "video"
+                      ? (previewDecoder ?? selectedSource.decoder ?? "-")
+                      : (selectedSource.decoder ?? "-")}
+                  </strong>
+                </span>
                 {selectedSource.kind === "video" ? <span>{t("media.duration")} <strong>{formatSeconds(selectedSource.durationSeconds)}</strong></span> : null}
               </div>
             </>

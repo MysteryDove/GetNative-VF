@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { startVerifyRunGroup, VERIFY_RESULT_FRAMES_CAP, type VerifyFrameEntry } from "./executeVerify";
+import { startVerifyRunGroup, type VerifyFrameEntry } from "./executeVerify";
 import { planVerifyRunGroup, defaultVerifyDraft } from "./verifyPlan";
 import { emptyProjectState } from "../project/normalize";
 import type { ProjectState, Recipe, Source } from "../project/types";
@@ -57,7 +57,16 @@ const video: Source = {
 
 type Listener = (event: WorkerEvent) => void;
 
-function makeFakeWorker(frameErrors: Array<number | null>) {
+function makeFakeWorker(
+  frameErrors: Array<number | null>,
+  options: {
+    coverage?: boolean;
+    eligibleFrames?: number;
+    selection?: "all" | "decoded_i_picture" | "every_n";
+    reverse?: boolean;
+    terminal?: "result" | "cancelled" | "error";
+  } = {},
+) {
   const listeners = new Set<Listener>();
   const worker = {
     subscribe(listener: Listener) {
@@ -69,24 +78,54 @@ function makeFakeWorker(frameErrors: Array<number | null>) {
       const job = { requestId: "req-1", jobId: "gui-job-1", runId: "gui-run-1" };
       onPrepared?.(job);
       queueMicrotask(() => {
-        const results = frameErrors.map((error, seq) => ({
+        let results = frameErrors.map((error, seq) => ({
           seq,
           frameIndex: seq * 2,
           pts: seq * 1001,
           timestampSeconds: seq / 24,
           error,
         }));
+        if (options.reverse) results = [...results].reverse();
+        const processedFrames = frameErrors.filter((error) => error !== null).length;
+        const failedFrames = frameErrors.length - processedFrames;
+        const coverage = {
+          selection: options.selection ?? "decoded_i_picture" as const,
+          eligibleFrames: options.eligibleFrames ?? frameErrors.length,
+          selectedFrames: frameErrors.length,
+          processedFrames,
+          failedFrames,
+        };
         for (const listener of listeners) {
           listener({
             protocolVersion: 1, requestId: "req-1", jobId: "gui-job-1",
             runId: "gui-run-1", timestampMs: 1, type: "progress",
             completed: results.length, total: results.length, results,
+            ...(options.coverage === false ? {} : { coverage }),
           });
-          listener({
-            protocolVersion: 1, requestId: "req-1", jobId: "gui-job-1",
-            runId: "gui-run-1", timestampMs: 2, type: "result", mode: "verify",
-            payload: { mode: "verify", frames_completed: results.length, frames_failed: 0 },
-          });
+          if (options.terminal === "cancelled") {
+            listener({
+              protocolVersion: 1, requestId: "req-1", jobId: "gui-job-1",
+              runId: "gui-run-1", timestampMs: 2, type: "cancelled", partial: true,
+              ...(options.coverage === false ? {} : { coverage }),
+            });
+          } else if (options.terminal === "error") {
+            listener({
+              protocolVersion: 1, requestId: "req-1", jobId: "gui-job-1",
+              runId: "gui-run-1", timestampMs: 2, type: "error",
+              code: "media_decode_error", message: "decode failed", retryable: false,
+            });
+          } else {
+            listener({
+              protocolVersion: 1, requestId: "req-1", jobId: "gui-job-1",
+              runId: "gui-run-1", timestampMs: 2, type: "result", mode: "verify",
+              payload: {
+                mode: "verify",
+                frames_completed: processedFrames,
+                frames_failed: failedFrames,
+              },
+              ...(options.coverage === false ? {} : { coverage }),
+            });
+          }
         }
       });
       return job;
@@ -140,8 +179,16 @@ describe("startVerifyRunGroup", () => {
     expect(run?.status).toBe("completed");
     // Streamed frames merged into the stored result, errors kept verbatim
     // (including the null for the failed frame) with indexed identities.
-    const stored = run?.result as { frames?: Array<{ seq: number; error: number | null }> };
+    const stored = run?.result as {
+      frames?: Array<{ seq: number; error: number | null }>;
+      coverage?: { eligibleFrames: number; processedFrames: number; failedFrames: number };
+    };
     expect(stored.frames?.map((frame) => frame.error)).toEqual([0.5, 1e-7, null]);
+    expect(stored.coverage).toMatchObject({
+      eligibleFrames: 3,
+      processedFrames: 2,
+      failedFrames: 1,
+    });
     expect(liveBatches).toHaveLength(3);
     expect(liveBatches.map((frame) => frame.frameIndex)).toEqual([0, 2, 4]);
     expect(queued[0]?.mode).toBe("verify");
@@ -150,8 +197,8 @@ describe("startVerifyRunGroup", () => {
     expect((run?.inputSnapshot as { concurrency?: number }).concurrency).toBe(2);
   });
 
-  it("caps retained frames for the terminal write while counting every frame", async () => {
-    const draft = { ...defaultVerifyDraft(), sourceIds: ["src_1"] };
+  it("retains and sorts all 34,072 frame metrics for the terminal write", async () => {
+    const draft = { ...defaultVerifyDraft(), sourceIds: ["src_1"], scopeKind: "full" as const };
     const planned = planVerifyRunGroup({
       draft,
       recipe,
@@ -162,9 +209,10 @@ describe("startVerifyRunGroup", () => {
     expect(planned.ok).toBe(true);
     if (!planned.ok) return;
 
-    const frameCount = VERIFY_RESULT_FRAMES_CAP + 7;
+    const frameCount = 34_072;
     const { worker } = makeFakeWorker(
-      Array.from({ length: frameCount }, (_, index) => (index % 2 === 0 ? 0.5 : null)),
+      Array.from({ length: frameCount }, (_, index) => index / frameCount),
+      { selection: "all", eligibleFrames: frameCount, reverse: true },
     );
     let state: ProjectState = emptyProjectState({ id: "p1" });
     state.sourcesById.src_1 = video;
@@ -183,12 +231,96 @@ describe("startVerifyRunGroup", () => {
     expect(result.ok).toBe(true);
     const run = Object.values(state.runsById)[0];
     expect(run?.status).toBe("completed");
-    // Every streamed frame counts toward progress...
     expect(run?.completed).toBe(frameCount);
-    // ...but the stored result keeps only the most recent capped entries.
-    const stored = run?.result as { frames?: Array<{ seq: number }> };
-    expect(stored.frames).toHaveLength(VERIFY_RESULT_FRAMES_CAP);
-    expect(stored.frames?.[0]?.seq).toBe(frameCount - VERIFY_RESULT_FRAMES_CAP);
+    const stored = run?.result as { frames?: Array<{ seq: number; frameIndex: number }> };
+    expect(stored.frames).toHaveLength(frameCount);
+    expect(stored.frames?.[0]).toMatchObject({ seq: 0, frameIndex: 0 });
     expect(stored.frames?.[stored.frames.length - 1]?.seq).toBe(frameCount - 1);
+    expect(stored.frames?.[stored.frames.length - 1]?.frameIndex).toBe((frameCount - 1) * 2);
+  });
+
+  it("persists cancelled coverage and notifies the live buffer after the terminal write", async () => {
+    const draft = { ...defaultVerifyDraft(), sourceIds: ["src_1"] };
+    const planned = planVerifyRunGroup({
+      draft,
+      recipe,
+      sourcesById: { src_1: video },
+      nowMs: 1,
+      requestIdPrefix: "t",
+    });
+    expect(planned.ok).toBe(true);
+    if (!planned.ok) return;
+
+    const { worker } = makeFakeWorker([0.5, 0.25], {
+      terminal: "cancelled",
+      eligibleFrames: 100,
+    });
+    let state: ProjectState = emptyProjectState({ id: "p1" });
+    state.sourcesById.src_1 = video;
+    const terminalRuns: string[] = [];
+    await startVerifyRunGroup({
+      plan: planned.plan,
+      recipe,
+      state,
+      onProjectChange: (updater) => { state = updater(state); },
+      bridge: { queue: () => {}, cancel: () => {} },
+      onTerminal: (runId) => terminalRuns.push(runId),
+      deps: { worker, nowMs: () => 1000 },
+    });
+
+    const run = Object.values(state.runsById)[0];
+    expect(run?.status).toBe("partial");
+    expect(run?.result).toMatchObject({
+      coverage: { eligibleFrames: 100, selectedFrames: 2, processedFrames: 2 },
+    });
+    expect(terminalRuns).toEqual([run?.id]);
+  });
+
+  it("keeps terminal results compatible when an older worker omits coverage", async () => {
+    const draft = { ...defaultVerifyDraft(), sourceIds: ["src_1"] };
+    const planned = planVerifyRunGroup({
+      draft, recipe, sourcesById: { src_1: video }, nowMs: 1, requestIdPrefix: "t",
+    });
+    expect(planned.ok).toBe(true);
+    if (!planned.ok) return;
+    const { worker } = makeFakeWorker([0.5], { coverage: false });
+    let state: ProjectState = emptyProjectState({ id: "p1" });
+    state.sourcesById.src_1 = video;
+    await startVerifyRunGroup({
+      plan: planned.plan,
+      recipe,
+      state,
+      onProjectChange: (updater) => { state = updater(state); },
+      bridge: { queue: () => {}, cancel: () => {} },
+      deps: { worker, nowMs: () => 1000 },
+    });
+    expect(Object.values(state.runsById)[0]?.result).not.toHaveProperty("coverage");
+  });
+
+  it("keeps every streamed metric when a worker fails after partial progress", async () => {
+    const draft = { ...defaultVerifyDraft(), sourceIds: ["src_1"] };
+    const planned = planVerifyRunGroup({
+      draft, recipe, sourcesById: { src_1: video }, nowMs: 1, requestIdPrefix: "t",
+    });
+    expect(planned.ok).toBe(true);
+    if (!planned.ok) return;
+    const { worker } = makeFakeWorker([0.2, 0.1], {
+      terminal: "error", eligibleFrames: 100, reverse: true,
+    });
+    let state: ProjectState = emptyProjectState({ id: "p1" });
+    state.sourcesById.src_1 = video;
+    await startVerifyRunGroup({
+      plan: planned.plan,
+      recipe,
+      state,
+      onProjectChange: (updater) => { state = updater(state); },
+      bridge: { queue: () => {}, cancel: () => {} },
+      deps: { worker, nowMs: () => 1000 },
+    });
+    const run = Object.values(state.runsById)[0];
+    expect(run?.status).toBe("failed");
+    expect((run?.result as { frames: VerifyFrameEntry[] }).frames.map((frame) => frame.seq))
+      .toEqual([0, 1]);
+    expect(run?.result).toMatchObject({ coverage: { eligibleFrames: 100 } });
   });
 });

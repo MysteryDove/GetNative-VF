@@ -12,6 +12,7 @@
 #include "getnative/cuda_analysis.hpp"
 #include "getnative/profile.hpp"
 #include "getnative/plan_store.hpp"
+#include "getnative/utf8_path.hpp"
 #include "getnative/vulkan_analysis.hpp"
 #if defined(GETNATIVE_HAS_MEDIA)
 #include "getnative/media_decode.hpp"
@@ -848,8 +849,8 @@ VerifyJobSpec parse_verify_begin(const JsonValue &command, std::string job_id,
         if (input.path.empty()) throw WorkerError("bad_request", "media path must not be empty");
         input.fingerprint = optional_string(media_input, "fingerprint").value_or("");
         input.cache_directory = optional_string(media_input, "cache_directory")
-            .value_or((std::filesystem::temp_directory_path()
-                       / "getnative-media-cache").string());
+            .value_or(path_to_utf8(std::filesystem::temp_directory_path()
+                                   / "getnative-media-cache"));
         const std::int32_t stream_index = require_int(media_input, "stream_index");
         if (stream_index < 0) {
             throw WorkerError("bad_request", "media stream_index must be non-negative");
@@ -989,7 +990,7 @@ void load_frame_into(const FrameAsset &asset, float *destination) {
     const std::uint64_t elements =
         static_cast<std::uint64_t>(asset.width) * static_cast<std::uint64_t>(asset.height);
     const std::uint64_t bytes = elements * sizeof(float);
-    std::ifstream input(asset.path, std::ios::binary | std::ios::ate);
+    std::ifstream input(path_from_utf8(asset.path), std::ios::binary | std::ios::ate);
     if (!input) {
         throw WorkerError("frame_asset_error", "cannot open frame asset: " + asset.path, true);
     }
@@ -1070,7 +1071,7 @@ public:
         }
         bytes_ = frame_bytes_ * slot_count_;
 #if defined(_WIN32)
-        const std::filesystem::path native_path{path};
+        const std::filesystem::path native_path = path_from_utf8(path);
         file_ = ::CreateFileW(native_path.c_str(), GENERIC_READ,
                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -1569,7 +1570,7 @@ public:
             {"type", JsonValue::string("hello_ok")},
             {"request_id", JsonValue::string(request_id)},
             {"timestamp_ms", JsonValue::integer(timestamp_ms())},
-            {"engine_version", JsonValue::string("0.1.4")},
+            {"engine_version", JsonValue::string("0.1.6")},
             {"commands", JsonValue::object({
                 {"analyze", JsonValue::boolean(true)},
                 {"cancel", JsonValue::boolean(true)},
@@ -1915,13 +1916,14 @@ public:
         job->job_id = "job-" + std::to_string(next_job_++);
         job->kind = kind;
         job->path = require_string(command, "path");
-        if (job->path.empty() || !std::filesystem::is_regular_file(job->path)) {
+        if (job->path.empty()
+            || !std::filesystem::is_regular_file(path_from_utf8(job->path))) {
             throw WorkerError("media_read_error", "media path does not name a regular file");
         }
         job->fingerprint = optional_string(command, "fingerprint");
         job->cache_directory = optional_string(command, "cache_directory")
-            .value_or((std::filesystem::temp_directory_path()
-                       / "getnative-media-cache").string());
+            .value_or(path_to_utf8(std::filesystem::temp_directory_path()
+                                   / "getnative-media-cache"));
         job->decoder = optional_string(command, "decoder").value_or("auto");
         if (!matches_media_decoder(job->decoder)) {
             throw WorkerError("bad_request", "decoder must be auto, software, nvdec, or vulkan_video");
@@ -1952,8 +1954,11 @@ public:
                 throw WorkerError("bad_request", "unknown media frame target: " + job->target);
             }
         }
-        if (kind == MediaJobKind::frame_window) {
-            const std::int32_t radius = optional_int(command, "window_radius", 12);
+        if (kind == MediaJobKind::frame_window || kind == MediaJobKind::preview) {
+            // Preview replies embed the window, so it parses a radius too;
+            // its default is 0 (clients that want the rail pass one).
+            const std::int32_t radius = optional_int(
+                command, "window_radius", kind == MediaJobKind::preview ? 0 : 12);
             if (radius < 0 || radius > 1000) {
                 throw WorkerError("bad_request", "window_radius must be within 0..1000");
             }
@@ -2004,6 +2009,21 @@ public:
                     throw WorkerError("bad_request", "asset item_id values must be unique");
                 }
             }
+        }
+
+        const bool png_preview = kind == MediaJobKind::preview
+            || (kind == MediaJobKind::asset_batch
+                && std::any_of(job->assets.begin(), job->assets.end(),
+                               [](const MediaAssetSpec &asset) {
+                                   return asset.format == "png";
+                               }));
+        if (png_preview) {
+            if (job->decoder == "nvdec" || job->decoder == "vulkan_video") {
+                throw WorkerError(
+                    "unsupported",
+                    "video previews support only the software decoder");
+            }
+            job->decoder = "software";
         }
 
         if (kind == MediaJobKind::index) {
@@ -2339,6 +2359,17 @@ private:
     std::shared_ptr<MediaJob> media_running_;
     bool media_stopping_ = false;
     std::thread media_executor_;
+    // Reuse across media jobs. Both are only ever touched on the media
+    // executor thread, so they need no locking. The index cache avoids a
+    // re-probe + index re-parse per request; the decode session keeps the
+    // demuxer/decoder open so repeated seeks only pay a flush.
+    std::string media_index_cache_key_;
+    std::shared_ptr<const media::IndexedMedia> media_index_cache_;
+    std::chrono::steady_clock::time_point media_index_cache_validated_at_{};
+    std::string media_session_key_;
+    std::unique_ptr<media::IndexedDecodeSession> media_session_;
+    // path#stream#backend keys of hardware sessions that already failed to
+    // open or decode, so later requests fall back to software immediately.
 #endif
 
     void require_greeting() {
@@ -2410,7 +2441,7 @@ private:
     void emit_progress(const std::string &request_id, const std::string &job_id,
                        const char *mode, std::string_view phase,
                        std::uint64_t completed, std::uint64_t total,
-                       JsonValue results) {
+                       JsonValue results, JsonValue coverage = JsonValue{}) {
         std::vector<std::pair<std::string, JsonValue>> members = {
             {"protocol_version", JsonValue::integer(kProtocolVersion)},
             {"type", JsonValue::string("progress")},
@@ -2424,6 +2455,9 @@ private:
         };
         if (results.type == JsonValue::Type::array && !results.items.empty()) {
             members.emplace_back("results", std::move(results));
+        }
+        if (coverage.type == JsonValue::Type::object) {
+            members.emplace_back("coverage", std::move(coverage));
         }
         emit(JsonValue::object(std::move(members)));
     }
@@ -2734,24 +2768,6 @@ private:
         return target;
     }
 
-    void emit_media_warning(const MediaJob &job, std::string from,
-                            std::string reason) {
-        for (const std::string &request_id : media_subscriber_snapshot(job)) {
-            emit(JsonValue::object({
-                {"protocol_version", JsonValue::integer(kProtocolVersion)},
-                {"type", JsonValue::string("warning")},
-                {"request_id", JsonValue::string(request_id)},
-                {"job_id", JsonValue::string(job.job_id)},
-                {"timestamp_ms", JsonValue::integer(timestamp_ms())},
-                {"code", JsonValue::string("hardware_decode_fallback")},
-                {"message", JsonValue::string(from + " -> software: " + reason)},
-                {"from", JsonValue::string(from)},
-                {"to", JsonValue::string("software")},
-                {"reason", JsonValue::string(reason)},
-            }));
-        }
-    }
-
     media::IndexedMedia ensure_media_index(MediaJob &job) {
         auto build = [&](const media::DecoderOptions &options) {
             return media::ensure_index(
@@ -2764,68 +2780,52 @@ private:
                     }
                 });
         };
-        std::vector<std::pair<std::string, std::string>> fallbacks;
-        if (job.decoder == "auto" || job.decoder == "nvdec") {
-#if defined(GETNATIVE_HAS_CUDA)
-            try {
-                CudaAnalysisEngine &cuda = resident_cuda_engine();
-                media::DecoderOptions options;
-                options.backend = media::DecoderOptions::Backend::cuda;
-                options.native_context = cuda.native_context();
-                options.native_queue = cuda.native_decode_stream();
-                media::IndexedMedia indexed = build(options);
-                validate_media_fingerprint(job, indexed.index);
-                return indexed;
-            } catch (const std::exception &error) {
-                if (job.cancel_requested.load(std::memory_order_relaxed)) throw;
-                fallbacks.emplace_back("nvdec", error.what());
-            }
-#else
-            fallbacks.emplace_back("nvdec", "CUDA decode was not compiled");
-#endif
-        }
-        if (job.decoder == "auto" || job.decoder == "vulkan_video") {
-#if defined(GETNATIVE_HAS_VULKAN)
-            try {
-                VulkanAnalysisEngine &vulkan = resident_vulkan_engine();
-                const VulkanNativeContextInfo &native = vulkan.native_context();
-                media::DecoderOptions options;
-                options.backend = media::DecoderOptions::Backend::vulkan_video;
-                options.native_instance = native.instance;
-                options.native_physical_device = native.physical_device;
-                options.native_device = native.device;
-                options.native_queue = native.compute_queue;
-                options.native_compute_queue_family = native.compute_queue_family;
-                options.native_decode_queue_family = native.decode_queue_family;
-                options.native_video_codec_operations = native.video_codec_operations;
-                options.native_instance_api_version = native.instance_api_version;
-                options.native_timeline_semaphore = native.timeline_semaphore;
-                options.native_device_extensions = native.enabled_device_extensions;
-                options.native_queue_lock_opaque = &vulkan;
-                options.lock_native_queue = [](void *opaque) {
-                    static_cast<VulkanAnalysisEngine *>(opaque)->lock_native_queue();
-                };
-                options.unlock_native_queue = [](void *opaque) {
-                    static_cast<VulkanAnalysisEngine *>(opaque)->unlock_native_queue();
-                };
-                media::IndexedMedia indexed = build(options);
-                validate_media_fingerprint(job, indexed.index);
-                return indexed;
-            } catch (const std::exception &error) {
-                if (job.cancel_requested.load(std::memory_order_relaxed)) throw;
-                fallbacks.emplace_back("vulkan_video", error.what());
-            }
-#else
-            fallbacks.emplace_back("vulkan_video", "Vulkan Video decode was not compiled");
-#endif
-        }
-        for (const auto &[from, reason] : fallbacks) {
-            emit_media_warning(job, from, reason);
-        }
         media::DecoderOptions software;
         media::IndexedMedia indexed = build(software);
         validate_media_fingerprint(job, indexed.index);
         return indexed;
+    }
+
+    // Media-index cache. Seeking the same file issues several media jobs per
+    // second; without this each one re-probes the container and re-parses the
+    // whole index file. Rate-limited size/mtime checks guard against the source
+    // changing without turning every NAS seek into a network metadata round
+    // trip. Only called on the media executor thread.
+    //
+    // Explicit index jobs always observe the on-disk index: their contract
+    // (rebuilt flag, corrupt-index recovery) describes the file itself.
+    const media::IndexedMedia &ensure_media_index_cached(MediaJob &job) {
+        const std::string key = job.path + "#"
+            + (job.stream_index ? std::to_string(*job.stream_index)
+                                : std::string{"auto"});
+        const auto now = std::chrono::steady_clock::now();
+        constexpr auto signature_ttl = std::chrono::seconds{5};
+        if (job.kind != MediaJobKind::index && media_index_cache_
+            && media_index_cache_key_ == key) {
+            validate_media_fingerprint(job, media_index_cache_->index);
+            // SMB metadata queries can block for hundreds of milliseconds (or
+            // until a reconnect timeout). One validation covers a burst of
+            // scrub/preview requests; explicit index jobs still bypass this.
+            if (now - media_index_cache_validated_at_ < signature_ttl) {
+                return *media_index_cache_;
+            }
+            if (media_index_cache_->index.source_size
+                    == std::filesystem::file_size(path_from_utf8(job.path))
+                && media_index_cache_->index.source_mtime_ns
+                    == media::source_mtime_unix_ns(job.path)) {
+                media_index_cache_validated_at_ = now;
+                return *media_index_cache_;
+            }
+        }
+        media::IndexedMedia indexed = ensure_media_index(job);
+        media_index_cache_ =
+            std::make_shared<const media::IndexedMedia>(std::move(indexed));
+        media_index_cache_key_ = key;
+        media_index_cache_validated_at_ = now;
+        // A (re)built index invalidates the decode session's index reference.
+        media_session_.reset();
+        media_session_key_.clear();
+        return *media_index_cache_;
     }
 
     static void validate_media_fingerprint(const MediaJob &job,
@@ -2835,6 +2835,67 @@ private:
                 "media_fingerprint_error",
                 "the source fingerprint changed after the media request was submitted");
         }
+    }
+
+    // The frame-window payload surrounding a target frame; shared by the
+    // frame_window job and the preview job (which embeds it so the browser
+    // rail does not need a second round trip per seek).
+    static JsonValue media_frame_window_payload(const media::MediaIndex &index,
+                                                std::uint64_t target,
+                                                std::uint32_t radius) {
+        std::vector<media::FrameIdentity> frames =
+            media::frame_window(index, target, radius);
+        std::vector<JsonValue> values;
+        values.reserve(frames.size());
+        for (const auto &frame : frames) values.push_back(frame_identity_json(frame));
+        JsonValue previous;
+        JsonValue next;
+        for (const auto &frame : index.frames) {
+            if (!frame.key_frame) continue;
+            if (frame.frame_index < target) previous = frame_identity_json(frame);
+            if (frame.frame_index > target && next.is_null()) next = frame_identity_json(frame);
+        }
+        return JsonValue::object({
+            {"selected", frame_identity_json(index.frames[target])},
+            {"frames", JsonValue::array(std::move(values))},
+            {"total_frames", JsonValue::integer(
+                static_cast<std::int64_t>(index.frames.size()))},
+            {"previous_keyframe", std::move(previous)},
+            {"next_keyframe", std::move(next)},
+            {"indexed_complete", JsonValue::boolean(true)},
+        });
+    }
+
+    // Returns the persistent software decode session for this source/mode,
+    // creating or replacing it when the key changed. Preview frame identity
+    // must use the same software reference semantics as the media index.
+    media::IndexedDecodeSession &media_session_for(MediaJob &job, bool needs_luma,
+                                                   bool needs_rgb,
+                                                   std::int32_t preview_dimension,
+                                                   std::string &backend_used) {
+        const media::MediaIndex &index = media_index_cache_->index;
+        const std::string base_key = media_index_cache_key_ + "#"
+            + std::to_string(index.stream_index)
+            + (needs_luma ? "#luma" : "") + (needs_rgb ? "#rgb" : "")
+            + "#d" + std::to_string(preview_dimension);
+        const std::string key = base_key + "#software";
+        if (media_session_ && media_session_key_ == key) {
+            backend_used = "software";
+            return *media_session_;
+        }
+        media::DecoderOptions options;
+        options.output_luma = needs_luma;
+        options.output_rgb = needs_rgb;
+        options.preview_maximum_dimension = preview_dimension;
+        // Aliasing shared_ptr: the session keeps the cached index (and
+        // therefore the cache entry) alive.
+        std::shared_ptr<const media::MediaIndex> index_ref(
+            media_index_cache_, &media_index_cache_->index);
+        media_session_ = std::make_unique<media::IndexedDecodeSession>(
+            job.path, std::move(index_ref), options);
+        media_session_key_ = key;
+        backend_used = "software";
+        return *media_session_;
     }
 
     static std::string media_cache_stem(const media::MediaIndex &index,
@@ -2849,10 +2910,45 @@ private:
             + std::to_string(media::MediaIndex::format_version) + std::string{suffix};
     }
 
+    static constexpr std::uint32_t media_preview_pipeline_version = 2U;
+
+    static std::optional<std::pair<std::int32_t, std::int32_t>>
+    media_png_dimensions(const std::filesystem::path &path) {
+        std::array<std::uint8_t, 24> header{};
+        std::ifstream input(path, std::ios::binary);
+        if (!input.read(reinterpret_cast<char *>(header.data()),
+                        static_cast<std::streamsize>(header.size()))) {
+            return std::nullopt;
+        }
+        constexpr std::array<std::uint8_t, 8> signature{
+            0x89U, 0x50U, 0x4eU, 0x47U, 0x0dU, 0x0aU, 0x1aU, 0x0aU};
+        if (!std::equal(signature.begin(), signature.end(), header.begin())
+            || header[12] != 'I' || header[13] != 'H'
+            || header[14] != 'D' || header[15] != 'R') {
+            return std::nullopt;
+        }
+        const auto read_be32 = [&](std::size_t offset) {
+            return (static_cast<std::uint32_t>(header[offset]) << 24U)
+                | (static_cast<std::uint32_t>(header[offset + 1U]) << 16U)
+                | (static_cast<std::uint32_t>(header[offset + 2U]) << 8U)
+                | static_cast<std::uint32_t>(header[offset + 3U]);
+        };
+        const std::uint32_t width = read_be32(16U);
+        const std::uint32_t height = read_be32(20U);
+        if (width == 0U || height == 0U
+            || width > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
+            || height > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+            return std::nullopt;
+        }
+        return std::pair{static_cast<std::int32_t>(width),
+                         static_cast<std::int32_t>(height)};
+    }
+
     static void write_media_asset(const std::filesystem::path &path,
                                   std::span<const std::uint8_t> bytes) {
         std::filesystem::create_directories(path.parent_path());
-        const std::filesystem::path temporary = path.string() + ".tmp";
+        std::filesystem::path temporary = path;
+        temporary += ".tmp";
         std::error_code ignored;
         std::filesystem::remove(temporary, ignored);
         try {
@@ -2932,7 +3028,7 @@ private:
     }
 
     void run_media_job(MediaJob &job) {
-        media::IndexedMedia indexed = ensure_media_index(job);
+        const media::IndexedMedia &indexed = ensure_media_index_cached(job);
         if (job.cancel_requested.load(std::memory_order_relaxed)) {
             throw WorkerError("cancelled", "media job was cancelled");
         }
@@ -2948,35 +3044,18 @@ private:
 
         if (job.kind == MediaJobKind::frame_window) {
             const std::uint64_t target = resolve_media_target(indexed.index, job);
-            std::vector<media::FrameIdentity> frames = media::frame_window(
+            JsonValue payload = media_frame_window_payload(
                 indexed.index, target, job.window_radius);
-            std::vector<JsonValue> values;
-            values.reserve(frames.size());
-            for (const auto &frame : frames) values.push_back(frame_identity_json(frame));
-            JsonValue previous;
-            JsonValue next;
-            for (const auto &frame : indexed.index.frames) {
-                if (!frame.key_frame) continue;
-                if (frame.frame_index < target) previous = frame_identity_json(frame);
-                if (frame.frame_index > target && next.is_null()) next = frame_identity_json(frame);
-            }
-            emit_media_result(job, JsonValue::object({
-                {"selected", frame_identity_json(indexed.index.frames[target])},
-                {"frames", JsonValue::array(std::move(values))},
-                {"total_frames", JsonValue::integer(
-                    static_cast<std::int64_t>(indexed.index.frames.size()))},
-                {"previous_keyframe", std::move(previous)},
-                {"next_keyframe", std::move(next)},
-                {"indexed_complete", JsonValue::boolean(true)},
-                {"index_path", JsonValue::string(indexed.index_path)},
-            }));
+            payload.members.emplace_back("index_path", JsonValue::string(indexed.index_path));
+            emit_media_result(job, std::move(payload));
             return;
         }
 
         std::vector<MediaAssetSpec> assets = job.assets;
+        std::uint64_t preview_target = 0U;
         if (job.kind == MediaJobKind::preview) {
-            assets = {{"preview", resolve_media_target(indexed.index, job),
-                       "png", job.maximum_dimension}};
+            preview_target = resolve_media_target(indexed.index, job);
+            assets = {{"preview", preview_target, "png", job.maximum_dimension}};
         }
         for (const MediaAssetSpec &asset : assets) {
             if (asset.frame_index >= indexed.index.frames.size()) {
@@ -2984,7 +3063,7 @@ private:
             }
         }
         const std::filesystem::path output_directory =
-            std::filesystem::path{job.cache_directory} / "media-assets";
+            path_from_utf8(job.cache_directory) / "media-assets";
 
         struct PreparedAsset {
             std::filesystem::path output_path;
@@ -3008,7 +3087,8 @@ private:
             if (asset.format == "png") {
                 item.output_path = output_directory / media_cache_stem(
                     indexed.index, asset.frame_index,
-                    "-d" + std::to_string(asset.maximum_dimension) + ".png");
+                    "-pv" + std::to_string(media_preview_pipeline_version)
+                        + "-d" + std::to_string(asset.maximum_dimension) + ".png");
                 const double scale = std::min(
                     1.0, static_cast<double>(asset.maximum_dimension)
                         / static_cast<double>(std::max(source_width, source_height)));
@@ -3025,6 +3105,12 @@ private:
                         + std::to_string(item.height) + ".f32le");
             }
             item.needs_decode = !std::filesystem::is_regular_file(item.output_path);
+            if (!item.needs_decode && asset.format == "png") {
+                if (const auto dimensions = media_png_dimensions(item.output_path)) {
+                    item.width = dimensions->first;
+                    item.height = dimensions->second;
+                }
+            }
             prepared.push_back(std::move(item));
         }
 
@@ -3035,65 +3121,88 @@ private:
                 selected.push_back(indexed.index.frames[assets[i].frame_index]);
             }
         }
+        std::sort(selected.begin(), selected.end(),
+                  [](const media::FrameIdentity &left, const media::FrameIdentity &right) {
+                      return left.frame_index < right.frame_index;
+                  });
+        selected.erase(std::unique(selected.begin(), selected.end(),
+                                   [](const media::FrameIdentity &left,
+                                      const media::FrameIdentity &right) {
+                                       return left.frame_index == right.frame_index;
+                                   }),
+                       selected.end());
         media::DecodeTelemetry telemetry;
-        media::DecoderOptions software;
+        // Luma only when an f32le asset needs it; pure-PNG requests skip the
+        // full-resolution float conversion entirely.
+        bool needs_rgb = false;
+        bool needs_luma = false;
+        std::int32_t preview_dimension = 0;
         for (std::size_t i = 0; i < assets.size(); ++i) {
-            if (prepared[i].needs_decode && assets[i].format == "png") {
-                software.output_rgb = true;
-                break;
+            if (!prepared[i].needs_decode) continue;
+            if (assets[i].format == "png") {
+                needs_rgb = true;
+                preview_dimension = std::max(
+                    preview_dimension, assets[i].maximum_dimension);
             }
+            else needs_luma = true;
         }
         std::vector<bool> produced(assets.size(), false);
+        std::string backend_used = "software";
         if (!selected.empty()) {
-            media::decode_selected_indexed(
-                job.path, indexed.index, selected, software,
-                job.stop_source.get_token(), [&](const media::HostFrame &frame) {
-                    for (std::size_t i = 0; i < assets.size(); ++i) {
-                        const MediaAssetSpec &asset = assets[i];
-                        PreparedAsset &item = prepared[i];
-                        if (asset.frame_index != frame.identity.frame_index) continue;
-                        if (asset.format == "png") {
-                            item.width = frame.width;
-                            item.height = frame.height;
-                            const double scale = std::min(
-                                1.0, static_cast<double>(asset.maximum_dimension)
-                                    / static_cast<double>(std::max(frame.width, frame.height)));
-                            item.width = std::max(
-                                1, static_cast<std::int32_t>(std::llround(frame.width * scale)));
-                            item.height = std::max(
-                                1, static_cast<std::int32_t>(std::llround(frame.height * scale)));
-                            if (!std::filesystem::is_regular_file(item.output_path)) {
-                                media::PreviewImage preview = media::encode_preview_png(
-                                    frame, asset.maximum_dimension);
-                                item.width = preview.width;
-                                item.height = preview.height;
-                                write_media_asset(item.output_path, preview.png);
-                            }
-                        } else {
-                            if ((job.expected_width != 0 && job.expected_width != frame.width)
-                                || (job.expected_height != 0 && job.expected_height != frame.height)) {
-                                throw WorkerError(
-                                    "media_decode_error",
-                                    "decoded frame geometry does not match the requested asset geometry");
-                            }
-                            item.width = frame.width;
-                            item.height = frame.height;
-                            if (!std::filesystem::is_regular_file(item.output_path)) {
-                                const std::span<const std::uint8_t> bytes{
-                                    reinterpret_cast<const std::uint8_t *>(frame.pixels.data()),
-                                    frame.pixels.size() * sizeof(float)};
-                                write_media_asset(item.output_path, bytes);
-                            }
+            auto consume = [&](const media::HostFrame &frame) {
+                for (std::size_t i = 0; i < assets.size(); ++i) {
+                    const MediaAssetSpec &asset = assets[i];
+                    PreparedAsset &item = prepared[i];
+                    if (asset.frame_index != frame.identity.frame_index) continue;
+                    if (asset.format == "png") {
+                        item.width = frame.width;
+                        item.height = frame.height;
+                        const double scale = std::min(
+                            1.0, static_cast<double>(asset.maximum_dimension)
+                                / static_cast<double>(std::max(frame.width, frame.height)));
+                        item.width = std::max(
+                            1, static_cast<std::int32_t>(std::llround(frame.width * scale)));
+                        item.height = std::max(
+                            1, static_cast<std::int32_t>(std::llround(frame.height * scale)));
+                        if (!std::filesystem::is_regular_file(item.output_path)) {
+                            media::PreviewImage preview = media::encode_preview_png(
+                                frame, asset.maximum_dimension);
+                            item.width = preview.width;
+                            item.height = preview.height;
+                            write_media_asset(item.output_path, preview.png);
                         }
-                        produced[i] = true;
-                        const std::size_t completed = static_cast<std::size_t>(
-                            std::count(produced.begin(), produced.end(), true));
-                        for (const std::string &request_id : media_subscriber_snapshot(job)) {
-                            emit_progress(request_id, job.job_id, media_mode(job.kind),
-                                          "decode", completed, assets.size(), JsonValue::array());
+                    } else {
+                        if ((job.expected_width != 0 && job.expected_width != frame.width)
+                            || (job.expected_height != 0 && job.expected_height != frame.height)) {
+                            throw WorkerError(
+                                "media_decode_error",
+                                "decoded frame geometry does not match the requested asset geometry");
+                        }
+                        item.width = frame.width;
+                        item.height = frame.height;
+                        if (!std::filesystem::is_regular_file(item.output_path)) {
+                            const std::span<const std::uint8_t> bytes{
+                                reinterpret_cast<const std::uint8_t *>(frame.pixels.data()),
+                                frame.pixels.size() * sizeof(float)};
+                            write_media_asset(item.output_path, bytes);
                         }
                     }
-                }, &telemetry);
+                    produced[i] = true;
+                    const std::size_t completed = static_cast<std::size_t>(
+                        std::count(produced.begin(), produced.end(), true));
+                    for (const std::string &request_id : media_subscriber_snapshot(job)) {
+                        emit_progress(request_id, job.job_id, media_mode(job.kind),
+                                      "decode", completed, assets.size(), JsonValue::array());
+                    }
+                }
+            };
+            std::string session_backend;
+            media::IndexedDecodeSession *session =
+                &media_session_for(job, needs_luma, needs_rgb,
+                                   needs_luma ? 0 : preview_dimension,
+                                   session_backend);
+            session->decode(selected, job.stop_source.get_token(), consume, &telemetry);
+            backend_used = session_backend;
         }
         std::vector<JsonValue> output_items;
         output_items.reserve(assets.size());
@@ -3104,7 +3213,7 @@ private:
                 {"item_id", JsonValue::string(asset.item_id)},
                 {"frame_index", JsonValue::integer(
                     static_cast<std::int64_t>(asset.frame_index))},
-                {"path", JsonValue::string(item.output_path.string())},
+                {"path", JsonValue::string(path_to_utf8(item.output_path))},
                 {"format", JsonValue::string(asset.format)},
                 {"width", JsonValue::integer(item.width)},
                 {"height", JsonValue::integer(item.height)},
@@ -3115,7 +3224,11 @@ private:
             {"assets", JsonValue::array(std::move(output_items))},
             {"decoded_frames", JsonValue::integer(
                 static_cast<std::int64_t>(telemetry.decoded_frames))},
-            {"decoder", JsonValue::string("software")},
+            {"decode_retries", JsonValue::integer(
+                static_cast<std::int64_t>(telemetry.decode_retries))},
+            {"discarded_packets", JsonValue::integer(
+                static_cast<std::int64_t>(telemetry.discarded_packets))},
+            {"decoder", JsonValue::string(backend_used)},
             {"index_path", JsonValue::string(indexed.index_path)},
             {"index_version", JsonValue::integer(media::MediaIndex::format_version)},
         });
@@ -3127,7 +3240,15 @@ private:
                 {"asset", std::move(first)},
                 {"decoded_frames", JsonValue::integer(
                     static_cast<std::int64_t>(telemetry.decoded_frames))},
-                {"decoder", JsonValue::string("software")},
+                {"decode_retries", JsonValue::integer(
+                    static_cast<std::int64_t>(telemetry.decode_retries))},
+                {"discarded_packets", JsonValue::integer(
+                    static_cast<std::int64_t>(telemetry.discarded_packets))},
+                {"decoder", JsonValue::string(backend_used)},
+                // One round trip per seek: the browser rail's frame window
+                // rides along with the preview image.
+                {"window", media_frame_window_payload(
+                    indexed.index, preview_target, job.window_radius)},
                 {"index_path", JsonValue::string(indexed.index_path)},
                 {"index_version", JsonValue::integer(media::MediaIndex::format_version)},
             });
@@ -3149,6 +3270,11 @@ private:
                 media_running_ = job;
             }
             try {
+                // A job cancelled while queued must not pay for an index load
+                // or decoder open before the cancellation is honored.
+                if (job->cancel_requested.load(std::memory_order_relaxed)) {
+                    throw WorkerError("cancelled", "media job was cancelled");
+                }
                 run_media_job(*job);
             } catch (const WorkerError &error) {
                 for (const std::string &request_id : finish_media_subscribers(*job)) {
@@ -3871,6 +3997,45 @@ private:
         return JsonValue::array(std::move(values));
     }
 
+    [[nodiscard]] static const char *scan_selection_name(
+        media::ScanSelection selection) noexcept {
+        switch (selection) {
+        case media::ScanSelection::all: return "all";
+        case media::ScanSelection::decoded_i_picture: return "decoded_i_picture";
+        case media::ScanSelection::every_n: return "every_n";
+        }
+        return "all";
+    }
+
+    [[nodiscard]] static std::uint64_t eligible_frame_count(
+        const media::MediaIndex &index, const media::ScanScope &scope) {
+        const std::uint64_t start = scope.start_frame.value_or(0U);
+        const std::uint64_t end = scope.end_frame.value_or(
+            index.frames.empty() ? 0U : index.frames.back().frame_index);
+        return static_cast<std::uint64_t>(std::count_if(
+            index.frames.begin(), index.frames.end(),
+            [start, end](const media::FrameIdentity &frame) {
+                return frame.frame_index >= start && frame.frame_index <= end;
+            }));
+    }
+
+    [[nodiscard]] static JsonValue verify_coverage_json(
+        const media::ScanScope &scope, std::uint64_t eligible_frames,
+        std::uint64_t selected_frames, std::uint64_t processed_frames,
+        std::uint64_t failed_frames) {
+        return JsonValue::object({
+            {"selection", JsonValue::string(scan_selection_name(scope.selection))},
+            {"eligible_frames", JsonValue::integer(
+                static_cast<std::int64_t>(eligible_frames))},
+            {"selected_frames", JsonValue::integer(
+                static_cast<std::int64_t>(selected_frames))},
+            {"processed_frames", JsonValue::integer(
+                static_cast<std::int64_t>(processed_frames))},
+            {"failed_frames", JsonValue::integer(
+                static_cast<std::int64_t>(failed_frames))},
+        });
+    }
+
     void run_media_verify_job(Job &job) {
         VerifyJobSpec &spec = job.verify;
         const VerifyJobSpec::MediaInput &input = *spec.media;
@@ -4051,11 +4216,15 @@ private:
         } catch (const std::exception &error) {
             throw WorkerError("bad_request", error.what());
         }
+        const std::uint64_t eligible_frames = eligible_frame_count(index, input.scope);
+        const std::uint64_t selected_frames = static_cast<std::uint64_t>(selected.size());
         if (selected.size() > static_cast<std::size_t>(kVerifyMaxFrames)) {
             throw WorkerError("bad_request", "scan scope exceeds the verify frame limit");
         }
         emit_progress(spec.request_id, spec.job_id, "verify", "index",
-                      0U, selected.size(), JsonValue::array());
+                      0U, selected.size(), JsonValue::array(),
+                      verify_coverage_json(
+                          input.scope, eligible_frames, selected_frames, 0U, 0U));
 
         const std::int32_t primary_size =
             spec.axis_mode == AxisMode::width_only ? spec.width : spec.height;
@@ -4089,8 +4258,16 @@ private:
             queue_store_publish(requests, batch.plans, batch.physical_build_count);
         }
         emit_progress(spec.request_id, spec.job_id, "verify", "plan",
-                      0U, selected.size(), JsonValue::array());
-        check_cancelled(job);
+                      0U, selected.size(), JsonValue::array(),
+                      verify_coverage_json(
+                          input.scope, eligible_frames, selected_frames, 0U, 0U));
+        if (job.cancel_requested.load(std::memory_order_relaxed)) {
+            emit_verify_cancelled(
+                spec, 0U, 0U, "media verification cancelled",
+                verify_coverage_json(
+                    input.scope, eligible_frames, selected_frames, 0U, 0U));
+            return;
+        }
 
         std::shared_ptr<const AxisPlan> horizontal;
         std::shared_ptr<const AxisPlan> vertical;
@@ -4158,7 +4335,10 @@ private:
             if (result_batch.empty()) return;
             emit_progress(spec.request_id, spec.job_id, "verify", "verify",
                           progress_completed, selected.size(),
-                          JsonValue::array(std::move(result_batch)));
+                          JsonValue::array(std::move(result_batch)),
+                          verify_coverage_json(
+                              input.scope, eligible_frames, selected_frames,
+                              completed, 0U));
             result_batch.clear();
             result_batch.reserve(result_batch_size);
         };
@@ -4449,7 +4629,9 @@ private:
                 max_inflight = std::max(max_inflight, pipeline.max_inflight());
                 queue_wait_ms += pipeline.queue_wait_ms();
                 decode_telemetry.decoded_frames += software_telemetry.decoded_frames;
+                decode_telemetry.decode_retries += software_telemetry.decode_retries;
                 decode_telemetry.selected_frames += software_telemetry.selected_frames;
+                decode_telemetry.discarded_packets += software_telemetry.discarded_packets;
                 decode_telemetry.host_frame_bytes += software_telemetry.host_frame_bytes;
                 decode_telemetry.conversion_bytes += software_telemetry.conversion_bytes;
                 decode_telemetry.decode_ms += software_telemetry.decode_ms;
@@ -4459,7 +4641,10 @@ private:
             if (error.code() == "cancelled") {
                 flush_results();
                 emit_verify_cancelled(
-                    spec, completed, 0U, "media verification cancelled");
+                    spec, completed, 0U, "media verification cancelled",
+                    verify_coverage_json(
+                        input.scope, eligible_frames, selected_frames,
+                        completed, 0U));
                 return;
             }
             throw;
@@ -4470,7 +4655,14 @@ private:
             throw WorkerError("media_decode_error", error.what());
         }
         flush_results();
-        check_cancelled(job);
+        if (job.cancel_requested.load(std::memory_order_relaxed)) {
+            emit_verify_cancelled(
+                spec, completed, 0U, "media verification cancelled",
+                verify_coverage_json(
+                    input.scope, eligible_frames, selected_frames,
+                    completed, 0U));
+            return;
+        }
 
         std::size_t source_upload_bytes = 0U;
         std::size_t device_conversion_bytes = 0U;
@@ -4517,6 +4709,8 @@ private:
             {"job_id", JsonValue::string(spec.job_id)},
             {"timestamp_ms", JsonValue::integer(timestamp_ms())},
             {"mode", JsonValue::string("verify")},
+            {"coverage", verify_coverage_json(
+                input.scope, eligible_frames, selected_frames, completed, 0U)},
             {"payload", JsonValue::object({
                 {"mode", JsonValue::string("verify")},
                 {"frames_completed", JsonValue::integer(
@@ -4555,6 +4749,10 @@ private:
                     {"decode_ms", JsonValue::number(decode_telemetry.decode_ms)},
                     {"decoded_frames", JsonValue::integer(
                         static_cast<std::int64_t>(decode_telemetry.decoded_frames))},
+                    {"decode_retries", JsonValue::integer(
+                        static_cast<std::int64_t>(decode_telemetry.decode_retries))},
+                    {"discarded_packets", JsonValue::integer(
+                        static_cast<std::int64_t>(decode_telemetry.discarded_packets))},
                     {"convert_ms", JsonValue::number(
                         decode_telemetry.convert_ms + device_convert_ms)},
                     {"upload_ms", JsonValue::number(upload_ms)},
@@ -4899,8 +5097,9 @@ private:
     }
 
     void emit_verify_cancelled(const VerifyJobSpec &spec, std::uint64_t completed,
-                               std::uint64_t failed, const std::string &detail) {
-        emit(JsonValue::object({
+                               std::uint64_t failed, const std::string &detail,
+                               JsonValue coverage = JsonValue{}) {
+        std::vector<std::pair<std::string, JsonValue>> members = {
             {"protocol_version", JsonValue::integer(kProtocolVersion)},
             {"type", JsonValue::string("cancelled")},
             {"request_id", JsonValue::string(spec.request_id)},
@@ -4914,7 +5113,11 @@ private:
                 {"frames_completed", JsonValue::integer(static_cast<std::int64_t>(completed))},
                 {"frames_failed", JsonValue::integer(static_cast<std::int64_t>(failed))},
             })},
-        }));
+        };
+        if (coverage.type == JsonValue::Type::object) {
+            members.emplace_back("coverage", std::move(coverage));
+        }
+        emit(JsonValue::object(std::move(members)));
     }
 
     void emit_partial_cancelled(const AnalyzeJobSpec &spec,

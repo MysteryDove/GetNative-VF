@@ -207,9 +207,12 @@ def collect_verify(worker, timeout=60.0):
     """Collect (terminal, streamed_results, warnings) until a terminal event."""
     results = {}
     warnings = []
+    last_progress_coverage = None
     while True:
         event = worker.read_event(timeout=timeout)
         if event["type"] == "progress":
+            if "coverage" in event:
+                last_progress_coverage = event["coverage"]
             for entry in event.get("results", []):
                 if entry["seq"] in results:
                     raise AssertionError(f"duplicate verify seq {entry['seq']}")
@@ -217,6 +220,8 @@ def collect_verify(worker, timeout=60.0):
         elif event["type"] == "warning":
             warnings.append(event)
         elif event["type"] in ("result", "error", "cancelled"):
+            if last_progress_coverage is not None:
+                event = {**event, "last_progress_coverage": last_progress_coverage}
             return event, results, warnings
 
 
@@ -1055,6 +1060,7 @@ def main():
                 cpu_terminal, cpu_results, cpu_warnings = collect_verify(worker)
                 cpu_provenance = cpu_terminal.get("payload", {}).get("provenance", {})
                 cpu_telemetry = cpu_terminal.get("payload", {}).get("telemetry", {})
+                cpu_coverage = cpu_terminal.get("coverage", {})
                 check("verify-media-software",
                       cpu_terminal["type"] == "result"
                       and len(cpu_results) == 30 and not cpu_warnings
@@ -1063,6 +1069,12 @@ def main():
                       and cpu_accepted.get("concurrency") == 2
                       and cpu_telemetry.get("requested_concurrency") == 2
                       and cpu_telemetry.get("effective_concurrency") == 2
+                      and cpu_coverage == {
+                          "selection": "all", "eligible_frames": 30,
+                          "selected_frames": 30, "processed_frames": 30,
+                          "failed_frames": 0,
+                      }
+                      and cpu_terminal.get("last_progress_coverage") == cpu_coverage
                       and 1 <= cpu_telemetry.get("max_inflight", 0) <= 2,
                       json.dumps({"terminal": cpu_terminal,
                                   "warnings": cpu_warnings})[:800])
@@ -1084,8 +1096,99 @@ def main():
                           and telemetry.get("requested_concurrency") == concurrency
                           and telemetry.get("effective_concurrency") == concurrency
                           and 1 <= telemetry.get("max_inflight", 0) <= concurrency,
-                          json.dumps({"accepted": accepted,
-                                      "terminal": terminal})[:1000])
+                           json.dumps({"accepted": accepted,
+                                       "terminal": terminal})[:1000])
+
+                worker.send(**verify_media_command(
+                    "vm-cpu-i-pictures", media_path, "cpu",
+                    concurrency=4,
+                    scan_scope={"selection": "decoded_i_picture"}))
+                i_accepted = worker.read_event()
+                i_terminal, i_results, i_warnings = collect_verify(worker)
+                i_telemetry = i_terminal.get("payload", {}).get("telemetry", {})
+                i_coverage = i_terminal.get("coverage", {})
+                check("verify-media-i-picture-indexed",
+                      i_accepted.get("concurrency") == 4
+                      and i_terminal["type"] == "result"
+                      and len(i_results) == 5
+                      and i_coverage == {
+                          "selection": "decoded_i_picture", "eligible_frames": 30,
+                          "selected_frames": 5, "processed_frames": 5,
+                          "failed_frames": 0,
+                      }
+                      and not i_warnings
+                      and list(i_results) == sorted(i_results)
+                      and i_telemetry.get("decoded_frames", 1000) <= 30,
+                      json.dumps({"accepted": i_accepted,
+                                  "terminal": i_terminal,
+                                  "warnings": i_warnings})[:1000])
+
+                every_n_scope = {
+                    "selection": "every_n", "every_n": 4,
+                    "start_frame": 3, "end_frame": 20,
+                }
+                worker.send(**verify_media_command(
+                    "vm-cpu-every-n", media_path, "cpu",
+                    scan_scope=every_n_scope))
+                every_n_terminal, every_n_results, every_n_warnings = \
+                    collect_verify(worker)
+                check("verify-media-every-n-inclusive-coverage",
+                      every_n_terminal["type"] == "result"
+                      and len(every_n_results) == 5
+                      and not every_n_warnings
+                      and every_n_terminal.get("coverage") == {
+                          "selection": "every_n", "eligible_frames": 18,
+                          "selected_frames": 5, "processed_frames": 5,
+                          "failed_frames": 0,
+                      },
+                      json.dumps({"terminal": every_n_terminal,
+                                  "warnings": every_n_warnings})[:1000])
+
+                cancel_path = os.path.join(scratch, "verify-media-cancel.mp4")
+                cancel_encoded = subprocess.run([
+                    ffmpeg, "-y", "-v", "error",
+                    "-f", "lavfi", "-i", "testsrc2=size=128x96:rate=24",
+                    "-frames:v", "600", "-c:v", "libx264", "-g", "24",
+                    "-bf", "2", "-pix_fmt", "yuv420p", cancel_path,
+                ], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL).returncode == 0
+                if cancel_encoded:
+                    worker.send(**verify_media_command(
+                        "vm-cpu-cancel", cancel_path, "cpu", concurrency=1))
+                    cancel_job_id = None
+                    cancel_sent = False
+                    cancel_results = {}
+                    cancel_terminal = None
+                    while cancel_terminal is None:
+                        event = worker.read_event()
+                        if event["type"] == "accepted":
+                            cancel_job_id = event["job_id"]
+                        elif event["type"] == "progress":
+                            for entry in event.get("results", []):
+                                cancel_results[entry["seq"]] = entry["error"]
+                            if event.get("coverage") and not cancel_sent:
+                                worker.send(
+                                    protocol_version=1, type="cancel",
+                                    request_id="vm-cpu-cancel-request",
+                                    job_id=cancel_job_id)
+                                cancel_sent = True
+                        elif event["type"] in ("result", "error", "cancelled"):
+                            cancel_terminal = event
+                    cancel_coverage = cancel_terminal.get("coverage", {})
+                    check("verify-media-cancelled-coverage",
+                          cancel_sent
+                          and cancel_terminal["type"] == "cancelled"
+                          and cancel_coverage.get("selection") == "all"
+                          and cancel_coverage.get("eligible_frames") == 600
+                          and cancel_coverage.get("selected_frames") == 600
+                          and cancel_coverage.get("processed_frames")
+                              == len(cancel_results)
+                          and cancel_coverage.get("failed_frames") == 0,
+                          json.dumps({"terminal": cancel_terminal,
+                                      "results": len(cancel_results)})[:1000])
+                else:
+                    print("SKIP verify-media-cancelled-coverage "
+                          "(FFmpeg H.264 encoder unavailable)")
 
                 decode_backends = {
                     row.get("id"): row
@@ -1111,6 +1214,11 @@ def main():
                 check("verify-media-software-indexed-seek",
                       late_cpu_terminal["type"] == "result"
                       and len(late_cpu_results) == 6 and not late_cpu_warnings
+                      and late_cpu_terminal.get("coverage") == {
+                          "selection": "all", "eligible_frames": 6,
+                          "selected_frames": 6, "processed_frames": 6,
+                          "failed_frames": 0,
+                      }
                       and late_cpu_telemetry.get("decoded_frames", 1000) <= 12,
                       json.dumps({"terminal": late_cpu_terminal,
                                   "warnings": late_cpu_warnings})[:1000])

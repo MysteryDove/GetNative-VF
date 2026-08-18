@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(getnative_engine VERSION 0.1.4 LANGUAGES C CXX)
+project(getnative_engine VERSION 0.1.6 LANGUAGES C CXX)
 
 include(CTest)
 find_package(Threads REQUIRED)
@@ -15,6 +15,14 @@ option(GETNATIVE_ENABLE_MEDIA
        "Build in-process FFmpeg 8 media indexing and decode support" ON)
 set(GETNATIVE_FFMPEG_ROOT "" CACHE PATH
     "Root of a self-contained FFmpeg SDK (include/, lib/, and runtime libraries)")
+if(NOT "${GETNATIVE_FFMPEG_DISCOVERY_ROOT}" STREQUAL "${GETNATIVE_FFMPEG_ROOT}")
+    unset(GETNATIVE_FFMPEG_INCLUDE_DIR CACHE)
+    foreach(GETNATIVE_FFMPEG_COMPONENT IN ITEMS AVFORMAT AVCODEC AVUTIL SWSCALE)
+        unset(GETNATIVE_FFMPEG_${GETNATIVE_FFMPEG_COMPONENT}_LIBRARY CACHE)
+    endforeach()
+    set(GETNATIVE_FFMPEG_DISCOVERY_ROOT "${GETNATIVE_FFMPEG_ROOT}"
+        CACHE INTERNAL "FFmpeg root used for the cached discovery results" FORCE)
+endif()
 option(GETNATIVE_BUILD_CUDA_AUTOTUNER
        "Build the standalone distributable CUDA launch-policy autotuner" OFF)
 set(GETNATIVE_PLANNER_FP_MODE "fast" CACHE STRING
@@ -126,6 +134,31 @@ if(GETNATIVE_ENABLE_MEDIA)
             "${GETNATIVE_FFMPEG_INCLUDE_DIR}")
         target_link_libraries(getnative_ffmpeg INTERFACE
             ${GETNATIVE_FFMPEG_LIBRARIES})
+        if(WIN32)
+            set(GETNATIVE_FFMPEG_RUNTIME_OUTPUTS)
+            foreach(GETNATIVE_FFMPEG_RUNTIME_LIBRARY IN ITEMS
+                    avformat-62.dll avcodec-62.dll avutil-60.dll swscale-9.dll)
+                set(GETNATIVE_FFMPEG_RUNTIME_SOURCE
+                    "${GETNATIVE_FFMPEG_ROOT}/bin/${GETNATIVE_FFMPEG_RUNTIME_LIBRARY}")
+                set(GETNATIVE_FFMPEG_RUNTIME_OUTPUT
+                    "${CMAKE_CURRENT_BINARY_DIR}/${GETNATIVE_FFMPEG_RUNTIME_LIBRARY}")
+                if(NOT EXISTS "${GETNATIVE_FFMPEG_RUNTIME_SOURCE}")
+                    message(FATAL_ERROR
+                        "FFmpeg runtime library is missing: ${GETNATIVE_FFMPEG_RUNTIME_SOURCE}")
+                endif()
+                add_custom_command(
+                    OUTPUT "${GETNATIVE_FFMPEG_RUNTIME_OUTPUT}"
+                    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                            "${GETNATIVE_FFMPEG_RUNTIME_SOURCE}"
+                            "${GETNATIVE_FFMPEG_RUNTIME_OUTPUT}"
+                    DEPENDS "${GETNATIVE_FFMPEG_RUNTIME_SOURCE}"
+                    VERBATIM)
+                list(APPEND GETNATIVE_FFMPEG_RUNTIME_OUTPUTS
+                    "${GETNATIVE_FFMPEG_RUNTIME_OUTPUT}")
+            endforeach()
+            add_custom_target(getnative_ffmpeg_runtime
+                DEPENDS ${GETNATIVE_FFMPEG_RUNTIME_OUTPUTS})
+        endif()
         set(GETNATIVE_FFMPEG_TARGET getnative_ffmpeg)
         set(GETNATIVE_FFMPEG_FOUND ON)
     else()
@@ -744,9 +777,17 @@ if(GETNATIVE_ENABLE_MEDIA)
     target_compile_features(getnative_media PUBLIC cxx_std_23)
     target_include_directories(getnative_media PUBLIC include)
     target_link_libraries(getnative_media PUBLIC ${GETNATIVE_FFMPEG_TARGET})
+    if(TARGET getnative_ffmpeg_runtime)
+        add_dependencies(getnative_media getnative_ffmpeg_runtime)
+    endif()
     find_library(GETNATIVE_XXHASH_LIBRARY NAMES xxhash)
     if(GETNATIVE_XXHASH_LIBRARY)
         target_link_libraries(getnative_media PRIVATE "${GETNATIVE_XXHASH_LIBRARY}")
+        target_compile_definitions(getnative_media PRIVATE GETNATIVE_USE_XXHASH=1)
+    else()
+        # Fall back to the in-tree copy so external LSMASH .lwi hash
+        # validation works everywhere (getnative_lz4 exports xxhash.h).
+        target_link_libraries(getnative_media PRIVATE getnative_lz4)
         target_compile_definitions(getnative_media PRIVATE GETNATIVE_USE_XXHASH=1)
     endif()
     if(GETNATIVE_ENABLE_CUDA)
@@ -876,11 +917,27 @@ if(BUILD_TESTING)
     getnative_enable_warnings(getnative_json_tests)
     add_test(NAME getnative_json_tests COMMAND getnative_json_tests)
 
+    add_executable(getnative_utf8_path_tests tests/utf8_path_test.cpp)
+    target_link_libraries(getnative_utf8_path_tests PRIVATE getnative_core)
+    target_compile_features(getnative_utf8_path_tests PRIVATE cxx_std_23)
+    getnative_enable_warnings(getnative_utf8_path_tests)
+    add_test(NAME getnative_utf8_path_tests COMMAND getnative_utf8_path_tests)
+
     add_executable(getnative_backend_policy_tests tests/backend_policy_test.cpp)
     target_include_directories(getnative_backend_policy_tests PRIVATE src/cli)
     target_compile_features(getnative_backend_policy_tests PRIVATE cxx_std_23)
     getnative_enable_warnings(getnative_backend_policy_tests)
     add_test(NAME getnative_backend_policy_tests COMMAND getnative_backend_policy_tests)
+
+    if(TARGET getnative_media)
+        add_executable(getnative_media_index_compat_tests
+            tests/media_index_compat_test.cpp)
+        target_link_libraries(getnative_media_index_compat_tests PRIVATE getnative_media)
+        target_compile_features(getnative_media_index_compat_tests PRIVATE cxx_std_23)
+        getnative_enable_warnings(getnative_media_index_compat_tests)
+        add_test(NAME getnative_media_index_compat_tests
+                 COMMAND getnative_media_index_compat_tests)
+    endif()
 
     find_program(GETNATIVE_PYTHON3 NAMES python3 python)
     if(GETNATIVE_PYTHON3)
@@ -888,12 +945,17 @@ if(BUILD_TESTING)
             COMMAND "${GETNATIVE_PYTHON3}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_protocol_test.py"
                 $<TARGET_FILE:getnative-engine>)
+        set_tests_properties(getnative_worker_protocol_tests PROPERTIES
+            RESOURCE_LOCK getnative_gpu
+            RUN_SERIAL TRUE)
         if(TARGET getnative_media)
             add_test(NAME getnative_media_worker_tests
                 COMMAND "${GETNATIVE_PYTHON3}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/media_worker_test.py"
                     $<TARGET_FILE:getnative-engine>)
-            set_tests_properties(getnative_media_worker_tests PROPERTIES TIMEOUT 180)
+            set_tests_properties(getnative_media_worker_tests PROPERTIES
+                TIMEOUT 180
+                RESOURCE_LOCK getnative_gpu)
         endif()
     endif()
 
@@ -916,7 +978,8 @@ if(BUILD_TESTING)
         add_test(NAME getnative_cuda_baseline_tests
                  COMMAND getnative_cuda_baseline_tests)
         set_tests_properties(getnative_cuda_baseline_tests PROPERTIES
-            SKIP_REGULAR_EXPRESSION "^SKIP:")
+            SKIP_REGULAR_EXPRESSION "^SKIP:"
+            RESOURCE_LOCK getnative_gpu)
     endif()
 
     if(GETNATIVE_ENABLE_VULKAN)
@@ -937,7 +1000,8 @@ if(BUILD_TESTING)
         add_test(NAME getnative_vulkan_analysis_tests
                  COMMAND getnative_vulkan_analysis_tests)
         set_tests_properties(getnative_vulkan_analysis_tests PROPERTIES
-            SKIP_REGULAR_EXPRESSION "^SKIP:")
+            SKIP_REGULAR_EXPRESSION "^SKIP:"
+            RESOURCE_LOCK getnative_gpu)
         if(GETNATIVE_VULKAN_VALIDATION_LAYER_DIR)
             set_tests_properties(getnative_vulkan_analysis_tests PROPERTIES
                 ENVIRONMENT
@@ -964,6 +1028,7 @@ if(BUILD_TESTING)
             "\"id\":\"vulkan\",\"compiled\":false")
     endif()
     set_tests_properties(getnative_cli_capabilities PROPERTIES
+        RESOURCE_LOCK getnative_gpu
         PASS_REGULAR_EXPRESSION "\\{\"schema_version\":2,\"engine\":\"getnative-engine\".*\"analyze\":false.*\"gui_min\":1,\"gui_max\":8,\"core_min\":1,\"core_max\":15.*\"id\":\"cpu\",\"compiled\":true,\"device_available\":true,\"analysis_command_available\":false.*\"selected_math_mode\":\"production\".*${GETNATIVE_EXPECTED_METAL_CAPABILITY}.*${GETNATIVE_EXPECTED_CUDA_CAPABILITY}.*${GETNATIVE_EXPECTED_VULKAN_CAPABILITY}.*\"muf-d278cd3\""
     )
 

@@ -371,6 +371,25 @@ The worker emits `accepted` before indexing, then publishes the exact selected
 frame total in `progress` once presentation-order indexing finishes. This keeps
 preparation cancellable without guessing a total.
 
+After indexing, media verification `progress`, `result`, and `cancelled` events
+may carry a top-level `coverage` object:
+
+```json
+{
+  "selection": "every_n",
+  "eligible_frames": 401,
+  "selected_frames": 81,
+  "processed_frames": 79,
+  "failed_frames": 1
+}
+```
+
+`eligible_frames` counts every indexed presentation-order frame inside the
+inclusive start/end range before applying the selection rule.
+`selected_frames` is the count after applying `all`, `every_n`, or
+`decoded_i_picture`. The processed/failed counts describe the terminal prefix
+at the time of the event. Older workers omit `coverage`.
+
 ```json
 {
   "protocol_version": 1,
@@ -466,10 +485,15 @@ optional `fingerprint` and `stream_index`, plus an application-owned
 share one engine job and receive separate terminal events.
 
 `media_index_begin` chooses the lowest video stream index when `stream_index`
-is absent. It records decoded `AVFrame` output identities in the private binary
-`GNVFLWI\0` format. The default stream uses `<media>.gnvf.lwi`; a saved legacy
-stream uses `<media>.stream-N.lwi`. A cache-directory index is used when the
-media directory is not writable. Version, source size/mtime/fingerprint, frame
+is absent. Normal indexing reads packets sequentially and records parser/BSF
+identities (the `packet_fast` mode), matching L-SMASH Works without decoding
+every frame. If parser identity is unavailable or ambiguous, or RAP
+verification is requested, it rebuilds in strict software metadata mode
+(`packet_rebuilt`). Both modes write the L-SMASH Works-compatible text format.
+The default stream uses `<media>.vf.lwi`; additional streams use
+`<media>.stream-N.vf.lwi`. A cache-directory `.vf.lwi` is used when the media
+directory is not writable; legacy private indexes remain readable. Version,
+source size/mtime/fingerprint, frame
 table checksum, stream/codec/timebase, timestamps, picture type, keyframe flag,
 and nearest keyframe anchor are validated on every load; invalid files rebuild
 atomically and cancelled builds leave no valid temporary index.
@@ -499,11 +523,11 @@ milliseconds).
 | `hello_ok` | Protocol negotiated | `engine_version`, `commands` |
 | `capabilities` | Capability envelope | `payload` (same schema as one-shot CLI) |
 | `accepted` | Job queued after backend initialization | `mode`, `job_id`, optional worker-confirmed `backend` (`cpu`, `cuda`, or `vulkan`) and accelerator `device`; verify adds `worker_count`, `suggested_in_flight` |
-| `progress` | Job progress | `completed`, `total`, `phase` (`plan`, `candidates`, or `verify`); verify adds `results` batches of `{seq, error\|null}` |
+| `progress` | Job progress | `completed`, `total`, `phase` (`plan`, `candidates`, or `verify`); verify adds `results` batches of `{seq, error\|null}`; media verify may add `coverage` |
 | `verify_consumed` | Ring slot may be reused; consumed internally by Tauri | `seq`, `slot`, `generation` |
 | `warning` | Non-fatal issue (e.g. backend fallback, verify frame failure) | `code`, `message`; verify frame failures add `seq` |
-| `result` | Job finished successfully | `mode`, `payload` (§4) |
-| `cancelled` | Job cancelled | `partial`, `payload` (partial results when `partial=true`) |
+| `result` | Job finished successfully | `mode`, `payload` (§4); media verify may add `coverage` |
+| `cancelled` | Job cancelled | `partial`, `payload` (partial results when `partial=true`); media verify may add `coverage` after indexing |
 | `error` | Command/job failed | `code`, `message`, `retryable` |
 | `shutdown` | Worker exiting | — |
 

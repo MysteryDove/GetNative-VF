@@ -2,6 +2,7 @@
 """Integration coverage for the in-process FFmpeg worker commands."""
 
 import json
+import os
 import pathlib
 import queue
 import shutil
@@ -96,6 +97,13 @@ def main():
             print("SKIP media worker integration: libx264 unavailable")
             return 0
 
+        rap_test = pathlib.Path(ENGINE).with_name(
+            "getnative_media_index_compat_tests.exe" if os.name == "nt"
+            else "getnative_media_index_compat_tests")
+        if rap_test.is_file():
+            subprocess.run([rap_test, "--verify-rap", media], check=True)
+            subprocess.run([rap_test, "--verify-decode-planner", media], check=True)
+
         worker = Worker()
         worker.send(type="hello", request_id="hello")
         hello = worker.event()
@@ -107,7 +115,7 @@ def main():
         assert indexed["frame_count"] == 120 and indexed["rebuilt"] is True
         assert index_path.name.endswith(".vf.lwi")
         assert index_path.read_bytes().startswith(b"<LSMASHWorksIndexVersion")
-        assert indexed["index_mode"] == "packet_rebuilt"
+        assert indexed["index_mode"] == "packet_fast"
         assert indexed["selective_decodes"] == 0
         assert indexed["packet_count"] == 120
         cached, _ = begin(worker, "index-2", "media_index_begin", media, cache,
@@ -132,7 +140,50 @@ def main():
             maximum_dimension=96)
         png = pathlib.Path(preview["asset"]["path"]).read_bytes()
         assert png[:8] == b"\x89PNG\r\n\x1a\n" and png[25] == 2
-        assert preview["decoded_frames"] <= 30
+        assert preview["decoder"] == "software"
+        assert preview["decoded_frames"] <= 30, preview
+
+        software_preview, _ = begin(
+            worker, "preview-software", "media_preview_begin", media, cache,
+            stream_index=indexed["stream_index"], frame_index=118,
+            maximum_dimension=96, decoder="software")
+        assert software_preview["decoder"] == "software"
+
+        smaller_preview, _ = begin(
+            worker, "preview-smaller", "media_preview_begin", media, cache,
+            stream_index=indexed["stream_index"], frame_index=118,
+            maximum_dimension=80)
+        shutil.copyfile(smaller_preview["asset"]["path"],
+                        software_preview["asset"]["path"])
+        resized_cache_hit, _ = begin(
+            worker, "preview-cached-dimensions", "media_preview_begin", media, cache,
+            stream_index=indexed["stream_index"], frame_index=118,
+            maximum_dimension=96)
+        assert resized_cache_hit["asset"]["from_cache"] is True
+        assert (resized_cache_hit["asset"]["width"],
+                resized_cache_hit["asset"]["height"]) == (
+                    smaller_preview["asset"]["width"],
+                    smaller_preview["asset"]["height"])
+
+        for decoder in ("nvdec", "vulkan_video"):
+            request_id = f"preview-unsupported-{decoder}"
+            worker.send(
+                type="media_preview_begin", request_id=request_id,
+                path=str(media), cache_directory=str(cache),
+                stream_index=indexed["stream_index"], frame_index=117,
+                maximum_dimension=96, decoder=decoder)
+            rejected, _ = worker.terminal(request_id)
+            assert rejected["type"] == "error" and rejected["code"] == "unsupported", rejected
+
+        worker.send(
+            type="media_asset_batch_begin", request_id="batch-preview-unsupported",
+            path=str(media), cache_directory=str(cache),
+            stream_index=indexed["stream_index"], decoder="nvdec",
+            assets=[{"item_id": "png", "frame_index": 1,
+                     "format": "png", "maximum_dimension": 80}])
+        rejected_batch, _ = worker.terminal("batch-preview-unsupported")
+        assert (rejected_batch["type"] == "error"
+                and rejected_batch["code"] == "unsupported"), rejected_batch
 
         cached_preview, _ = begin(
             worker, "preview-cache-hit", "media_preview_begin", media, cache,
@@ -140,6 +191,79 @@ def main():
             maximum_dimension=96)
         assert cached_preview["asset"]["from_cache"] is True
         assert cached_preview["decoded_frames"] == 0
+        assert cached_preview["decoder"] == "software"
+
+        unicode_root = root / "媒体-日本語-한글"
+        unicode_root.mkdir()
+        unicode_media = unicode_root / "视频-夢-영상.mp4"
+        unicode_cache = unicode_root / "缓存-キャッシュ-캐시"
+        shutil.copy2(media, unicode_media)
+        unicode_indexed, _ = begin(
+            worker, "unicode-index", "media_index_begin", unicode_media,
+            unicode_cache, decoder="software")
+        assert unicode_indexed["frame_count"] == 120
+        assert pathlib.Path(unicode_indexed["index_path"]).is_file()
+        unicode_preview, _ = begin(
+            worker, "unicode-preview", "media_preview_begin", unicode_media,
+            unicode_cache, stream_index=unicode_indexed["stream_index"],
+            frame_index=119, maximum_dimension=96)
+        unicode_png = pathlib.Path(unicode_preview["asset"]["path"])
+        assert unicode_png.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+        assert unicode_cache in unicode_png.parents
+
+        # MPEG-TS has no keyframe index; a timestamp seek lands on the last
+        # packet with dts <= target, which with B-frame reordering sits past
+        # the keyframe. Previewing must still decode from the anchor GOP.
+        ts_media = root / "bframes.m2ts"
+        assert encode(ffmpeg, ts_media)
+        ts_indexed, _ = begin(
+            worker, "ts-index", "media_index_begin", ts_media,
+            cache, decoder="software")
+        assert ts_indexed["frame_count"] == 120
+        for name, frame in (("ts-preview-start", 0), ("ts-preview-mid", 100)):
+            ts_preview, _ = begin(
+                worker, name, "media_preview_begin", ts_media, cache,
+                stream_index=ts_indexed["stream_index"], frame_index=frame,
+                maximum_dimension=96)
+            ts_png = pathlib.Path(ts_preview["asset"]["path"]).read_bytes()
+            assert ts_png[:8] == b"\x89PNG\r\n\x1a\n"
+            assert ts_preview["decoded_frames"] <= 30
+
+        # Corrupted packets inside the target GOP must not abort decoding:
+        # the bad packet is dropped (ffmpeg CLI semantics) and later frames
+        # still decode with verified timestamps. Size and mtime are preserved
+        # so the cached index stays authoritative for packet positions.
+        stat = ts_media.stat()
+        records = []
+        current = None
+        for line in pathlib.Path(ts_indexed["index_path"]).read_text().splitlines():
+            if line.startswith("Index="):
+                fields = dict(p.split("=", 1) for p in line[6:].split(",") if "=" in p)
+                current = {"pos": int(fields["POS"]), "pts": int(fields["PTS"])}
+            elif line.startswith("Key=") and current is not None:
+                current["pic"] = int(line[4:].split(",")[1].split("=")[1])
+                records.append(current)
+                current = None
+        presentation = sorted(range(len(records)), key=lambda i: records[i]["pts"])
+        b_pos = b_ordinal = None
+        for ordinal, record_index in enumerate(presentation):
+            if records[record_index]["pic"] == 3 and 40 < ordinal < 80:
+                b_pos, b_ordinal = records[record_index]["pos"], ordinal
+                break
+        assert b_pos is not None
+        with open(ts_media, "r+b") as damaged:
+            damaged.seek(b_pos + 400)
+            damaged.write(b"\xff" * 128)
+        os.utime(ts_media, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        for name, frame in (("ts-preview-damaged", b_ordinal + 1),
+                            ("ts-preview-damaged-later", b_ordinal + 2)):
+            ts_preview, _ = begin(
+                worker, name, "media_preview_begin", ts_media, cache,
+                stream_index=ts_indexed["stream_index"], frame_index=frame,
+                maximum_dimension=96)
+            ts_png = pathlib.Path(ts_preview["asset"]["path"]).read_bytes()
+            assert ts_png[:8] == b"\x89PNG\r\n\x1a\n"
+            assert "discarded_packets" in ts_preview
 
         checksums, _ = begin(
             worker, "pixel-check", "media_asset_batch_begin", media, cache,
@@ -158,16 +282,23 @@ def main():
             actual_values, baseline_values = array("f"), array("f")
             actual_values.frombytes(actual)
             baseline_values.frombytes(baseline)
-            assert max(abs(left - right) for left, right in zip(
-                actual_values, baseline_values)) <= 1e-6
+            maximum_error = max(abs(left - right) for left, right in zip(
+                actual_values, baseline_values))
+            assert maximum_error <= 1e-6, (frame, maximum_error)
 
-        frames = list(range(95, 120))
+        # Request order is part of the response contract, but decode order must
+        # be normalized internally for a persistent indexed session.
+        frames = list(reversed(range(95, 120)))
         batch, _ = begin(
             worker, "batch", "media_asset_batch_begin", media, cache,
             stream_index=indexed["stream_index"],
             assets=[{"item_id": f"thumb-{frame}", "frame_index": frame,
                      "format": "png", "maximum_dimension": 80} for frame in frames])
-        assert len(batch["assets"]) == 25 and batch["decoded_frames"] <= 48
+        batch_decode_limit = 48 if batch["decoder"] == "software" else 72
+        assert len(batch["assets"]) == 25, batch
+        assert batch["decoder"] == "software"
+        assert batch["decoded_frames"] <= batch_decode_limit, batch
+        assert batch["decode_retries"] == 0, batch
 
         cached_batch, _ = begin(
             worker, "batch-cache-hit", "media_asset_batch_begin", media, cache,
@@ -257,7 +388,9 @@ def main():
                 worker, "missing-preview", "media_preview_begin", missing_media, cache,
                 stream_index=missing["stream_index"], frame_index=29,
                 maximum_dimension=64)
-            assert missing_preview["decoded_frames"] >= 30
+            # Raw elementary streams have no usable timestamps, but the LWI
+            # packet position still permits a GOP-local byte seek.
+            assert 1 <= missing_preview["decoded_frames"] <= 15
 
         blocked = root / "blocked-sidecar"
         blocked.mkdir()

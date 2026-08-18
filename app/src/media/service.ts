@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { DecodeBackendCapability, EngineEnvelope } from "../engine/types";
 import type { SourceKind, SourceState } from "../project/types";
@@ -258,42 +258,56 @@ export function requestFrameWindow(request: {
   });
 }
 
+export type MediaPreviewResult = {
+  url: string;
+  window: MediaFrameWindow | null;
+  decoder: string | null;
+};
+
 export function requestMediaPreview(request: {
   path: string;
   fingerprint?: string | null;
   streamIndex?: number | null;
+  target?: FrameWindowTarget;
   frameIndex?: number | null;
   timestampSeconds?: number | null;
   exact?: boolean;
   maxDimension?: number;
-}): MediaTask<string> {
+  windowRadius?: number;
+}): MediaTask<MediaPreviewResult> {
   if (request.streamIndex == null) {
     const requestId = mediaRequestId();
     const promise = invoke<ArrayBuffer | Uint8Array | number[]>("media_preview", { request })
-      .then(previewBytesToUrl);
+      .then((payload) => ({ url: previewBytesToUrl(payload), window: null, decoder: null }));
     return { requestId, promise, cancel: async () => undefined };
   }
+  const target = request.target
+    ?? (request.timestampSeconds != null ? "timestamp" : "frame");
   const task = submitMediaTask<{
     asset: { path: string };
+    window?: MediaFrameWindow | null;
+    decoder?: string | null;
   }>("media_preview_begin", {
     path: request.path,
     fingerprint: request.fingerprint ?? null,
     stream_index: request.streamIndex,
-    target: request.timestampSeconds != null ? "timestamp" : "frame",
+    target: target.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`),
     frame_index: request.frameIndex ?? null,
     timestamp_seconds: request.timestampSeconds ?? null,
     maximum_dimension: request.maxDimension ?? 1600,
+    window_radius: request.windowRadius ?? 0,
   });
   return {
     requestId: task.requestId,
     cancel: task.cancel,
-    promise: task.promise.then(async (result) => {
-      const payload = await invoke<ArrayBuffer | Uint8Array | number[]>(
-        "engine_worker_media_read_asset",
-        { path: result.asset.path },
-      );
-      return previewBytesToUrl(payload);
-    }),
+    // The worker leaves the PNG in the shared cache; the asset protocol
+    // streams it straight into the <img> element, so no IPC byte copy or
+    // Blob churn per seek.
+    promise: task.promise.then((result) => ({
+      url: convertFileSrc(result.asset.path),
+      window: result.window ?? null,
+      decoder: result.decoder ?? null,
+    })),
   };
 }
 
@@ -310,7 +324,7 @@ function previewBytesToUrl(payload: ArrayBuffer | Uint8Array | number[]): string
 export function getMediaPreview(
   request: Parameters<typeof requestMediaPreview>[0],
 ): Promise<string> {
-  return requestMediaPreview(request).promise;
+  return requestMediaPreview(request).promise.then((result) => result.url);
 }
 
 export type MediaFrameAsset = {
@@ -387,11 +401,13 @@ type MediaAssetBatchResult = {
     from_cache: boolean;
   }>;
   decoded_frames: number;
+  decoder?: string | null;
 };
 
 export type MediaPreviewBatchResult = {
   assets: Array<{ itemId: string; frameIndex: number; url: string; width: number; height: number }>;
   decodedFrames: number;
+  decoder: string | null;
 };
 
 export function requestMediaPreviewBatch(request: {
@@ -414,20 +430,15 @@ export function requestMediaPreviewBatch(request: {
   return {
     requestId: task.requestId,
     cancel: task.cancel,
-    promise: task.promise.then(async (result) => ({
+    promise: task.promise.then((result) => ({
       decodedFrames: result.decoded_frames,
-      assets: await Promise.all(result.assets.map(async (asset) => {
-        const payload = await invoke<ArrayBuffer | Uint8Array | number[]>(
-          "engine_worker_media_read_asset",
-          { path: asset.path },
-        );
-        return {
-          itemId: asset.item_id,
-          frameIndex: asset.frame_index,
-          url: previewBytesToUrl(payload),
-          width: asset.width,
-          height: asset.height,
-        };
+      decoder: result.decoder ?? null,
+      assets: result.assets.map((asset) => ({
+        itemId: asset.item_id,
+        frameIndex: asset.frame_index,
+        url: convertFileSrc(asset.path),
+        width: asset.width,
+        height: asset.height,
       })),
     })),
   };

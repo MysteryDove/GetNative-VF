@@ -1,4 +1,5 @@
 #include "getnative/media_decode.hpp"
+#include "getnative/utf8_path.hpp"
 
 #include <algorithm>
 #include <array>
@@ -10,15 +11,19 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <string_view>
 #include <sstream>
 #include <system_error>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 extern "C" {
@@ -122,7 +127,17 @@ std::uint64_t checksum(std::span<const std::uint8_t> bytes) {
 
 std::int64_t file_mtime_ns(const std::filesystem::path &path) {
     const auto value = std::filesystem::last_write_time(path).time_since_epoch();
+#if defined(_WIN32)
+    // MSVC's file clock counts 100 ns ticks since 1601-01-01 (FILETIME).
+    // Rebase onto the Unix epoch so stored mtimes match indexes written on
+    // other platforms and no longer overflow int64 into negative values.
+    constexpr std::int64_t filetime_unix_offset = 116444736000000000LL;
+    const auto ticks = std::chrono::duration_cast<
+        std::chrono::duration<std::int64_t, std::ratio<1, 10000000LL>>>(value).count();
+    return (ticks - filetime_unix_offset) * 100LL;
+#else
     return std::chrono::duration_cast<std::chrono::nanoseconds>(value).count();
+#endif
 }
 
 std::uint8_t picture_code(const std::optional<std::string> &value) {
@@ -192,6 +207,13 @@ std::vector<std::uint8_t> frame_payload(const MediaIndex &index) {
         output.integer(frame.repeat_pict);
         output.integer(frame.extradata_index);
         output.integer(static_cast<std::uint16_t>(0U));
+        output.integer(frame.packet_duration.value_or(kMissingTimestamp));
+        output.integer(frame.color_range);
+        output.integer(frame.color_space);
+        output.integer(frame.color_primaries);
+        output.integer(frame.color_transfer);
+        output.integer(frame.chroma_location);
+        output.integer(static_cast<std::uint32_t>(0U));
     }
     return std::move(output.data);
 }
@@ -218,6 +240,11 @@ std::vector<std::uint8_t> serialize(const MediaIndex &index) {
     output.string(index.profile);
     output.string(index.pixel_format);
     output.string(index.range);
+    output.integer(index.color_range);
+    output.integer(index.color_space);
+    output.integer(index.color_primaries);
+    output.integer(index.color_transfer);
+    output.integer(index.chroma_location);
     output.string(index.decoder);
     output.string(index.format_name);
     output.string(index.index_mode);
@@ -276,19 +303,21 @@ std::string cache_index_path(const std::string &cache_directory,
     std::replace_if(key.begin(), key.end(),
                     [](unsigned char value) { return !std::isalnum(value); }, '_');
     if (key.size() > 96U) key.resize(96U);
-    return (std::filesystem::path{cache_directory}
-            / (key + ".stream-" + std::to_string(index.stream_index) + ".vf.lwi"))
-        .string();
+    return path_to_utf8(path_from_utf8(cache_directory)
+                        / (key + ".stream-" + std::to_string(index.stream_index) + ".vf.lwi"));
 }
 
-std::string lwi_hash(const std::filesystem::path &path) {
+// LSMASH hashes the first mebibyte and, for files larger than 2 MiB, the
+// last one. The accepted FileHash is XXH3-64 (current LSMASH) or XXH32
+// (legacy LSMASH); both are computed here so either validates.
+std::pair<std::string, std::string> lwi_hashes(const std::filesystem::path &path) {
     std::ifstream input(path, std::ios::binary);
     if (!input) throw std::runtime_error("failed to open media for LWI hash");
     const std::uint64_t size = std::filesystem::file_size(path);
     constexpr std::size_t edge = 1024U * 1024U;
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(std::min<std::uint64_t>(size, edge)));
     input.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    if (size > edge) {
+    if (size > 2U * edge) {
         input.clear();
         input.seekg(-static_cast<std::streamoff>(edge), std::ios::end);
         const std::size_t old = bytes.size();
@@ -296,17 +325,28 @@ std::string lwi_hash(const std::filesystem::path &path) {
         input.read(reinterpret_cast<char *>(bytes.data() + old), static_cast<std::streamsize>(edge));
     }
 #if defined(GETNATIVE_HAS_XXHASH)
-    return "0x" + [&] {
+    const auto hex64 = [](std::uint64_t value) {
         char buffer[17]{};
         std::snprintf(buffer, sizeof(buffer), "%016llx",
-                      static_cast<unsigned long long>(XXH3_64bits(bytes.data(), bytes.size())));
-        return std::string{buffer};
-    }();
+                      static_cast<unsigned long long>(value));
+        return "0x" + std::string{buffer};
+    };
+    const auto hex32 = [](std::uint32_t value) {
+        char buffer[9]{};
+        std::snprintf(buffer, sizeof(buffer), "%08x", value);
+        return "0x" + std::string{buffer};
+    };
+    return {hex64(XXH3_64bits(bytes.data(), bytes.size())),
+            hex32(XXH32(bytes.data(), bytes.size(), 0))};
 #else
     // Keep a deterministic fallback for builds without xxHash. Such builds
-    // still read generated .vf.lwi files, but reject external hashes.
+    // still read generated .vf.lwi files, but cannot validate external hashes.
     return {};
 #endif
+}
+
+std::string lwi_hash(const std::filesystem::path &path) {
+    return lwi_hashes(path).first;
 }
 
 std::string trim(std::string value) {
@@ -335,11 +375,11 @@ std::unordered_map<std::string, std::string> comma_fields(std::string_view value
     return fields;
 }
 
-std::int64_t parse_integer(std::string_view value, std::int64_t fallback = 0) {
+std::int64_t parse_integer(std::string_view value, std::int64_t fallback = 0, int base = 0) {
     try {
         std::string text{trim(std::string{value})};
         std::size_t consumed = 0U;
-        const std::int64_t result = std::stoll(text, &consumed, 0);
+        const std::int64_t result = std::stoll(text, &consumed, base);
         return consumed == text.size() ? result : fallback;
     } catch (...) {
         return fallback;
@@ -357,10 +397,24 @@ std::optional<std::string> tag_value(std::string_view source, std::string_view n
     return std::string{source.substr(value_begin, end - value_begin)};
 }
 
+// Header scalars appear as <Name=value> in genuine LSMASH indexes and as
+// <Name>value</Name> in indexes written by older revisions of this project;
+// accept both forms.
+std::optional<std::string> header_field(std::string_view source, std::string_view name) {
+    if (std::optional<std::string> tagged = tag_value(source, name)) return tagged;
+    const std::string open = "<" + std::string{name} + "=";
+    const std::size_t begin = source.find(open);
+    if (begin == std::string_view::npos) return std::nullopt;
+    const std::size_t value_begin = begin + open.size();
+    const std::size_t end = source.find('>', value_begin);
+    if (end == std::string_view::npos) return std::nullopt;
+    return std::string{source.substr(value_begin, end - value_begin)};
+}
+
 MediaIndex read_lwi_text(const std::string &index_path, const std::string &media_path,
                          std::optional<std::string_view> expected_fingerprint,
                          std::optional<std::uint32_t> expected_stream) {
-    std::ifstream input(index_path, std::ios::binary);
+    std::ifstream input(path_from_utf8(index_path), std::ios::binary);
     if (!input) throw std::runtime_error("LWI index does not exist");
     const std::string text{std::istreambuf_iterator<char>{input}, {}};
     if (text.find("LSMASHWorksIndexVersion") == std::string::npos
@@ -383,7 +437,7 @@ MediaIndex read_lwi_text(const std::string &index_path, const std::string &media
     MediaIndex result;
     result.source_path = media_path;
     const auto scalar = [&](std::string_view key) -> std::optional<std::string> {
-        return tag_value(text, key);
+        return header_field(text, key);
     };
     if (!scalar("FileSize") || !scalar("FileLastModificationTime")
         || !scalar("ActiveVideoStreamIndex")
@@ -394,9 +448,14 @@ MediaIndex read_lwi_text(const std::string &index_path, const std::string &media
         ? static_cast<std::uint64_t>(parse_integer(*scalar("FileSize"))) : 0U;
     result.source_mtime_ns = scalar("FileLastModificationTime").has_value()
         ? parse_integer(*scalar("FileLastModificationTime")) * 1000000000LL : 0LL;
+    // LSMASH zero-pads this field in decimal (%+011d), which a base-0 parse
+    // would misread as octal for stream indices above 7.
     result.stream_index = scalar("ActiveVideoStreamIndex").has_value()
-        ? static_cast<std::uint32_t>(std::max<std::int64_t>(0, parse_integer(*scalar("ActiveVideoStreamIndex")))) : 0U;
-    const std::size_t duration_tag = text.find("<StreamDuration=");
+        ? static_cast<std::uint32_t>(std::max<std::int64_t>(
+            0, parse_integer(*scalar("ActiveVideoStreamIndex"), 0, 10))) : 0U;
+    const std::string active_duration = "<StreamDuration="
+        + std::to_string(result.stream_index) + ",0>";
+    const std::size_t duration_tag = text.find(active_duration);
     if (duration_tag != std::string::npos) {
         const std::size_t value_begin = text.find('>', duration_tag);
         const std::size_t value_end = text.find("</StreamDuration>", value_begin);
@@ -408,18 +467,31 @@ MediaIndex read_lwi_text(const std::string &index_path, const std::string &media
     }
     const std::size_t reader_tag = text.find("<LibavReaderIndex=");
     if (reader_tag != std::string::npos) {
-        const std::size_t value_begin = text.find('>', reader_tag);
-        if (value_begin != std::string::npos) {
-            const std::string value = text.substr(reader_tag, value_begin - reader_tag);
-            const std::size_t comma = value.rfind(',');
-            if (comma != std::string::npos) result.format_name = value.substr(comma + 1U);
+        const std::size_t value_begin = reader_tag
+            + std::string_view{"<LibavReaderIndex="}.size();
+        const std::size_t value_end = text.find('>', value_begin);
+        if (value_end != std::string::npos) {
+            const std::string value = text.substr(value_begin, value_end - value_begin);
+            const std::size_t first_comma = value.find(',');
+            const std::size_t second_comma = first_comma == std::string::npos
+                ? std::string::npos : value.find(',', first_comma + 1U);
+            if (first_comma != std::string::npos) {
+                result.format_flags = parse_integer(value.substr(0U, first_comma), 0, 0);
+            }
+            if (second_comma != std::string::npos) {
+                result.raw_demuxer = parse_integer(value.substr(
+                    first_comma + 1U, second_comma - first_comma - 1U)) != 0;
+                result.format_name = trim(value.substr(second_comma + 1U));
+            }
         }
     }
     if (expected_stream && result.stream_index != *expected_stream) {
         throw std::runtime_error("LWI active video stream does not match request");
     }
     {
-        const std::size_t info_begin = text.find("<StreamInfo=");
+        const std::string active_info = "<StreamInfo="
+            + std::to_string(result.stream_index) + ",0>";
+        const std::size_t info_begin = text.find(active_info);
         const std::size_t info_end = info_begin == std::string::npos
             ? std::string::npos : text.find("</StreamInfo>", info_begin);
         const std::string info_body = info_end == std::string::npos ? std::string{}
@@ -448,6 +520,10 @@ MediaIndex read_lwi_text(const std::string &index_path, const std::string &media
             else if (result.pixel_format.find("p010") != std::string::npos
                      || result.pixel_format.find("10") != std::string::npos) result.bit_depth = 10;
         }
+        if (fields.count("ColorSpace")) {
+            result.color_space = static_cast<std::int32_t>(
+                parse_integer(fields.at("ColorSpace"), 2));
+        }
         result.index_mode = "lwi_external";
     }
     std::istringstream lines{text};
@@ -460,11 +536,30 @@ MediaIndex read_lwi_text(const std::string &index_path, const std::string &media
         line = trim(line);
         if (line == "</StreamIndexEntries>") { in_stream_entries = false; continue; }
         if (line == "</ExtraDataList>") { in_extra = false; continue; }
-        if (line.rfind("<StreamIndexEntries", 0U) == 0U) { in_stream_entries = true; continue; }
-        if (line.rfind("<ExtraDataList", 0U) == 0U) { in_extra = true; continue; }
+        if (line.rfind("<StreamIndexEntries=", 0U) == 0U) {
+            const std::size_t value_begin = std::string_view{"<StreamIndexEntries="}.size();
+            const std::size_t comma = line.find(',', value_begin);
+            in_stream_entries = comma != std::string::npos
+                && parse_integer(line.substr(value_begin, comma - value_begin), -1, 10)
+                    == static_cast<std::int64_t>(result.stream_index);
+            continue;
+        }
+        if (line.rfind("<ExtraDataList=", 0U) == 0U) {
+            const std::size_t value_begin = std::string_view{"<ExtraDataList="}.size();
+            const std::size_t comma = line.find(',', value_begin);
+            in_extra = comma != std::string::npos
+                && parse_integer(line.substr(value_begin, comma - value_begin), -1, 10)
+                    == static_cast<std::int64_t>(result.stream_index);
+            continue;
+        }
         if (line.rfind("Index=", 0U) == 0U) {
             if (have_pending) result.frames.push_back(pending);
             pending = FrameIdentity{};
+            pending.color_range = result.color_range;
+            pending.color_space = result.color_space;
+            pending.color_primaries = result.color_primaries;
+            pending.color_transfer = result.color_transfer;
+            pending.chroma_location = result.chroma_location;
             pending.decode_index = result.frames.size();
             const auto fields = comma_fields(line.substr(6U));
             if (fields.count("_") && parse_integer(fields.at("_"), result.stream_index)
@@ -490,8 +585,17 @@ MediaIndex read_lwi_text(const std::string &index_path, const std::string &media
                 else if (pic == 2) pending.picture_type = "P";
                 else if (pic == 3) pending.picture_type = "B";
             }
-            if (fields.count("POC")) pending.poc = parse_integer(fields.at("POC"));
+            if (fields.count("POC")) {
+                pending.poc = static_cast<std::int32_t>(std::clamp<std::int64_t>(
+                    parse_integer(fields.at("POC")),
+                    std::numeric_limits<std::int32_t>::min(),
+                    std::numeric_limits<std::int32_t>::max()));
+            }
             if (fields.count("Repeat")) pending.repeat_pict = static_cast<std::int32_t>(parse_integer(fields.at("Repeat")));
+            if (fields.count("Field")) {
+                const std::int64_t field = parse_integer(fields.at("Field"));
+                pending.field_order = field == 1 ? "tt" : field == 2 ? "bb" : "unknown";
+            }
             if (fields.count("Super")) pending.vp9_superframe = parse_integer(fields.at("Super")) != 0;
             pending.rap = pending.key_frame;
             continue;
@@ -503,7 +607,9 @@ MediaIndex read_lwi_text(const std::string &index_path, const std::string &media
             entry.file_position = parse_integer(comma == std::string::npos
                                                     ? line.substr(4U) : line.substr(4U, comma - 4U), -1);
             entry.timestamp = parse_integer(fields.count("TS") ? fields.at("TS") : "0");
-            entry.flags = static_cast<std::uint32_t>(parse_integer(fields.count("Flags") ? fields.at("Flags") : "0"));
+            // LSMASH writes Flags in hex without a 0x prefix.
+            entry.flags = static_cast<std::uint32_t>(parse_integer(
+                fields.count("Flags") ? fields.at("Flags") : "0", 0, 16));
             entry.size = static_cast<std::uint32_t>(parse_integer(fields.count("Size") ? fields.at("Size") : "0"));
             entry.distance = static_cast<std::uint32_t>(parse_integer(fields.count("Distance") ? fields.at("Distance") : "0"));
             result.stream_index_entries.push_back(entry);
@@ -514,41 +620,152 @@ MediaIndex read_lwi_text(const std::string &index_path, const std::string &media
             extra.index = static_cast<std::uint32_t>(result.extradata.size());
             extra.codec_id = static_cast<std::uint32_t>(std::max<std::int64_t>(
                 0, parse_integer(fields.count("Codec") ? fields.at("Codec") : "0")));
+            extra.fourcc = static_cast<std::uint32_t>(std::max<std::int64_t>(
+                0, parse_integer(fields.count("4CC") ? fields.at("4CC") : "0")));
             extra.width = static_cast<std::int32_t>(parse_integer(fields.count("Width") ? fields.at("Width") : "0"));
             extra.height = static_cast<std::int32_t>(parse_integer(fields.count("Height") ? fields.at("Height") : "0"));
             extra.pixel_format = fields.count("Format") ? fields.at("Format") : "";
             extra.bit_rate = static_cast<std::uint32_t>(std::max<std::int64_t>(
                 0, parse_integer(fields.count("BPS") ? fields.at("BPS") : "0")));
+            // LSMASH appends the raw extradata blob plus one newline right
+            // after this line; consume those bytes so they are never mistaken
+            // for frame records.
+            const std::int64_t blob_size = parse_integer(fields.count("Size") ? fields.at("Size") : "0");
+            if (blob_size > 0) {
+                extra.data.resize(static_cast<std::size_t>(blob_size));
+                lines.read(reinterpret_cast<char *>(extra.data.data()),
+                           static_cast<std::streamsize>(extra.data.size()));
+                if (static_cast<std::int64_t>(lines.gcount()) != blob_size) {
+                    throw std::runtime_error("LWI extradata blob is truncated");
+                }
+            }
+            if (lines.peek() == '\r') lines.ignore();
+            if (lines.peek() == '\n') lines.ignore();
             result.extradata.push_back(std::move(extra));
+            continue;
         }
     }
     if (have_pending) result.frames.push_back(pending);
     if (result.frames.empty()) throw std::runtime_error("LWI contains no video index records");
-    for (std::size_t index = 0; index < result.frames.size(); ++index) {
-        result.frames[index].frame_index = index;
-        result.frames[index].keyframe_anchor = result.frames[index].rap ? index
-            : (index == 0U ? 0U : result.frames[index - 1U].keyframe_anchor);
-        result.frames[index].keyframe_timestamp = result.frames[result.frames[index].keyframe_anchor].pts;
-        if (result.frames[index].pts && result.time_base_den != 0) {
-            result.frames[index].timestamp_seconds = static_cast<double>(*result.frames[index].pts)
-                * result.time_base_num / result.time_base_den;
+    // LWI records are listed in decoding order (decode_index was assigned in
+    // file order while parsing). LSMASH derives its public frame numbering by
+    // sorting on timestamps, so mirror that here: frame numbers then agree
+    // with the VapourSynth plugin instead of following packet order.
+    const std::size_t record_count = result.frames.size();
+    bool unique_pts = true;
+    bool complete_pts = true;
+    {
+        std::unordered_set<std::int64_t> seen_pts;
+        seen_pts.reserve(record_count);
+        for (const FrameIdentity &frame : result.frames) {
+            if (!frame.pts) {
+                complete_pts = false;
+                unique_pts = false;
+            } else if (!seen_pts.insert(*frame.pts).second) {
+                unique_pts = false;
+            }
         }
     }
-    result.source_size = result.source_size != 0U ? result.source_size : std::filesystem::file_size(media_path);
-    const std::uint64_t actual_size = std::filesystem::file_size(media_path);
+    std::vector<std::size_t> order(record_count);
+    std::iota(order.begin(), order.end(), 0U);
+    if (complete_pts) {
+        std::stable_sort(order.begin(), order.end(), [&](std::size_t left, std::size_t right) {
+            const std::int64_t left_pts = *result.frames[left].pts;
+            const std::int64_t right_pts = *result.frames[right].pts;
+            return left_pts != right_pts ? left_pts < right_pts : left < right;
+        });
+    } else {
+        const bool poc_codec = result.codec == "h264" || result.codec == "hevc";
+        const bool usable_poc = poc_codec
+            && std::all_of(result.frames.begin(), result.frames.end(),
+                           [](const FrameIdentity &frame) {
+                               return frame.poc.has_value();
+                           })
+            && std::any_of(result.frames.begin(), result.frames.end(),
+                           [](const FrameIdentity &frame) {
+                               return frame.poc.value_or(0) != 0;
+                           });
+        if (usable_poc) {
+            order.clear();
+            for (std::size_t begin = 0U; begin < record_count;) {
+                std::size_t end = begin + 1U;
+                while (end < record_count && !result.frames[end].rap) ++end;
+                std::vector<std::size_t> run(end - begin);
+                std::iota(run.begin(), run.end(), begin);
+                std::stable_sort(run.begin(), run.end(), [&](std::size_t left,
+                                                             std::size_t right) {
+                    const std::int32_t left_poc = *result.frames[left].poc;
+                    const std::int32_t right_poc = *result.frames[right].poc;
+                    return left_poc != right_poc ? left_poc < right_poc
+                                                 : left < right;
+                });
+                order.insert(order.end(), run.begin(), run.end());
+                begin = end;
+            }
+        } else {
+            std::vector<std::size_t> pts_slots;
+            std::vector<std::size_t> timestamped;
+            for (std::size_t decode = 0U; decode < record_count; ++decode) {
+                if (!result.frames[decode].pts) continue;
+                pts_slots.push_back(decode);
+                timestamped.push_back(decode);
+            }
+            std::stable_sort(timestamped.begin(), timestamped.end(),
+                             [&](std::size_t left, std::size_t right) {
+                const std::int64_t left_pts = *result.frames[left].pts;
+                const std::int64_t right_pts = *result.frames[right].pts;
+                return left_pts != right_pts ? left_pts < right_pts : left < right;
+            });
+            for (std::size_t slot = 0U; slot < pts_slots.size(); ++slot) {
+                order[pts_slots[slot]] = timestamped[slot];
+            }
+        }
+    }
+    std::vector<FrameIdentity> presentation;
+    presentation.reserve(record_count);
+    result.decode_to_presentation.resize(record_count);
+    result.presentation_to_decode.resize(record_count);
+    for (std::size_t presentation_index = 0U; presentation_index < record_count; ++presentation_index) {
+        FrameIdentity frame = std::move(result.frames[order[presentation_index]]);
+        result.decode_to_presentation[frame.decode_index] = presentation_index;
+        result.presentation_to_decode[presentation_index] = frame.decode_index;
+        frame.frame_index = presentation_index;
+        if (frame.pts && result.time_base_den != 0) {
+            frame.timestamp_seconds = static_cast<double>(*frame.pts)
+                * result.time_base_num / result.time_base_den;
+        }
+        presentation.push_back(std::move(frame));
+    }
+    result.frames = std::move(presentation);
+    // Keyframe anchors walk in decoding order: each frame's anchor is the
+    // most recent random-access picture at or before its decode position.
+    std::size_t current_anchor = 0U;
+    for (std::size_t decode = 0U; decode < record_count; ++decode) {
+        FrameIdentity &frame = result.frames[result.decode_to_presentation[decode]];
+        if (frame.rap) current_anchor = frame.frame_index;
+        frame.keyframe_anchor = current_anchor;
+        frame.leading_frame = frame.frame_index < current_anchor;
+        frame.keyframe_timestamp = result.frames[current_anchor].pts;
+    }
+    const std::filesystem::path source_path = path_from_utf8(media_path);
+    result.source_size = result.source_size != 0U
+        ? result.source_size : std::filesystem::file_size(source_path);
+    const std::uint64_t actual_size = std::filesystem::file_size(source_path);
     if (result.source_size != actual_size) throw std::runtime_error("LWI source size mismatch");
-    const std::int64_t actual_mtime = file_mtime_ns(media_path);
+    const std::int64_t actual_mtime = file_mtime_ns(source_path);
     if (result.source_mtime_ns != 0LL && result.source_mtime_ns / 1000000000LL != actual_mtime / 1000000000LL) {
         throw std::runtime_error("LWI source mtime mismatch");
     }
-    if (const auto hash = scalar("FileHash"); hash && !hash->empty()) {
+    if (const auto hash = header_field(text, "FileHash"); hash && !hash->empty()) {
         std::string expected_hash = *hash;
-        std::string actual_hash = lwi_hash(media_path);
         std::transform(expected_hash.begin(), expected_hash.end(), expected_hash.begin(),
                        [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
-        std::transform(actual_hash.begin(), actual_hash.end(), actual_hash.begin(),
-                       [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
-        if (actual_hash.empty() || expected_hash != actual_hash) {
+        // Same policy as the LSMASH loader: accept either the XXH3-64 or the
+        // legacy XXH32 hash of the source. When xxHash is unavailable the
+        // quick-fingerprint check below still validates the media.
+        const auto hashes = lwi_hashes(source_path);
+        if (!hashes.first.empty() && expected_hash != hashes.first
+            && expected_hash != hashes.second) {
             throw std::runtime_error("LWI source hash mismatch");
         }
     }
@@ -557,53 +774,99 @@ MediaIndex read_lwi_text(const std::string &index_path, const std::string &media
         throw std::runtime_error("media fingerprint does not match the LWI");
     }
     result.index_mode = "lwi_external";
-    result.seek_method = "pts";
+    const auto monotonic_decode_value = [&](bool dts) {
+        std::optional<std::int64_t> previous;
+        for (std::size_t decode = 0U; decode < record_count; ++decode) {
+            const FrameIdentity &frame = result.frames[result.decode_to_presentation[decode]];
+            if (dts && frame.vp8_invisible_frame) continue;
+            const auto value = dts ? frame.dts : frame.file_position;
+            if (!value || (previous && *value <= *previous)) return false;
+            previous = value;
+        }
+        return previous.has_value();
+    };
+    if (unique_pts) {
+        result.seek_method = "pts";
+    } else if (monotonic_decode_value(true)) {
+        result.seek_method = "dts";
+    } else if ((result.raw_demuxer || result.format_name == "mpeg"
+                || result.format_name == "mpegts")
+               && monotonic_decode_value(false)) {
+        result.seek_method = "file_position";
+    } else {
+        result.seek_method = "sample_order";
+    }
     result.packet_count = result.frames.size();
     result.decoder = "software";
-    result.decode_to_presentation.resize(result.frames.size());
-    result.presentation_to_decode.resize(result.frames.size());
-    for (std::size_t i = 0; i < result.frames.size(); ++i) {
-        result.decode_to_presentation[result.frames[i].decode_index] = i;
-        result.presentation_to_decode[i] = result.frames[i].decode_index;
-    }
     return result;
 }
 
 std::string serialize_lwi(const MediaIndex &index, const std::string &media_path) {
+    const std::filesystem::path source_path = path_from_utf8(media_path);
     std::ostringstream output;
     const AVCodec *codec = avcodec_find_decoder_by_name(index.codec.c_str());
     const int codec_id = codec != nullptr ? static_cast<int>(codec->id) : 0;
     output << "<LSMASHWorksIndexVersion=0.0.3.0>\n<LibavReaderIndexFile=19>\n";
     output << "<InputFilePath>" << media_path << "</InputFilePath>\n";
-    output << "<FileSize>" << index.source_size << "</FileSize>\n";
-    output << "<FileLastModificationTime>" << index.source_mtime_ns / 1000000000LL << "</FileLastModificationTime>\n";
-    output << "<FileHash>" << lwi_hash(media_path) << "</FileHash>\n";
+    // Header scalars use LSMASH's <Name=value> form so the VapourSynth
+    // plugin can load this index as well as read_lwi_text.
+    output << "<FileSize=" << index.source_size << ">\n";
+    output << "<FileLastModificationTime=" << index.source_mtime_ns / 1000000000LL << ">\n";
+    output << "<FileHash=" << lwi_hash(source_path) << ">\n";
     const std::size_t format_separator = index.format_name.find(',');
     const std::string format_name = format_separator == std::string::npos
         ? index.format_name : index.format_name.substr(0U, format_separator);
-    output << "<LibavReaderIndex=0x00000100,0," << format_name << ">\n";
-    output << "<ActiveVideoStreamIndex>+" << index.stream_index << "</ActiveVideoStreamIndex>\n";
+    output << "<LibavReaderIndex=0x" << std::hex << index.format_flags << std::dec
+           << "," << (index.raw_demuxer ? 1 : 0) << "," << format_name << ">\n";
+    output << "<ActiveVideoStreamIndex>+" << std::setw(10) << std::setfill('0')
+           << index.stream_index << std::setfill(' ') << "</ActiveVideoStreamIndex>\n";
     output << "<ActiveAudioStreamIndex>-0000000002</ActiveAudioStreamIndex>\n<DefaultAudioStreamIndex>-0000000001</DefaultAudioStreamIndex>\n";
     output << "<StreamInfo=" << index.stream_index << ",0>\nCodec=" << codec_id
            << ",TimeBase=" << index.time_base_num << "/" << index.time_base_den
            << ",Width=" << index.width << ",Height=" << index.height
-           << ",Format=" << index.pixel_format << ",ColorSpace=0\n</StreamInfo>\n";
-    for (const FrameIdentity &frame : index.frames) {
-        output << "Index=" << index.stream_index << ",POS=" << frame.file_position.value_or(0)
+           << ",Format=" << index.pixel_format << ",ColorSpace=" << index.color_space
+           << "\n</StreamInfo>\n";
+    // LSMASH lists packets in decoding order; readers (including the
+    // VapourSynth plugin and read_lwi_text above) derive presentation frame
+    // numbers by sorting on the timestamps stored here.
+    std::vector<const FrameIdentity *> decode_order;
+    decode_order.reserve(index.frames.size());
+    for (const FrameIdentity &frame : index.frames) decode_order.push_back(&frame);
+    std::sort(decode_order.begin(), decode_order.end(),
+              [](const FrameIdentity *left, const FrameIdentity *right) {
+                  return left->decode_index < right->decode_index;
+              });
+    for (const FrameIdentity *record : decode_order) {
+        const FrameIdentity &frame = *record;
+        output << "Index=" << index.stream_index << ",POS=" << frame.file_position.value_or(-1)
                << ",PTS=" << frame.pts.value_or(AV_NOPTS_VALUE) << ",DTS=" << frame.dts.value_or(AV_NOPTS_VALUE)
-               << ",EDI=" << frame.extradata_index << "\nKey=" << (frame.key_frame ? 1 : 0)
+               << ",EDI=" << frame.extradata_index << "\nKey=" << (frame.rap ? 1 : 0)
                << ",Pic=" << static_cast<int>(picture_code(frame.picture_type)) << ",POC=" << frame.poc.value_or(0)
-               << ",Repeat=" << frame.repeat_pict << ",Field=0,Super=" << (frame.vp9_superframe ? 1 : 0) << "\n";
+               << ",Repeat=" << frame.repeat_pict
+               << ",Field=" << (frame.field_order == "tt" || frame.field_order == "tb" ? 1
+                                   : frame.field_order == "bb" || frame.field_order == "bt" ? 2 : 0)
+               << ",Super=" << (frame.vp9_superframe ? 1 : 0) << "\n";
     }
-    output << "</LibavReaderIndex>\n<StreamIndexEntries=" << index.stream_index << ",0," << index.stream_index_entries.size() << ">\n";
+    output << "</LibavReaderIndex>\n<VideoConsistentFieldRepeatPict>0</VideoConsistentFieldRepeatPict>\n"
+           << "<StreamDuration=" << index.stream_index << ",0>" << index.duration_ticks
+           << "</StreamDuration>\n<StreamIndexEntries=" << index.stream_index << ",0,"
+           << index.stream_index_entries.size() << ">\n";
     for (const StreamIndexEntry &entry : index.stream_index_entries) {
-        output << "POS=" << entry.file_position << ",TS=" << entry.timestamp << ",Flags=" << entry.flags
+        output << "POS=" << entry.file_position << ",TS=" << entry.timestamp
+               << ",Flags=" << std::hex << entry.flags << std::dec
                << ",Size=" << entry.size << ",Distance=" << entry.distance << "\n";
     }
     output << "</StreamIndexEntries>\n<ExtraDataList=" << index.stream_index << ",0," << index.extradata.size() << ">\n";
     for (const ExtraDataInfo &extra : index.extradata) {
-        output << "Size=" << extra.data.size() << ",Codec=" << extra.codec_id << ",4CC=0x0,Width="
-               << extra.width << ",Height=" << extra.height << ",Format=" << extra.pixel_format << ",BPS=" << extra.bit_rate << "\n\n";
+        output << "Size=" << extra.data.size() << ",Codec=" << extra.codec_id
+               << ",4CC=0x" << std::hex << extra.fourcc << std::dec
+               << ",Width=" << extra.width << ",Height=" << extra.height
+               << ",Format=" << extra.pixel_format << ",BPS=" << extra.bit_rate << "\n";
+        if (!extra.data.empty()) {
+            output.write(reinterpret_cast<const char *>(extra.data.data()),
+                         static_cast<std::streamsize>(extra.data.size()));
+        }
+        output << "\n";
     }
     output << "</ExtraDataList>\n</LibavReaderIndexFile>\n";
     return output.str();
@@ -650,7 +913,7 @@ std::string preferred_index_path(const std::string &path,
 MediaIndex load_index(const std::string &index_path, const std::string &media_path,
                       std::optional<std::string_view> expected_fingerprint,
                       std::optional<std::uint32_t> expected_stream) {
-    std::ifstream input(index_path, std::ios::binary | std::ios::ate);
+    std::ifstream input(path_from_utf8(index_path), std::ios::binary | std::ios::ate);
     if (!input) throw std::runtime_error("media index does not exist");
     const std::streamoff raw_size = input.tellg();
     if (raw_size < 0 || raw_size > static_cast<std::streamoff>(2ULL * 1024ULL * 1024ULL * 1024ULL)) {
@@ -670,7 +933,7 @@ MediaIndex load_index(const std::string &index_path, const std::string &media_pa
         }
     }
     const std::uint32_t version = reader.integer<std::uint32_t>();
-    if (version != 1U && version != MediaIndex::format_version) {
+    if (version < 1U || version > MediaIndex::format_version) {
         throw std::runtime_error("media index version is incompatible");
     }
     (void)reader.integer<std::uint32_t>();
@@ -692,6 +955,13 @@ MediaIndex load_index(const std::string &index_path, const std::string &media_pa
     index.profile = reader.string();
     index.pixel_format = reader.string();
     index.range = reader.string();
+    if (version >= 3U) {
+        index.color_range = reader.integer<std::int32_t>();
+        index.color_space = reader.integer<std::int32_t>();
+        index.color_primaries = reader.integer<std::int32_t>();
+        index.color_transfer = reader.integer<std::int32_t>();
+        index.chroma_location = reader.integer<std::int32_t>();
+    }
     index.decoder = reader.string();
     if (version >= 2U) {
         index.format_name = reader.string();
@@ -734,8 +1004,10 @@ MediaIndex load_index(const std::string &index_path, const std::string &media_pa
     }
     if (version == 1U) index.index_mode = "legacy_native";
     constexpr std::size_t old_frame_bytes = 52U;
-    constexpr std::size_t new_frame_bytes = 96U;
-    const std::size_t frame_bytes = version >= 2U ? new_frame_bytes : old_frame_bytes;
+    constexpr std::size_t version_2_frame_bytes = 96U;
+    constexpr std::size_t version_3_frame_bytes = 128U;
+    const std::size_t frame_bytes = version >= 3U ? version_3_frame_bytes
+        : version >= 2U ? version_2_frame_bytes : old_frame_bytes;
     if (frame_count == 0U || frame_count > 1000000000ULL
         || reader.remaining() != frame_count * frame_bytes) {
         throw std::runtime_error("media index frame table size is invalid");
@@ -782,17 +1054,47 @@ MediaIndex load_index(const std::string &index_path, const std::string &media_pa
             if (position >= 0) frame.file_position = position;
             if (!frame.rap) frame.rap = frame.key_frame;
             if (poc != std::numeric_limits<std::int32_t>::min()) frame.poc = poc;
+            if (version >= 3U) {
+                const auto packet_duration = reader.integer<std::int64_t>();
+                if (packet_duration != kMissingTimestamp) {
+                    frame.packet_duration = packet_duration;
+                }
+                frame.color_range = reader.integer<std::int32_t>();
+                frame.color_space = reader.integer<std::int32_t>();
+                frame.color_primaries = reader.integer<std::int32_t>();
+                frame.color_transfer = reader.integer<std::int32_t>();
+                frame.chroma_location = reader.integer<std::int32_t>();
+                (void)reader.integer<std::uint32_t>();
+            }
         } else {
             frame.decode_index = ordinal;
             frame.rap = frame.key_frame;
         }
-        if (frame.frame_index != ordinal || frame.keyframe_anchor > frame.frame_index) {
+        // Open-GOP leading pictures are presented before the RAP that starts
+        // their decode run, so their anchor may legitimately have a larger
+        // presentation index than the frame itself.
+        if (frame.frame_index != ordinal || frame.keyframe_anchor >= frame_count) {
             throw std::runtime_error("media index frame identity is invalid");
         }
         index.frames.push_back(std::move(frame));
     }
 
-    const std::filesystem::path source{media_path};
+    index.decode_to_presentation.resize(static_cast<std::size_t>(frame_count));
+    index.presentation_to_decode.resize(static_cast<std::size_t>(frame_count));
+    std::vector<char> seen_decode_index(static_cast<std::size_t>(frame_count), 0);
+    for (std::size_t presentation = 0U;
+         presentation < index.frames.size(); ++presentation) {
+        const std::uint64_t decode = index.frames[presentation].decode_index;
+        if (decode >= frame_count || seen_decode_index[decode]) {
+            throw std::runtime_error(
+                "media index decode/presentation mapping is invalid");
+        }
+        seen_decode_index[decode] = 1;
+        index.decode_to_presentation[decode] = presentation;
+        index.presentation_to_decode[presentation] = decode;
+    }
+
+    const std::filesystem::path source = path_from_utf8(media_path);
     const std::uint64_t actual_size = std::filesystem::file_size(source);
     const std::int64_t actual_mtime = file_mtime_ns(source);
     if (index.source_size != actual_size || index.source_mtime_ns != actual_mtime) {
@@ -809,16 +1111,17 @@ MediaIndex load_index(const std::string &index_path, const std::string &media_pa
 
 void write_index_atomic(const std::string &index_path, const MediaIndex &index,
                         std::stop_token stop) {
-    const std::filesystem::path destination{index_path};
+    const std::filesystem::path destination = path_from_utf8(index_path);
     if (destination.has_parent_path()) {
         std::filesystem::create_directories(destination.parent_path());
     }
-    const std::filesystem::path temporary = destination.string() + ".tmp";
+    std::filesystem::path temporary = destination;
+    temporary += ".tmp";
     std::error_code cleanup_error;
     std::filesystem::remove(temporary, cleanup_error);
     try {
         std::vector<std::uint8_t> bytes;
-        const std::string filename = destination.filename().string();
+        const std::string filename = path_to_utf8(destination.filename());
         if (filename.size() >= 7U && filename.ends_with(".vf.lwi")) {
             const std::string text = serialize_lwi(index, index.source_path);
             bytes.assign(text.begin(), text.end());
@@ -869,11 +1172,11 @@ IndexedMedia ensure_index(const std::string &path,
     const std::string fingerprint = quick_fingerprint(path);
     const std::string preferred = preferred_index_path(path, stream, default_stream);
     const std::string external = external_lwi_path(path, stream, default_stream);
-    const std::filesystem::path source_path{path};
+    const std::filesystem::path source_path = path_from_utf8(path);
     const std::filesystem::path source_stem = source_path.parent_path() / source_path.stem();
     const std::string stem_external = stream == default_stream
-        ? source_stem.string() + ".lwi"
-        : source_stem.string() + ".stream-" + std::to_string(stream) + ".lwi";
+        ? path_to_utf8(source_stem) + ".lwi"
+        : path_to_utf8(source_stem) + ".stream-" + std::to_string(stream) + ".lwi";
     const std::string legacy = legacy_lwi_path(path, stream, default_stream);
     MediaIndex shell;
     shell.fingerprint = fingerprint;
@@ -886,18 +1189,24 @@ IndexedMedia ensure_index(const std::string &path,
     const std::vector<const std::string *> candidates = index_options.allow_lwi
         ? std::vector<const std::string *>{&external, &stem_external, &legacy, &preferred, &fallback}
         : std::vector<const std::string *>{&legacy, &preferred, &fallback};
-    for (const std::string *candidate : candidates) {
-        try {
-            MediaIndex loaded = load_index(*candidate, path, fingerprint, stream);
-            if (loaded.index_mode == "legacy_native") continue;
-            return {std::move(loaded), *candidate, false};
-        } catch (const std::exception &) {
+    // LWI has no field that records whether RAP candidates were independently
+    // decoded. Reusing any existing index here would silently turn a verified
+    // request into an ordinary parser/demuxer index, so verification requests
+    // deliberately rebuild.
+    if (!index_options.rap_verification) {
+        for (const std::string *candidate : candidates) {
+            try {
+                MediaIndex loaded = load_index(*candidate, path, fingerprint, stream);
+                if (loaded.index_mode == "legacy_native") continue;
+                return {std::move(loaded), *candidate, false};
+            } catch (const std::exception &) {
+            }
         }
     }
     if (stop.stop_requested()) throw std::runtime_error("cancelled");
     MediaIndex index = index_media(path, stream, options, index_options, stop, std::move(progress));
-    index.source_size = std::filesystem::file_size(path);
-    index.source_mtime_ns = file_mtime_ns(path);
+    index.source_size = std::filesystem::file_size(source_path);
+    index.source_mtime_ns = file_mtime_ns(source_path);
     std::string written_path;
     try {
         index.source_path = path;
