@@ -111,7 +111,7 @@ void write_capabilities_impl(
         vulkan_video_reason = error.what();
     }
 #endif
-    output << "{\"schema_version\":2,\"engine\":\"getnative-engine\",\"version\":\"0.1.6\","
+    output << "{\"schema_version\":2,\"engine\":\"getnative-engine\",\"version\":\"0.2.0\","
               "\"commands\":{\"capabilities\":true,\"geometry\":true,\"analyze\":"
            << available;
 #if defined(GETNATIVE_HAS_MEDIA)
