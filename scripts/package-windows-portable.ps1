@@ -112,6 +112,19 @@ if (-not (Test-Path -LiteralPath $gui)) {
 if (-not (Test-Path -LiteralPath (Join-Path $stage "bin\getnative-engine.exe"))) {
     throw "Staged engine was not produced"
 }
+if (-not (Test-Path -LiteralPath (Join-Path $stage "share\getnative\LICENSE.txt") -PathType Leaf)) {
+    throw "Staged project license is missing"
+}
+if ($Backends -match "vulkan") {
+    foreach ($required in @(
+        "bin\vulkan-1.dll",
+        "share\getnative\licenses\vulkan-loader\LICENSE.txt"
+    )) {
+        if (-not (Test-Path -LiteralPath (Join-Path $stage $required) -PathType Leaf)) {
+            throw "Staged Vulkan runtime is incomplete: $required"
+        }
+    }
+}
 
 $version = (Get-Content (Join-Path $appDirectory "src-tauri\tauri.conf.json") -Raw |
     ConvertFrom-Json).version
@@ -144,8 +157,29 @@ if ($Backends -match "cuda" -and ($cuda.Count -ne 1 -or -not $cuda[0].compiled))
 if ($Backends -match "vulkan" -and ($vulkan.Count -ne 1 -or -not $vulkan[0].compiled)) {
     throw "portable engine is missing a compiled Vulkan backend"
 }
+$provenance = Get-Content (Join-Path $portableRoot "build-provenance.json") -Raw |
+    ConvertFrom-Json
+if ($Backends -match "cuda" -and $provenance.cuda_toolkit_version -eq "unknown") {
+    throw "portable provenance is missing the CUDA Toolkit version"
+}
+if ($Backends -match "vulkan" -and $provenance.vulkan_sdk_version -eq "unknown") {
+    throw "portable provenance is missing the Vulkan SDK version"
+}
+foreach ($name in @(
+    "ffmpeg.exe", "ffprobe.exe", "nvcc.exe", "cuobjdump.exe",
+    "glslangValidator.exe", "spirv-val.exe", "vulkan-1.lib"
+)) {
+    if (Get-ChildItem $portableRoot -Recurse -File -Filter $name) {
+        throw "$name entered the portable package"
+    }
+}
+$checksumPath = Join-Path $artifactRoot "SHA256SUMS-windows-x64.txt"
+$checksum = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLower()
+"$checksum  $([IO.Path]::GetFileName($archive))" |
+    Set-Content -LiteralPath $checksumPath -Encoding ascii
 
 Write-Host "portable_dir=$portableRoot"
 Write-Host "portable_zip=$archive"
+Write-Host "checksums=$checksumPath"
 Write-Host "cuda_compiled=$($cuda[0].compiled) device=$($cuda[0].device_available)"
 Write-Host "vulkan_compiled=$($vulkan[0].compiled) device=$($vulkan[0].device_available)"

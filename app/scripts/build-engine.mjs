@@ -9,7 +9,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
@@ -45,6 +45,7 @@ const managedFfmpegPatterns = [
   /^libavutil\.60\.dylib$/u,
   /^libswscale\.9\.dylib$/u,
 ];
+const managedVulkanPatterns = [/^vulkan-1\.dll$/iu, /^libvulkan\.so\.1$/u];
 
 function fail(message) {
   console.error(message);
@@ -79,16 +80,43 @@ function enabled(value) {
   return ["1", "on", "true", "yes"].includes((value || "").toLowerCase());
 }
 
-function cudaToolkitAvailable() {
-  const roots = [
+function cudaToolkitRoots() {
+  return [
     process.env.GETNATIVE_CUDA_ROOT,
     process.env.CUDAToolkit_ROOT,
     process.env.CUDA_PATH,
     process.env.CUDA_HOME,
     "/usr/local/cuda",
   ].filter(Boolean);
+}
+
+function cudaToolkitAvailable() {
   const executable = process.platform === "win32" ? "nvcc.exe" : "nvcc";
-  return roots.some((root) => existsSync(join(root, "bin", executable)));
+  return cudaToolkitRoots().some((root) => existsSync(join(root, "bin", executable)));
+}
+
+function cudaToolkitVersion() {
+  if (process.env.CUDA_TOOLKIT_VERSION) return process.env.CUDA_TOOLKIT_VERSION;
+  for (const root of cudaToolkitRoots()) {
+    const manifest = join(root, "version.json");
+    if (!existsSync(manifest)) continue;
+    try {
+      const version = JSON.parse(readFileSync(manifest, "utf8"))?.cuda?.version;
+      if (typeof version === "string" && version.length > 0) return version;
+    } catch {
+      // Continue to another toolkit root when a manifest is incomplete.
+    }
+  }
+  return "unknown";
+}
+
+function vulkanSdkVersion() {
+  if (process.env.VULKAN_SDK_VERSION) return process.env.VULKAN_SDK_VERSION;
+  if (process.env.VULKAN_SDK) {
+    const version = basename(resolve(process.env.VULKAN_SDK));
+    if (/^\d+\.\d+\.\d+(?:\.\d+)?$/u.test(version)) return version;
+  }
+  return "unknown";
 }
 
 function cleanManagedStageFiles() {
@@ -97,9 +125,23 @@ function cleanManagedStageFiles() {
   for (const name of readdirSync(binaryDirectory)) {
     const managedEngine = name === "getnative-engine" || name === "getnative-engine.exe";
     const managedFfmpeg = managedFfmpegPatterns.some((pattern) => pattern.test(name));
+    const managedVulkan = managedVulkanPatterns.some((pattern) => pattern.test(name));
     const forbiddenSidecar = /^(?:ffmpeg|ffprobe)(?:\.exe)?$/iu.test(name);
-    if (managedEngine || managedFfmpeg || forbiddenSidecar) rmSync(join(binaryDirectory, name));
+    if (managedEngine || managedFfmpeg || managedVulkan || forbiddenSidecar) {
+      rmSync(join(binaryDirectory, name));
+    }
   }
+}
+
+function stagedVulkanRuntime() {
+  if (!vulkanEnabled) return [];
+  const name = process.platform === "win32" ? "vulkan-1.dll" : "libvulkan.so.1";
+  const runtime = join(stageDirectory, "bin", name);
+  if (!existsSync(runtime)) fail(`staged Vulkan loader was not found: ${runtime}`);
+  return [{
+    name,
+    sha256: createHash("sha256").update(readFileSync(runtime)).digest("hex"),
+  }];
 }
 
 function stageFfmpegRuntime() {
@@ -311,6 +353,7 @@ if (!skipTests) {
 cleanManagedStageFiles();
 run(cmake, ["--install", buildDirectory, "--prefix", stageDirectory], environment);
 const ffmpegRuntime = stageFfmpegRuntime();
+const vulkanRuntime = stagedVulkanRuntime();
 
 const executableName = process.platform === "win32" ? "getnative-engine.exe" : "getnative-engine";
 const stagedEngine = join(stageDirectory, "bin", executableName);
@@ -365,8 +408,15 @@ writeFileSync(
       cuda_minimum_architecture: cudaMinimumArchitecture,
       cuda_architectures: cudaArchitectures,
       cuda_ptx_architectures: cudaPtxArchitectures,
+      cuda_toolkit_version: cudaEnabled
+        ? cudaToolkitVersion()
+        : "not-applicable",
+      vulkan_sdk_version: vulkanEnabled
+        ? vulkanSdkVersion()
+        : "not-applicable",
       engine_sha256: sha256,
       ffmpeg_runtime: ffmpegRuntime,
+      vulkan_runtime: vulkanRuntime,
       ctest_passed: !skipTests,
     },
     null,
@@ -378,4 +428,7 @@ console.log(`staged_engine=${stagedEngine}`);
 console.log(`engine_sha256=${sha256}`);
 if (ffmpegRuntime.length > 0) {
   console.log(`ffmpeg_runtime=${ffmpegRuntime.map(({ name }) => name).join(",")}`);
+}
+if (vulkanRuntime.length > 0) {
+  console.log(`vulkan_runtime=${vulkanRuntime.map(({ name }) => name).join(",")}`);
 }

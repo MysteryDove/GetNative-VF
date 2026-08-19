@@ -88,6 +88,16 @@ to the restrictions in the included zlib license.
 Source: https://zlib.net/fossils/zlib-1.3.1.tar.gz
 SHA-256: 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23
 
+## Vulkan Loader
+
+CUDA/Vulkan release packages distribute the Khronos Vulkan Loader 1.4.357.0
+beside the engine so capability discovery works without a separately installed
+Vulkan SDK. GPU vendors still provide the installable client driver used by the
+loader. The loader is licensed under the Apache License 2.0; the complete
+license is packaged under `share/getnative/licenses/vulkan-loader/`.
+
+Source: https://github.com/KhronosGroup/Vulkan-Loader/tree/vulkan-sdk-1.4.357.0
+
 ## xxHash
 
 The engine vendors xxHash 0.8.3 for plan-store checksums and media-index

@@ -183,8 +183,9 @@ and complete CUDA target provenance into the package resources.
 
 ## Local Windows portable package
 
-On a machine that already has VS 2026, CUDA, the Vulkan SDK, Rust, pnpm,
-and the pinned FFmpeg 8.1.2 SDK under `.deps/ffmpeg-windows-x64`:
+On a machine that already has VS 2026, CUDA 13.3.1, Vulkan SDK 1.4.357.0,
+Rust, pnpm, and the pinned FFmpeg 8.1.2 SDK under
+`.deps/ffmpeg-windows-x64`:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/package-windows-portable.ps1
@@ -210,9 +211,16 @@ GitHub Actions has three validation and packaging layers:
   publishing a release.
 
 Release packages compile the consumer CUDA matrix (SM75/86/89/120) and the
-Vulkan compute backend. GitHub-hosted runners have no GPU, so device tests
-skip and the packaged engine still starts without an NVIDIA driver or Vulkan
-device. Hardware-runner gates remain the place for CUDA/Vulkan correctness
-and performance. The bundled media runtime contains only the pinned
+Vulkan compute backend with CUDA 13.3.1 and Vulkan SDK 1.4.357.0. These SDKs
+are build inputs and their compiler tools are not copied into the portable
+artifact. CUDA loads the NVIDIA Driver API at runtime; the Khronos Vulkan
+loader is packaged beside the engine and uses the target system's graphics
+driver. `build-provenance.json` records both SDK pins and the loader hash.
+The Package workflow builds the required Khronos components from the checked-in
+Linux and Windows SDK configuration specs under `.github/vulkan-sdk/`.
+GitHub-hosted runners have no GPU, so device tests skip and the packaged engine
+still starts without an NVIDIA driver or Vulkan device. Hardware-runner gates
+remain the place for CUDA/Vulkan correctness and performance. The bundled media
+runtime contains only the pinned
 `libavformat`, `libavcodec`, `libavutil`, and `libswscale` shared libraries;
 the command-line FFmpeg programs are test tools only.

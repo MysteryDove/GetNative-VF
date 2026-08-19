@@ -639,6 +639,25 @@ if(GETNATIVE_ENABLE_VULKAN)
         message(FATAL_ERROR
             "GETNATIVE_ENABLE_VULKAN requires glslc or glslangValidator")
     endif()
+    if(WIN32)
+        find_file(GETNATIVE_VULKAN_RUNTIME
+            NAMES vulkan-1.dll
+            HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+        set(GETNATIVE_VULKAN_RUNTIME_NAME vulkan-1.dll)
+    else()
+        find_file(GETNATIVE_VULKAN_RUNTIME
+            NAMES libvulkan.so.1
+            HINTS "$ENV{VULKAN_SDK}/lib" "$ENV{VULKAN_SDK}/lib64"
+            PATHS /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib)
+        set(GETNATIVE_VULKAN_RUNTIME_NAME libvulkan.so.1)
+    endif()
+    if(NOT GETNATIVE_VULKAN_RUNTIME)
+        message(FATAL_ERROR
+            "GETNATIVE_ENABLE_VULKAN requires a redistributable Vulkan loader runtime")
+    endif()
+    file(REAL_PATH "${GETNATIVE_VULKAN_RUNTIME}"
+         GETNATIVE_VULKAN_RUNTIME_REAL)
+    message(STATUS "GetNative Vulkan runtime: ${GETNATIVE_VULKAN_RUNTIME_REAL}")
     get_filename_component(GETNATIVE_VULKAN_SHADER_COMPILER_NAME
         "${GETNATIVE_VULKAN_SHADER_COMPILER}" NAME)
     if(GETNATIVE_VULKAN_SHADER_COMPILER_NAME MATCHES "^glslc(\\.exe)?$")
@@ -859,8 +878,17 @@ target_compile_features(getnative-engine PRIVATE cxx_std_23)
 getnative_enable_warnings(getnative-engine)
 
 install(TARGETS getnative-engine RUNTIME DESTINATION bin)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../LICENSE"
+        DESTINATION share/getnative RENAME LICENSE.txt)
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../THIRD_PARTY_NOTICES.md"
         DESTINATION share/getnative)
+if(GETNATIVE_ENABLE_VULKAN)
+    install(FILES "${GETNATIVE_VULKAN_RUNTIME_REAL}"
+            DESTINATION bin RENAME "${GETNATIVE_VULKAN_RUNTIME_NAME}")
+    install(FILES
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-loader/LICENSE.txt"
+            DESTINATION share/getnative/licenses/vulkan-loader)
+endif()
 
 if(BUILD_TESTING)
     add_executable(getnative_core_tests tests/core_test.cpp)
