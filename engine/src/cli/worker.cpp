@@ -2753,7 +2753,9 @@ private:
         const std::uint64_t target = std::min(job.frame_index.value_or(0U), last);
         if (job.target == "previous_keyframe") {
             for (auto iterator = index.frames.rbegin(); iterator != index.frames.rend(); ++iterator) {
-                if (iterator->key_frame && iterator->frame_index <= target) {
+                // Strictly before: when the current frame is itself a keyframe
+                // an inclusive bound would resolve to it and the seek no-ops.
+                if (iterator->key_frame && iterator->frame_index < target) {
                     return iterator->frame_index;
                 }
             }
@@ -2761,7 +2763,7 @@ private:
         }
         if (job.target == "next_keyframe") {
             for (const auto &frame : index.frames) {
-                if (frame.key_frame && frame.frame_index >= target) return frame.frame_index;
+                if (frame.key_frame && frame.frame_index > target) return frame.frame_index;
             }
             return last;
         }

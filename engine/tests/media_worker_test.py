@@ -166,6 +166,33 @@ def main():
         assert window["selected"]["frame_index"] == 119
         assert window["previous_keyframe"]["frame_index"] >= 96
 
+        # Keyframe stepping from a frame that is itself a keyframe must move
+        # (regression: inclusive bounds resolved the step back to the current
+        # frame, so the "next/previous keyframe" actions appeared dead).
+        anchor, _ = begin(
+            worker, "window-anchor", "media_frame_window", media, cache,
+            stream_index=indexed["stream_index"], target="frame", frame_index=24,
+            window_radius=1)
+        key = anchor["next_keyframe"]["frame_index"]
+        at_key, _ = begin(
+            worker, "window-at-key", "media_frame_window", media, cache,
+            stream_index=indexed["stream_index"], target="frame",
+            frame_index=key, window_radius=1)
+        assert at_key["selected"]["key_frame"] is True
+        prev_kf = at_key["previous_keyframe"]["frame_index"]
+        next_kf = at_key["next_keyframe"]["frame_index"]
+        assert prev_kf < key < next_kf
+        stepped_next, _ = begin(
+            worker, "window-step-next", "media_frame_window", media, cache,
+            stream_index=indexed["stream_index"], target="next_keyframe",
+            frame_index=key, window_radius=1)
+        assert stepped_next["selected"]["frame_index"] == next_kf
+        stepped_prev, _ = begin(
+            worker, "window-step-prev", "media_frame_window", media, cache,
+            stream_index=indexed["stream_index"], target="previous_keyframe",
+            frame_index=key, window_radius=1)
+        assert stepped_prev["selected"]["frame_index"] == prev_kf
+
         preview, _ = begin(
             worker, "preview", "media_preview_begin", media, cache,
             stream_index=indexed["stream_index"], frame_index=119,
