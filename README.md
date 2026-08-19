@@ -26,6 +26,10 @@ npm run tauri dev
 
 The dev command builds and stages the C++ engine before starting Tauri.
 
+Rust builds use `sccache` through the repository Cargo configuration. Install
+`sccache` 0.17 or newer and ensure it is on `PATH` before running Cargo or
+Tauri commands. Use `sccache --show-stats` to inspect local cache effectiveness.
+
 To build the engine and a runnable Linux Tauri test distribution:
 
 ```sh

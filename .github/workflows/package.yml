@@ -33,6 +33,8 @@ jobs:
     name: Linux x64 package
     needs: version
     runs-on: ubuntu-22.04
+    env:
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
       - name: Install build and bundle dependencies
@@ -87,6 +89,10 @@ jobs:
           cache: pnpm
           cache-dependency-path: app/pnpm-lock.yaml
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: v0.17.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: app/src-tauri
@@ -186,6 +192,8 @@ jobs:
     name: Windows x64 package
     needs: version
     runs-on: windows-2022
+    env:
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: ilammy/msvc-dev-cmd@v1
@@ -247,6 +255,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: v0.17.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: app/src-tauri
