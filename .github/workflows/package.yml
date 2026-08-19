@@ -44,10 +44,14 @@ jobs:
           libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
           libxdo-dev libssl-dev patchelf libfuse2 desktop-file-utils
           libvulkan1
+      - name: Resolve Vulkan SDK config path
+        id: vulkan-config
+        shell: bash
+        run: echo "path=$(realpath .github/vulkan-sdk/1.4.357.0-linux.json)" >> "$GITHUB_OUTPUT"
       - name: Install Vulkan SDK components
         uses: humbletim/setup-vulkan-sdk@v1.2.1
         with:
-          vulkan-config-file: .github/vulkan-sdk/1.4.357.0-linux.json
+          vulkan-config-file: ${{ steps.vulkan-config.outputs.path }}
           vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang, SPIRV-Tools
           vulkan-use-cache: true
       - name: Verify Vulkan SDK
@@ -225,10 +229,16 @@ jobs:
             throw "cuda.h was not found under CUDA_PATH=$env:CUDA_PATH"
           }
           & (Join-Path $env:CUDA_PATH "bin\nvcc.exe") --version
+      - name: Resolve Vulkan SDK config path
+        id: vulkan-config
+        shell: pwsh
+        run: |
+          $path = (Resolve-Path ".github/vulkan-sdk/1.4.357.0-windows.json").Path.Replace("\", "/")
+          "path=$path" >> $env:GITHUB_OUTPUT
       - name: Install Vulkan SDK components
         uses: humbletim/setup-vulkan-sdk@v1.2.1
         with:
-          vulkan-config-file: .github/vulkan-sdk/1.4.357.0-windows.json
+          vulkan-config-file: ${{ steps.vulkan-config.outputs.path }}
           vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang, SPIRV-Tools
           vulkan-use-cache: true
       - name: Verify Vulkan SDK
