@@ -1016,8 +1016,8 @@ std::filesystem::path default_plan_store_dir() {
 std::optional<std::filesystem::path> resolve_plan_store_dir() {
     const char *toggle = std::getenv("GETNATIVE_PLAN_CACHE");
     if (toggle != nullptr && std::string_view{toggle} == "off") return std::nullopt;
-    if (const char *explicit_dir = std::getenv("GETNATIVE_PLAN_CACHE_DIR")) {
-        if (*explicit_dir != '\0') return std::filesystem::path{explicit_dir};
+    if (const auto explicit_dir = path_from_environment("GETNATIVE_PLAN_CACHE_DIR")) {
+        if (!explicit_dir->empty()) return explicit_dir;
     }
     return default_plan_store_dir();
 }
@@ -1606,7 +1606,7 @@ public:
             {"type", JsonValue::string("hello_ok")},
             {"request_id", JsonValue::string(request_id)},
             {"timestamp_ms", JsonValue::integer(timestamp_ms())},
-            {"engine_version", JsonValue::string("0.2.0")},
+            {"engine_version", JsonValue::string("0.2.1")},
             {"commands", JsonValue::object({
                 {"analyze", JsonValue::boolean(true)},
                 {"cancel", JsonValue::boolean(true)},
@@ -2582,7 +2582,7 @@ private:
         if (!directory) return nullptr;
         try {
             plan_store_.emplace(*directory);
-            log_ << "worker: plan store at " << directory->string() << '\n';
+            log_ << "worker: plan store at " << path_to_utf8(*directory) << '\n';
         } catch (const std::exception &error) {
             log_ << "worker: plan store disabled: " << error.what() << '\n';
         }

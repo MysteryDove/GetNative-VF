@@ -9,10 +9,12 @@ import type {
   Sample,
   Source,
   VerificationReview,
+  VerificationFusion,
 } from "./types";
 import { profileFor } from "../engine/profiles";
 import { recipeReadiness } from "./recipe";
 import { migrateGeometrySnapshot } from "../engine/geometry";
+import { snakeCaseSnapshot } from "./verificationFusion";
 
 const projectRoutes: ProjectRoute[] = [
   "overview",
@@ -37,7 +39,7 @@ export function emptyProjectState(partial?: Partial<ProjectState["project"]>): P
     project: {
       id: partial?.id ?? "",
       name: partial?.name ?? "",
-      schemaVersion: partial?.schemaVersion ?? 1,
+      schemaVersion: partial?.schemaVersion ?? 2,
       createdAt: partial?.createdAt ?? "",
       updatedAt: partial?.updatedAt ?? "",
       activeRecipeId: partial?.activeRecipeId ?? null,
@@ -52,6 +54,7 @@ export function emptyProjectState(partial?: Partial<ProjectState["project"]>): P
     runGroupsById: {},
     runsById: {},
     verificationReviewsByRunId: {},
+    verificationFusionsById: {},
     uiStateByRoute: {},
   };
 }
@@ -169,6 +172,62 @@ export function openedToProjectState(opened: OpenedProjectDto): ProjectState {
     tags: review.tags ?? [],
   }));
 
+  const fusions: VerificationFusion[] = (manifest.verification_fusions ?? []).map((fusion) => ({
+    id: fusion.id,
+    createdAt: fusion.created_at,
+    sourceId: fusion.source_id,
+    sourceFingerprint: fusion.source_fingerprint,
+    sourcePath: fusion.source_path,
+    sourceLabel: fusion.source_label ?? null,
+    streamIndex: fusion.stream_index,
+    algorithm: {
+      name: fusion.algorithm.name,
+      version: fusion.algorithm.version,
+      tieBreak: fusion.algorithm.tie_break,
+    },
+    compatibilitySnapshot: {
+      metric: {
+        cropLeft: fusion.compatibility_snapshot.metric.crop_left,
+        cropRight: fusion.compatibility_snapshot.metric.crop_right,
+        cropTop: fusion.compatibility_snapshot.metric.crop_top,
+        cropBottom: fusion.compatibility_snapshot.metric.crop_bottom,
+        pixelExclusionThreshold: fusion.compatibility_snapshot.metric.pixel_exclusion_threshold,
+        pNorm: fusion.compatibility_snapshot.metric.p_norm,
+      },
+      axisMode: fusion.compatibility_snapshot.axis_mode,
+      profileId: fusion.compatibility_snapshot.profile_id,
+      mathMode: fusion.compatibility_snapshot.math_mode,
+    },
+    inputs: fusion.inputs.map((item) => ({
+      runId: item.run_id,
+      recipeId: item.recipe_id,
+      recipeRevision: item.recipe_revision,
+      recipeName: item.recipe_name,
+      recipeCreatedAt: item.recipe_created_at,
+      recipeSnapshot: item.recipe_snapshot,
+      scanScope: item.scan_scope,
+    })),
+    frames: fusion.frames.map((frame) => ({
+      frameIndex: frame.frame_index,
+      fusedError: frame.fused_error,
+      winnerRunId: frame.winner_run_id,
+      winnerRecipeId: frame.winner_recipe_id,
+      candidateCount: frame.candidate_count,
+      candidates: frame.candidates.map((candidate) => ({
+        runId: candidate.run_id,
+        recipeId: candidate.recipe_id,
+        error: candidate.error,
+      })),
+    })),
+    statistics: {
+      totalFrames: fusion.statistics.total_frames,
+      singleCandidateFrames: fusion.statistics.single_candidate_frames,
+      multiCandidateFrames: fusion.statistics.multi_candidate_frames,
+      tiedFrames: fusion.statistics.tied_frames,
+      winsByRecipe: fusion.statistics.wins_by_recipe,
+    },
+  }));
+
   const recipesById = indexById(recipes);
 
   return {
@@ -193,6 +252,7 @@ export function openedToProjectState(opened: OpenedProjectDto): ProjectState {
       acc[review.runId] = review;
       return acc;
     }, {}),
+    verificationFusionsById: indexById(fusions),
     uiStateByRoute: manifest.ui_state_by_route ?? {},
   };
 }
@@ -297,6 +357,61 @@ export function projectStateToManifest(state: ProjectState): ProjectManifestDto 
     verification_reviews: Object.values(state.verificationReviewsByRunId).map((review) => ({
       run_id: review.runId,
       tags: review.tags,
+    })),
+    verification_fusions: Object.values(state.verificationFusionsById).map((fusion) => ({
+      id: fusion.id,
+      created_at: fusion.createdAt,
+      source_id: fusion.sourceId,
+      source_fingerprint: fusion.sourceFingerprint,
+      source_path: fusion.sourcePath,
+      source_label: fusion.sourceLabel,
+      stream_index: fusion.streamIndex,
+      algorithm: {
+        name: fusion.algorithm.name,
+        version: fusion.algorithm.version,
+        tie_break: fusion.algorithm.tieBreak,
+      },
+      compatibility_snapshot: {
+        metric: {
+          crop_left: fusion.compatibilitySnapshot.metric.cropLeft,
+          crop_right: fusion.compatibilitySnapshot.metric.cropRight,
+          crop_top: fusion.compatibilitySnapshot.metric.cropTop,
+          crop_bottom: fusion.compatibilitySnapshot.metric.cropBottom,
+          pixel_exclusion_threshold: fusion.compatibilitySnapshot.metric.pixelExclusionThreshold,
+          p_norm: fusion.compatibilitySnapshot.metric.pNorm,
+        },
+        axis_mode: fusion.compatibilitySnapshot.axisMode,
+        profile_id: fusion.compatibilitySnapshot.profileId,
+        math_mode: fusion.compatibilitySnapshot.mathMode,
+      },
+      inputs: fusion.inputs.map((item) => ({
+        run_id: item.runId,
+        recipe_id: item.recipeId,
+        recipe_revision: item.recipeRevision,
+        recipe_name: item.recipeName,
+        recipe_created_at: item.recipeCreatedAt,
+        recipe_snapshot: snakeCaseSnapshot(item.recipeSnapshot),
+        scan_scope: snakeCaseSnapshot(item.scanScope),
+      })),
+      frames: fusion.frames.map((frame) => ({
+        frame_index: frame.frameIndex,
+        fused_error: frame.fusedError,
+        winner_run_id: frame.winnerRunId,
+        winner_recipe_id: frame.winnerRecipeId,
+        candidate_count: frame.candidateCount,
+        candidates: frame.candidates.map((candidate) => ({
+          run_id: candidate.runId,
+          recipe_id: candidate.recipeId,
+          error: candidate.error,
+        })),
+      })),
+      statistics: {
+        total_frames: fusion.statistics.totalFrames,
+        single_candidate_frames: fusion.statistics.singleCandidateFrames,
+        multi_candidate_frames: fusion.statistics.multiCandidateFrames,
+        tied_frames: fusion.statistics.tiedFrames,
+        wins_by_recipe: fusion.statistics.winsByRecipe,
+      },
     })),
     ui_state_by_route: state.uiStateByRoute,
   };

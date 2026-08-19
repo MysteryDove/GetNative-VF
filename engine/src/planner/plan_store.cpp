@@ -773,9 +773,9 @@ bool PlanStore::publish_grid(
         }
 
         // Atomic publish: write tmp in the same directory, then rename.
-        const std::filesystem::path tmp_path =
-            path.string() + ".tmp-" + std::to_string(
-                std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        std::filesystem::path tmp_path = path;
+        tmp_path += ".tmp-" + std::to_string(
+            std::hash<std::thread::id>{}(std::this_thread::get_id()));
         {
             std::ofstream output(tmp_path, std::ios::binary | std::ios::trunc);
             if (!output) return false;

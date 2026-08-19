@@ -145,6 +145,61 @@ export type VerificationReview = {
   tags: string[];
 };
 
+export type VerificationFusionCandidate = {
+  runId: string;
+  recipeId: string;
+  error: number;
+};
+
+export type VerificationFusionFrame = {
+  frameIndex: number;
+  fusedError: number;
+  winnerRunId: string;
+  winnerRecipeId: string;
+  candidateCount: number;
+  candidates: VerificationFusionCandidate[];
+};
+
+export type VerificationFusionInput = {
+  runId: string;
+  recipeId: string;
+  recipeRevision: number;
+  recipeName: string;
+  recipeCreatedAt: string | null;
+  recipeSnapshot: unknown;
+  scanScope: unknown;
+};
+
+export type VerificationFusion = {
+  id: string;
+  createdAt: string;
+  sourceId: string;
+  sourceFingerprint: string;
+  sourcePath: string;
+  sourceLabel: string | null;
+  streamIndex: number;
+  algorithm: {
+    name: "min_error_per_frame";
+    version: 1;
+    tieBreak: "recipe_created_at_asc";
+  };
+  compatibilitySnapshot: {
+    metric: MetricSpec;
+    axisMode: AxisMode;
+    profileId: string;
+    mathMode: MathMode;
+  };
+  inputs: VerificationFusionInput[];
+  frames: VerificationFusionFrame[];
+  statistics: {
+    totalFrames: number;
+    singleCandidateFrames: number;
+    multiCandidateFrames: number;
+    tiedFrames: number;
+    winsByRecipe: Record<string, number>;
+  };
+};
+
 export type ProjectMeta = {
   id: string;
   name: string;
@@ -166,10 +221,11 @@ export type ProjectState = {
   runGroupsById: Record<string, RunGroup>;
   runsById: Record<string, Run>;
   verificationReviewsByRunId: Record<string, VerificationReview>;
+  verificationFusionsById: Record<string, VerificationFusion>;
   uiStateByRoute: Record<string, unknown>;
 };
 
-/** Wire format for the schema-1 Project manifest (snake_case, language-neutral). */
+/** Wire format for the schema-2 Project manifest (snake_case, language-neutral). */
 export type ProjectManifestDto = {
   schema_version: number;
   id: string;
@@ -268,6 +324,57 @@ export type ProjectManifestDto = {
   verification_reviews: Array<{
     run_id: string;
     tags?: string[];
+  }>;
+  verification_fusions?: Array<{
+    id: string;
+    created_at: string;
+    source_id: string;
+    source_fingerprint: string;
+    source_path: string;
+    source_label?: string | null;
+    stream_index: number;
+    algorithm: {
+      name: "min_error_per_frame";
+      version: 1;
+      tie_break: "recipe_created_at_asc";
+    };
+    compatibility_snapshot: {
+      metric: {
+        crop_left: number;
+        crop_right: number;
+        crop_top: number;
+        crop_bottom: number;
+        pixel_exclusion_threshold: number;
+        p_norm: number;
+      };
+      axis_mode: AxisMode;
+      profile_id: string;
+      math_mode: MathMode;
+    };
+    inputs: Array<{
+      run_id: string;
+      recipe_id: string;
+      recipe_revision: number;
+      recipe_name: string;
+      recipe_created_at: string | null;
+      recipe_snapshot: unknown;
+      scan_scope: unknown;
+    }>;
+    frames: Array<{
+      frame_index: number;
+      fused_error: number;
+      winner_run_id: string;
+      winner_recipe_id: string;
+      candidate_count: number;
+      candidates: Array<{ run_id: string; recipe_id: string; error: number }>;
+    }>;
+    statistics: {
+      total_frames: number;
+      single_candidate_frames: number;
+      multi_candidate_frames: number;
+      tied_frames: number;
+      wins_by_recipe: Record<string, number>;
+    };
   }>;
   ui_state_by_route?: Record<string, unknown>;
 };

@@ -47,6 +47,7 @@ pub fn run() {
             project::project_discard_recovery,
             prefs::app_get_preferences,
             prefs::app_set_language,
+            prefs::app_set_theme,
             prefs::app_pick_axis_plan_cache_dir,
             prefs::app_set_axis_plan_cache_dir,
         ])

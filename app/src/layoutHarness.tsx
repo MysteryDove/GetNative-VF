@@ -20,7 +20,7 @@ const initialState: ProjectState = {
   project: {
     id: "project-1",
     name: "Layout reproduction",
-    schemaVersion: 1,
+    schemaVersion: 2,
     createdAt: "2026-08-18T00:00:00Z",
     updatedAt: "2026-08-18T00:00:00Z",
     activeRecipeId: "recipe-1",
@@ -127,6 +127,7 @@ const initialState: ProjectState = {
     },
   },
   verificationReviewsByRunId: {},
+  verificationFusionsById: {},
   uiStateByRoute: {},
 };
 
@@ -309,6 +310,8 @@ function Harness() {
       capabilities={capabilities}
       language="zh-CN"
       onLanguageChange={() => undefined}
+      themeMode="system"
+      onThemeChange={() => undefined}
       axisPlanCacheDir={null}
       onAxisPlanCacheDirChange={async () => undefined}
       onNavigate={setRoute}

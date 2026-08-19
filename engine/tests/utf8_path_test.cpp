@@ -44,6 +44,20 @@ int main() {
             require(value == "utf8-path", "failed to read Unicode path fixture");
         }
 
+#if defined(_WIN32)
+        require(::_wputenv_s(L"GETNATIVE_UTF8_PATH_TEST",
+                             L"\u5a92\u4f53-\u65e5\u672c\u8a9e-\ud55c\uae00") == 0,
+                "failed to set Unicode environment path fixture");
+#else
+        require(::setenv("GETNATIVE_UTF8_PATH_TEST", directory_name.c_str(), 1) == 0,
+                "failed to set Unicode environment path fixture");
+#endif
+        const auto environment_path =
+            getnative::path_from_environment("GETNATIVE_UTF8_PATH_TEST");
+        require(environment_path.has_value(), "failed to read environment path");
+        require(getnative::path_to_utf8(*environment_path) == directory_name,
+                "environment path did not preserve Unicode");
+
         std::error_code cleanup_error;
         std::filesystem::remove_all(root, cleanup_error);
         require(!cleanup_error, "failed to remove Unicode path fixture");

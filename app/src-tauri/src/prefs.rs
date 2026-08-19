@@ -12,12 +12,27 @@ pub enum AppLanguage {
     En,
 }
 
+/// Theme selection: `system` follows the OS appearance, the other two pin the
+/// UI regardless of the OS setting.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AppTheme {
+    #[serde(rename = "system")]
+    #[default]
+    System,
+    #[serde(rename = "light")]
+    Light,
+    #[serde(rename = "dark")]
+    Dark,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppPreferences {
     pub language: AppLanguage,
     #[serde(default)]
     pub axis_plan_cache_dir: Option<String>,
+    #[serde(default)]
+    pub theme: AppTheme,
 }
 
 impl Default for AppPreferences {
@@ -25,6 +40,7 @@ impl Default for AppPreferences {
         Self {
             language: AppLanguage::ZhCn,
             axis_plan_cache_dir: None,
+            theme: AppTheme::System,
         }
     }
 }
@@ -39,6 +55,12 @@ pub struct SetLanguageRequest {
 #[serde(rename_all = "camelCase")]
 pub struct SetAxisPlanCacheDirRequest {
     pub path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetThemeRequest {
+    pub theme: AppTheme,
 }
 
 fn preferences_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -89,6 +111,17 @@ pub fn app_set_language(
 }
 
 #[tauri::command]
+pub fn app_set_theme(
+    app: AppHandle,
+    request: SetThemeRequest,
+) -> Result<AppPreferences, String> {
+    let mut prefs = load_preferences(&app)?;
+    prefs.theme = request.theme;
+    save_preferences(&app, &prefs)?;
+    Ok(prefs)
+}
+
+#[tauri::command]
 pub fn app_pick_axis_plan_cache_dir() -> Result<Option<String>, String> {
     Ok(rfd::FileDialog::new()
         .pick_folder()
@@ -120,14 +153,28 @@ mod tests {
     }
 
     #[test]
+    fn default_theme_is_system() {
+        assert_eq!(AppPreferences::default().theme, AppTheme::System);
+    }
+
+    #[test]
     fn language_serde_uses_stable_codes() {
         let prefs = AppPreferences {
             language: AppLanguage::En,
             axis_plan_cache_dir: None,
+            theme: AppTheme::Dark,
         };
         let json = serde_json::to_string(&prefs).unwrap();
         assert!(json.contains("\"en\""));
+        assert!(json.contains("\"dark\""));
         let parsed: AppPreferences = serde_json::from_str(r#"{"language":"zh-CN"}"#).unwrap();
         assert_eq!(parsed.language, AppLanguage::ZhCn);
+    }
+
+    #[test]
+    fn theme_defaults_to_system_when_absent() {
+        // Preferences written before the theme field existed must still load.
+        let parsed: AppPreferences = serde_json::from_str(r#"{"language":"en"}"#).unwrap();
+        assert_eq!(parsed.theme, AppTheme::System);
     }
 }

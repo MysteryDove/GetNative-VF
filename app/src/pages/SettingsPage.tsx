@@ -2,17 +2,22 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Check, FolderOpen, RotateCcw } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Translator } from "../i18n";
+import type { ThemeMode } from "../utils/theme";
 
 export function SettingsPage({
   t,
   language,
   onLanguageChange,
+  themeMode,
+  onThemeChange,
   axisPlanCacheDir,
   onAxisPlanCacheDirChange,
 }: {
   t: Translator;
   language: "zh-CN" | "en";
   onLanguageChange: (locale: "zh-CN" | "en") => void;
+  themeMode: ThemeMode;
+  onThemeChange: (mode: ThemeMode) => void;
   axisPlanCacheDir: string | null;
   onAxisPlanCacheDirChange: (path: string | null) => Promise<void>;
 }) {
@@ -53,6 +58,20 @@ export function SettingsPage({
           </select>
         </label>
         <p className="help-copy">{t("settings.languageHelp")}</p>
+      </section>
+      <section className="page-section">
+        <label className="language-field block">
+          <span>{t("settings.themeLabel")}</span>
+          <select
+            value={themeMode}
+            onChange={(event) => onThemeChange(event.target.value as ThemeMode)}
+          >
+            <option value="system">{t("settings.themeSystem")}</option>
+            <option value="light">{t("settings.themeLight")}</option>
+            <option value="dark">{t("settings.themeDark")}</option>
+          </select>
+        </label>
+        <p className="help-copy">{t("settings.themeHelp")}</p>
       </section>
       <section className="page-section">
         <h3>{t("settings.cacheTitle")}</h3>

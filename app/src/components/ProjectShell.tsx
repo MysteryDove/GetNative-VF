@@ -16,6 +16,7 @@ import { SamplesPage } from "../pages/SamplesPage";
 import { ErrorNotice, type UiError } from "./ErrorNotice";
 import { runGroupProgress, type ExecutionState } from "../engine/runReducer";
 import type { ExecutionBridge } from "../engine/executeRunGroup";
+import type { ThemeMode } from "../utils/theme";
 import { actualBackendLabel } from "../engine/backendSelection";
 
 function formatRate(value: number | null | undefined): string {
@@ -38,6 +39,8 @@ export function ProjectShell({
   capabilities,
   language,
   onLanguageChange,
+  themeMode,
+  onThemeChange,
   axisPlanCacheDir,
   onAxisPlanCacheDirChange,
   onNavigate,
@@ -60,6 +63,8 @@ export function ProjectShell({
   capabilities: EngineEnvelope | null;
   language: "zh-CN" | "en";
   onLanguageChange: (locale: "zh-CN" | "en") => void;
+  themeMode: ThemeMode;
+  onThemeChange: (mode: ThemeMode) => void;
   axisPlanCacheDir: string | null;
   onAxisPlanCacheDirChange: (path: string | null) => Promise<void>;
   onNavigate: (route: ProjectRoute) => void;
@@ -223,6 +228,8 @@ export function ProjectShell({
                   t={t}
                   language={language}
                   onLanguageChange={onLanguageChange}
+                  themeMode={themeMode}
+                  onThemeChange={onThemeChange}
                   axisPlanCacheDir={axisPlanCacheDir}
                   onAxisPlanCacheDirChange={onAxisPlanCacheDirChange}
                 />

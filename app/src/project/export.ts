@@ -3,7 +3,8 @@ import { extractHeightSeries, metricCompatibilityKey } from "../engine/runGroupP
 import { extractKernelResultRows } from "../engine/kernelRunGroup";
 import { extractVerifyFrames } from "../engine/verifyPlan";
 import type { MetricSpec } from "../engine/protocol";
-import type { ProjectState, Run } from "./types";
+import type { ProjectState, Run, VerificationFusion } from "./types";
+import { snakeCaseSnapshot } from "./verificationFusion";
 
 /**
  * Structured export of stored Run data. JSON carries full provenance; CSV
@@ -124,6 +125,99 @@ export async function saveArtifact(input: {
       content: input.content,
     },
   });
+}
+
+export function buildVerificationFusionJson(fusion: VerificationFusion): string {
+  const payload = {
+    export_schema_version: 1,
+    kind: "getnative_verification_fusion",
+    fusion: {
+      id: fusion.id,
+      created_at: fusion.createdAt,
+      source_id: fusion.sourceId,
+      source_fingerprint: fusion.sourceFingerprint,
+      source_path: fusion.sourcePath,
+      source_label: fusion.sourceLabel,
+      stream_index: fusion.streamIndex,
+      algorithm: {
+        name: fusion.algorithm.name,
+        version: fusion.algorithm.version,
+        tie_break: fusion.algorithm.tieBreak,
+      },
+      compatibility_snapshot: {
+        metric: {
+          crop_left: fusion.compatibilitySnapshot.metric.cropLeft,
+          crop_right: fusion.compatibilitySnapshot.metric.cropRight,
+          crop_top: fusion.compatibilitySnapshot.metric.cropTop,
+          crop_bottom: fusion.compatibilitySnapshot.metric.cropBottom,
+          pixel_exclusion_threshold: fusion.compatibilitySnapshot.metric.pixelExclusionThreshold,
+          p_norm: fusion.compatibilitySnapshot.metric.pNorm,
+        },
+        axis_mode: fusion.compatibilitySnapshot.axisMode,
+        profile_id: fusion.compatibilitySnapshot.profileId,
+        math_mode: fusion.compatibilitySnapshot.mathMode,
+      },
+      inputs: fusion.inputs.map((input) => ({
+        run_id: input.runId,
+        recipe_id: input.recipeId,
+        recipe_revision: input.recipeRevision,
+        recipe_name: input.recipeName,
+        recipe_created_at: input.recipeCreatedAt,
+        recipe_snapshot: snakeCaseSnapshot(input.recipeSnapshot),
+        scan_scope: snakeCaseSnapshot(input.scanScope),
+      })),
+      frames: fusion.frames.map((frame) => ({
+        frame_index: frame.frameIndex,
+        fused_error: frame.fusedError,
+        winner_run_id: frame.winnerRunId,
+        winner_recipe_id: frame.winnerRecipeId,
+        candidate_count: frame.candidateCount,
+        candidates: frame.candidates.map((candidate) => ({
+          run_id: candidate.runId,
+          recipe_id: candidate.recipeId,
+          error: candidate.error,
+        })),
+      })),
+      statistics: {
+        total_frames: fusion.statistics.totalFrames,
+        single_candidate_frames: fusion.statistics.singleCandidateFrames,
+        multi_candidate_frames: fusion.statistics.multiCandidateFrames,
+        tied_frames: fusion.statistics.tiedFrames,
+        wins_by_recipe: fusion.statistics.winsByRecipe,
+      },
+    },
+  };
+  return JSON.stringify(payload, null, 2);
+}
+
+function csvCell(value: string | number | boolean | null): string {
+  const text = value == null ? "" : String(value);
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+export function buildVerificationFusionCsv(fusion: VerificationFusion): string {
+  const header = [
+    "fusion_id", "source_id", "frame_index", "fused_error", "winner_run_id", "winner_recipe_id",
+    "winner_recipe_name", "candidate_count", "candidate_run_id", "candidate_recipe_id",
+    "candidate_recipe_name", "candidate_error", "is_winner",
+  ];
+  const recipeNames = new Map(fusion.inputs.map((input) => [input.recipeId, input.recipeName]));
+  const rows = fusion.frames.flatMap((frame) => frame.candidates.map((candidate) => [
+    fusion.id,
+    fusion.sourceId,
+    frame.frameIndex,
+    frame.fusedError,
+    frame.winnerRunId,
+    frame.winnerRecipeId,
+    recipeNames.get(frame.winnerRecipeId) ?? "",
+    frame.candidateCount,
+    candidate.runId,
+    candidate.recipeId,
+    recipeNames.get(candidate.recipeId) ?? "",
+    candidate.error,
+    candidate.runId === frame.winnerRunId && candidate.recipeId === frame.winnerRecipeId && candidate.error === frame.fusedError,
+  ].map((value) => csvCell(value)).join(",")));
+  return [header.join(","), ...rows].join("\n") + "\n";
 }
 
 export { metricCompatibilityKey };

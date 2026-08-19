@@ -4,6 +4,7 @@
 
 #include "getnative/axis_plan.hpp"
 #include "getnative/plan_store.hpp"
+#include "getnative/utf8_path.hpp"
 
 #include "plan_serialize.hpp"
 
@@ -210,6 +211,23 @@ void test_pack_roundtrip() {
     check(equal, "pack-roundtrip-67-plans");
 }
 
+void test_pack_roundtrip_in_unicode_directory() {
+    ScratchDir scratch;
+    const std::string directory_name =
+        "\xe4\xb8\xad\xe6\x96\x87-\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e-\xed\x95\x9c\xea\xb8\x80";
+    const std::filesystem::path directory =
+        scratch.path / getnative::path_from_utf8(directory_name);
+    const auto requests = grid_requests(240, 200, 3, getnative::Filter::bilinear());
+    const auto plans = build_all(requests);
+    const std::uint64_t grid = getnative::PlanStore::grid_hash(requests);
+
+    getnative::PlanStore store(directory);
+    const bool published = store.publish_grid(grid, requests, plans);
+    const auto loaded = store.read_grid(grid);
+    check(published && loaded.has_value() && loaded->plans.size() == plans.size(),
+          "pack-roundtrip-unicode-directory");
+}
+
 void test_pack_gating() {
     ScratchDir scratch;
     const auto requests = grid_requests(240, 200, 4, getnative::Filter::bicubic(0.0, 0.5));
@@ -339,6 +357,7 @@ int main() {
     test_serialize_roundtrip();
     test_serialize_rejects_garbage();
     test_pack_roundtrip();
+    test_pack_roundtrip_in_unicode_directory();
     test_pack_gating();
     test_pack_eviction();
     test_lru_policy();

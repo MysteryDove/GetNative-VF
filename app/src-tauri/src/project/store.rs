@@ -459,6 +459,21 @@ mod tests {
     }
 
     #[test]
+    fn create_open_save_round_trip_in_unicode_directory() {
+        let root = temp_dir();
+        let dir = root.join("\u{4e2d}\u{6587}-\u{65e5}\u{672c}\u{8a9e}-\u{d55c}\u{ae00}");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("\u{9879}\u{76ee}-\u{5922}.getnative.json");
+
+        let opened = create_project_at_path(&path, "Unicode").unwrap();
+        let reopened = open_manifest_at_path(&path).unwrap();
+
+        assert_eq!(reopened.manifest.id, opened.manifest.id);
+        assert_eq!(reopened.storage_path.as_deref(), path.to_str());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn missing_media_does_not_block_open() {
         let dir = temp_dir();
         let path = dir.join("missing-media.getnative.json");
@@ -566,7 +581,7 @@ mod tests {
         let dir = temp_dir();
         let path = dir.join("future-readable.getnative.json");
         let mut value = serde_json::to_value(empty_manifest("Future", false)).unwrap();
-        value["schema_version"] = serde_json::json!(2);
+        value["schema_version"] = serde_json::json!(3);
         value["future_field"] = serde_json::json!(true);
         let original = serde_json::to_vec_pretty(&value).unwrap();
         fs::write(&path, &original).unwrap();
@@ -574,7 +589,7 @@ mod tests {
         let opened = open_manifest_at_path(&path).unwrap();
         assert!(opened.read_only);
         assert_eq!(opened.schema_status, "newer_read_only");
-        assert_eq!(opened.manifest.schema_version, 2);
+        assert_eq!(opened.manifest.schema_version, 3);
         assert_eq!(fs::read(&path).unwrap(), original);
         let _ = fs::remove_dir_all(dir);
     }

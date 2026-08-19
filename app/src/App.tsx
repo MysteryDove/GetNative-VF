@@ -23,6 +23,15 @@ import {
 import { applyTerminalEventToRun, type ExecutionBridge } from "./engine/executeRunGroup";
 import { applyOpenResult, createTauriProjectStorage } from "./project/storage";
 import { restoredProjectRoute } from "./project/normalize";
+import {
+  applyTheme,
+  isThemeMode,
+  resolveTheme,
+  storeThemeMode,
+  systemTheme,
+  type ResolvedTheme,
+  type ThemeMode,
+} from "./utils/theme";
 import type {
   ProjectRoute,
   ProjectCommandResult,
@@ -35,12 +44,15 @@ import "./App.css";
 type AppPreferences = {
   language: LocaleCode;
   axisPlanCacheDir: string | null;
+  theme?: ThemeMode;
 };
 
 const storage = createTauriProjectStorage();
 
 function App() {
   const [locale, setLocale] = useState<LocaleCode>(DEFAULT_LOCALE);
+  const [themeMode, setThemeMode] = useState<ThemeMode>("system");
+  const [systemResolved, setSystemResolved] = useState<ResolvedTheme>(() => systemTheme());
   const [axisPlanCacheDir, setAxisPlanCacheDir] = useState<string | null>(null);
   const [prefsReady, setPrefsReady] = useState(false);
   const [project, setProject] = useState<ProjectState | null>(null);
@@ -81,6 +93,10 @@ function App() {
         if (isLocaleCode(prefs.language)) {
           setLocale(prefs.language);
         }
+        if (isThemeMode(prefs.theme)) {
+          setThemeMode(prefs.theme);
+          storeThemeMode(prefs.theme);
+        }
         setAxisPlanCacheDir(prefs.axisPlanCacheDir ?? null);
       })
       .catch((error: unknown) => {
@@ -92,6 +108,24 @@ function App() {
       })
       .finally(() => setPrefsReady(true));
   }, []);
+
+  // Track the OS appearance while "system" mode can depend on it, then apply
+  // the resolved theme. The boot application skips the cross-fade; later
+  // changes (settings switch or OS toggle) animate.
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = () => setSystemResolved(media.matches ? "dark" : "light");
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, []);
+
+  const resolvedTheme = resolveTheme(themeMode, systemResolved);
+  const bootThemeApplied = useRef(false);
+  useEffect(() => {
+    const animate = bootThemeApplied.current;
+    bootThemeApplied.current = true;
+    applyTheme(resolvedTheme, animate);
+  }, [resolvedTheme]);
 
   // Worker session lifecycle: stream engine events into the Job Tray state,
   // and prefer the resident worker's capability envelope (analyze=true per the
@@ -220,6 +254,26 @@ function App() {
     } catch (error) {
       const uiError = {
         summary: createTranslator(next)("app.error.languageSave"),
+        detail: String(error),
+      };
+      if (project) {
+        setProjectError(uiError);
+      } else {
+        setHubError(uiError);
+      }
+    }
+  }
+
+  async function changeTheme(next: ThemeMode) {
+    setThemeMode(next);
+    storeThemeMode(next);
+    try {
+      await invoke<AppPreferences>("app_set_theme", {
+        request: { theme: next },
+      });
+    } catch (error) {
+      const uiError = {
+        summary: t("app.error.themeSave"),
         detail: String(error),
       };
       if (project) {
@@ -492,6 +546,8 @@ function App() {
       capabilities={capabilities}
       language={locale}
       onLanguageChange={changeLanguage}
+      themeMode={themeMode}
+      onThemeChange={(mode: ThemeMode) => void changeTheme(mode)}
       axisPlanCacheDir={axisPlanCacheDir}
       onAxisPlanCacheDirChange={changeAxisPlanCacheDir}
       onNavigate={handleNavigate}

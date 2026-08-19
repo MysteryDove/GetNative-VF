@@ -88,33 +88,61 @@ fn validate_reveal_path(path: &Path) -> Result<PathBuf, ManifestValidationError>
     Ok(path)
 }
 
+#[cfg(target_os = "windows")]
+fn explorer_select_argument(path: &Path) -> std::ffi::OsString {
+    let mut argument = std::ffi::OsString::from("/select,");
+    argument.push(path.as_os_str());
+    argument
+}
+
 fn reveal_project_path(path: &Path) -> Result<(), ManifestValidationError> {
     let path = validate_reveal_path(path)?;
 
-    #[cfg(target_os = "macos")]
-    let status = Command::new("/usr/bin/open").arg("-R").arg(&path).status();
-
     #[cfg(target_os = "windows")]
-    let status = Command::new("explorer.exe")
-        .arg(format!("/select,{}", path.display()))
-        .status();
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let status = Command::new("xdg-open")
-        .arg(path.parent().unwrap_or(Path::new("/")))
-        .status();
-
-    let status = status.map_err(|error| ManifestValidationError {
-        code: ManifestErrorCode::IoError,
-        message: format!("failed to show project in its folder: {error}"),
-    })?;
-    if !status.success() {
-        return Err(ManifestValidationError {
-            code: ManifestErrorCode::IoError,
-            message: format!("show project command exited with status {status}"),
-        });
+    {
+        // Explorer is a GUI broker and commonly exits with code 1 after handing
+        // the request to an existing process. Preserve the native UTF-16 path
+        // and consider a successful spawn to be a successful handoff.
+        Command::new("explorer.exe")
+            .arg(explorer_select_argument(&path))
+            .spawn()
+            .map_err(|error| ManifestValidationError {
+                code: ManifestErrorCode::IoError,
+                message: format!("failed to show project in its folder: {error}"),
+            })?;
+        return Ok(());
     }
-    Ok(())
+
+    #[cfg(unix)]
+    {
+        #[cfg(target_os = "macos")]
+        let status = Command::new("/usr/bin/open").arg("-R").arg(&path).status();
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let status = Command::new("xdg-open")
+            .arg(path.parent().unwrap_or(Path::new("/")))
+            .status();
+
+        let status = status.map_err(|error| ManifestValidationError {
+            code: ManifestErrorCode::IoError,
+            message: format!("failed to show project in its folder: {error}"),
+        })?;
+        if !status.success() {
+            return Err(ManifestValidationError {
+                code: ManifestErrorCode::IoError,
+                message: format!("show project command exited with status {status}"),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "windows", unix)))]
+    {
+        Err(ManifestValidationError {
+            code: ManifestErrorCode::IoError,
+            message: "show project is unsupported on this platform".to_owned(),
+        })
+    }
 }
 
 #[tauri::command]
@@ -358,5 +386,18 @@ mod tests {
         ));
         let error = validate_reveal_path(&missing).unwrap_err();
         assert_eq!(error.code, ManifestErrorCode::IoError);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn explorer_select_argument_preserves_unicode_project_path() {
+        use std::ffi::OsString;
+
+        let path = PathBuf::from(
+            "C:\\projects\\\u{4e2d}\u{6587}-\u{65e5}\u{672c}\u{8a9e}-\u{d55c}\u{ae00}\\demo.getnative.json",
+        );
+        let mut expected = OsString::from("/select,");
+        expected.push(&path);
+        assert_eq!(explorer_select_argument(&path), expected);
     }
 }

@@ -8,20 +8,19 @@ export type ErrorPlotDatum = {
   x: string;
   metric: number;
   color: string;
+  /** Optional emphasis for derived/aggregate series. */
+  lineWidth?: number;
   /** Series label shown in the marker tooltip, e.g. "8bit.png · Lanczos 3". */
   label?: string;
 };
 
 /*
- * Canvas cannot read CSS custom properties, so these literals duplicate the
- * App.css :root palette. Correspondence (keep in sync with App.css):
- *   AXIS_COLOR      #4a514d  ~ --border-strong family (single-use literal)
- *   GRID_COLOR      #232826  ~ --border-faint family (single-use literal)
- *   THRESHOLD_COLOR #c9a24b  ~ --warning family (muted amber, single-use)
- *   SELECTED_COLOR  #6ea8fe  ~ accent-blue, no CSS equivalent (canvas-only)
- *   DEFAULT_SERIES_COLOR / SERIES_PALETTE: categorical series hues, canvas-only.
+ * Theme-aware chrome (grid, axis, threshold, selection) is class-driven via
+ * CSS custom properties — see .plot-grid-line / .plot-axis-line /
+ * .plot-threshold-line / .plot-selected-line and the .is-selected / .is-best
+ * marker states in App.css. Only the categorical series palette stays in JS:
+ * those hues read on both the dark and the light plot surface.
  */
-const AXIS_COLOR = "#4a514d";
 
 /** Fallback series color when a datum carries no explicit color. */
 export const DEFAULT_SERIES_COLOR = "#3b82f6";
@@ -31,9 +30,7 @@ const SERIES_PALETTE = [DEFAULT_SERIES_COLOR, "#22c55e", "#f59e0b", "#a855f7", "
 
 export function plotSeriesColor(index: number): string {
   return SERIES_PALETTE[index % SERIES_PALETTE.length];
-}const GRID_COLOR = "#232826";
-const THRESHOLD_COLOR = "#c9a24b";
-const SELECTED_COLOR = "#6ea8fe";
+}
 
 const SUPERSCRIPTS: Record<string, string> = {
   "-": "⁻",
@@ -282,7 +279,7 @@ export function ErrorLinePlot({
                 x2={margin.left + innerWidth}
                 y1={yScale(tick)}
                 y2={yScale(tick)}
-                stroke={GRID_COLOR}
+                className="plot-grid-line"
                 strokeWidth={1}
               />
               <text className="error-plot-tick" x={margin.left - 8} y={yScale(tick) + 3} textAnchor="end">
@@ -298,7 +295,7 @@ export function ErrorLinePlot({
                 x2={xScale(tick)}
                 y1={margin.top + innerHeight}
                 y2={margin.top + innerHeight + 5}
-                stroke={AXIS_COLOR}
+                className="plot-axis-line"
                 strokeWidth={1}
               />
               <text
@@ -318,7 +315,7 @@ export function ErrorLinePlot({
             width={innerWidth}
             height={innerHeight}
             fill="none"
-            stroke={AXIS_COLOR}
+            className="plot-axis-line"
             strokeWidth={1}
           />
 
@@ -369,7 +366,7 @@ export function ErrorLinePlot({
                 x2={margin.left + innerWidth}
                 y1={thresholdY}
                 y2={thresholdY}
-                stroke={THRESHOLD_COLOR}
+                className="plot-threshold-line"
                 strokeWidth={1}
                 strokeDasharray="5 4"
               />
@@ -390,7 +387,7 @@ export function ErrorLinePlot({
               x2={selectedPixelX}
               y1={margin.top}
               y2={margin.top + innerHeight}
-              stroke={SELECTED_COLOR}
+              className="plot-selected-line"
               strokeWidth={1}
               strokeDasharray="3 3"
             />
@@ -412,7 +409,7 @@ export function ErrorLinePlot({
             const markerStride = Math.max(1, Math.ceil(points.length / MAX_MARKERS));
             return (
               <g key={runId}>
-                <path d={path} fill="none" stroke={color} strokeWidth={1.6} />
+                <path d={path} fill="none" stroke={color} strokeWidth={points[0]?.lineWidth ?? 1.6} />
                 {points.map((point, index) => {
                   const isBest = bestKey === point.key;
                   const isSelected = samePlotX(selectedX, point.x);
@@ -425,9 +422,9 @@ export function ErrorLinePlot({
                       cy={yScale(yValue(point.metric))}
                       r={isBest || isSelected ? 4.5 : isValley ? 5 : 3}
                       fill={isValley ? "none" : color}
-                      stroke={isSelected ? SELECTED_COLOR : isBest ? "#f0f4f2" : isValley ? color : "none"}
+                      stroke={isSelected || isBest ? undefined : isValley ? color : "none"}
                       strokeWidth={isBest || isSelected || isValley ? 1.6 : 0}
-                      className="error-plot-marker"
+                      className={`error-plot-marker${isSelected ? " is-selected" : isBest ? " is-best" : ""}`}
                       onClick={() => onSelect?.(point.x)}
                     >
                       <title>{`${point.label ? `${point.label} · ` : ""}${point.x}: ${point.metric.toExponential(3)}`}</title>

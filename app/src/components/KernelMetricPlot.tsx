@@ -307,9 +307,9 @@ export function KernelMetricPlot({
                       cy={y(point.metric)}
                       r={selected ? pointRadius + 1.5 : pointRadius}
                       fill={color}
-                      stroke={selected ? "#f0f4f2" : "none"}
+                      stroke={selected ? undefined : "none"}
                       strokeWidth={selected ? 1.6 : 0}
-                      className="kernel-metric-point"
+                      className={`kernel-metric-point${selected ? " is-selected" : ""}`}
                       onClick={() => onSelect?.(key)}
                     >
                       <title>{`${point.kernelLabel} / ${point.sampleLabel}: ${point.metric.toExponential(3)}`}</title>
