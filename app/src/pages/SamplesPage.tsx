@@ -27,11 +27,13 @@ export function SamplesPage({
   state,
   onProjectChange,
   onStartHeightAnalysis,
+  active = true,
 }: {
   t: Translator;
   state: ProjectState;
   onProjectChange: ProjectUpdater;
-  onStartHeightAnalysis?: () => void;
+  onStartHeightAnalysis?: (selectedIds?: string[]) => void;
+  active?: boolean;
 }) {
   const samples = useMemo(
     () => Object.values(state.samplesById).sort((a, b) => a.order - b.order),
@@ -78,7 +80,7 @@ export function SamplesPage({
     },
     [onProjectChange, state, t],
   );
-  const dropActive = useFileDrop((paths) => void handleDropPaths(paths));
+  const dropActive = useFileDrop((paths) => void handleDropPaths(paths), active);
 
   useEffect(() => {
     if (focusedId && state.samplesById[focusedId]) return;
@@ -92,7 +94,7 @@ export function SamplesPage({
       return null;
     });
     setPreviewError("");
-    if (!focusedSample || !focusedSource || focusedSource.state !== "ready") return;
+    if (!active || !focusedSample || !focusedSource || focusedSource.state !== "ready") return;
     if (focusedSourceChanged) {
       setPreviewError(t("samples.sourceChanged"));
       return;
@@ -131,7 +133,7 @@ export function SamplesPage({
     return () => {
       cancelled = true;
     };
-  }, [focusedSample, focusedSource, focusedSourceChanged, onProjectChange, t]);
+  }, [active, focusedSample, focusedSource, focusedSourceChanged, onProjectChange, t]);
 
   useEffect(
     () => () => {
@@ -212,6 +214,17 @@ export function SamplesPage({
     }
     return true;
   }).length;
+  const selectedReadyCount = samples.filter((sample) => {
+    if (!selectedIds.has(sample.id) || !sample.included) return false;
+    const source = state.sourcesById[sample.sourceId];
+    return Boolean(
+      source?.state === "ready" &&
+        (!sample.sourceFingerprint ||
+          !source.fingerprint ||
+          sample.sourceFingerprint === source.fingerprint),
+    );
+  }).length;
+  const analysisReady = selectedCount > 0 ? selectedReadyCount > 0 : includedReadyCount > 0;
 
   return (
     <div className={`page-panel samples-page ${dropActive ? "drop-active" : ""}`}>
@@ -224,8 +237,8 @@ export function SamplesPage({
           <button
             className="secondary-button primary-command"
             type="button"
-            disabled={includedReadyCount === 0}
-            onClick={onStartHeightAnalysis}
+            disabled={!analysisReady}
+            onClick={() => onStartHeightAnalysis(selectedCount > 0 ? [...selectedIds] : undefined)}
           >
             {t("samples.startHeightAnalysis")}
           </button>

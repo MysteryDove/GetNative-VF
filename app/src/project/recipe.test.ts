@@ -100,6 +100,19 @@ describe("recipe domain", () => {
     expect(invalidReadiness.missing).toContain("metric_invalid");
   });
 
+  it("blocks a Recipe whose migrated geometry needs review", () => {
+    const state = emptyProjectState({ id: "p1" });
+    const created = createRecipe(
+      state,
+      { ...fullPayload(), geometry: { ...geometry, needsReview: true } },
+      sequencedIds(),
+    );
+    if (!created.ok) throw new Error("setup");
+    const result = recipeReadiness(created.recipe);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.missing).toContain("geometry_review");
+  });
+
   it("activates any recipe as current and deactivates the pointer", () => {
     const state = emptyProjectState({ id: "p1" });
     const first = createRecipe(state, fullPayload(), sequencedIds());

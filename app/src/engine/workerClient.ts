@@ -26,6 +26,7 @@ import type {
   VerifyCoverage,
   WorkerEvent,
   EndpointRule,
+  GeometryWire,
 } from "./protocol";
 
 export type FrameAssetRef = {
@@ -55,6 +56,7 @@ export type HeightJobParams = {
   baseHeight?: string | null;
   baseWidth?: string | null;
   grid?: { start: string; stop: string; step: string };
+  geometry?: GeometryWire | null;
 };
 
 export type KernelJobParams = {
@@ -71,6 +73,7 @@ export type KernelJobParams = {
   endpointRule?: EndpointRule;
   baseHeight?: string | null;
   baseWidth?: string | null;
+  geometry?: GeometryWire | null;
 };
 
 export type VerifyMediaJobParams = {
@@ -89,6 +92,7 @@ export type VerifyMediaJobParams = {
   metric: HeightJobParams["metric"];
   backend?: "cpu" | "cuda" | "vulkan" | "auto";
   concurrency: number;
+  geometry?: GeometryWire | null;
 };
 
 export type WorkerHello = {
@@ -287,6 +291,7 @@ export class EngineWorkerClient {
       baseHeight: params.baseHeight ?? null,
       baseWidth: params.baseWidth ?? null,
       grid: params.grid,
+      geometry: params.geometry ?? null,
     }, onPrepared);
   }
 
@@ -304,6 +309,7 @@ export class EngineWorkerClient {
       endpointRule: params.endpointRule ?? "inclusive",
       baseHeight: params.baseHeight ?? null,
       baseWidth: params.baseWidth ?? null,
+      geometry: params.geometry ?? null,
     }, onPrepared);
   }
 
@@ -393,6 +399,7 @@ export class EngineWorkerClient {
           metric: params.metric,
           backend: params.backend ?? "auto",
           concurrency: params.concurrency,
+          geometry: params.geometry ?? null,
         },
       });
     } catch (error) {

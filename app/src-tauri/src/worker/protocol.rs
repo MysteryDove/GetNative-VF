@@ -60,6 +60,19 @@ pub struct CandidateGridCommand {
     pub step: String,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GeometryCommand {
+    pub width: u32,
+    pub height: u32,
+    pub src_left: f64,
+    pub src_top: f64,
+    pub src_width: f64,
+    pub src_height: f64,
+    pub base_width: Option<u32>,
+    pub base_height: Option<u32>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerAnalyzeRequest {
@@ -83,6 +96,7 @@ pub struct WorkerAnalyzeRequest {
     pub base_height: Option<String>,
     pub base_width: Option<String>,
     pub grid: Option<CandidateGridCommand>,
+    pub geometry: Option<GeometryCommand>,
 }
 
 fn validate_kernel_command(kernel: &KernelCommand) -> Result<(), String> {
@@ -118,6 +132,32 @@ fn validate_frame_geometry(width: u32, height: u32, label: &str) -> Result<(), S
         return Err(format!(
             "bad_request: {label} must be within 2..={MAX_FRAME_AXIS}"
         ));
+    }
+    Ok(())
+}
+
+fn validate_geometry(geometry: &GeometryCommand, label: &str) -> Result<(), String> {
+    validate_frame_geometry(geometry.width, geometry.height, label)?;
+    for (name, value) in [
+        ("srcLeft", geometry.src_left),
+        ("srcTop", geometry.src_top),
+        ("srcWidth", geometry.src_width),
+        ("srcHeight", geometry.src_height),
+    ] {
+        if !value.is_finite() || (name == "srcWidth" || name == "srcHeight") && value <= 0.0 {
+            return Err(format!("bad_request: geometry {name} must be finite and positive"));
+        }
+    }
+    if geometry.src_left < 0.0 || geometry.src_top < 0.0
+        || geometry.src_left + geometry.src_width > geometry.width as f64 + 1e-9
+        || geometry.src_top + geometry.src_height > geometry.height as f64 + 1e-9
+    {
+        return Err("bad_request: geometry source rectangle exceeds canvas".to_owned());
+    }
+    if geometry.base_width.is_some_and(|value| value == 0 || value > MAX_FRAME_AXIS)
+        || geometry.base_height.is_some_and(|value| value == 0 || value > MAX_FRAME_AXIS)
+    {
+        return Err("bad_request: geometry base dimensions must be within 1..=65536".to_owned());
     }
     Ok(())
 }
@@ -170,6 +210,9 @@ pub(crate) fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), Str
         ));
     }
     validate_frame_geometry(asset.width, asset.height, "frame asset dimensions")?;
+    if let Some(geometry) = request.geometry.as_ref() {
+        validate_geometry(geometry, "geometry canvas")?;
+    }
     if !matches!(request.axis_mode.as_str(), "h_only" | "w_only" | "h_plus_w") {
         return Err(format!("bad_request: unknown axisMode {}", request.axis_mode));
     }
@@ -351,6 +394,18 @@ pub(crate) fn analyze_command(request: &WorkerAnalyzeRequest) -> Result<Value, S
         "metric": metric_json(&request.metric),
         "backend": request.backend,
     });
+    if let Some(geometry) = &request.geometry {
+        command["geometry"] = json!({
+            "width": geometry.width,
+            "height": geometry.height,
+            "src_left": geometry.src_left,
+            "src_top": geometry.src_top,
+            "src_width": geometry.src_width,
+            "src_height": geometry.src_height,
+            "base_width": geometry.base_width,
+            "base_height": geometry.base_height,
+        });
+    }
     if request.mode == "kernel" {
         // Kernel mode: the single fixed axis value travels as `candidate`
         // and the ordered kernel list as `kernels` (engine protocol v1.1).
@@ -407,6 +462,7 @@ pub struct VerifyMediaBeginRequest {
     pub backend: String,
     #[serde(default = "default_media_verify_concurrency")]
     pub concurrency: u32,
+    pub geometry: Option<GeometryCommand>,
 }
 
 fn default_media_verify_concurrency() -> u32 {
@@ -418,6 +474,9 @@ pub(crate) fn validate_verify_media_begin(request: &VerifyMediaBeginRequest) -> 
         return Err("bad_request: requestId and path must not be empty".to_owned());
     }
     validate_frame_geometry(request.width, request.height, "verify geometry")?;
+    if let Some(geometry) = request.geometry.as_ref() {
+        validate_geometry(geometry, "verify geometry canvas")?;
+    }
     if !matches!(request.axis_mode.as_str(), "h_only" | "w_only" | "h_plus_w") {
         return Err(format!("bad_request: unknown axisMode {}", request.axis_mode));
     }
@@ -485,6 +544,16 @@ pub(crate) fn verify_media_begin_command(
         "metric": metric_json(&request.metric),
         "backend": request.backend,
         "concurrency": request.concurrency,
+        "resolved_geometry": request.geometry.as_ref().map(|geometry| json!({
+            "width": geometry.width,
+            "height": geometry.height,
+            "src_left": geometry.src_left,
+            "src_top": geometry.src_top,
+            "src_width": geometry.src_width,
+            "src_height": geometry.src_height,
+            "base_width": geometry.base_width,
+            "base_height": geometry.base_height,
+        })),
     })
 }
 

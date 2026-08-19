@@ -4,6 +4,7 @@ import { kernelParamsForWire, type ExecutionBridge } from "./executeRunGroup";
 import { isTerminalPhase } from "./runReducer";
 import type { ProjectState, Recipe, Run } from "../project/types";
 import type { VerifyCoverage, WorkerEvent } from "./protocol";
+import { geometryCandidate, geometryToWire } from "./geometry";
 
 export type VerifyFrameEntry = {
   seq: number;
@@ -179,13 +180,10 @@ async function runEngineMediaVerifyMember(
       everyN: member.scanScope.everyN ?? null,
       startFrame: member.scanScope.startFrame ?? null,
       endFrame: member.scanScope.endFrame ?? null,
-      axisMode: recipe.axisMode,
+      axisMode: member.request.axisMode,
       kernel: kernelParamsForWire(recipe.kernel!),
-      candidate: String(
-        recipe.axisMode === "w_only"
-          ? recipe.geometry!.canvasWidth
-          : recipe.geometry!.canvasHeight,
-      ),
+      candidate: String(geometryCandidate(member.request.geometry, member.request.axisMode)),
+      geometry: geometryToWire(member.request.geometry),
       metric: {
         cropLeft: recipe.metric!.cropLeft,
         cropRight: recipe.metric!.cropRight,

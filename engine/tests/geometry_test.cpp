@@ -88,6 +88,13 @@ void test_candidate_geometry_resolver() {
     expect_close(height.src_height, 837.25, "H-only keeps fractional active height");
     expect_close(height.src_top, 0.375, "H-only centers fractional active height");
 
+    const auto oversized_base = getnative::resolve_candidate_geometry(
+        1920, 1080, getnative::GeometryAxisMode::height_only, 843.8, 1081);
+    expect(oversized_base.height == 845,
+           "base height above source height remains a parity reference");
+    expect_close(oversized_base.src_height, 843.8,
+                 "oversized base does not replace the active height");
+
     const auto width = getnative::resolve_candidate_geometry(
         1920, 1080, getnative::GeometryAxisMode::width_only, 1488.5,
         std::nullopt, 1490);

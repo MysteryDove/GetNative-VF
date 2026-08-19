@@ -54,6 +54,10 @@ export type KernelRef = {
 
 export type GeometrySnapshot = {
   mode: "standard" | "pro";
+  /** Source shape this resolved geometry was measured against. */
+  sourceWidth?: number;
+  sourceHeight?: number;
+  /** Compatibility aliases. New code must use srcWidth/srcHeight. */
   activeWidth: number;
   activeHeight: number;
   canvasWidth: number;
@@ -65,6 +69,22 @@ export type GeometrySnapshot = {
   baseWidth?: number | null;
   baseHeight?: number | null;
   parity?: "even" | "odd" | null;
+  /** Historical geometry whose fractional meaning could not be proven. */
+  needsReview?: boolean;
+};
+
+export type BaseMode = "integer" | "even" | "odd";
+
+/** The complete geometry object sent over the worker wire. */
+export type GeometryWire = {
+  width: number;
+  height: number;
+  srcLeft: number;
+  srcTop: number;
+  srcWidth: number;
+  srcHeight: number;
+  baseWidth?: number | null;
+  baseHeight?: number | null;
 };
 
 /** One engine-valid Height computation: one Sample, one fixed kernel, many heights. */
@@ -83,13 +103,7 @@ export type HeightAnalyzeRequest = {
   heightGrid: CandidateGridSpec;
   widthGrid?: CandidateGridSpec | null;
   geometry?: GeometrySnapshot | null;
-  /**
-   * Fractional-scan context (engine worker v1.1): explicit base-canvas
-   * overrides as decimal strings. Choosing an odd base height/width is how
-   * the user explores base parity (the reverse-peak check). Engine v1 ignores
-   * these (fixed shift=0, floor canvas); the semantic contract carries them
-   * so v1.1 wiring needs no app-side reshaping.
-   */
+  /** Fractional-scan base-canvas overrides as decimal integer strings. */
   baseHeight?: string | null;
   baseWidth?: string | null;
   metric: MetricSpec;

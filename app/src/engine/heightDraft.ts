@@ -8,6 +8,7 @@ import type {
   MetricSpec,
   SearchPreset,
   EndpointRule,
+  BaseMode,
 } from "./protocol";
 import { buildCandidateGrid, workEstimate } from "./candidateGrid";
 import { profileFor, profilesFor } from "./profiles";
@@ -15,7 +16,6 @@ import { profileFor, profilesFor } from "./profiles";
 export const CUDA_MAXIMUM_P_NORM = 4;
 
 export type HeightDraft = {
-  subroute: "height" | "kernel";
   preset: SearchPreset;
   axisMode: AxisMode;
   start: string;
@@ -37,6 +37,8 @@ export type HeightDraft = {
   /** Optional base height for fractional geometry. */
   baseHeight: string;
   baseWidth: string;
+  baseHeightMode: BaseMode;
+  baseWidthMode: BaseMode;
 };
 
 export function defaultHeightDraft(capabilities: EngineEnvelope | null): HeightDraft {
@@ -67,7 +69,6 @@ export function heightDraftForProfile(
 ): HeightDraft {
   const profile = profileFor(profileId, capabilities);
   return {
-    subroute: "height",
     preset: "integer_coarse",
     axisMode: profile.default_axis_mode,
     start: profile.default_grid.start,
@@ -92,6 +93,8 @@ export function heightDraftForProfile(
     },
     baseHeight: "",
     baseWidth: "",
+    baseHeightMode: "integer",
+    baseWidthMode: "integer",
   };
 }
 
@@ -100,7 +103,7 @@ export function applyProfileDefaults(
   draft: HeightDraft,
   capabilities: EngineEnvelope | null,
 ): HeightDraft {
-  return { ...heightDraftForProfile(capabilities, draft.profileId), subroute: draft.subroute };
+  return heightDraftForProfile(capabilities, draft.profileId);
 }
 
 export function applyPreset(draft: HeightDraft, preset: SearchPreset): HeightDraft {
@@ -126,6 +129,17 @@ export function applyPreset(draft: HeightDraft, preset: SearchPreset): HeightDra
   return { ...draft, preset: "custom" };
 }
 
+/** The scanned axis must have an explicit base for decimal candidates to stay fractional. */
+export function missingFractionalBaseAxis(
+  draft: Pick<HeightDraft, "preset" | "axisMode" | "baseHeight" | "baseWidth" | "baseHeightMode" | "baseWidthMode">,
+): "height" | "width" | null {
+  if (draft.preset !== "fractional_refine") return null;
+  if (draft.axisMode === "w_only") {
+    return draft.baseWidthMode !== "integer" || draft.baseWidth.trim() ? null : "width";
+  }
+  return draft.baseHeightMode !== "integer" || draft.baseHeight.trim() ? null : "height";
+}
+
 export function resolveHeightGrid(
   draft: HeightDraft,
 ): { ok: true; grid: CandidateGridSpec } | { ok: false; reason: string } {
@@ -138,7 +152,7 @@ export function resolveHeightGrid(
     const start = (selected - half).toFixed(draft.step.includes(".") ? draft.step.split(".")[1].length : 1);
     const stop = (selected + half).toFixed(draft.step.includes(".") ? draft.step.split(".")[1].length : 1);
     return buildCandidateGrid({
-      axis: "height",
+      axis: draft.axisMode === "w_only" ? "width" : "height",
       start,
       stop,
       step: draft.step,
@@ -148,7 +162,7 @@ export function resolveHeightGrid(
     });
   }
   return buildCandidateGrid({
-    axis: "height",
+    axis: draft.axisMode === "w_only" ? "width" : "height",
     start: draft.start,
     stop: draft.stop,
     step: draft.step,

@@ -1,5 +1,5 @@
 import { Activity, Check, X } from "lucide-react";
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope, EngineState } from "../engine/types";
 import type { ProjectRoute, ProjectState } from "../project/types";
@@ -76,6 +76,17 @@ export function ProjectShell({
   const [navCollapsed, setNavCollapsed] = useState(
     () => localStorage.getItem("getnative.navCollapsed") === "1",
   );
+  // Analyze subroute lives in the shell: the nav sidebar switches between the
+  // resolution test and the algorithm test.
+  const [analyzeSubroute, setAnalyzeSubroute] = useState<"height" | "kernel">("height");
+  const navigateAnalyze = (subroute: "height" | "kernel") => {
+    setAnalyzeSubroute(subroute);
+    onNavigate("analyze");
+  };
+  const [pendingAnalyzeSampleIds, setPendingAnalyzeSampleIds] = useState<string[] | null>(null);
+  const consumeAnalyzeSampleSelection = useCallback(() => {
+    setPendingAnalyzeSampleIds(null);
+  }, []);
   const toggleNav = () => {
     setNavCollapsed((current) => {
       localStorage.setItem("getnative.navCollapsed", current ? "0" : "1");
@@ -139,13 +150,16 @@ export function ProjectShell({
           onToggleCollapse={toggleNav}
           onSettings={() => onNavigate("settings")}
           onDiagnostics={() => onNavigate("diagnostics")}
+          analyzeSubroute={analyzeSubroute}
+          onAnalyzeSubroute={navigateAnalyze}
         />
 
         <div className="project-content">
           <div className={`project-page-stack ${projectError ? "has-notice" : ""}`}>
             {projectError ? <ErrorNotice error={projectError} t={t} /> : null}
             <div className="project-page-host">
-              {route === "overview" && (
+              {/* Keep every page mounted so route changes preserve local selections and drafts. */}
+              <div hidden={route !== "overview"}>
                 <OverviewPage
                   t={t}
                   state={state}
@@ -153,31 +167,44 @@ export function ProjectShell({
                   onNavigate={onNavigate}
                   onProjectChange={onProjectChange}
                 />
-              )}
-              {route === "media" && (
-                <MediaPage t={t} state={state} onProjectChange={onProjectChange} />
-              )}
-              {route === "samples" && (
+              </div>
+              <div hidden={route !== "media"}>
+                <MediaPage
+                  t={t}
+                  state={state}
+                  active={route === "media"}
+                  onProjectChange={onProjectChange}
+                />
+              </div>
+              <div hidden={route !== "samples"}>
                 <SamplesPage
                   t={t}
                   state={state}
+                  active={route === "samples"}
                   onProjectChange={onProjectChange}
-                  onStartHeightAnalysis={() => onNavigate("analyze")}
+                  onStartHeightAnalysis={(selectedIds) => {
+                    setPendingAnalyzeSampleIds(selectedIds ?? null);
+                    setAnalyzeSubroute("height");
+                    onNavigate("analyze");
+                  }}
                 />
-              )}
-              {route === "analyze" && (
+              </div>
+              <div hidden={route !== "analyze"}>
                 <AnalyzePage
                   t={t}
                   state={state}
                   capabilities={capabilities}
                   analyzeAvailable={analyzeAvailable}
+                  subroute={analyzeSubroute}
+                  initialSampleIds={pendingAnalyzeSampleIds}
+                  onInitialSampleSelectionConsumed={consumeAnalyzeSampleSelection}
                   onOpenDiagnostics={() => onNavigate("diagnostics")}
                   onOpenSamples={() => onNavigate("samples")}
                   onProjectChange={onProjectChange}
                   executionBridge={executionBridge}
                 />
-              )}
-              {route === "verify" && (
+              </div>
+              <div hidden={route !== "verify"}>
                 <VerifyPage
                   t={t}
                   state={state}
@@ -187,11 +214,11 @@ export function ProjectShell({
                   onProjectChange={onProjectChange}
                   executionBridge={executionBridge}
                 />
-              )}
-              {route === "results" && (
+              </div>
+              <div hidden={route !== "results"}>
                 <ResultsPage t={t} state={state} onProjectChange={onProjectChange} />
-              )}
-              {route === "settings" && (
+              </div>
+              <div hidden={route !== "settings"}>
                 <SettingsPage
                   t={t}
                   language={language}
@@ -199,8 +226,8 @@ export function ProjectShell({
                   axisPlanCacheDir={axisPlanCacheDir}
                   onAxisPlanCacheDirChange={onAxisPlanCacheDirChange}
                 />
-              )}
-              {route === "diagnostics" && (
+              </div>
+              <div hidden={route !== "diagnostics"}>
                 <DiagnosticsPage
                   t={t}
                   engineState={engineState}
@@ -210,7 +237,7 @@ export function ProjectShell({
                   onEngineError={onEngineError}
                   onGeometrySuccess={onGeometrySuccess}
                 />
-              )}
+              </div>
             </div>
           </div>
 
@@ -235,8 +262,27 @@ export function ProjectShell({
                       </span>
                     ) : null}
                     {group.total > 0 ? (
-                      <span className="job-progress">
+                      <span className="job-progress-count">
                         {group.completed}/{group.total}
+                      </span>
+                    ) : null}
+                    {group.total > 0 || group.phase === "queued" || group.phase === "running" ? (
+                      <span
+                        className={`job-progress-track ${group.total > 0 ? "determinate" : "indeterminate"}`}
+                        role="progressbar"
+                        aria-label={t("jobs.progress")}
+                        aria-valuemin={0}
+                        aria-valuemax={group.total > 0 ? group.total : undefined}
+                        aria-valuenow={group.total > 0 ? Math.min(group.completed, group.total) : undefined}
+                      >
+                        <span
+                          className="job-progress-fill"
+                          style={
+                            group.total > 0
+                              ? { width: `${Math.min(100, Math.max(0, (group.completed / group.total) * 100))}%` }
+                              : undefined
+                          }
+                        />
                       </span>
                     ) : null}
                     {group.phase === "running" && group.fpsCurrent != null ? (

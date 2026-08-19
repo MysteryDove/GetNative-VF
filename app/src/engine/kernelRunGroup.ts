@@ -1,6 +1,5 @@
 import type { EngineEnvelope } from "./types";
-import type { KernelRef } from "./protocol";
-import { profileFor } from "./profiles";
+import type { AxisMode, KernelRef } from "./protocol";
 import { validateBackendPNorm } from "./heightDraft";
 import {
   geometryGroupKey,
@@ -38,6 +37,7 @@ export type KernelRunGroupPlan = {
     kernels: KernelRef[];
     metric: KernelDraft["metric"];
     profileId: string;
+    axisMode: AxisMode;
     sampleIds: string[];
     geometryKeys: string[];
   };
@@ -54,6 +54,7 @@ export function planKernelRunGroup(input: {
   sourcesById: Record<string, PlanSource>;
   geometries: ResolvedGeometryMap;
   capabilities: EngineEnvelope | null;
+  axisMode: AxisMode;
   nowMs?: number;
   requestIdPrefix?: string;
 }): { ok: true; plan: KernelRunGroupPlan } | { ok: false; reason: string } {
@@ -63,7 +64,7 @@ export function planKernelRunGroup(input: {
     input.capabilities,
     input.draft.backendPreference,
     input.draft.metric.pNorm,
-    profileFor(input.draft.profileId, input.capabilities).default_axis_mode,
+    input.axisMode,
   );
   if (!pNorm.ok) return pNorm;
 
@@ -116,7 +117,7 @@ export function planKernelRunGroup(input: {
       streamIndex: sample.streamIndex ?? null,
       frameIndex: sample.frameIndex ?? null,
       geometry,
-      axisMode: profileFor(input.draft.profileId, input.capabilities).default_axis_mode,
+      axisMode: input.axisMode,
       kernels: resolved.candidates.map((kernel) => ({
         id: kernel.id,
         parameters: { ...kernel.parameters },
@@ -154,6 +155,7 @@ export function planKernelRunGroup(input: {
         kernels: resolved.candidates,
         metric: { ...input.draft.metric },
         profileId: input.draft.profileId,
+        axisMode: input.axisMode,
         sampleIds: included.map((sample) => sample.id),
         geometryKeys: [...geometryKeys],
       },
@@ -207,6 +209,55 @@ export type KernelResultRow = {
   metric: number;
   sampleLabel: string;
 };
+
+const KERNEL_SORT_ORDER = new Map(
+  ["bilinear", "bicubic", "lanczos", "spline16", "spline36", "spline64"]
+    .map((id, index) => [id, index]),
+);
+
+function compareKernelParameterValue(a: unknown, b: unknown): number {
+  const aNumber = typeof a === "number" ? a : Number(a);
+  const bNumber = typeof b === "number" ? b : Number(b);
+  if (Number.isFinite(aNumber) && Number.isFinite(bNumber)) return aNumber - bNumber;
+  return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: "base" });
+}
+
+/** Canonical display order: kernel family, parameter name/value, sample, then Run. */
+export function compareKernelResultRows(a: KernelResultRow, b: KernelResultRow): number {
+  const aRank = KERNEL_SORT_ORDER.get(a.kernelId) ?? Number.MAX_SAFE_INTEGER;
+  const bRank = KERNEL_SORT_ORDER.get(b.kernelId) ?? Number.MAX_SAFE_INTEGER;
+  if (aRank !== bRank) return aRank - bRank;
+  const idOrder = a.kernelId.localeCompare(b.kernelId, undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+  if (idOrder !== 0) return idOrder;
+
+  const aParameters = Object.entries(a.parameters).sort(([aKey], [bKey]) =>
+    aKey.localeCompare(bKey, undefined, { numeric: true, sensitivity: "base" })
+  );
+  const bParameters = Object.entries(b.parameters).sort(([aKey], [bKey]) =>
+    aKey.localeCompare(bKey, undefined, { numeric: true, sensitivity: "base" })
+  );
+  for (let index = 0; index < Math.max(aParameters.length, bParameters.length); index += 1) {
+    const aEntry = aParameters[index];
+    const bEntry = bParameters[index];
+    if (!aEntry) return -1;
+    if (!bEntry) return 1;
+    const keyOrder = aEntry[0].localeCompare(bEntry[0], undefined, {
+      numeric: true,
+      sensitivity: "base",
+    });
+    if (keyOrder !== 0) return keyOrder;
+    const valueOrder = compareKernelParameterValue(aEntry[1], bEntry[1]);
+    if (valueOrder !== 0) return valueOrder;
+  }
+  const sampleOrder = a.sampleLabel.localeCompare(b.sampleLabel, undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+  return sampleOrder !== 0 ? sampleOrder : a.runId.localeCompare(b.runId);
+}
 
 /**
  * Flatten kernel runs into result-table rows, hiding runs whose snapshot

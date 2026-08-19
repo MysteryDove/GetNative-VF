@@ -1,4 +1,5 @@
 import { useMemo, useState, type ReactNode } from "react";
+import { ArrowDown, ArrowDownUp, ArrowUp } from "lucide-react";
 import type { Translator } from "../i18n";
 
 /** getnative convention: error <= 1e-6 means the candidate perfectly descales. */
@@ -75,6 +76,8 @@ export function ResultMetricTable({
               role="columnheader"
               className={`result-table-sort ${metricSort !== "none" ? "active" : ""}`}
               title={t("analyze.sortByMetric")}
+              aria-label={t("analyze.sortByMetric")}
+              aria-sort={metricSort === "none" ? "none" : metricSort === "asc" ? "ascending" : "descending"}
               onClick={() =>
                 setMetricSort((current) =>
                   current === "none" ? "asc" : current === "asc" ? "desc" : "none",
@@ -82,7 +85,9 @@ export function ResultMetricTable({
               }
             >
               {label}
-              {metricSort === "asc" ? " ▲" : metricSort === "desc" ? " ▼" : ""}
+              <span className="result-table-sort-icon" aria-hidden="true">
+                {metricSort === "asc" ? <ArrowUp size={13} /> : metricSort === "desc" ? <ArrowDown size={13} /> : <ArrowDownUp size={13} />}
+              </span>
             </button>
           ) : (
             <span key={index} role="columnheader">

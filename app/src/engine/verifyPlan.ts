@@ -2,6 +2,7 @@ import type { BackendPreference, ScanScope, VerifyRequest } from "./protocol";
 import { validateVerifyShape } from "./shapeGuards";
 import { recipeReadiness } from "../project/recipe";
 import type { ProjectState, Recipe, Run, RunGroup, Source } from "../project/types";
+import { geometryForSource } from "./geometry";
 
 /**
  * Whole-video Verification (全视频检查) setup. One member VerificationRun per
@@ -151,6 +152,7 @@ export function planVerifyRunGroup(input: {
   for (const [index, source] of selected.entries()) {
     if (source.kind !== "video") return { ok: false, reason: "source_not_video" };
     if (source.state !== "ready") return { ok: false, reason: "source_unavailable" };
+    if (!source.width || !source.height) return { ok: false, reason: "source_dims_missing" };
     const streamIndex = source.selectedStreamIndex ?? 0;
     const scope = resolveScanScope(input.draft, streamIndex);
     if (!scope.ok) return scope;
@@ -163,7 +165,12 @@ export function planVerifyRunGroup(input: {
       sourceFingerprint: source.fingerprint ?? null,
       recipeId: input.recipe.id,
       recipeRevision: input.recipe.revision,
-      geometry: recipeGeometry,
+      geometry: geometryForSource(
+        recipeGeometry,
+        input.recipe.axisMode,
+        source.width,
+        source.height,
+      ),
       kernel: recipeKernel,
       metric: recipeMetric,
       axisMode: input.recipe.axisMode,

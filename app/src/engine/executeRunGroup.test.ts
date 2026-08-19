@@ -381,7 +381,7 @@ describe("applyTerminalEventToRun", () => {
 });
 
 describe("startKernelRunGroup", () => {
-  it("submits fixed-geometry ordered kernel lists and binds runs", async () => {
+  it("submits a fractional H-only Recipe without restoring the profile's H+W axis", async () => {
     const { startKernelRunGroup } = await import("./executeRunGroup");
     const { planKernelRunGroup } = await import("./kernelRunGroup");
     const { defaultKernelDraft } = await import("./kernelDraft");
@@ -394,12 +394,16 @@ describe("startKernelRunGroup", () => {
       { id: "bilinear", parameters: {} },
       { id: "bicubic", parameters: { b: 0, c: 0.5 } },
     ];
+    // Base is a parity reference, so it may exceed the source axis length.
+    draft.baseHeight = "1081";
     const geometry = {
-      mode: "standard" as const,
-      activeWidth: 1920, activeHeight: 1080,
-      canvasWidth: 1280, canvasHeight: 720,
-      srcLeft: 0, srcTop: 0, srcWidth: 1920, srcHeight: 1080,
-      baseWidth: null, baseHeight: 720, parity: null,
+      mode: "pro" as const,
+      sourceWidth: 1920, sourceHeight: 1080,
+      activeWidth: 1920, activeHeight: 843.8,
+      canvasWidth: 1920, canvasHeight: 845,
+      srcLeft: 0, srcTop: 0.6000000000000227,
+      srcWidth: 1920, srcHeight: 843.8,
+      baseWidth: null, baseHeight: 1081, parity: null,
     };
     const key = geometryGroupKeyForTest(draft);
     const planned = planKernelRunGroup({
@@ -408,6 +412,7 @@ describe("startKernelRunGroup", () => {
       sourcesById: sources,
       geometries: { [key]: geometry },
       capabilities: null,
+      axisMode: "h_only",
       nowMs: 1,
       requestIdPrefix: "t",
     });
@@ -439,7 +444,20 @@ describe("startKernelRunGroup", () => {
 
     expect(result.ok).toBe(true);
     expect(submissions).toHaveLength(1);
-    expect(submissions[0]?.candidate).toBe("720");
+    expect(submissions[0]?.axisMode).toBe("h_only");
+    expect(submissions[0]?.candidate).toBe("843.8");
+    expect(submissions[0]?.baseHeight).toBe("1081");
+    expect(submissions[0]?.baseWidth).toBeNull();
+    expect(submissions[0]?.geometry).toEqual({
+      width: 1920,
+      height: 845,
+      srcLeft: 0,
+      srcTop: 0.6000000000000227,
+      srcWidth: 1920,
+      srcHeight: 843.8,
+      baseWidth: null,
+      baseHeight: 1081,
+    });
     expect(submissions[0]?.kernels).toEqual([
       { id: "bilinear" },
       { id: "bicubic", b: 0, c: 0.5 },

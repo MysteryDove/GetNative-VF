@@ -28,10 +28,13 @@ export function useHeightDraft({
   capabilities,
   includedSamples,
   sourcesById,
+  subroute,
 }: {
   capabilities: EngineEnvelope | null;
   includedSamples: Sample[];
   sourcesById: ProjectState["sourcesById"];
+  /** Owned by the shell nav; only gates plan building (height subroute only). */
+  subroute: "height" | "kernel";
 }) {
   const [draft, setDraft] = useState<HeightDraft>(() => defaultHeightDraft(capabilities));
   const [draftSeeded, setDraftSeeded] = useState(Boolean(capabilities));
@@ -61,14 +64,14 @@ export function useHeightDraft({
   const pNormMaximum = pNormMaximumForBackend(capabilities, resolvedBackend);
 
   const planResult = useMemo(() => {
-    if (draft.subroute !== "height") return null;
+    if (subroute !== "height") return null;
     return planHeightRunGroup({
       draft,
       samples: includedSamples,
       sourcesById,
       capabilities,
     });
-  }, [draft, includedSamples, sourcesById, capabilities]);
+  }, [draft, includedSamples, sourcesById, capabilities, subroute]);
 
   const plan: HeightRunGroupPlan | null = planResult?.ok ? planResult.plan : null;
 

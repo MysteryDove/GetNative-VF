@@ -115,6 +115,7 @@ export function recipeReadiness(recipe: Recipe): RecipeReadiness {
   const missing: string[] = [];
   if (!recipe.name.trim()) missing.push("name");
   if (!recipe.geometry) missing.push("geometry");
+  else if (recipe.geometry.needsReview) missing.push("geometry_review");
   if (!recipe.kernel?.id) missing.push("kernel");
   if (!recipe.metric) {
     missing.push("metric");

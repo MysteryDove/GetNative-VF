@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Run } from "../project/types";
-import { runActualBackend, runDecodeProvenance } from "./ResultsPage";
+import { runActualBackend, runDecodeProvenance, sourceFilterLabel } from "./ResultsPage";
+import type { ProjectState } from "../project/types";
 
 function runWithTelemetry(telemetry: Record<string, unknown>): Run {
   return { result: { telemetry } } as Run;
@@ -51,5 +52,33 @@ describe("runDecodeProvenance", () => {
 
   it("keeps legacy results compatible", () => {
     expect(runDecodeProvenance({ result: { telemetry: {} } } as Run)).toBeNull();
+  });
+});
+
+describe("sourceFilterLabel", () => {
+  it("uses the source label or filename and adds a short fingerprint", () => {
+    const state = {
+      sourcesById: {
+        first: { id: "first", path: "C:/media/SourceA.mkv", label: "SourceA", fingerprint: "123456789", videoStreams: [] },
+        second: { id: "second", path: "C:/media/123.png", fingerprint: null, videoStreams: [] },
+      },
+    } as unknown as ProjectState;
+    expect(sourceFilterLabel("first", state)).toBe("SourceA (#123456)");
+    expect(sourceFilterLabel("second", state)).toBe("123.png");
+    expect(sourceFilterLabel("missing", state)).toBe("missing");
+  });
+
+  it("omits the quick fingerprint algorithm prefix", () => {
+    const state = {
+      sourcesById: {
+        source: {
+          id: "source",
+          path: "C:/media/00001.m2ts",
+          fingerprint: "quick-sha256-v1:abcdef123456",
+          videoStreams: [],
+        },
+      },
+    } as unknown as ProjectState;
+    expect(sourceFilterLabel("source", state)).toBe("00001.m2ts (#abcdef)");
   });
 });

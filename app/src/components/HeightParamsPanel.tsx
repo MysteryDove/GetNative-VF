@@ -2,8 +2,12 @@ import { RotateCcw, SlidersHorizontal } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
 import { kernelDisplayName, profileDisplayName } from "../engine/displayNames";
-import { kernelSignature, type HeightDraft } from "../engine/heightDraft";
-import type { KernelRef, SearchPreset } from "../engine/protocol";
+import {
+  kernelSignature,
+  missingFractionalBaseAxis,
+  type HeightDraft,
+} from "../engine/heightDraft";
+import type { BaseMode, KernelRef, SearchPreset } from "../engine/protocol";
 import { backendOptionLabel } from "../engine/backendSelection";
 import { MetricEditor } from "./MetricEditor";
 import { RunLaunchButton } from "./RunLaunchButton";
@@ -45,6 +49,36 @@ export function HeightParamsPanel({
 }) {
   const kernelOptions = capabilities?.payload.kernels ?? [];
   const profileOptions = capabilities?.payload.profiles ?? [];
+  const missingBaseAxis = missingFractionalBaseAxis(draft);
+  const baseModes: BaseMode[] = ["integer", "odd", "even"];
+  const baseModeField = (axis: "height" | "width") => axis === "height" ? "baseHeightMode" : "baseWidthMode";
+  const baseValueField = (axis: "height" | "width") => axis === "height" ? "baseHeight" : "baseWidth";
+  const renderBaseMode = (axis: "height" | "width") => {
+    const mode = axis === "height" ? draft.baseHeightMode : draft.baseWidthMode;
+    const label = axis === "height" ? t("analyze.baseHeight") : t("analyze.baseWidth");
+    return (
+      <div className="block" key={axis}>
+        <span>{label}</span>
+        <div className="button-radio base-mode-radio" role="radiogroup" aria-label={label}>
+          {baseModes.map((item) => (
+            <button
+              key={item}
+              type="button"
+              role="radio"
+              aria-checked={mode === item}
+              className={mode === item ? "active" : ""}
+              onClick={() => onPatch({
+                [baseModeField(axis)]: item,
+                [baseValueField(axis)]: "",
+              })}
+            >
+              {t(`analyze.baseMode.${item}`)}
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  };
 
   return (
     <aside className="analyze-params pane">
@@ -170,23 +204,16 @@ export function HeightParamsPanel({
         </select>
       </label>
 
-      <label className="block">
-        <span>{t("analyze.baseHeight")}</span>
-        <input
-          value={draft.baseHeight}
-          onChange={(event) => onPatch({ baseHeight: event.target.value })}
-          placeholder={t("analyze.optional")}
-        />
-      </label>
-      <label className="block">
-        <span>{t("analyze.baseWidth")}</span>
-        <input
-          value={draft.baseWidth}
-          onChange={(event) => onPatch({ baseWidth: event.target.value })}
-          placeholder={t("analyze.optional")}
-        />
-      </label>
+      {draft.axisMode !== "w_only" ? renderBaseMode("height") : null}
+      {draft.axisMode !== "h_only" ? renderBaseMode("width") : null}
       <p className="help-copy">{t("analyze.baseParityHint")}</p>
+      {missingBaseAxis ? (
+        <p className="help-copy warning-copy" role="alert">
+          {t("analyze.fractionalBaseRequired", {
+            base: t(missingBaseAxis === "width" ? "analyze.baseWidth" : "analyze.baseHeight"),
+          })}
+        </p>
+      ) : null}
 
       <label className="block">
         <span>{t("analyze.fixedKernel")}</span>
@@ -247,15 +274,9 @@ export function HeightParamsPanel({
           <span>{t("analyze.lanczosTaps")}</span>
           <input
             type="number"
-            min={1}
-            max={15}
-            step={1}
-            value={String(draft.kernelParameters.taps ?? 3)}
-            onChange={(event) =>
-              onPatch({
-                kernelParameters: { ...draft.kernelParameters, taps: event.target.value },
-              })
-            }
+            value="3"
+            readOnly
+            aria-readonly="true"
           />
         </label>
       ) : null}
@@ -267,16 +288,19 @@ export function HeightParamsPanel({
             {kernelOptions
               .filter((kernel) => kernel.id !== draft.kernelId)
               .flatMap((kernel) => {
-                // Kernels with a taps parameter (lanczos) are offered per-taps.
-                const variants: Array<number | null> =
-                  "taps" in kernel.parameters ? [2, 3, 4, 5, 6] : [null];
+                // Capability parameters describe a family, not a runnable
+                // candidate. Generate the required explicit parameters here.
+                const variants: Array<number | null> = kernel.id === "lanczos" ? [3] : [null];
                 return variants.map((taps) => {
+                  let parameters: KernelRef["parameters"] = {};
+                  if (kernel.id === "lanczos" && taps != null) {
+                    parameters = { taps };
+                  } else if (kernel.id === "bicubic") {
+                    parameters = { b: 0, c: 0.5 };
+                  }
                   const candidate: KernelRef = {
                     id: kernel.id,
-                    parameters:
-                      taps != null
-                        ? { ...kernel.parameters, taps }
-                        : { ...kernel.parameters },
+                    parameters,
                   };
                   const signature = kernelSignature(candidate);
                   const checked = draft.compareKernels.some(

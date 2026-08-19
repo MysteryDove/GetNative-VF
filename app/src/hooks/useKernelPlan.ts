@@ -8,13 +8,21 @@ import {
   type KernelDraft,
   type ResolvedGeometryMap,
 } from "../engine/kernelDraft";
-import { buildKernelResultRows, planKernelRunGroup } from "../engine/kernelRunGroup";
+import {
+  buildKernelResultRows,
+  compareKernelResultRows,
+  planKernelRunGroup,
+} from "../engine/kernelRunGroup";
 import { metricCompatibilityKey } from "../engine/runGroupPlan";
 import { profileFor } from "../engine/profiles";
 import { resolveBackendPreference, validateBackendPNorm } from "../engine/heightDraft";
+import { geometryForSource } from "../engine/geometry";
 import { pNormMaximumForBackend } from "../engine/backendSelection";
 import { activeRecipe } from "../project/recipe";
-import { includedSamples as selectIncludedSamples } from "../project/samples";
+import {
+  includedSamples as selectIncludedSamples,
+  resultSampleIsVisible,
+} from "../project/samples";
 import type { ProjectState } from "../project/types";
 
 export type SampleDims = { width: number; height: number };
@@ -35,6 +43,7 @@ export function useKernelPlan({
   excludedSampleIds,
   selectedResultKey,
   sampleFilter,
+  showExcludedResults,
   onSelectResultKey,
 }: {
   state: ProjectState;
@@ -49,6 +58,7 @@ export function useKernelPlan({
   selectedResultKey: string | null;
   /** Result table sample switch: null = all samples. */
   sampleFilter: string | null;
+  showExcludedResults: boolean;
   onSelectResultKey: (updater: (current: string | null) => string | null) => void;
 }) {
   // MetricSpec inherits from Height by default; an explicit unlink is visible.
@@ -97,12 +107,14 @@ export function useKernelPlan({
   const currentRecipe = activeRecipe(state);
   const recipeGeometry = currentRecipe?.geometry ?? null;
   const recipeProfileId = currentRecipe?.profileId ?? null;
+  const kernelAxisMode = currentRecipe?.axisMode ??
+    profileFor(draft.profileId, capabilities).default_axis_mode;
 
   // Mirror the Recipe geometry's base size (and profile) into the draft so
   // per-source-shape group keys line up with the plan's key derivation.
   useEffect(() => {
     if (!recipeGeometry) return;
-    const baseHeight = String(recipeGeometry.baseHeight);
+    const baseHeight = recipeGeometry.baseHeight != null ? String(recipeGeometry.baseHeight) : "";
     const baseWidth =
       recipeGeometry.baseWidth != null ? String(recipeGeometry.baseWidth) : "";
     if (
@@ -138,11 +150,16 @@ export function useKernelPlan({
     return [...groups.values()];
   }, [includedSamples, sampleDims, draft.baseHeight, draft.baseWidth, draft.profileId]);
 
-  /** Every source shape resolves to the same Recipe geometry. */
+  /** Resolve the locked src/base semantics independently for every source shape. */
   const geometries = useMemo<ResolvedGeometryMap>(() => {
     if (!recipeGeometry) return {};
-    return Object.fromEntries(geometryGroups.map((group) => [group.key, recipeGeometry]));
-  }, [geometryGroups, recipeGeometry]);
+    return Object.fromEntries(
+      geometryGroups.map((group) => [
+        group.key,
+        geometryForSource(recipeGeometry, currentRecipe?.axisMode ?? "h_plus_w", group.dims.width, group.dims.height),
+      ]),
+    );
+  }, [geometryGroups, recipeGeometry, currentRecipe?.axisMode]);
 
   const candidates = useMemo(
     () => resolveKernelCandidates(draft, capabilities),
@@ -156,11 +173,11 @@ export function useKernelPlan({
       sourcesById: state.sourcesById,
       geometries,
       capabilities,
+      axisMode: kernelAxisMode,
     });
     return result.ok ? result.plan : null;
-  }, [draft, testSamples, state.sourcesById, geometries, capabilities]);
+  }, [draft, testSamples, state.sourcesById, geometries, capabilities, kernelAxisMode]);
 
-  const kernelAxisMode = profileFor(draft.profileId, capabilities).default_axis_mode;
   const resolvedBackend = resolveBackendPreference(
     capabilities,
     draft.backendPreference,
@@ -185,9 +202,13 @@ export function useKernelPlan({
   const kernelRuns = useMemo(
     () =>
       Object.values(state.runsById)
-        .filter((run) => run.runType === "kernel")
+        .filter(
+          (run) =>
+            run.runType === "kernel" &&
+            resultSampleIsVisible(state.samplesById, run.sampleId, showExcludedResults),
+        )
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
-    [state.runsById],
+    [showExcludedResults, state.runsById, state.samplesById],
   );
   const activeMetricKey = metricCompatibilityKey(draft.metric);
   const resultRows = useMemo(
@@ -196,7 +217,7 @@ export function useKernelPlan({
   );
   const kernelTableRows = useMemo(
     () =>
-      resultRows.rows.map((row) => {
+      [...resultRows.rows].sort(compareKernelResultRows).map((row) => {
         const key = `${row.runId}-${row.kernelLabel}`;
         return {
           key,

@@ -32,6 +32,7 @@ import {
   defaultHeightDraft,
   fixedKernelsForDraft,
   kernelSignature,
+  missingFractionalBaseAxis,
   resolveBackendPreference,
   resolveHeightGrid,
   selectableBackends,
@@ -883,6 +884,87 @@ describe("height plan base-canvas overrides (engine v1.1 contract)", () => {
     assert(clean.ok, "clean plan ok");
     if (clean.ok) {
       assert(clean.plan.members[0]?.request.baseHeight === null, "empty base -> null");
+    }
+  });
+
+  it("requires an explicit base on the scanned axis for fractional plans", () => {
+    const heightDraft = {
+      ...defaultHeightDraft(null),
+      preset: "fractional_refine" as const,
+      axisMode: "h_plus_w" as const,
+      baseWidth: "1920",
+    };
+    assert(missingFractionalBaseAxis(heightDraft) === "height", "H+W scans height");
+    const missingHeight = planHeightRunGroup({
+      draft: heightDraft,
+      samples: baseSamples,
+      sourcesById: baseSources,
+      capabilities: null,
+    });
+    assert(
+      !missingHeight.ok && missingHeight.reason === "fractional_base_required",
+      "fractional height requires base height",
+    );
+
+    const widthDraft = {
+      ...heightDraft,
+      axisMode: "w_only" as const,
+      baseHeight: "1080",
+      baseWidth: "",
+    };
+    assert(missingFractionalBaseAxis(widthDraft) === "width", "W-only scans width");
+    const missingWidth = planHeightRunGroup({
+      draft: widthDraft,
+      samples: baseSamples,
+      sourcesById: baseSources,
+      capabilities: null,
+    });
+    assert(
+      !missingWidth.ok && missingWidth.reason === "fractional_base_required",
+      "fractional width requires base width",
+    );
+
+    assert(
+      missingFractionalBaseAxis({ ...heightDraft, baseHeight: "1080" }) === null,
+      "height base satisfies fractional height",
+    );
+    assert(
+      missingFractionalBaseAxis({ ...widthDraft, baseWidth: "1920" }) === null,
+      "width base satisfies fractional width",
+    );
+  });
+
+  it("resolves radio base modes to stable concrete bases", () => {
+    const draft = {
+      ...defaultHeightDraft(null),
+      preset: "fractional_refine" as const,
+      axisMode: "h_only" as const,
+      refineSelected: "837",
+      refineHalfSpan: "0.5",
+      step: "0.1",
+      baseHeightMode: "even" as const,
+    };
+    const even = planHeightRunGroup({
+      draft,
+      samples: baseSamples,
+      sourcesById: baseSources,
+      capabilities: null,
+    });
+    assert(even.ok, "even mode plan ok");
+    if (even.ok) {
+      assert(even.plan.members[0]?.request.baseHeight === "838", "even base covers max candidate");
+      assert(even.plan.intentSnapshot.baseHeightMode === "even", "base mode is persisted");
+    }
+
+    const odd = planHeightRunGroup({
+      draft: { ...draft, baseHeightMode: "odd" as const },
+      samples: baseSamples,
+      sourcesById: baseSources,
+      capabilities: null,
+    });
+    assert(odd.ok, "odd mode plan ok");
+    if (odd.ok) {
+      assert(odd.plan.members[0]?.request.baseHeight === "839", "odd base covers max candidate");
     }
   });
 });

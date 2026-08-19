@@ -5,10 +5,13 @@ import { resolveGeometrySnapshot } from "../engine/geometryResolve";
 import {
   activateRecipe,
   applyPayloadToCurrentRecipe,
-  setRecipeNameSuffix,
 } from "../project/recipeApply";
 import { activeRecipe, createRecipe } from "../project/recipe";
-import { includedSamples as selectIncludedSamples } from "../project/samples";
+import {
+  includedSamples as selectIncludedSamples,
+  hiddenResultSampleIds as resolveHiddenResultSampleIds,
+  selectedAnalysisSamples,
+} from "../project/samples";
 import { useRunGroupSubmit } from "../hooks/useRunGroupSubmit";
 import { useHeightDraft } from "../hooks/useHeightDraft";
 import { startHeightRunGroup, type ExecutionBridge } from "../engine/executeRunGroup";
@@ -30,13 +33,20 @@ import { plotSeriesColor } from "../components/ErrorLinePlot";
 import { RecipeSummaryStrip } from "../components/RecipeSummaryStrip";
 import { HeightParamsPanel } from "../components/HeightParamsPanel";
 import { HeightResultsPanel } from "../components/HeightResultsPanel";
+import { Modal } from "../components/Modal";
 import { toggleSetValue } from "../utils/collections";
+import { srcFromScanSelection } from "../engine/geometry";
+import { missingFractionalBaseAxis } from "../engine/heightDraft";
+import type { SearchPreset } from "../engine/protocol";
 
 export function AnalyzePage({
   t,
   state,
   capabilities,
   analyzeAvailable,
+  subroute,
+  initialSampleIds,
+  onInitialSampleSelectionConsumed,
   onOpenDiagnostics,
   onOpenSamples,
   onProjectChange,
@@ -46,19 +56,34 @@ export function AnalyzePage({
   state: ProjectState;
   capabilities: EngineEnvelope | null;
   analyzeAvailable: boolean;
+  /** Owned by the shell nav sidebar (resolution test / algorithm test). */
+  subroute: "height" | "kernel";
+  initialSampleIds?: readonly string[] | null;
+  onInitialSampleSelectionConsumed?: () => void;
   onOpenDiagnostics: () => void;
   onOpenSamples: () => void;
   onProjectChange: (updater: (state: ProjectState) => ProjectState) => void;
   executionBridge: ExecutionBridge;
 }) {
-  const [hiddenSampleIds, setHiddenSampleIds] = useState<Set<string>>(new Set());
+  const [hiddenSampleIds, setHiddenSampleIds] = useState<Set<string>>(() => {
+    if (!initialSampleIds?.length) return new Set();
+    const selected = new Set(initialSampleIds);
+    return new Set(
+      selectIncludedSamples(state)
+        .filter((sample) => !selected.has(sample.id))
+        .map((sample) => sample.id),
+    );
+  });
   const [applyBusy, setApplyBusy] = useState(false);
   const [applyNotice, setApplyNotice] = useState("");
   const [applyDialogOpen, setApplyDialogOpen] = useState(false);
+  const [applySelection, setApplySelection] = useState<string | null>(null);
+  const [fractionalWarningAxis, setFractionalWarningAxis] = useState<"height" | "width" | null>(null);
+  const [showExcludedResults, setShowExcludedResults] = useState(false);
   const { submitting, notice: submitNotice, submit: submitRunGroup } = useRunGroupSubmit();
   // Kernel draft is lifted here so the hand-built scan list survives subroute
-  // switches (height ↔ kernel). It does NOT survive leaving the Analyze route
-  // (uiStateByRoute persistence is out of scope).
+  // switches (height ↔ kernel). ProjectShell keeps route pages mounted so this
+  // draft also survives leaving and returning to Analyze during the session.
   const [kernelDraft, setKernelDraft] = useState<KernelDraft | null>(null);
   const [kernelInheritMetric, setKernelInheritMetric] = useState(true);
 
@@ -66,6 +91,33 @@ export function AnalyzePage({
     () => selectIncludedSamples(state),
     [state.samplesById],
   );
+  const analysisSamples = useMemo(
+    () => selectedAnalysisSamples(includedSamples, initialSampleIds).filter(
+      (sample) => !hiddenSampleIds.has(sample.id),
+    ),
+    [hiddenSampleIds, includedSamples, initialSampleIds],
+  );
+
+  const hiddenResultSampleIds = useMemo(() => {
+    return resolveHiddenResultSampleIds(
+      state.samplesById,
+      hiddenSampleIds,
+      showExcludedResults,
+    );
+  }, [hiddenSampleIds, showExcludedResults, state.samplesById]);
+
+  useEffect(() => {
+    if (initialSampleIds == null) return;
+    const selected = new Set(initialSampleIds);
+    setHiddenSampleIds(
+      new Set(
+        includedSamples
+          .filter((sample) => !selected.has(sample.id))
+          .map((sample) => sample.id),
+      ),
+    );
+    onInitialSampleSelectionConsumed?.();
+  }, [includedSamples, initialSampleIds, onInitialSampleSelectionConsumed]);
 
   const {
     draft,
@@ -82,8 +134,9 @@ export function AnalyzePage({
     plan,
   } = useHeightDraft({
     capabilities,
-    includedSamples,
+    includedSamples: analysisSamples,
     sourcesById: state.sourcesById,
+    subroute,
   });
 
   // Seed the kernel draft lazily: capabilities can arrive after first render.
@@ -119,25 +172,48 @@ export function AnalyzePage({
 
   const activeMetricKey = metricCompatibilityKey(draft.metric);
   const seriesRows = useMemo(
-    () => buildSeriesTable(heightRuns, state, hiddenSampleIds, activeMetricKey),
-    [heightRuns, state, hiddenSampleIds, activeMetricKey],
+    () => buildSeriesTable(
+      heightRuns,
+      state,
+      hiddenResultSampleIds,
+      activeMetricKey,
+      draft.axisMode,
+    ),
+    [heightRuns, state, hiddenResultSampleIds, activeMetricKey, draft.axisMode],
   );
 
-  const visibleSamples = includedSamples.filter((sample) => !hiddenSampleIds.has(sample.id));
+  const visibleSamples = analysisSamples;
   const plotTitle =
     visibleSamples.length === 1
       ? visibleSamples[0].label || visibleSamples[0].id
       : t("analyze.plotTitle");
 
+  const missingBaseAxis = missingFractionalBaseAxis(draft);
+  const hasExcludedSamples = Object.values(state.samplesById).some((sample) => !sample.included);
+
   const runBlockedReason = !analyzeAvailable
     ? t("analyze.runBlocked.noCommand")
-    : includedSamples.length === 0
+    : analysisSamples.length === 0
       ? t("analyze.runBlocked.noSamples")
+      : missingBaseAxis
+        ? t("analyze.fractionalBaseRequired", {
+            base: t(missingBaseAxis === "width" ? "analyze.baseWidth" : "analyze.baseHeight"),
+          })
       : !work.ok || !plan
         ? t("analyze.runBlocked.invalidGrid")
         : null;
 
   const canRun = analyzeAvailable && plan !== null && !submitting;
+
+  function handleSetPreset(preset: SearchPreset) {
+    setPreset(preset);
+    if (preset !== "fractional_refine") {
+      setFractionalWarningAxis(null);
+      return;
+    }
+    const axis = missingFractionalBaseAxis({ ...draft, preset });
+    if (axis) setFractionalWarningAxis(axis);
+  }
 
   function startRun() {
     if (!plan) return;
@@ -168,7 +244,7 @@ export function AnalyzePage({
 
   /** First included Sample's source dimensions; required to resolve geometry. */
   const applySourceDims = useMemo(() => {
-    const sample = includedSamples.find((item) => {
+    const sample = analysisSamples.find((item) => {
       const source = state.sourcesById[item.sourceId];
       return source?.width && source?.height;
     });
@@ -176,7 +252,7 @@ export function AnalyzePage({
     return source?.width && source.height
       ? { width: source.width, height: source.height }
       : null;
-  }, [includedSamples, state.sourcesById]);
+  }, [analysisSamples, state.sourcesById]);
 
   /** All Recipes, newest first — the options of the current-recipe selector. */
   const recipeOptions = useMemo(
@@ -208,20 +284,13 @@ export function AnalyzePage({
     unknownSize: t("recipe.unknownSize"),
   };
 
-  function changeRecipeSuffix(suffix: string) {
-    if (!currentRecipe) return;
-    const result = setRecipeNameSuffix(state, currentRecipe.id, suffix, applyLabels);
-    if (!result.ok) return;
-    const next = result.state;
-    onProjectChange(() => next);
-  }
-
-  function openApplyDialog() {
+  function openApplyDialog(selected?: string) {
     setApplyNotice("");
     if (!applySourceDims) {
       setApplyNotice(t("recipe.applyNoDims"));
       return;
     }
+    setApplySelection(selected ?? null);
     setApplyDialogOpen(true);
   }
 
@@ -241,11 +310,19 @@ export function AnalyzePage({
         setApplyNotice(t("recipe.applyNoDims"));
         return;
       }
-      let baseHeight = values.baseHeight;
-      if (baseHeight == null && values.baseWidth != null) {
-        baseHeight = Math.round((values.baseWidth * dims.height) / dims.width);
-      }
-      if (baseHeight == null) {
+      const selectedNumber = applySelection == null ? null : Number(applySelection);
+      const axis = draft.axisMode;
+      const selectedGeometry = selectedNumber != null
+        ? srcFromScanSelection({
+            axisMode: axis,
+            selected: selectedNumber,
+            sourceWidth: dims.width,
+            sourceHeight: dims.height,
+          })
+        : { srcWidth: dims.width, srcHeight: dims.height };
+      const srcHeight = values.srcHeight ?? selectedGeometry.srcHeight;
+      const srcWidth = values.srcWidth ?? selectedGeometry.srcWidth;
+      if (!(srcHeight > 0) || !(srcWidth > 0)) {
         setApplyNotice(t("recipe.applyFailed"));
         return;
       }
@@ -253,7 +330,10 @@ export function AnalyzePage({
         profileId: draft.profileId,
         sourceWidth: dims.width,
         sourceHeight: dims.height,
-        baseHeight,
+        axisMode: axis,
+        srcHeight,
+        srcWidth,
+        baseHeight: values.baseHeight,
         baseWidth: values.baseWidth,
       });
       const result = applyPayloadToCurrentRecipe(
@@ -284,14 +364,10 @@ export function AnalyzePage({
 
   return (
     <div className="page-panel analyze-page">
-      <div className="page-header">
-        <h2>{t("analyze.title")}</h2>
-      </div>
-
-      <div className="recipe-strip">
+      <div className="recipe-strip analyze-recipe-strip">
         <div className="recipe-strip-cell">
-          <span className="recipe-strip-label">{t("recipe.strip.active")}</span>
           <div className="editing-target-row">
+            <span className="recipe-strip-label">{t("recipe.strip.active")}</span>
             {recipeOptions.length ? (
               <RecipePicker
                 t={t}
@@ -304,16 +380,6 @@ export function AnalyzePage({
             <button className="secondary-button" type="button" onClick={createNewRecipe}>
               {t("recipe.newDraft")}
             </button>
-            {currentRecipe ? (
-              <input
-                className="recipe-suffix-input"
-                value={currentRecipe.nameSuffix ?? ""}
-                placeholder={t("analyze.recipeSuffixHint")}
-                aria-label={t("analyze.recipeSuffix")}
-                title={t("analyze.recipeSuffix")}
-                onChange={(event) => changeRecipeSuffix(event.target.value)}
-              />
-            ) : null}
           </div>
           <RecipeSummaryStrip
             t={t}
@@ -324,39 +390,29 @@ export function AnalyzePage({
         </div>
       </div>
 
-      <div className="subroute-tabs">
-        <button
-          className={draft.subroute === "height" ? "active" : ""}
-          type="button"
-          onClick={() => patch({ subroute: "height" })}
-        >
-          {t("analyze.height")}
-        </button>
-        <button
-          className={draft.subroute === "kernel" ? "active" : ""}
-          type="button"
-          onClick={() => patch({ subroute: "kernel" })}
-        >
-          {t("analyze.kernel")}
-        </button>
+      <div className="analyze-subroute-host" hidden={subroute !== "kernel"}>
+        {kernelDraft ? (
+          <KernelAnalyzePanel
+            t={t}
+            state={state}
+            capabilities={capabilities}
+            analyzeAvailable={analyzeAvailable}
+            showExcludedResults={showExcludedResults}
+            excludedResultsAvailable={hasExcludedSamples}
+            onToggleExcludedResults={setShowExcludedResults}
+            draft={kernelDraft}
+            onDraftChange={handleKernelDraftChange}
+            inheritMetric={kernelInheritMetric}
+            onInheritMetricChange={setKernelInheritMetric}
+            inheritedMetric={draft.metric}
+            onOpenDiagnostics={onOpenDiagnostics}
+            onProjectChange={onProjectChange}
+            executionBridge={executionBridge}
+          />
+        ) : null}
       </div>
 
-      {draft.subroute === "kernel" && kernelDraft ? (
-        <KernelAnalyzePanel
-          t={t}
-          state={state}
-          capabilities={capabilities}
-          analyzeAvailable={analyzeAvailable}
-          draft={kernelDraft}
-          onDraftChange={handleKernelDraftChange}
-          inheritMetric={kernelInheritMetric}
-          onInheritMetricChange={setKernelInheritMetric}
-          inheritedMetric={draft.metric}
-          onOpenDiagnostics={onOpenDiagnostics}
-          onProjectChange={onProjectChange}
-          executionBridge={executionBridge}
-        />
-      ) : draft.subroute === "kernel" ? null : (
+      <div className="analyze-subroute-host" hidden={subroute !== "height"}>
         <div className="analyze-layout">
           <aside className="analyze-samples pane">
             <h3>{t("analyze.samplesTitle")}</h3>
@@ -414,7 +470,12 @@ export function AnalyzePage({
                 members={plan.members.map((member) => ({
                   key: member.planKey,
                   title: member.sampleLabel,
-                  subtitle: `${member.kernel.id} · ${member.heightGrid.candidates.length} h`,
+                  subtitle:
+                    `${member.kernel.id} · ${member.heightGrid.candidates.length} h · ` +
+                    t("analyze.resolvedBase", {
+                      width: member.request.baseWidth ?? "integer",
+                      height: member.request.baseHeight ?? "integer",
+                    }),
                 }))}
                 truncateAt={12}
                 multiMemberNote={
@@ -426,15 +487,20 @@ export function AnalyzePage({
 
           <HeightResultsPanel
             t={t}
+            state={state}
+            axisMode={draft.axisMode}
             analyzeAvailable={analyzeAvailable}
             seriesRows={seriesRows}
             grid={grid}
             work={work}
             plotTitle={plotTitle}
-            hasIncludedSamples={includedSamples.length > 0}
+            hasIncludedSamples={analysisSamples.length > 0}
             applyBusy={applyBusy}
             applyNotice={applyNotice}
             submitNotice={submitNotice}
+            showExcludedResults={showExcludedResults}
+            excludedResultsAvailable={hasExcludedSamples}
+            onToggleExcludedResults={setShowExcludedResults}
             onOpenDiagnostics={onOpenDiagnostics}
             onOpenApplyDialog={openApplyDialog}
             onRefineAroundSelection={refineAroundHeight}
@@ -452,19 +518,54 @@ export function AnalyzePage({
             submitting={submitting}
             runBlockedReason={runBlockedReason}
             onPatch={patch}
-            onSetPreset={setPreset}
+            onSetPreset={handleSetPreset}
             onResetProfileDefaults={resetToProfileDefaults}
             onRun={startRun}
           />
         </div>
-      )}
+      </div>
       {applyDialogOpen && applySourceDims ? (
         <ApplyGeometryDialog
           t={t}
           busy={applyBusy}
+          axisMode={draft.axisMode}
+          sourceWidth={applySourceDims.width}
+          sourceHeight={applySourceDims.height}
+          initialSrcHeight={
+            applySelection != null && draft.axisMode !== "w_only" ? Number(applySelection) : null
+          }
+          initialSrcWidth={
+            applySelection != null && draft.axisMode === "w_only" ? Number(applySelection) : null
+          }
           onCancel={() => setApplyDialogOpen(false)}
           onConfirm={handleApplyGeometry}
         />
+      ) : null}
+      {fractionalWarningAxis ? (
+        <Modal
+          onClose={() => setFractionalWarningAxis(null)}
+          title={t("analyze.fractionalBaseWarning.title")}
+          closeLabel={t("common.close")}
+          actions={
+            <button
+              className="primary-button"
+              type="button"
+              onClick={() => setFractionalWarningAxis(null)}
+            >
+              {t("analyze.fractionalBaseWarning.action")}
+            </button>
+          }
+        >
+          <p>
+            {t("analyze.fractionalBaseWarning.body", {
+              base: t(
+                fractionalWarningAxis === "width"
+                  ? "analyze.baseWidth"
+                  : "analyze.baseHeight",
+              ),
+            })}
+          </p>
+        </Modal>
       ) : null}
     </div>
   );

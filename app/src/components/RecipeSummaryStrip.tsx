@@ -38,7 +38,10 @@ export function RecipeSummaryStrip({
         <span>
           {t("recipe.revision", { revision: recipe.revision })}
           {recipe.geometry
-            ? ` · ${recipe.geometry.canvasWidth}×${recipe.geometry.canvasHeight}`
+            ? ` · ${recipe.geometry.canvasWidth}×${recipe.geometry.canvasHeight}` +
+              ` · src ${recipe.geometry.srcWidth}×${recipe.geometry.srcHeight}` +
+              ` · base ${recipe.geometry.baseWidth ?? "integer"}×${recipe.geometry.baseHeight ?? "integer"}` +
+              (recipe.geometry.needsReview ? ` · ${t("recipe.missing.geometryReview")}` : "")
             : ""}
           {recipe.kernel?.id ? ` · ${kernelDisplayName(t, recipe.kernel.id)}` : ""}
           {recipe.profileId ? ` · ${profileDisplayName(t, recipe.profileId)}` : ""}

@@ -388,6 +388,7 @@ mod tests {
             base_height: None,
             base_width: None,
             grid: None,
+            geometry: None,
         };
         validate_analyze(&request).unwrap();
         session
@@ -529,6 +530,7 @@ mod tests {
             base_height: None,
             base_width: None,
             grid: None,
+            geometry: None,
         };
         session
             .write_command(&analyze_command(&request).unwrap())

@@ -63,6 +63,20 @@ export function KernelScanList({
     );
   }
 
+  const renderedKernels = draft.scanList
+    .map((kernel, index) => ({ kernel, index }))
+    .sort((a, b) => {
+      const familyA = KERNEL_FAMILY_ORDER.indexOf(a.kernel.id as typeof KERNEL_FAMILY_ORDER[number]);
+      const familyB = KERNEL_FAMILY_ORDER.indexOf(b.kernel.id as typeof KERNEL_FAMILY_ORDER[number]);
+      const familyOrder = (familyA < 0 ? KERNEL_FAMILY_ORDER.length : familyA) -
+        (familyB < 0 ? KERNEL_FAMILY_ORDER.length : familyB);
+      if (familyOrder !== 0) return familyOrder;
+      return kernelChipLabel(t, a.kernel).localeCompare(kernelChipLabel(t, b.kernel), undefined, {
+        numeric: true,
+        sensitivity: "base",
+      });
+    });
+
   return (
     <div className="analyze-table-host">
       <h3>{t("analyze.k.scanList.title")}</h3>
@@ -72,7 +86,7 @@ export function KernelScanList({
           {work > 0 ? ` · ${t("analyze.workEstimate", { count: String(work) })}` : ""}
         </div>
         <div className="candidate-chips">
-          {draft.scanList.map((kernel, index) => {
+          {renderedKernels.map(({ kernel, index }) => {
             const signature = kernelSignature(kernel);
             return (
               <button

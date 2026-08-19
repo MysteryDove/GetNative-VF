@@ -1,7 +1,8 @@
 import type { EngineEnvelope } from "./types";
-import type { CandidateGridSpec, KernelRef, MetricSpec } from "./protocol";
+import type { AxisMode, CandidateGridSpec, KernelRef, MetricSpec } from "./protocol";
 import {
   fixedKernelsForDraft,
+  missingFractionalBaseAxis,
   resolveHeightGrid,
   type HeightDraft,
   validateBackendPNorm,
@@ -11,6 +12,7 @@ import type { HeightAnalyzeRequest } from "./protocol";
 import type { ProjectState, Run, RunGroup } from "../project/types";
 import type { Translator } from "../i18n";
 import { kernelDisplayName } from "./displayNames";
+import { baseForMode } from "./geometry";
 
 export type HeightRunGroupType =
   | "single_height"
@@ -59,6 +61,8 @@ export type HeightRunGroupPlan = {
     sampleIds: string[];
     baseHeight: string | null;
     baseWidth: string | null;
+    baseHeightMode: HeightDraft["baseHeightMode"];
+    baseWidthMode: HeightDraft["baseWidthMode"];
   };
 };
 
@@ -112,9 +116,26 @@ export function planHeightRunGroup(input: {
   const now = input.nowMs ?? Date.now();
   const baseHeight = input.draft.baseHeight?.trim() || null;
   const baseWidth = input.draft.baseWidth?.trim() || null;
+  if (missingFractionalBaseAxis(input.draft)) {
+    return { ok: false, reason: "fractional_base_required" };
+  }
   const baseValid = (value: string | null) => value === null || /^[1-9]\d*$/.test(value);
   if (!baseValid(baseHeight) || !baseValid(baseWidth)) {
     return { ok: false, reason: "base_invalid" };
+  }
+  const candidateMaximum = Math.max(...grid.grid.candidates.map(Number));
+  if (!Number.isFinite(candidateMaximum) || candidateMaximum <= 0) {
+    return { ok: false, reason: "grid_invalid" };
+  }
+
+  function resolveBase(
+    mode: HeightDraft["baseHeightMode"],
+    explicit: string | null,
+    srcMaximum: number,
+  ): string | null {
+    if (explicit) return explicit;
+    const value = baseForMode(srcMaximum, mode);
+    return value == null ? null : String(value);
   }
 
   for (const sample of included) {
@@ -129,6 +150,26 @@ export function planHeightRunGroup(input: {
     ) {
       return { ok: false, reason: "sample_fingerprint_stale" };
     }
+
+    const baseHeightForMember = input.draft.axisMode === "w_only"
+      ? null
+      : resolveBase(input.draft.baseHeightMode, baseHeight, candidateMaximum);
+    let widthMaximum: number | null = null;
+    if (input.draft.axisMode === "w_only") {
+      widthMaximum = candidateMaximum;
+    } else if (input.draft.axisMode === "h_plus_w") {
+      if (baseWidth && input.draft.baseWidthMode === "integer") {
+        widthMaximum = 1;
+      } else if (input.draft.baseWidthMode !== "integer") {
+        if (!(source.width && source.height)) {
+          return { ok: false, reason: "source_dimensions_required" };
+        }
+        widthMaximum = source.width * candidateMaximum / source.height;
+      }
+    }
+    const baseWidthForMember = input.draft.axisMode === "h_only" || widthMaximum == null
+      ? null
+      : resolveBase(input.draft.baseWidthMode, baseWidth, widthMaximum);
 
     for (const kernel of kernels) {
       const requestId = `${prefix}_${now}_${requestSeq++}`;
@@ -145,8 +186,8 @@ export function planHeightRunGroup(input: {
         kernel,
         axisMode: input.draft.axisMode,
         heightGrid: grid.grid,
-        baseHeight,
-        baseWidth,
+        baseHeight: baseHeightForMember,
+        baseWidth: baseWidthForMember,
         metric: { ...input.draft.metric },
         profileId: input.draft.profileId,
         mathMode: input.draft.mathMode,
@@ -216,8 +257,12 @@ export function planHeightRunGroup(input: {
         heightGrid: grid.grid,
         kernels,
         sampleIds: included.map((sample) => sample.id),
-        baseHeight: input.draft.baseHeight?.trim() || null,
-        baseWidth: input.draft.baseWidth?.trim() || null,
+        baseHeight: members[0]?.request.baseHeight ?? null,
+        baseWidth: members.every((member) => member.request.baseWidth === members[0]?.request.baseWidth)
+          ? members[0]?.request.baseWidth ?? null
+          : null,
+        baseHeightMode: input.draft.baseHeightMode,
+        baseWidthMode: input.draft.baseWidthMode,
       },
     },
   };
@@ -359,6 +404,7 @@ export function buildSeriesTable(
   state: ProjectState,
   hiddenSampleIds: Set<string>,
   activeMetricKey: string,
+  activeAxisMode?: AxisMode,
 ): SeriesTable {
   const rows: SeriesTableRow[] = [];
   const seriesMeta: SeriesMeta[] = [];
@@ -366,8 +412,19 @@ export function buildSeriesTable(
   for (const run of runs) {
     if (run.sampleId && hiddenSampleIds.has(run.sampleId)) continue;
     const snapshot = run.inputSnapshot as
-      | { metric?: { cropLeft: number; cropRight: number; cropTop: number; cropBottom: number; pixelExclusionThreshold: number; pNorm: number }; kernel?: { id: string; parameters?: Record<string, string | number | boolean> } }
+      | {
+          metric?: { cropLeft: number; cropRight: number; cropTop: number; cropBottom: number; pixelExclusionThreshold: number; pNorm: number };
+          kernel?: { id: string; parameters?: Record<string, string | number | boolean> };
+          request?: { axisMode?: AxisMode };
+        }
       | null;
+    if (
+      activeAxisMode &&
+      snapshot?.request?.axisMode &&
+      snapshot.request.axisMode !== activeAxisMode
+    ) {
+      continue;
+    }
     if (snapshot?.metric) {
       if (metricCompatibilityKey(snapshot.metric) !== activeMetricKey) {
         incompatibleCount += 1;

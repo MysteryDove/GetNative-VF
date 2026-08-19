@@ -175,6 +175,10 @@ kernels**. The wire shape drops `kernel`/`candidates` for a single
                   "width": 1920, "height": 1080},
   "axis_mode": "h_only",
   "candidate": "810",
+  "geometry": {"width": 1280, "height": 720,
+               "src_left": 0.0, "src_top": 0.5,
+               "src_width": 1280.0, "src_height": 719.0,
+               "base_width": null, "base_height": 720},
   "kernels": [
     {"id": "bilinear"},
     {"id": "bicubic", "b": 0.0, "c": 0.5},
@@ -192,6 +196,10 @@ Field rules:
   and fractional geometry semantics as a height candidate; for `h_plus_w`
   the secondary axis derives per kernel from the aspect ratio exactly like
   height mode.
+- `geometry` is optional for fixed-geometry Kernel and Verify jobs. When
+  present, `src_*`, offsets, canvas size, and nullable base dimensions are
+  authoritative; the engine does not re-derive fractional offsets from the
+  canvas.
 - `kernels` entries follow the height-mode `kernel` rules (`b`/`c`
   bicubic-only, `taps` lanczos-only, and all applicable parameters required).
   Duplicates are legal (a bicubic (b, c) grid needs them). Cap: 4096.
@@ -260,6 +268,10 @@ one at a time on the executor thread):
 Field rules:
 
 - `geometry` gives the frame dimensions every streamed asset must match.
+  Media Verify additionally carries `resolved_geometry` with `src_left`,
+  `src_top`, `src_width`, `src_height`, and nullable `base_width`/
+  `base_height`; these complete fields are authoritative for a fractional
+  Recipe and prevent offset re-derivation.
 - `candidate` is a single decimal with the same plan semantics as one
   `analyze` candidate (primary axis from `axis_mode`; the secondary axis
   in `h_plus_w` mode is aspect-derived exactly like height mode).

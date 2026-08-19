@@ -469,6 +469,71 @@ button {
   color: #818c86;
 }
 
+.results-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-strip);
+}
+
+.results-filter-group {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+
+.results-filter-label {
+  flex: 0 0 56px;
+  padding-top: 6px;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.results-filter-group .button-radio {
+  min-width: 0;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 2px;
+  scrollbar-width: thin;
+}
+
+.results-filter-group .button-radio button {
+  flex: 0 0 auto;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.height-results-filters {
+  flex: 0 0 auto;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.height-results-filters + .analyze-plot-host {
+  /* The middle column is window-height; the plot fills whatever the toolbar,
+     filters and result table leave, and rescales via its ResizeObserver. */
+  flex: 1 1 0;
+  min-height: 180px;
+  overflow: auto;
+}
+
+.height-results-filters + .analyze-plot-host .plot-skeleton {
+  height: 100%;
+  min-height: 0;
+}
+
+.height-results-filters + .analyze-plot-host .error-plot {
+  min-height: 180px;
+}
+
 .geometry-row {
   display: flex;
   align-items: center;
@@ -1275,6 +1340,74 @@ button {
   box-shadow: inset 0 0 0 1px #3d4a43;
 }
 
+/* Analyze nav group: expandable row with subroute entries beneath it. */
+.nav-group-row {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+}
+
+.nav-group-row .nav-item {
+  flex: 1;
+  min-width: 0;
+}
+
+.nav-group-toggle {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--text-disabled);
+  background: transparent;
+  cursor: pointer;
+}
+
+.nav-group-toggle:hover {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+
+.nav-group-toggle svg {
+  transform: rotate(-90deg);
+  transition: transform 0.12s ease;
+}
+
+.nav-group-toggle svg.open {
+  transform: none;
+}
+
+.nav-subitems {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 2px 0 4px 25px;
+  padding-left: 9px;
+  border-left: 1px solid var(--border);
+}
+
+.nav-subitem {
+  min-height: 26px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 4px;
+  color: var(--text-dim);
+  background: transparent;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.nav-subitem:hover {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+
+.nav-subitem.active {
+  color: var(--text-bright);
+  background: #2a332e;
+}
+
 .project-content {
   display: grid;
   grid-template-rows: minmax(0, 1fr) 42px;
@@ -1309,6 +1442,18 @@ button {
 
 .project-page-host > .page-panel,
 .project-page-host > .diagnostics-page {
+  height: 100%;
+}
+
+/* Route keep-alive wrappers retain page state without affecting the host grid. */
+.project-page-host > div {
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.project-page-host > div > .page-panel,
+.project-page-host > div > .diagnostics-page {
   height: 100%;
 }
 
@@ -1490,30 +1635,11 @@ button {
   line-height: 1.45;
 }
 
-.subroute-tabs {
-  display: flex;
-  gap: 4px;
-  padding: 10px 16px 0;
-}
-
-.subroute-tabs button {
-  height: 30px;
-  padding: 0 12px;
-  border: 1px solid var(--border-control);
-  border-radius: 4px;
+.analyze-excluded-toggle {
+  margin-left: auto;
+  margin-top: 0;
   color: var(--text-placeholder);
-  background: var(--surface-inset);
-  cursor: pointer;
-}
-
-.subroute-tabs button:disabled {
-  cursor: not-allowed;
-  opacity: 0.7;
-}
-
-.subroute-tabs button.active {
-  color: var(--text-secondary);
-  background: var(--surface-active);
+  font-size: 11px;
 }
 
 /* Button-style radio groups (params panel preset/axis) */
@@ -1714,10 +1840,41 @@ button {
   white-space: nowrap;
 }
 
-.job-progress {
+.job-progress-count {
   flex: 0 0 auto;
   color: var(--text-meta-dim);
   font-variant-numeric: tabular-nums;
+}
+
+.job-progress-track {
+  position: relative;
+  flex: 0 1 96px;
+  width: 96px;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--border-track);
+}
+
+.job-progress-fill {
+  display: block;
+  height: 100%;
+  min-width: 0;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 180ms ease;
+}
+
+.job-progress-track.indeterminate .job-progress-fill {
+  width: 38%;
+  min-width: 38%;
+  animation: job-progress-indeterminate 1.1s ease-in-out infinite;
+}
+
+@keyframes job-progress-indeterminate {
+  0% { transform: translateX(-115%); }
+  50% { transform: translateX(155%); }
+  100% { transform: translateX(270%); }
 }
 
 .job-fps {
@@ -1729,9 +1886,26 @@ button {
 }
 
 .analyze-page {
+  /* Fixed to the host height: the page itself never scrolls; only the
+     three layout columns scroll internally. */
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Keep-alive subroute wrapper: hands the remaining page height to
+   .analyze-layout so each column is exactly window-height. */
+.analyze-subroute-host {
+  flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
+}
+
+.analyze-subroute-host[hidden] {
+  display: none;
 }
 
 .analyze-layout {
@@ -1739,6 +1913,9 @@ button {
   min-height: 0;
   display: grid;
   grid-template-columns: 220px minmax(0, 1fr) 280px;
+  /* Single row pinned to the container height; without it the implicit auto
+     row sizes to content and the fixed-height columns overflow the page. */
+  grid-template-rows: minmax(0, 1fr);
   border-top: 1px solid var(--border);
 }
 
@@ -1810,6 +1987,25 @@ button {
   white-space: nowrap;
 }
 
+.kernel-sample-option {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 6px;
+  align-items: start;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.kernel-sample-option > div {
+  min-width: 0;
+}
+
+.kernel-sample-list strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .analyze-plot {
   display: flex;
   flex-direction: column;
@@ -1867,6 +2063,21 @@ button {
   font-size: 10px;
   font-weight: 400;
   font-variant-numeric: tabular-nums;
+}
+
+/* Kernel results table header: title, excluded-results toggle, apply action. */
+.analyze-table-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.analyze-table-toolbar h3 {
+  margin: 0;
+}
+
+.analyze-table-toolbar .primary-button {
+  margin-left: auto;
 }
 
 .candidate-preview-meta {
@@ -1983,6 +2194,7 @@ button {
 
 .error-plot-zoom-surface {
   cursor: crosshair;
+  touch-action: none;
 }
 
 .error-plot-zoom-selection {
@@ -2092,6 +2304,10 @@ button {
 }
 
 .result-table-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
   border: 0;
   background: transparent;
   color: inherit;
@@ -2099,6 +2315,16 @@ button {
   text-align: left;
   padding: 0;
   cursor: pointer;
+}
+
+.result-table-sort-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--text-faint);
+}
+
+.result-table-sort.active .result-table-sort-icon {
+  color: var(--accent);
 }
 
 .result-table-sort:hover,
@@ -2126,6 +2352,137 @@ button {
 
 .result-table-row:hover {
   background: var(--surface-control);
+}
+
+.kernel-metric-plot {
+  margin: 0 0 10px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface-inset);
+}
+
+.kernel-metric-plot-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 7px;
+}
+
+.kernel-metric-plot-heading h3 {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted-strong);
+}
+
+.kernel-metric-plot-heading span {
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.kernel-metric-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-bottom: 6px;
+}
+
+.kernel-metric-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.kernel-metric-legend-item .swatch {
+  width: 12px;
+  height: 3px;
+  border-radius: 1px;
+}
+
+.kernel-metric-chart-scroll {
+  position: relative;
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border: 1px solid var(--border-faint);
+  background: #101312;
+  scrollbar-width: thin;
+}
+
+.kernel-metric-chart {
+  display: block;
+  height: 300px;
+  max-height: 300px;
+}
+
+.kernel-metric-reset {
+  position: absolute;
+  top: 4px;
+  right: 8px;
+  z-index: 2;
+  border: 1px solid var(--border-control-strong);
+  border-radius: 4px;
+  padding: 2px 8px;
+  background: var(--surface-control);
+  color: var(--text-subtle);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.kernel-metric-reset:hover {
+  color: var(--text-heading);
+  border-color: var(--border-strong);
+}
+
+.kernel-metric-zoom-surface {
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.kernel-metric-zoom-selection {
+  fill: rgba(59, 130, 246, 0.14);
+  stroke: #3b82f6;
+  stroke-width: 1;
+  pointer-events: none;
+}
+
+.kernel-metric-grid {
+  stroke: var(--border-faint);
+  stroke-width: 1;
+}
+
+.kernel-metric-frame {
+  fill: none;
+  stroke: var(--border-strong);
+  stroke-width: 1;
+}
+
+.kernel-metric-axis {
+  stroke: var(--border-strong);
+  stroke-width: 1;
+}
+
+.kernel-metric-tick,
+.kernel-metric-axis-label {
+  fill: var(--text-placeholder);
+  font-size: 10px;
+  letter-spacing: 0;
+}
+
+.kernel-metric-kernel-label {
+  fill: var(--text-faint);
+}
+
+.kernel-metric-point {
+  cursor: pointer;
+}
+
+.kernel-metric-point:hover {
+  stroke: var(--text-bright);
+  stroke-width: 1.6;
 }
 
 .analyze-params label.block {
@@ -2229,7 +2586,7 @@ button {
 @media (max-width: 1024px) {
   .analyze-layout {
     grid-template-columns: minmax(0, 1fr) 250px;
-    grid-template-rows: auto minmax(360px, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
   }
 
   .analyze-samples {
@@ -2414,7 +2771,7 @@ button {
 }
 
 .selection-pane {
-  grid-template-rows: 38px auto auto minmax(0, 1fr);
+  grid-template-rows: 38px auto minmax(0, 1fr);
 }
 
 .pane-heading {
@@ -2827,6 +3184,7 @@ button {
 }
 
 .sample-add-actions {
+  position: relative;
   align-items: stretch;
   flex-direction: column;
   padding: 10px;
@@ -2843,7 +3201,6 @@ button {
   background: #204533;
 }
 
-.selection-note,
 .selection-empty {
   margin: 0;
   padding: 8px 10px;
@@ -2852,16 +3209,36 @@ button {
   line-height: 1.4;
 }
 
-.selection-note {
-  min-height: 30px;
-  visibility: hidden;
-  background: transparent;
-}
-
-.selection-note.visible {
-  visibility: visible;
+/* Transient dedup hint: floats under the add buttons, never takes layout
+   space, and ignores pointer events so the sample list stays clickable. */
+.dedup-popup {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 10px;
+  right: 10px;
+  z-index: 6;
+  margin: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--warning);
+  border-radius: 6px;
   color: var(--warning);
   background: var(--warning-bg);
+  font-size: 11px;
+  line-height: 1.4;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+  animation: dedup-popup-in 140ms ease-out;
+}
+
+@keyframes dedup-popup-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .selected-sample-row {
@@ -3191,7 +3568,7 @@ button {
   .selection-pane {
     grid-column: 1 / -1;
     grid-row: 2;
-    grid-template-columns: 180px 220px minmax(0, 1fr);
+    grid-template-columns: 200px minmax(0, 1fr);
     grid-template-rows: 38px minmax(0, 1fr);
     border-top: 1px solid var(--border);
     border-left: 0;
@@ -3206,13 +3583,8 @@ button {
     grid-row: 2;
   }
 
-  .selection-note {
-    grid-column: 2;
-    grid-row: 2;
-  }
-
   .selected-sample-list {
-    grid-column: 3;
+    grid-column: 2;
     grid-row: 2;
     border-left: 1px solid var(--border);
   }
@@ -3272,6 +3644,63 @@ button {
   gap: 10px;
   border-top: 1px solid var(--border);
   padding-top: 12px;
+}
+
+.geometry-axis {
+  display: grid;
+  gap: 8px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-faint);
+}
+
+.geometry-axis-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(150px, 0.7fr);
+  gap: 10px;
+}
+
+.geometry-field {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.geometry-field > span {
+  color: var(--text-meta);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.geometry-field input,
+.geometry-field select {
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  padding: 0 9px;
+  border: 1px solid var(--border-control);
+  border-radius: 4px;
+  outline: 0;
+  color: var(--text-primary);
+  background: var(--surface-sunken);
+  font-size: 12px;
+}
+
+.geometry-field input:focus,
+.geometry-field select:focus {
+  border-color: var(--accent-dim);
+  box-shadow: 0 0 0 2px rgba(121, 227, 173, 0.08);
+}
+
+.geometry-field select {
+  cursor: pointer;
+}
+
+.geometry-field option {
+  color: var(--text-primary);
+  background: var(--surface-raised);
 }
 
 .recipe-row {
@@ -3352,6 +3781,31 @@ button {
 
 .recipe-strip-cell .help-copy {
   padding: 4px 0;
+}
+
+/* Analyze page: compact current-recipe bar — one picker row with an inline
+   label, plus a single-line summary beneath it. */
+.analyze-recipe-strip {
+  margin: 10px 12px 8px;
+}
+
+.analyze-recipe-strip .recipe-strip-cell {
+  padding: 4px 10px 2px;
+}
+
+.analyze-recipe-strip .recipe-strip-label {
+  display: inline;
+  flex-shrink: 0;
+  margin: 0;
+}
+
+.analyze-recipe-strip .editing-target-row {
+  margin: 0;
+}
+
+.analyze-recipe-strip .dense-row {
+  min-height: 24px;
+  font-size: 11px;
 }
 
 .recipe-badge:not(.active) {
@@ -3458,12 +3912,6 @@ button {
   font-size: 11px;
 }
 
-.recipe-suffix-input {
-  flex: 0 1 140px;
-  min-width: 72px;
-  font-size: 11px;
-}
-
 /* Verify page: compact current-recipe picker + inline summary */
 .verify-current-row {
   display: flex;
@@ -3546,6 +3994,12 @@ button {
 .plot-verdict.perfect {
   border-color: #3d7a5f;
   background: #152019;
+}
+
+.plot-valley-candidates {
+  align-items: center;
+  margin: 6px 2px 0;
+  max-height: none;
 }
 
 .plot-verdict-cell {

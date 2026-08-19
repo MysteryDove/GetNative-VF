@@ -146,6 +146,34 @@ describe("planVerifyRunGroup", () => {
     expect(result.plan.intentSnapshot.concurrency).toBe(2);
   });
 
+  it("resolves geometry independently for differently sized sources", () => {
+    const other: Source = { ...video, id: "src_2", width: 1280, height: 800 };
+    const recipe = {
+      ...completeRecipe,
+      axisMode: "h_plus_w" as const,
+      geometry: {
+        ...completeRecipe.geometry!,
+        sourceWidth: 1920,
+        sourceHeight: 1080,
+        srcWidth: 1280,
+        srcHeight: 720,
+        baseWidth: null,
+        baseHeight: 721,
+      },
+    };
+    const result = planVerifyRunGroup({
+      draft: { ...defaultVerifyDraft(), sourceIds: ["src_1", "src_2"] },
+      recipe,
+      sourcesById: { src_1: video, src_2: other },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.plan.members[0]?.request.geometry.srcWidth).toBe(1280);
+    expect(result.plan.members[1]?.request.geometry.srcWidth).toBe(1152);
+    expect(result.plan.members[0]?.request.geometry.sourceWidth).toBe(1920);
+    expect(result.plan.members[1]?.request.geometry.sourceWidth).toBe(1280);
+  });
+
   it("accepts only integer concurrency values from one through eight", () => {
     for (const concurrency of [1, 2, 4, 8]) {
       const result = planVerifyRunGroup({

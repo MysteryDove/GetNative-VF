@@ -158,6 +158,38 @@ std::optional<std::string> optional_string(const JsonValue &object, std::string_
     return value->string_value;
 }
 
+std::optional<Geometry> optional_geometry(const JsonValue &object,
+                                          std::string_view key = "geometry") {
+    const JsonValue *value = object.find(key);
+    if (!value || value->is_null()) return std::nullopt;
+    if (value->type != JsonValue::Type::object) {
+        throw WorkerError("bad_request", "geometry must be an object");
+    }
+    const std::int32_t width = require_int(*value, "width");
+    const std::int32_t height = require_int(*value, "height");
+    const bool has_src_fields = value->find("src_left") || value->find("src_top")
+        || value->find("src_width") || value->find("src_height");
+    if (!has_src_fields) return std::nullopt; // v1 dimension-only geometry
+    if (!value->find("src_left") || !value->find("src_top")
+        || !value->find("src_width") || !value->find("src_height")) {
+        throw WorkerError("bad_request", "fractional geometry requires all src fields");
+    }
+    const double src_left = require_number(*value, "src_left");
+    const double src_top = require_number(*value, "src_top");
+    const double src_width = require_number(*value, "src_width");
+    const double src_height = require_number(*value, "src_height");
+    if (width < 2 || height < 2 || width > 32768 || height > 32768
+        || src_width <= 0.0 || src_height <= 0.0 || src_left < 0.0 || src_top < 0.0
+        || src_left + src_width > static_cast<double>(width) + 1e-9
+        || src_top + src_height > static_cast<double>(height) + 1e-9) {
+        throw WorkerError("bad_request", "geometry source rectangle exceeds canvas");
+    }
+    return Geometry{
+        static_cast<std::int64_t>(width), static_cast<std::int64_t>(height),
+        src_left, src_top, src_width, src_height,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Analyze request model
 // ---------------------------------------------------------------------------
@@ -202,6 +234,7 @@ struct AnalyzeJobSpec {
     std::optional<std::int64_t> base_height;
     std::optional<std::int64_t> base_width;
     std::optional<CandidateRangeSpec> grid;
+    std::optional<Geometry> geometry;
     bool profile_geometry = false;
 };
 
@@ -214,6 +247,7 @@ struct VerifyJobSpec {
     AxisMode axis_mode = AxisMode::height_only;
     Filter filter{};
     std::string candidate;
+    std::optional<Geometry> geometry;
     MetricSpec metric{};
     std::size_t worker_count = 0;
     std::size_t concurrency = kMediaVerifyDefaultConcurrency;
@@ -622,6 +656,7 @@ AnalyzeJobSpec parse_analyze(const JsonValue &command, std::string job_id) {
     spec.endpoint_rule = parse_endpoint_rule(command);
     spec.base_height = optional_decimal_integer(command, "base_height");
     spec.base_width = optional_decimal_integer(command, "base_width");
+    spec.geometry = optional_geometry(command);
     spec.grid = parse_candidate_grid(command);
     if (backend == "cuda"
         && (spec.metric.norm < cuda_minimum_p_norm
@@ -779,6 +814,7 @@ VerifyJobSpec parse_verify_begin(const JsonValue &command, std::string job_id,
     spec.backend = media_mode ? spec.requested_backend : BackendChoice::cpu;
 
     spec.axis_mode = parse_axis_mode(require_string(command, "axis_mode"));
+    spec.geometry = optional_geometry(command, "resolved_geometry");
     spec.filter = parse_filter(require_member(command, "kernel"));
     spec.metric = parse_metric(require_member(command, "metric"));
     if (media_mode && spec.requested_backend == BackendChoice::cuda
@@ -3388,6 +3424,9 @@ private:
                              : result_count);
         const auto geometry_for = [&](double value) {
             try {
+                if (spec.kernel_mode && spec.geometry) {
+                    return *spec.geometry;
+                }
                 if (!spec.profile_geometry) {
                     const double active_width = spec.axis_mode == AxisMode::width_only
                         ? value
@@ -4234,14 +4273,23 @@ private:
             spec.axis_mode == AxisMode::width_only ? spec.height : spec.width;
         const double value = parse_json(spec.candidate).number_value;
         std::vector<AxisPlanRequest> requests;
-        requests.push_back(make_axis_request(primary_size, value, spec.filter));
+        if (spec.geometry) {
+            requests.push_back(make_geometry_axis_request(
+                *spec.geometry, spec.axis_mode == AxisMode::width_only, primary_size, spec.filter));
+        } else {
+            requests.push_back(make_axis_request(primary_size, value, spec.filter));
+        }
         if (spec.axis_mode == AxisMode::height_plus_width) {
-            const double derived = static_cast<double>(secondary_size) * value
-                / static_cast<double>(primary_size);
-            if (derived < 2.0) {
-                throw WorkerError("bad_request", "derived secondary axis length is too small");
+            if (spec.geometry) {
+                requests.push_back(make_geometry_axis_request(*spec.geometry, true, secondary_size, spec.filter));
+            } else {
+                const double derived = static_cast<double>(secondary_size) * value
+                    / static_cast<double>(primary_size);
+                if (derived < 2.0) {
+                    throw WorkerError("bad_request", "derived secondary axis length is too small");
+                }
+                requests.push_back(make_axis_request(secondary_size, derived, spec.filter));
             }
-            requests.push_back(make_axis_request(secondary_size, derived, spec.filter));
         }
 
         const auto plan_start = std::chrono::steady_clock::now();
@@ -4812,14 +4860,23 @@ private:
         const double value = parse_json(spec.candidate).number_value;
 
         std::vector<AxisPlanRequest> requests;
-        requests.push_back(make_axis_request(primary_size, value, spec.filter));
+        if (spec.geometry) {
+            requests.push_back(make_geometry_axis_request(
+                *spec.geometry, spec.axis_mode == AxisMode::width_only, primary_size, spec.filter));
+        } else {
+            requests.push_back(make_axis_request(primary_size, value, spec.filter));
+        }
         if (spec.axis_mode == AxisMode::height_plus_width) {
-            const double derived = static_cast<double>(secondary_size) * value
-                / static_cast<double>(primary_size);
-            if (derived < 2.0) {
-                throw WorkerError("bad_request", "derived secondary axis length is too small");
+            if (spec.geometry) {
+                requests.push_back(make_geometry_axis_request(*spec.geometry, true, secondary_size, spec.filter));
+            } else {
+                const double derived = static_cast<double>(secondary_size) * value
+                    / static_cast<double>(primary_size);
+                if (derived < 2.0) {
+                    throw WorkerError("bad_request", "derived secondary axis length is too small");
+                }
+                requests.push_back(make_axis_request(secondary_size, derived, spec.filter));
             }
-            requests.push_back(make_axis_request(secondary_size, derived, spec.filter));
         }
 
         const auto plan_start = std::chrono::steady_clock::now();
@@ -5167,6 +5224,27 @@ private:
             throw WorkerError(
                 "bad_request",
                 "candidate destination must be within 2..source_size-1");
+        }
+        return request;
+    }
+
+    static AxisPlanRequest make_geometry_axis_request(const Geometry &geometry,
+                                                       bool horizontal,
+                                                       std::int32_t source_size,
+                                                       const Filter &filter) {
+        AxisPlanRequest request;
+        request.source_size = source_size;
+        request.destination_size = static_cast<std::int32_t>(
+            horizontal ? geometry.width : geometry.height);
+        request.active_length = horizontal ? geometry.src_width : geometry.src_height;
+        request.shift = horizontal ? geometry.src_left : geometry.src_top;
+        request.filter = filter;
+        request.border = BorderMode::mirror;
+        if (request.destination_size < 2 || request.source_size < 2
+            || request.destination_size >= request.source_size
+            || !std::isfinite(request.active_length) || !std::isfinite(request.shift)
+            || request.active_length <= 0.0 || request.shift < 0.0) {
+            throw WorkerError("bad_request", "geometry destination must be within source bounds");
         }
         return request;
     }

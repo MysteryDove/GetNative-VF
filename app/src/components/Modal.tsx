@@ -1,5 +1,5 @@
 import { X } from "lucide-react";
-import { useEffect, useId } from "react";
+import { useEffect, useId, useRef } from "react";
 import type { JSX } from "react";
 
 /**
@@ -19,6 +19,7 @@ export function Modal(props: {
   const { onClose, title, closeLabel, labelledBy, actions, children } = props;
   const generatedTitleId = useId();
   const titleId = labelledBy ?? generatedTitleId;
+  const backdropPress = useRef(false);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -29,7 +30,21 @@ export function Modal(props: {
   }, [onClose]);
 
   return (
-    <div className="modal-backdrop" role="presentation" onClick={onClose}>
+    <div
+      className="modal-backdrop"
+      role="presentation"
+      onPointerDown={(event) => {
+        backdropPress.current = event.target === event.currentTarget;
+      }}
+      onPointerUp={(event) => {
+        const shouldClose = backdropPress.current && event.target === event.currentTarget;
+        backdropPress.current = false;
+        if (shouldClose) onClose();
+      }}
+      onPointerCancel={() => {
+        backdropPress.current = false;
+      }}
+    >
       <div
         className="modal-card"
         role="dialog"

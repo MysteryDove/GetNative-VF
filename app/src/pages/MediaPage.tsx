@@ -21,7 +21,7 @@ import {
   type MediaCapabilities,
 } from "../media/service";
 import type { ProjectState, Source } from "../project/types";
-import { dispatchFrameBrowserKey, findDuplicateSampleId, isSourceFrameSampled } from "../media/frameBrowser";
+import { dispatchFrameBrowserKey, findDuplicateSampleId } from "../media/frameBrowser";
 import {
   applyRelinkedProbe,
   cancelSourceImport,
@@ -53,10 +53,12 @@ export function MediaPage({
   t,
   state,
   onProjectChange,
+  active = true,
 }: {
   t: Translator;
   state: ProjectState;
   onProjectChange: ProjectUpdater;
+  active?: boolean;
 }) {
   const sources = useMemo(() => Object.values(state.sourcesById), [state.sourcesById]);
   const persistedSelection = mediaViewState(state).selectedSourceId;
@@ -69,6 +71,8 @@ export function MediaPage({
   const [importing, setImporting] = useState(0);
   const [indexProgress, reportIndexProgress] = useIndexProgress(state.sourcesById);
   const [error, setError] = useState("");
+  // Transient dedup popup: set only when an add is blocked by the dedup rule.
+  const [dedupPopupId, setDedupPopupId] = useState<number | null>(null);
 
   const selectedSource = selectedSourceId ? state.sourcesById[selectedSourceId] : null;
   const sourceSamples = useMemo(
@@ -133,7 +137,7 @@ export function MediaPage({
     selectVideoFrame,
     scrubVideoFrame,
   } = useMediaPreview({
-    selectedSource,
+    selectedSource: active ? selectedSource : null,
     videoDecodeAvailable: mediaCapabilities?.video_decode_available,
     setError,
     onSourceChanged: markSourceChanged,
@@ -161,11 +165,23 @@ export function MediaPage({
     setSelectedSourceId(sources[0]?.id ?? null);
   }, [selectedSourceId, sources, state.sourcesById]);
 
+  // The dedup popup never survives a frame/source switch.
+  const selectedFrameIndex = frameWindow?.selected.frame_index ?? null;
+  useEffect(() => {
+    setDedupPopupId(null);
+  }, [selectedSourceId, selectedFrameIndex]);
+
+  useEffect(() => {
+    if (dedupPopupId == null) return;
+    const timer = window.setTimeout(() => setDedupPopupId(null), 3200);
+    return () => window.clearTimeout(timer);
+  }, [dedupPopupId]);
+
   useEffect(() => {
     getMediaCapabilities().then(setMediaCapabilities).catch((reason) => setError(String(reason)));
   }, []);
 
-  const dropActive = useFileDrop((paths) => void importPaths(paths));
+  const dropActive = useFileDrop((paths) => void importPaths(paths), active);
 
   async function pickFiles() {
     try {
@@ -235,6 +251,7 @@ export function MediaPage({
       frameIndex: selectedFrame?.frame_index ?? null,
     });
     if (duplicateId && !window.confirm(t("media.duplicateSampleConfirm"))) {
+      setDedupPopupId((id) => (id ?? 0) + 1);
       return;
     }
     const sample = buildFrameSample({
@@ -260,11 +277,6 @@ export function MediaPage({
     onProjectChange((current) => withoutSample(current, sampleId));
   }
 
-  const currentFrame = frameWindow?.selected.frame_index ?? 0;
-  const alreadySelected = Boolean(
-    selectedSource &&
-      isSourceFrameSampled(Object.values(state.samplesById), selectedSource, currentFrame),
-  );
   return (
     <div className={`page-panel media-page ${dropActive ? "drop-active" : ""}`}>
       <div className="page-header media-header">
@@ -476,10 +488,12 @@ export function MediaPage({
                 {t("media.addAndContinue")}
               </button>
             ) : null}
+            {dedupPopupId != null ? (
+              <p className="dedup-popup" role="status">
+                {t("media.alreadySelected")}
+              </p>
+            ) : null}
           </div>
-          <p className={`selection-note ${alreadySelected ? "visible" : ""}`} aria-live="polite">
-            {alreadySelected ? t("media.alreadySelected") : " "}
-          </p>
           <div className="selected-sample-list">
             {sourceSamples.map((sample) => (
               <div className="selected-sample-row" key={sample.id}>

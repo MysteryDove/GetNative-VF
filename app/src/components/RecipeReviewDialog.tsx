@@ -7,6 +7,7 @@ import { Modal } from "./Modal";
 export const MISSING_LABEL_KEYS = {
   name: "recipe.missing.name",
   geometry: "recipe.missing.geometry",
+  geometry_review: "recipe.missing.geometryReview",
   kernel: "recipe.missing.kernel",
   metric: "recipe.missing.metric",
   metric_invalid: "recipe.missing.metricInvalid",
@@ -74,7 +75,8 @@ export function RecipeReviewDialog({
             {recipe.geometry
               ? `${recipe.geometry.canvasWidth}×${recipe.geometry.canvasHeight}` +
                 ` · src (${recipe.geometry.srcLeft}, ${recipe.geometry.srcTop}) ` +
-                `${recipe.geometry.srcWidth}×${recipe.geometry.srcHeight}`
+                `${recipe.geometry.srcWidth}×${recipe.geometry.srcHeight}` +
+                ` · base ${recipe.geometry.baseWidth ?? "integer"}×${recipe.geometry.baseHeight ?? "integer"}`
               : t("recipe.fieldMissing")}
           </span>
         </div>

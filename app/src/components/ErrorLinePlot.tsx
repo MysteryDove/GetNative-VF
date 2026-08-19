@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
+import { useElementSize } from "../hooks/useElementSize";
 
 export type ErrorPlotDatum = {
   key: string;
@@ -100,20 +101,17 @@ function decimateMinMax<T>(points: T[], value: (point: T) => number, maxBuckets:
 /** Marker budget per series; beyond it markers would drown the SVG DOM. */
 const MAX_MARKERS = 300;
 
-function useElementSize() {
-  const ref = useRef<HTMLDivElement | null>(null);
-  const [size, setSize] = useState({ width: 0, height: 0 });
-  useEffect(() => {
-    const element = ref.current;
-    if (!element) return;
-    const observer = new ResizeObserver((entries) => {
-      const box = entries[0]?.contentRect;
-      if (box) setSize({ width: box.width, height: box.height });
-    });
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
-  return [ref, size] as const;
+/**
+ * X values arrive as strings from heterogeneous sources (grid draft, engine
+ * rows, verdict formatting), so compare numerically with a small relative
+ * tolerance instead of by exact string equality.
+ */
+function samePlotX(a: string | null | undefined, b: string): boolean {
+  if (a == null) return false;
+  const na = Number(a);
+  const nb = Number(b);
+  if (!Number.isFinite(na) || !Number.isFinite(nb)) return a === b;
+  return Math.abs(na - nb) <= 1e-6 * Math.max(1, Math.abs(na), Math.abs(nb));
 }
 
 /**
@@ -132,6 +130,7 @@ export function ErrorLinePlot({
   thresholdLabel,
   bestKey,
   selectedX,
+  valleyKeys,
   onSelect,
   resetLabel,
   onZoomRangeChange,
@@ -145,6 +144,8 @@ export function ErrorLinePlot({
   thresholdLabel: string;
   bestKey?: string | null;
   selectedX?: string | null;
+  /** Point keys of detected local valleys, drawn as hollow ring markers. */
+  valleyKeys?: ReadonlySet<string> | null;
   onSelect?: (x: string) => void;
   resetLabel?: string;
   onZoomRangeChange?: (range: { xMin: number; xMax: number } | null) => void;
@@ -247,8 +248,10 @@ export function ErrorLinePlot({
       : null;
 
   const toDataX = (event: { clientX: number; currentTarget: Element }) => {
+    // currentTarget is the zoom-surface rect itself: its bounds already start
+    // at the plot area's left edge, so no margin offset is subtracted here.
     const rect = event.currentTarget.getBoundingClientRect();
-    const ratio = (event.clientX - rect.left - margin.left) / Math.max(1, innerWidth);
+    const ratio = (event.clientX - rect.left) / Math.max(1, rect.width);
     const value = domain.xMin + ratio * (domain.xMax - domain.xMin);
     return Math.min(domain.xMax, Math.max(domain.xMin, value));
   };
@@ -412,17 +415,18 @@ export function ErrorLinePlot({
                 <path d={path} fill="none" stroke={color} strokeWidth={1.6} />
                 {points.map((point, index) => {
                   const isBest = bestKey === point.key;
-                  const isSelected = selectedX === point.x;
-                  if (index % markerStride !== 0 && !isBest && !isSelected) return null;
+                  const isSelected = samePlotX(selectedX, point.x);
+                  const isValley = !isBest && !isSelected && (valleyKeys?.has(point.key) ?? false);
+                  if (index % markerStride !== 0 && !isBest && !isSelected && !isValley) return null;
                   return (
                     <circle
                       key={point.key}
                       cx={xScale(Number(point.x))}
                       cy={yScale(yValue(point.metric))}
-                      r={isBest || isSelected ? 4.5 : 3}
-                      fill={color}
-                      stroke={isSelected ? SELECTED_COLOR : isBest ? "#f0f4f2" : "none"}
-                      strokeWidth={isBest || isSelected ? 1.6 : 0}
+                      r={isBest || isSelected ? 4.5 : isValley ? 5 : 3}
+                      fill={isValley ? "none" : color}
+                      stroke={isSelected ? SELECTED_COLOR : isBest ? "#f0f4f2" : isValley ? color : "none"}
+                      strokeWidth={isBest || isSelected || isValley ? 1.6 : 0}
                       className="error-plot-marker"
                       onClick={() => onSelect?.(point.x)}
                     >

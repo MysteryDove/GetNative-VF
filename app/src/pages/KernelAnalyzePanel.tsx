@@ -20,6 +20,7 @@ import { BlockedState } from "../components/BlockedState";
 import { KernelScanList, KernelScanListBuilder } from "../components/KernelScanList";
 import { MetricEditor } from "../components/MetricEditor";
 import { ResultMetricTable } from "../components/ResultMetricTable";
+import { KernelMetricPlot } from "../components/KernelMetricPlot";
 import { RunGroupPlanCard } from "../components/RunGroupPlanCard";
 import { RunLaunchButton } from "../components/RunLaunchButton";
 import { backendOptionLabel } from "../engine/backendSelection";
@@ -30,6 +31,9 @@ export function KernelAnalyzePanel({
   state,
   capabilities,
   analyzeAvailable,
+  showExcludedResults,
+  excludedResultsAvailable,
+  onToggleExcludedResults,
   draft,
   onDraftChange,
   inheritMetric,
@@ -43,6 +47,10 @@ export function KernelAnalyzePanel({
   state: ProjectState;
   capabilities: EngineEnvelope | null;
   analyzeAvailable: boolean;
+  showExcludedResults: boolean;
+  /** False when no Sample is excluded; the toggle is hidden then. */
+  excludedResultsAvailable: boolean;
+  onToggleExcludedResults: (value: boolean) => void;
   /** Lifted to AnalyzePage so the hand-built scan list survives subroute switches. */
   draft: KernelDraft;
   onDraftChange: (updater: (current: KernelDraft) => KernelDraft) => void;
@@ -98,6 +106,7 @@ export function KernelAnalyzePanel({
     excludedSampleIds,
     selectedResultKey,
     sampleFilter,
+    showExcludedResults,
     onSelectResultKey: setSelectedResultKey,
   });
 
@@ -111,7 +120,8 @@ export function KernelAnalyzePanel({
       state,
       {
         kernel: { id: kernel.id, parameters: { ...kernel.parameters } },
-        axisMode: profileFor(draft.profileId, capabilities).default_axis_mode,
+        axisMode: currentRecipe?.axisMode ??
+          profileFor(draft.profileId, capabilities).default_axis_mode,
         profileId: draft.profileId,
         mathMode: draft.mathMode,
         ...(includeDivergedMetric ? { metric: { ...draft.metric } } : {}),
@@ -150,6 +160,8 @@ export function KernelAnalyzePanel({
       ? t("analyze.runBlocked.noSamples")
       : !recipeGeometry
         ? t("analyze.k.noRecipeGeometry")
+        : recipeGeometry.needsReview
+          ? t("analyze.k.geometryReview")
         : testSamples.length === 0
           ? t("analyze.k.noneSelected")
           : draft.scanList.length === 0
@@ -162,7 +174,7 @@ export function KernelAnalyzePanel({
                   ? t("analyze.k.planInvalid")
                   : null;
 
-  const canRun = analyzeAvailable && recipeGeometry !== null && plan !== null && !submitting;
+  const canRun = analyzeAvailable && recipeGeometry !== null && !recipeGeometry.needsReview && plan !== null && !submitting;
 
   function startRun() {
     if (!plan) return;
@@ -194,37 +206,39 @@ export function KernelAnalyzePanel({
         {includedSamples.length === 0 ? (
           <p className="empty-copy">{t("analyze.noSamples")}</p>
         ) : (
-          <ul className="analyze-sample-list">
+          <ul className="analyze-sample-list kernel-sample-list">
             {includedSamples.map((sample) => {
               const source = state.sourcesById[sample.sourceId];
               const dims = sampleDims[sample.id];
               const excluded = excludedSampleIds.has(sample.id);
               return (
                 <li key={sample.id} className={excluded ? "hidden-series" : ""}>
-                  <input
-                    type="checkbox"
-                    className="sample-check"
-                    checked={!excluded}
-                    aria-label={t("samples.include")}
-                    onChange={() => toggleSampleExcluded(sample.id)}
-                  />
-                  <div>
-                    <strong>{sample.label || sample.id}</strong>
-                    <span>
-                      {source?.label || source?.path || sample.sourceId}
-                      {sample.frameIndex != null ? ` · #${sample.frameIndex}` : ""}
-                      {dims ? ` · ${dims.width}×${dims.height}` : ""}
-                    </span>
-                    {sample.tags.length ? (
-                      <span className="sample-tags">
-                        {sample.tags.map((tag) => (
-                          <span className="sample-tag" key={tag}>
-                            {tag}
-                          </span>
-                        ))}
+                  <label className="kernel-sample-option">
+                    <input
+                      type="checkbox"
+                      className="sample-check"
+                      checked={!excluded}
+                      aria-label={t("samples.include")}
+                      onChange={() => toggleSampleExcluded(sample.id)}
+                    />
+                    <div>
+                      <strong>{sample.label || sample.id}</strong>
+                      <span>
+                        {source?.label || source?.path || sample.sourceId}
+                        {sample.frameIndex != null ? ` · #${sample.frameIndex}` : ""}
+                        {dims ? ` · ${dims.width}×${dims.height}` : ""}
                       </span>
-                    ) : null}
-                  </div>
+                      {sample.tags.length ? (
+                        <span className="sample-tags">
+                          {sample.tags.map((tag) => (
+                            <span className="sample-tag" key={tag}>
+                              {tag}
+                            </span>
+                          ))}
+                        </span>
+                      ) : null}
+                    </div>
+                  </label>
                 </li>
               );
             })}
@@ -256,7 +270,8 @@ export function KernelAnalyzePanel({
                 <span>
                   {`${t("analyze.k.canvas")} ${recipeGeometry.canvasWidth}×${recipeGeometry.canvasHeight}` +
                     ` · src (${recipeGeometry.srcLeft}, ${recipeGeometry.srcTop}) ` +
-                    `${recipeGeometry.srcWidth}×${recipeGeometry.srcHeight}`}
+                    `${recipeGeometry.srcWidth}×${recipeGeometry.srcHeight}` +
+                    ` · base ${recipeGeometry.baseWidth ?? "integer"}×${recipeGeometry.baseHeight ?? "integer"}`}
                 </span>
               </div>
             </div>
@@ -281,6 +296,16 @@ export function KernelAnalyzePanel({
         <div className="analyze-table-host">
           <div className="analyze-table-toolbar">
             <h3>{t("analyze.resultsTable")}</h3>
+            {excludedResultsAvailable ? (
+              <label className="series-visibility analyze-excluded-toggle">
+                <input
+                  type="checkbox"
+                  checked={showExcludedResults}
+                  onChange={(event) => onToggleExcludedResults(event.target.checked)}
+                />
+                <span>{t("analyze.showExcludedResults")}</span>
+              </label>
+            ) : null}
             <button
               className="primary-button"
               type="button"
@@ -312,19 +337,33 @@ export function KernelAnalyzePanel({
             </div>
           ) : null}
           {resultRows.rows.length ? (
-            <ResultMetricTable
-              t={t}
-              ariaLabel={t("analyze.resultsTable")}
-              columns={[
-                t("analyze.col.kernel"),
-                t("analyze.col.metric"),
-                t("analyze.col.sample"),
-                t("analyze.col.run"),
-              ]}
-              metricColumnIndex={1}
-              columnTemplate="minmax(140px, 1.4fr) 96px minmax(80px, 1fr) 72px"
-              rows={visibleTableRows}
-            />
+            <>
+              <KernelMetricPlot
+                t={t}
+                selectedKey={selectedResultKey}
+                onSelect={(key) =>
+                  setSelectedResultKey((current) => (current === key ? null : key))
+                }
+                rows={
+                  sampleFilter
+                    ? resultRows.rows.filter((row) => row.sampleId === sampleFilter)
+                    : resultRows.rows
+                }
+              />
+              <ResultMetricTable
+                t={t}
+                ariaLabel={t("analyze.resultsTable")}
+                columns={[
+                  t("analyze.col.kernel"),
+                  t("analyze.col.metric"),
+                  t("analyze.col.sample"),
+                  t("analyze.col.run"),
+                ]}
+                metricColumnIndex={1}
+                columnTemplate="minmax(140px, 1.4fr) 96px minmax(80px, 1fr) 72px"
+                rows={visibleTableRows}
+              />
+            </>
           ) : (
             <BlockedState
               title={

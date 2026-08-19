@@ -12,6 +12,40 @@ export function includedSamples(state: ProjectState): Sample[] {
     .sort((a, b) => a.order - b.order);
 }
 
+/** Limit an included Sample list to a one-shot selection passed into Analyze. */
+export function selectedAnalysisSamples(
+  samples: Sample[],
+  selectedIds?: readonly string[] | null,
+): Sample[] {
+  if (!selectedIds?.length) return samples;
+  const selected = new Set(selectedIds);
+  return samples.filter((sample) => selected.has(sample.id));
+}
+
+/** Global historical-result visibility: excluded Samples are hidden by default. */
+export function hiddenResultSampleIds(
+  samplesById: ProjectState["samplesById"],
+  locallyHidden: ReadonlySet<string>,
+  showExcluded: boolean,
+): Set<string> {
+  const hidden = new Set(locallyHidden);
+  if (!showExcluded) {
+    for (const sample of Object.values(samplesById)) {
+      if (!sample.included) hidden.add(sample.id);
+    }
+  }
+  return hidden;
+}
+
+export function resultSampleIsVisible(
+  samplesById: ProjectState["samplesById"],
+  sampleId: string | null,
+  showExcluded: boolean,
+): boolean {
+  if (showExcluded || sampleId == null) return true;
+  return samplesById[sampleId]?.included !== false;
+}
+
 /**
  * Returns a NEW ProjectState with the given Source patched to `state: "error"`
  * plus the provided errorCode/errorDetail. Missing source returns the input

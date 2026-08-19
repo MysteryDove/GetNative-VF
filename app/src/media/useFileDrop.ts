@@ -3,12 +3,16 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 /**
  * Window-level file drag/drop hook (Tauri webview drag events). Returns true
- * while a drag hovers so pages can show a drop overlay. Only one page is
- * mounted at a time, so per-page subscription is safe.
+ * while a drag hovers so pages can show a drop overlay. Keep-alive routes
+ * pass enabled=false so only the visible page owns the webview subscription.
  */
-export function useFileDrop(onPaths: (paths: string[]) => void): boolean {
+export function useFileDrop(onPaths: (paths: string[]) => void, enabled = true): boolean {
   const [dropActive, setDropActive] = useState(false);
   useEffect(() => {
+    if (!enabled) {
+      setDropActive(false);
+      return;
+    }
     let disposed = false;
     let unlisten: (() => void) | undefined;
     getCurrentWebview()
@@ -31,6 +35,6 @@ export function useFileDrop(onPaths: (paths: string[]) => void): boolean {
       disposed = true;
       unlisten?.();
     };
-  }, [onPaths]);
+  }, [enabled, onPaths]);
   return dropActive;
 }

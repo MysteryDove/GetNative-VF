@@ -8,7 +8,12 @@ import {
   geometryGroupKey,
   resolveKernelCandidates,
 } from "./kernelDraft";
-import { materializeKernelRunGroup, planKernelRunGroup } from "./kernelRunGroup";
+import {
+  compareKernelResultRows,
+  materializeKernelRunGroup,
+  planKernelRunGroup,
+  type KernelResultRow,
+} from "./kernelRunGroup";
 import type { EngineEnvelope } from "./types";
 import type { MetricSpec } from "./protocol";
 
@@ -150,6 +155,7 @@ describe("planKernelRunGroup", () => {
       sourcesById: sources,
       geometries: resolvedGeometries(d),
       capabilities,
+      axisMode: "h_plus_w",
       nowMs: 1,
       requestIdPrefix: "test",
     });
@@ -173,6 +179,22 @@ describe("planKernelRunGroup", () => {
     expect(materialized.runs[0]?.total).toBe(6);
   });
 
+  it("preserves a W-only Recipe axis in algorithm-test requests", () => {
+    const d = draft();
+    const result = planKernelRunGroup({
+      draft: d,
+      samples: [sample],
+      sourcesById: sources,
+      geometries: resolvedGeometries(d),
+      capabilities,
+      axisMode: "w_only",
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.plan.members[0]?.request.axisMode).toBe("w_only");
+    expect(result.plan.intentSnapshot.axisMode).toBe("w_only");
+  });
+
   it("blocks when geometry is unresolved or the source is stale", () => {
     const d = draft();
     const unresolved = planKernelRunGroup({
@@ -181,6 +203,7 @@ describe("planKernelRunGroup", () => {
       sourcesById: sources,
       geometries: {},
       capabilities,
+      axisMode: "h_plus_w",
     });
     expect(unresolved.ok).toBe(false);
     if (!unresolved.ok) expect(unresolved.reason).toBe("geometry_unresolved");
@@ -191,6 +214,7 @@ describe("planKernelRunGroup", () => {
       sourcesById: sources,
       geometries: resolvedGeometries(d),
       capabilities,
+      axisMode: "h_plus_w",
     });
     expect(stale.ok).toBe(false);
     if (!stale.ok) expect(stale.reason).toBe("sample_fingerprint_stale");
@@ -209,6 +233,7 @@ describe("planKernelRunGroup", () => {
       sourcesById: sources,
       geometries: resolvedGeometries(d),
       capabilities,
+      axisMode: "h_plus_w",
     });
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe("kernel_list_too_small");
@@ -236,6 +261,37 @@ describe("extractKernelResultRows (worker v1.1 payload)", () => {
     ]);
     expect(extractKernelResultRows(null)).toBeNull();
     expect(extractKernelResultRows({ candidates: "bogus" })).toBeNull();
+  });
+});
+
+describe("compareKernelResultRows", () => {
+  it("orders kernel families first and numeric parameters within each family", () => {
+    const row = (
+      kernelId: string,
+      parameters: KernelResultRow["parameters"],
+    ): KernelResultRow => ({
+      runId: "run-1",
+      sampleId: "sample-1",
+      kernelId,
+      parameters,
+      kernelLabel: kernelId,
+      metric: 1,
+      sampleLabel: "sample",
+    });
+    const rows = [
+      row("bicubic", { b: 1, c: 1 }),
+      row("lanczos", { taps: 2 }),
+      row("bicubic", { b: 0.1, c: 1 }),
+      row("bilinear", {}),
+      row("bicubic", { b: 1, c: 0.1 }),
+    ].sort(compareKernelResultRows);
+    expect(rows.map((item) => [item.kernelId, item.parameters])).toEqual([
+      ["bilinear", {}],
+      ["bicubic", { b: 0.1, c: 1 }],
+      ["bicubic", { b: 1, c: 0.1 }],
+      ["bicubic", { b: 1, c: 1 }],
+      ["lanczos", { taps: 2 }],
+    ]);
   });
 });
 

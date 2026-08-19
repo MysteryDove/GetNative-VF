@@ -10,6 +10,7 @@ import {
 import { isTerminalPhase, type QueueJobInput } from "./runReducer";
 import type { BackendPreference, KernelRef } from "./protocol";
 import type { ProjectState, Run } from "../project/types";
+import { geometryCandidate, geometryToWire } from "./geometry";
 
 /**
  * RunGroup execution orchestration (GUI-3): materialize the plan into
@@ -305,7 +306,7 @@ export async function startHeightRunGroup(input: {
 /**
  * Kernel RunGroup execution (GUI-4): one member per Sample, each holding one
  * fixed geometry and the full ordered kernel candidate list. The wire
- * candidate is the member geometry's active/base height. The same profile and
+ * candidate is the member geometry's primary src axis. The same profile and
  * optional parity canvas dimensions are sent so the worker reconstructs the
  * resolved fractional geometry for every kernel.
  */
@@ -397,7 +398,7 @@ export async function startKernelRunGroup(input: {
           height: asset.height,
         },
         axisMode: member.request.axisMode,
-        candidate: String(member.geometry.baseHeight ?? member.geometry.srcHeight),
+        candidate: String(geometryCandidate(member.geometry, member.request.axisMode)),
         profileId: member.request.profileId,
         endpointRule: "inclusive",
         baseHeight: member.request.geometry.baseHeight == null
@@ -406,6 +407,7 @@ export async function startKernelRunGroup(input: {
         baseWidth: member.request.geometry.baseWidth == null
           ? null
           : String(member.request.geometry.baseWidth),
+        geometry: geometryToWire(member.geometry),
         kernels: member.kernels.map((kernel) => kernelParamsForWire(kernel)),
         metric: {
           cropLeft: member.request.metric.cropLeft,

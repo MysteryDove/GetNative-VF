@@ -12,6 +12,7 @@ import type {
 } from "./types";
 import { profileFor } from "../engine/profiles";
 import { recipeReadiness } from "./recipe";
+import { migrateGeometrySnapshot } from "../engine/geometry";
 
 const projectRoutes: ProjectRoute[] = [
   "overview",
@@ -128,7 +129,7 @@ export function openedToProjectState(opened: OpenedProjectDto): ProjectState {
       parentRecipeId: recipe.parent_recipe_id ?? null,
       createdAt: recipe.created_at ?? "",
       updatedAt: recipe.updated_at ?? "",
-      geometry: recipe.geometry ?? null,
+      geometry: migrateGeometrySnapshot(recipe.geometry),
       kernel: recipe.kernel ?? null,
       metric: recipe.metric ?? null,
       axisMode: recipe.axis_mode ?? profileFor(recipe.profile_id ?? "").default_axis_mode,

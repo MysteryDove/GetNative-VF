@@ -16,6 +16,9 @@ import { toggleSetValue } from "../utils/collections";
 import { actualBackendLabel } from "../engine/backendSelection";
 import type { ActualBackend } from "../engine/protocol";
 import { verificationRunLabel, verifyCoverageDisplay } from "../engine/verifyResults";
+import { sourceFilterLabel } from "../project/sourceLabel";
+
+export { sourceFilterLabel } from "../project/sourceLabel";
 
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
 
@@ -78,6 +81,8 @@ export function ResultsPage({
 }) {
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [selectedRuns, setSelectedRuns] = useState<Set<string>>(new Set());
+  const [runGroupFilter, setRunGroupFilter] = useState("all");
+  const [sourceFilter, setSourceFilter] = useState("all");
   const [notice, setNotice] = useState("");
 
   const groups = useMemo(
@@ -93,6 +98,54 @@ export function ResultsPage({
         .filter((run) => !run.runGroupId || !state.runGroupsById[run.runGroupId])
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
     [state.runsById, state.runGroupsById],
+  );
+
+  const runFilterOptions = useMemo(() => {
+    const entries = [
+      ...groups.map((group) => ({ value: group.id, createdAt: group.createdAt })),
+      ...ungroupedRuns.map((run) => ({ value: `run:${run.id}`, createdAt: run.createdAt })),
+    ].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.value.localeCompare(b.value));
+    return entries.map((entry, index) => ({
+      value: entry.value,
+      label: t("results.runOption", { number: String(index + 1) }),
+    }));
+  }, [groups, ungroupedRuns, t]);
+
+  const sourceFilterOptions = useMemo(() => {
+    const sourceIds = new Set<string>();
+    for (const group of groups) {
+      for (const runId of group.memberRunIds) {
+        const sourceId = state.runsById[runId]?.sourceId;
+        if (sourceId) sourceIds.add(sourceId);
+      }
+    }
+    for (const run of ungroupedRuns) {
+      if (run.sourceId) sourceIds.add(run.sourceId);
+    }
+    return [...sourceIds].map((sourceId) => ({
+      value: sourceId,
+      label: sourceFilterLabel(sourceId, state),
+    }));
+  }, [groups, state, ungroupedRuns]);
+
+  const visibleGroups = useMemo(
+    () =>
+      groups.filter((group) => {
+        if (runGroupFilter !== "all" && runGroupFilter !== group.id) return false;
+        return sourceFilter === "all" || group.memberRunIds.some(
+          (runId) => state.runsById[runId]?.sourceId === sourceFilter,
+        );
+      }),
+    [groups, runGroupFilter, sourceFilter, state.runsById],
+  );
+
+  const visibleUngroupedRuns = useMemo(
+    () =>
+      ungroupedRuns.filter((run) => {
+        if (runGroupFilter !== "all" && runGroupFilter !== `run:${run.id}`) return false;
+        return sourceFilter === "all" || run.sourceId === sourceFilter;
+      }),
+    [runGroupFilter, sourceFilter, ungroupedRuns],
   );
 
   /** MetricSpec key of the current selection; incompatible Runs cannot join. */
@@ -262,6 +315,61 @@ export function ResultsPage({
 
       {notice ? <p className="help-copy">{notice}</p> : null}
 
+      <div className="results-filters" aria-label={t("results.filters.title")}>
+        <div className="results-filter-group" role="radiogroup" aria-label={t("results.filters.runs")}>
+          <span className="results-filter-label">{t("results.filters.runs")}</span>
+          <div className="button-radio">
+            <button
+              type="button"
+              role="radio"
+              aria-checked={runGroupFilter === "all"}
+              className={runGroupFilter === "all" ? "active" : ""}
+              onClick={() => setRunGroupFilter("all")}
+            >
+              {t("results.filters.all")}
+            </button>
+            {runFilterOptions.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                role="radio"
+                aria-checked={runGroupFilter === option.value}
+                className={runGroupFilter === option.value ? "active" : ""}
+                onClick={() => setRunGroupFilter(option.value)}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="results-filter-group" role="radiogroup" aria-label={t("results.filters.source")}>
+          <span className="results-filter-label">{t("results.filters.source")}</span>
+          <div className="button-radio">
+            <button
+              type="button"
+              role="radio"
+              aria-checked={sourceFilter === "all"}
+              className={sourceFilter === "all" ? "active" : ""}
+              onClick={() => setSourceFilter("all")}
+            >
+              {t("results.filters.all")}
+            </button>
+            {sourceFilterOptions.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                role="radio"
+                aria-checked={sourceFilter === option.value}
+                className={sourceFilter === option.value ? "active" : ""}
+                onClick={() => setSourceFilter(option.value)}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
       {isEmpty ? (
         <section className="page-section">
           <p className="empty-copy">{t("results.emptyBody")}</p>
@@ -292,8 +400,11 @@ export function ResultsPage({
 
           <section className="page-section">
             <h3>{t("results.groups")}</h3>
-            <div className="dense-table">
-              {groups.map((group) => (
+            {visibleGroups.length === 0 && visibleUngroupedRuns.length === 0 ? (
+              <p className="empty-copy">{t("results.noFilterMatches")}</p>
+            ) : (
+              <div className="dense-table">
+              {visibleGroups.map((group) => (
                 <RunGroupBlock
                   key={group.id}
                   t={t}
@@ -309,7 +420,7 @@ export function ResultsPage({
                   runSelectable={runSelectable}
                 />
               ))}
-              {ungroupedRuns.map((run) => (
+              {visibleUngroupedRuns.map((run) => (
                 <RunRow
                   key={run.id}
                   t={t}
@@ -322,7 +433,8 @@ export function ResultsPage({
                   selectable={runSelectable(run)}
                 />
               ))}
-            </div>
+              </div>
+            )}
           </section>
         </>
       )}
