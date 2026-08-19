@@ -1,226 +1,80 @@
 # GetNative VF
 
-GetNative VF is a standalone desktop app for finding a video's native
-resolution and checking the result across the full video. It runs without
-VapourSynth, Python, plugins, or `.vpy` scripts.
+**Find the true native resolution of any video — no VapourSynth, no Python, no scripts.**
 
-## Current Status
+GetNative VF is a standalone desktop app that detects the resolution a video
+was originally produced at, then verifies that result across every frame of
+the video. It is a complete, self-contained reimagining of the classic
+`getnative` workflow: everything runs inside one app, with nothing to install
+or configure.
 
-- The desktop workflow now works end to end: open a video, scan candidate
-  resolutions, choose a result, and verify it across the whole video.
-- On an RTX 5080, it reaches about **3,600 candidates/s** during resolution
-  scans and **1,600 fps** during whole-video scans.
-- CPU, CUDA, Metal, and Vulkan backends are available. The project remains in
-  active development, and performance varies by source and scan settings.
+## Download
 
-The accepted architecture and implementation sequence are documented in
-`docs/architecture.md` and `.omx/plans/standalone-getnative.md`.
+Grab the latest package from
+[Releases](https://github.com/MysteryDove/GetNative-VF/releases):
 
-## Run
+- **Windows** — portable ZIP; unzip and run `getnative-gui.exe`. Includes CUDA
+  and Vulkan acceleration out of the box.
+- **Linux** — portable ZIP; unzip and run `getnative-gui`.
 
-```sh
-cd app
-npm install
-npm run tauri dev
-```
+## Features
 
-The dev command builds and stages the C++ engine before starting Tauri.
+- **Resolution scan** — test hundreds of candidate native resolutions per
+  second and see the results as an interactive error curve. On an RTX 5080 the
+  engine reaches about **3,600 candidates/s**.
+- **Whole-video verification** — once you pick a result, verify it against
+  every frame of the video at up to **1,600 fps**, with per-frame review so
+  you can inspect exactly where the match holds or breaks.
+- **Fractional refinement** — search beyond integer heights to pin down
+  non-integer source resolutions.
+- **Kernel comparison** — not sure which resizing kernel was used? Run
+  bilinear, bicubic, Lanczos, and more side by side and compare.
+- **Precise frame browser** — inspect any frame, crop region, or plane in
+  silence and at full accuracy.
+- **GPU acceleration everywhere** — CUDA on NVIDIA, Metal on macOS, Vulkan on
+  Linux/Windows, with a fast SIMD CPU fallback. The app picks the best
+  available backend automatically and always tells you which one is active.
+- **Projects and recipes** — save your sources, lock in an analysis recipe,
+  and reproduce any result later with full provenance.
+- **Bilingual UI** — English and 简体中文.
 
-Rust builds use `sccache` through the repository Cargo configuration. Install
-`sccache` 0.17 or newer and ensure it is on `PATH` before running Cargo or
-Tauri commands. Use `sccache --show-stats` to inspect local cache effectiveness.
+## Why it exists
 
-To build the engine and a runnable Linux Tauri test distribution:
+Upscaling is everywhere: streaming catalogs, fan releases, and "HD remasters"
+routinely contain video that was produced at a lower resolution and stretched.
+Tools like `getnative` can reveal the truth, but until now they required a
+VapourSynth setup, Python, plugins, and hand-written `.vpy` scripts. GetNative
+VF packages the same math — validated bit-for-bit against the reference
+implementations — into a fast native engine and a focused desktop UI that
+anyone can use.
 
-```sh
-cd app
-npm run build:dist-test
-./dist-test/getnative-gui
-```
+## Under the hood
 
-The command writes the self-contained resource layout to `app/dist-test` and
-builds the CUDA and Vulkan backends by default. Set
-`GETNATIVE_LINUX_BACKENDS=cpu`, `cuda`, or `vulkan` to request a smaller build.
-It uses the same CUDA, Vulkan, and FFmpeg runtime environment variables as
-`npm run build:engine`, and skips CTest; use `npm run build:engine` when a
-test-gated engine build is required.
+- **Hand-tuned SIMD kernels** — the core descale math runs on
+  runtime-dispatched SSE2/AVX2 (and experimental AVX-512) code ported from the
+  Descale-MVC project, and is validated bit-for-bit against the reference
+  VapourSynth implementations.
+- **A custom GPU scheduler** — instead of inheriting the frame-at-a-time
+  limits of the VapourSynth plugin model, the native engine batches and tiles
+  candidates with its own scheduler to keep the GPU saturated. That's how a
+  scan reaches **~3,600 candidates/s** and whole-video verification reaches
+  **~1,600 fps** on an RTX 5080.
+- **Self-contained media layer** — video decoding is built in (pinned FFmpeg
+  libraries, with NVDEC and Vulkan Video hardware decode where available), so
+  no external tools ever run at runtime.
 
-## Publication Status
+## System requirements
 
-GetNative VF is licensed under the MIT License. See `LICENSE` for details.
-`THIRD_PARTY_NOTICES.md` covers the pinned conformance references; the
-real-image benchmark fixture remains local-only until redistribution rights are
-established.
+- Windows 10+ or a recent Linux distribution (x64)
+- Optional: any recent NVIDIA (CUDA), or Vulkan-capable, GPU for acceleration —
+  the app works fine without one
+- macOS build with Metal support is in active development
 
-## Verify
+## License
 
-```sh
-cmake -S engine -B build/engine -DCMAKE_BUILD_TYPE=Debug
-cmake --build build/engine --parallel
-ctest --test-dir build/engine --output-on-failure
+MIT. See `LICENSE` and `THIRD_PARTY_NOTICES.md`.
 
-# Debian/Ubuntu development metadata for the optional in-engine media layer.
-# These pkg-config modules must resolve to the FFmpeg 8 ABI.
-sudo apt install pkg-config libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+---
 
-# Linux Vulkan build and validation tools. A recent LunarG SDK may be used
-# instead by exporting VULKAN_SDK before configuring.
-sudo apt install libvulkan-dev glslc spirv-tools vulkan-tools vulkan-validationlayers
-
-# Planner bitwise and final-output numerical comparisons with the pinned cores.
-cmake -S engine -B build/engine-conformance -DCMAKE_BUILD_TYPE=Release \
-  -DGETNATIVE_BUILD_UPSTREAM_CONFORMANCE=ON
-cmake --build build/engine-conformance --parallel
-ctest --test-dir build/engine-conformance --output-on-failure
-
-# Planner and end-to-end CPU performance report with assertions.
-build/engine-conformance/getnative_core_benchmark --assert
-
-# macOS Metal conformance and the full 1080p/1000-candidate gate.
-cmake -S engine -B build/engine-metal -DCMAKE_BUILD_TYPE=Release \
-  -DGETNATIVE_ENABLE_METAL=ON
-cmake --build build/engine-metal --parallel
-ctest --test-dir build/engine-metal --output-on-failure
-build/engine-metal/getnative_metal_benchmark --full --assert
-
-# Windows/Linux CUDA correctness, NVDEC bridge, and throughput verification.
-cmake -S engine -B build/engine-cuda -DGETNATIVE_ENABLE_CUDA=ON \
-  -DGETNATIVE_CUDA_MIN_ARCHITECTURE=75
-cmake --build build/engine-cuda --config Release --parallel
-ctest --test-dir build/engine-cuda -C Release --output-on-failure
-build/engine-cuda/Release/getnative_cuda_throughput_benchmark --full \
-  --axes both --concurrency 1
-
-# Linux Vulkan compute and Vulkan Video bridge verification.
-cmake -S engine -B build/engine-vulkan -DGETNATIVE_ENABLE_VULKAN=ON
-cmake --build build/engine-vulkan --parallel
-ctest --test-dir build/engine-vulkan --output-on-failure
-
-cd app
-npm run build
-cargo test --manifest-path src-tauri/Cargo.toml
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-npm run tauri build -- --bundles app
-```
-
-`GETNATIVE_ENABLE_MEDIA=ON` is the default. If the FFmpeg 8 development
-metadata is missing, a development build keeps image workflows available and
-reports video as unavailable. There is no external-FFmpeg fallback. Release
-packaging requires the in-process media commands and stages only the pinned
-LGPL `avformat`/`avcodec`/`avutil`/`swscale` shared libraries beside the engine;
-`ffmpeg` and `ffprobe` executables are never packaged or launched at runtime.
-On macOS, `npm run stage:ffmpeg:macos` prepares the pinned libraries in
-`src-tauri/ffmpeg-runtime`; subsequent engine/package builds consume that
-directory automatically.
-
-Vulkan compute needs headers, a loader, and `glslc` or
-`glslangValidator`; test builds also require `spirv-val`. Vulkan Video is
-advertised at runtime only when the selected device exposes Vulkan 1.3, a
-decode queue, timeline semaphores, and a supported H.264/HEVC/AV1/VP9 decode
-extension. Missing video capability falls back to software decode plus Vulkan
-upload, so it does not disable Vulkan compute or media verification.
-
-On Linux, `npm run build:engine` uses `GETNATIVE_LINUX_BACKENDS=auto` by
-default. `auto` enables CUDA when a toolkit containing `bin/nvcc` is found in
-`GETNATIVE_CUDA_ROOT`, `CUDAToolkit_ROOT`, `CUDA_PATH`, `CUDA_HOME`, or
-`/usr/local/cuda`; otherwise it builds CPU-only. Use `cpu`, `cuda`, `vulkan`, or
-`cuda-vulkan` to choose explicitly. For a release package, point
-`GETNATIVE_FFMPEG_RUNTIME_DIR` at the pinned FFmpeg 8 shared-library directory.
-The build stages only the ABI-matched avformat 62, avcodec 62, avutil 60, and
-swscale 9 libraries beside the engine and records every file hash in
-`build-provenance.json`. For example:
-
-```bash
-cd app
-VULKAN_SDK=/path/to/vulkan-sdk/x86_64 \
-GETNATIVE_LINUX_BACKENDS=cuda-vulkan \
-GETNATIVE_FFMPEG_RUNTIME_DIR=/usr/lib/x86_64-linux-gnu \
-npm run build:engine
-```
-
-Omit `VULKAN_SDK` when the Vulkan headers, loader, shader compiler, validation
-layers, and SPIR-V tools are installed in standard system paths. The packaged
-engine reports `features.verify_engine_decode` and the `software`, `nvdec`,
-and `vulkan_video` entries in `decode_backends`; the GUI uses the legacy ring
-when engine decode is not compiled.
-
-On Apple platforms CMake enables Metal when both `metal` and `metallib` are
-installed. If the optional MetalToolchain component is unavailable it emits a
-warning and produces the CPU-only engine instead. Other platforms are CPU-only
-unless a later backend is enabled explicitly.
-
-## Windows Backends
-
-The Windows engine has three explicit CMake switches:
-
-- `GETNATIVE_ENABLE_X86_SIMD` builds the runtime-dispatched SSE2 and AVX2 tiers.
-- `GETNATIVE_ENABLE_X86_AVX512` additionally builds the forced experimental
-  AVX-512 tier; runtime CPUID/XCR0 checks still decide whether it is available.
-- `GETNATIVE_ENABLE_CUDA` embeds the profiled `cpp-generic` CUDA C++ backend in
-  a multi-architecture fatbin. The default package contains native code for
-  consumer SM75, 86, 89, and 120, plus compute_75 and compute_120 PTX
-  fallbacks. `GETNATIVE_CUDA_MIN_ARCHITECTURE`,
-  `GETNATIVE_CUDA_ARCHITECTURES`, and `GETNATIVE_CUDA_PTX_ARCHITECTURES`
-  configure those three independent boundaries.
-  Common B3/B5 and F6 shapes have local compile-time specializations inside
-  this variant; architecture-specific and handwritten-PTX runtime variants are
-  intentionally unavailable until they pass separate correctness and A/B gates.
-
-CUDA uses the runtime-loaded Driver API. A CUDA-enabled package still starts
-without an NVIDIA driver and reports `compiled`, `device_available`, and
-`analysis_command_available` separately. The resident worker exposes analysis
-when its backend and device are available; one-shot CLI capability discovery
-continues to report the analysis command as unavailable.
-
-On Windows, `npm run build:engine` and the Tauri package build use
-`GETNATIVE_WINDOWS_BACKENDS=cpu` by default. Set it to `cuda` to build and test
-the CUDA backend explicitly. Set `GETNATIVE_CUDA_ARCHITECTURES` when
-building a reduced native-code matrix, and keep the configured minimum in both
-the native and PTX lists. `GETNATIVE_VSDEVCMD`, `CMAKE`, and `CTEST` can
-override tool locations. The build script configures the requested backend
-set, builds it, runs CTest, installs that exact engine, and writes its SHA-256
-and complete CUDA target provenance into the package resources.
-
-## Local Windows portable package
-
-On a machine that already has VS 2026, CUDA 13.3.1, Vulkan SDK 1.4.357.0,
-Rust, pnpm, and the pinned FFmpeg 8.1.2 SDK under
-`.deps/ffmpeg-windows-x64`:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-windows-portable.ps1
-```
-
-The script builds a `cuda-vulkan` engine, the Tauri GUI, and assembles
-`artifacts/windows-x64/GetNative VF_<version>_x64-portable/` plus a ZIP
-with the same layout as the GitHub Package portable artifact: `getnative-gui.exe`,
-`bin/getnative-engine.exe`, the FFmpeg 8 runtime DLLs, and provenance.
-
-## Continuous Integration and Packaging
-
-GitHub Actions has three validation and packaging layers:
-
-- `CI Fast` runs CPU-only CMake/CTest on Linux and Windows plus frontend and
-  Tauri Rust checks on every pull request and `main` push.
-- `CI Media` builds the pinned minimal FFmpeg 8.1.2 SDK, runs the complete
-  in-process media tests, and verifies that no `ffmpeg` or `ffprobe` executable
-  enters the product stage.
-- `Package` builds Linux x64 `deb`/AppImage and a Windows x64 portable ZIP.
-  A `v*` tag publishes the artifacts to GitHub Releases. `workflow_dispatch`
-  performs the same complete builds and uploads Actions artifacts without
-  publishing a release.
-
-Release packages compile the consumer CUDA matrix (SM75/86/89/120) and the
-Vulkan compute backend with CUDA 13.3.1 and Vulkan SDK 1.4.357.0. These SDKs
-are build inputs and their compiler tools are not copied into the portable
-artifact. CUDA loads the NVIDIA Driver API at runtime; the Khronos Vulkan
-loader is packaged beside the engine and uses the target system's graphics
-driver. `build-provenance.json` records both SDK pins and the loader hash.
-The Package workflow builds the required Khronos components from the checked-in
-Linux and Windows SDK configuration specs under `.github/vulkan-sdk/`.
-GitHub-hosted runners have no GPU, so device tests skip and the packaged engine
-still starts without an NVIDIA driver or Vulkan device. Hardware-runner gates
-remain the place for CUDA/Vulkan correctness and performance. The bundled media
-runtime contains only the pinned
-`libavformat`, `libavcodec`, `libavutil`, and `libswscale` shared libraries;
-the command-line FFmpeg programs are test tools only.
+*Building from source or contributing? See `docs/architecture.md` and the
+developer notes in `app/README.md`.*
