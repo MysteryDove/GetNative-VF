@@ -406,8 +406,11 @@ struct DeviceRecord {
                       VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME);
             add_codec(VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR,
                       VK_KHR_VIDEO_DECODE_H265_EXTENSION_NAME);
+#if defined(VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR) \
+    && defined(VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME)
             add_codec(VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR,
                       VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME);
+#endif
 #if defined(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME)
             add_codec(VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR,
                       VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME);
@@ -438,7 +441,10 @@ struct DeviceRecord {
         };
         add_video_codec(VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR, "h264");
         add_video_codec(VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR, "hevc");
+#if defined(VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR) \
+    && defined(VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME)
         add_video_codec(VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR, "av1");
+#endif
 #if defined(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME)
         add_video_codec(VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR, "vp9");
 #endif

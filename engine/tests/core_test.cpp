@@ -375,7 +375,7 @@ void test_batch_matches_scalar_and_preserves_order() {
     }
     getnative::AxisPlanCache cache;
     std::vector<getnative::CandidateAnalysis> candidates;
-    for (const auto [id, native_width, native_height] :
+    for (const auto &[id, native_width, native_height] :
          {std::tuple{"third", 8, 7}, std::tuple{"first", 9, 6}, std::tuple{"second", 7, 8}}) {
         candidates.push_back({id,
                               cache.get_or_build({width, native_width, static_cast<double>(native_width),
