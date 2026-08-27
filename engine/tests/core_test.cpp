@@ -18,6 +18,7 @@
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -47,7 +48,8 @@ void expect_throws(Function &&function, std::string_view message) {
 }
 
 [[nodiscard]] double oracle_weight(const getnative::Filter &filter, double distance) {
-    const double x = std::abs(distance);
+    const double stretched = filter.blur == 1.0 ? distance : distance / filter.blur;
+    const double x = std::abs(stretched);
     const auto square = [](double value) { return value * value; };
     const auto cube = [&](double value) { return square(value) * value; };
     switch (filter.type) {
@@ -100,7 +102,7 @@ void expect_throws(Function &&function, std::string_view message) {
 }
 
 [[nodiscard]] std::vector<double> dense_forward(const getnative::AxisPlanRequest &request) {
-    const std::int32_t support = request.filter.support();
+    const std::int32_t support = request.filter.effective_support();
     const double ratio = static_cast<double>(request.source_size) / request.active_length;
     std::vector<double> matrix(static_cast<std::size_t>(request.source_size)
                                * static_cast<std::size_t>(request.destination_size));
@@ -133,6 +135,47 @@ void expect_throws(Function &&function, std::string_view message) {
         }
     }
     return matrix;
+}
+
+template <class T>
+void expect_same_bits(const std::vector<T> &actual, const std::vector<T> &expected,
+                      std::string_view message) {
+    expect(actual.size() == expected.size(), message);
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+        if constexpr (std::is_floating_point_v<T>) {
+            using Bits = std::conditional_t<sizeof(T) == sizeof(std::uint32_t),
+                                            std::uint32_t, std::uint64_t>;
+            if (std::bit_cast<Bits>(actual[index]) != std::bit_cast<Bits>(expected[index])) {
+                throw std::runtime_error(std::string{message});
+            }
+        } else if (actual[index] != expected[index]) {
+            throw std::runtime_error(std::string{message});
+        }
+    }
+}
+
+void expect_same_plan_bits(const getnative::AxisPlan &actual,
+                           const getnative::AxisPlan &expected,
+                           std::string_view message) {
+    expect(actual.source_size == expected.source_size
+               && actual.destination_size == expected.destination_size
+               && actual.support == expected.support
+               && actual.half_bandwidth == expected.half_bandwidth
+               && actual.forward_width == expected.forward_width
+               && std::bit_cast<std::uint64_t>(actual.active_length)
+                   == std::bit_cast<std::uint64_t>(expected.active_length)
+               && std::bit_cast<std::uint64_t>(actual.shift)
+                   == std::bit_cast<std::uint64_t>(expected.shift),
+           message);
+    expect_same_bits(actual.forward_offsets, expected.forward_offsets, message);
+    expect_same_bits(actual.forward_indices, expected.forward_indices, message);
+    expect_same_bits(actual.forward_weights, expected.forward_weights, message);
+    expect_same_bits(actual.transpose_offsets, expected.transpose_offsets, message);
+    expect_same_bits(actual.transpose_indices, expected.transpose_indices, message);
+    expect_same_bits(actual.transpose_weights, expected.transpose_weights, message);
+    expect_same_bits(actual.lower_ld, expected.lower_ld, message);
+    expect_same_bits(actual.upper_l, expected.upper_l, message);
+    expect_same_bits(actual.inverse_diagonal, expected.inverse_diagonal, message);
 }
 
 [[nodiscard]] std::vector<double> dense_least_squares(const std::vector<double> &a,
@@ -209,6 +252,72 @@ void test_kernel_values_and_support() {
     expect_throws([&] { (void)getnative::Filter::lanczos(0).support(); }, "nonpositive Lanczos taps are rejected");
     expect_throws([&] { (void)getnative::Filter::lanczos(16).support(); },
                   "Lanczos taps beyond zimg's supported range are rejected");
+}
+
+void test_blur_support_weights_unity_and_cache_key() {
+    struct SupportCase {
+        getnative::Filter filter;
+        std::int32_t expected;
+    };
+    const std::vector<SupportCase> support_cases{
+        {getnative::Filter::bilinear(0.75), 1},
+        {getnative::Filter::bicubic(0.0, 0.5, 1.01), 3},
+        {getnative::Filter::lanczos(3, 1.25), 4},
+        {getnative::Filter::spline36(1.5), 5},
+        {getnative::Filter::spline64(1.25), 5},
+        {getnative::Filter::spline64(1.5), 6},
+    };
+    for (const auto &[filter, expected] : support_cases) {
+        expect(filter.effective_support() == expected,
+               "effective support equals ceil(base support times blur)");
+    }
+
+    const auto lanczos = getnative::Filter::lanczos(3, 1.5);
+    expect(std::abs(lanczos.weight(4.49)) > 0.0,
+           "blur stretches the Lanczos kernel inside the original taps window");
+    expect(lanczos.weight(4.5) == 0.0,
+           "blurred Lanczos retains original taps as its scaled window");
+
+    const getnative::AxisPlanRequest default_unity{
+        47, 31, 31.25, -0.125, getnative::Filter::spline64(),
+        getnative::BorderMode::mirror,
+    };
+    auto explicit_filter = getnative::Filter::spline64();
+    explicit_filter.blur = 1.0;
+    auto explicit_unity = default_unity;
+    explicit_unity.filter = explicit_filter;
+    expect_same_plan_bits(getnative::build_axis_plan(default_unity),
+                          getnative::build_axis_plan(explicit_unity),
+                          "default and explicit unity blur plans are bit-identical");
+
+    getnative::AxisPlanCache cache;
+    const auto unity = cache.get_or_build(default_unity);
+    auto widened = default_unity;
+    widened.filter.blur = 1.01;
+    const auto non_unity = cache.get_or_build(widened);
+    expect(unity != non_unity && cache.size() == 2U,
+           "blur bit pattern isolates plan cache entries");
+    expect(non_unity->support == widened.filter.effective_support(),
+           "AxisPlan reports effective support");
+}
+
+void test_invalid_blur_is_rejected() {
+    for (const double blur : {0.0, -1.0,
+                              std::numeric_limits<double>::quiet_NaN(),
+                              std::numeric_limits<double>::infinity()}) {
+        auto filter = getnative::Filter::bicubic();
+        filter.blur = blur;
+        expect_throws([&] { (void)filter.effective_support(); },
+                      "nonpositive or nonfinite blur is rejected");
+        expect_throws([&] {
+            (void)getnative::build_axis_plan({17, 11, 11.0, 0.0, filter,
+                                              getnative::BorderMode::mirror});
+        }, "planner rejects nonpositive or nonfinite blur");
+    }
+    auto too_wide = getnative::Filter::lanczos(15);
+    too_wide.blur = static_cast<double>(std::numeric_limits<std::int32_t>::max());
+    expect_throws<std::length_error>([&] { (void)too_wide.effective_support(); },
+                                     "overflowing effective support is rejected");
 }
 
 void test_planner_weights_match_border_and_shift_oracle() {
@@ -600,6 +709,8 @@ void test_workspace_is_bounded_reusable_and_row_based() {
 int main() {
     try {
         test_kernel_values_and_support();
+        test_blur_support_weights_unity_and_cache_key();
+        test_invalid_blur_is_rejected();
         test_planner_weights_match_border_and_shift_oracle();
         test_banded_inverse_matches_dense_reference();
         test_forward_inverse_roundtrip();

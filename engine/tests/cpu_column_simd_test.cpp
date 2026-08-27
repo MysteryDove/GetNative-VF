@@ -51,6 +51,9 @@ using NamedFilter = std::pair<std::string_view, getnative::Filter>;
         {"lanczos6", getnative::Filter::lanczos(6)},
         {"lanczos7", getnative::Filter::lanczos(7)},
         {"lanczos8", getnative::Filter::lanczos(8)},
+        {"bicubic-catrom-blur125", getnative::Filter::bicubic(0.0, 0.5, 1.25)},
+        {"spline64-blur125", getnative::Filter::spline64(1.25)},
+        {"spline64-blur150", getnative::Filter::spline64(1.5)},
     };
     return values;
 }
