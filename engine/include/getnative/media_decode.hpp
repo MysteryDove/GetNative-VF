@@ -1,5 +1,7 @@
 #pragma once
 
+#include "getnative/stop_token.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>

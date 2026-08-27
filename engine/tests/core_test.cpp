@@ -1,6 +1,7 @@
 #include "getnative/axis_plan.hpp"
 #include "getnative/cpu_analysis.hpp"
 #include "getnative/filter.hpp"
+#include "getnative/joining_thread.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -375,7 +376,7 @@ void test_batch_matches_scalar_and_preserves_order() {
     }
     getnative::AxisPlanCache cache;
     std::vector<getnative::CandidateAnalysis> candidates;
-    for (const auto [id, native_width, native_height] :
+    for (const auto &[id, native_width, native_height] :
          {std::tuple{"third", 8, 7}, std::tuple{"first", 9, 6}, std::tuple{"second", 7, 8}}) {
         candidates.push_back({id,
                               cache.get_or_build({width, native_width, static_cast<double>(native_width),
@@ -472,7 +473,7 @@ void test_cache_is_singleton_per_key_under_concurrency() {
                                              getnative::Filter::lanczos(3),
                                              getnative::BorderMode::repeat};
     std::vector<std::shared_ptr<const getnative::AxisPlan>> plans(32);
-    std::vector<std::jthread> threads;
+    std::vector<getnative::JoiningThread> threads;
     for (std::size_t i = 0; i < plans.size(); ++i) {
         threads.emplace_back([&, i] { plans[i] = cache.get_or_build(request); });
     }

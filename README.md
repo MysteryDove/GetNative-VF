@@ -70,6 +70,23 @@ anyone can use.
   the app works fine without one
 - macOS build with Metal support is in active development
 
+## Supported Build Matrix
+
+| Target | CPU | GPU | CI |
+| --- | --- | --- | --- |
+| macOS ARM64 (`macos-15`) | NEON | Metal | `engine-macos.yml` |
+| Linux x86_64 (`ubuntu-24.04`) | SIMD/scalar | Vulkan when a device is available | `engine-linux.yml` |
+| Linux ARM64 (`ubuntu-24.04-arm`) | NEON/scalar | Vulkan when a device is available | `engine-linux.yml` |
+| Windows x86_64 | SIMD/scalar | CUDA/Vulkan | Existing package/remote workflow |
+
+Linux ARM64 Vulkan builds use the distro packages `glslang-tools`,
+`spirv-tools`, and `libvulkan-dev`. LunarG does not publish a Linux ARM64 SDK;
+`glslangValidator` is accepted as the shader compiler fallback and SPIR-V is
+architecture-independent. Runtime Vulkan conformance is skipped with the
+existing `SKIP:` contract when no device is available. MoltenVK, Lavapipe
+device testing, Raspberry Pi v3dv evidence, and Tauri ARM64 packaging remain
+out of scope.
+
 ## License
 
 MIT. See `LICENSE` and `THIRD_PARTY_NOTICES.md`.

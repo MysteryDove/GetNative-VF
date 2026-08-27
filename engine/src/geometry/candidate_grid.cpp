@@ -1,7 +1,7 @@
 #include "getnative/candidate_grid.hpp"
+#include "getnative/number_parse.hpp"
 
 #include <algorithm>
-#include <charconv>
 #include <cmath>
 #include <iomanip>
 #include <limits>
@@ -107,8 +107,7 @@ std::string format_fixed(std::int64_t units, std::uint32_t scale) {
 
 double parse_double(std::string_view text) {
     double value = 0.0;
-    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
-    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value)) {
+    if (!getnative::parse_finite_double(text, value)) {
         throw std::invalid_argument("invalid floating-point decimal: " + std::string{text});
     }
     return value;

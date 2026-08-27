@@ -1,6 +1,7 @@
 #pragma once
 
 #include "getnative/cpu_analysis.hpp"
+#include "getnative/stop_token.hpp"
 
 #include <cstddef>
 #include <cstdint>

@@ -1,6 +1,6 @@
 #include "json.hpp"
+#include "getnative/number_parse.hpp"
 
-#include <charconv>
 #include <cmath>
 #include <iomanip>
 #include <sstream>
@@ -256,8 +256,7 @@ private:
         }
         const std::string raw{text_.substr(start, offset_ - start)};
         double value = 0.0;
-        const auto [end, error] = std::from_chars(raw.data(), raw.data() + raw.size(), value);
-        if (error != std::errc{} || end != raw.data() + raw.size()) fail("invalid number");
+        if (!getnative::parse_finite_double(raw, value)) fail("invalid number");
         return JsonValue::number(value, raw);
     }
 

@@ -13,6 +13,7 @@
 #include "getnative/cpu_analysis.hpp"
 #include "getnative/cpu_features.hpp"
 #include "getnative/filter.hpp"
+#include "getnative/joining_thread.hpp"
 
 #include "inverse_columns.hpp"
 
@@ -705,7 +706,8 @@ struct SourceRing {
     ring.frames.resize(config.ring_frames);
     ring.prime_step = choose_prime_step(config.ring_frames);
     const std::size_t elements =
-        static_cast<std::size_t>(config.source_width) * config.source_height;
+        static_cast<std::size_t>(config.source_width)
+        * static_cast<std::size_t>(config.source_height);
     for (std::size_t index = 0; index < config.ring_frames; ++index) {
         ring.frames[index].assign(elements, 0.0F);
         if (decorrelated) {
@@ -1310,7 +1312,7 @@ class PersistentFrameExecutor {
     std::condition_variable job_ready_;
     std::condition_variable job_finished_;
     std::condition_variable workers_ready_;
-    std::vector<std::jthread> threads_;
+    std::vector<getnative::JoiningThread> threads_;
     std::atomic_size_t cursor_{0};
     std::atomic_size_t processed_frames_{0};
     std::size_t job_end_ = 0;
@@ -2064,7 +2066,8 @@ int main(int argc, char **argv) {
         if (need_frontend_source) {
             phase_marker("frontend_source_fill");
             structured_pixels.emplace(
-                static_cast<std::size_t>(config.source_width) * config.source_height, 0.0F);
+                static_cast<std::size_t>(config.source_width)
+                    * static_cast<std::size_t>(config.source_height), 0.0F);
             fill_structured_frame(*structured_pixels, config.source_width, config.source_height,
                                   config.source_width, 0);
             structured_source.emplace(structured_pixels->data(), config.source_width,

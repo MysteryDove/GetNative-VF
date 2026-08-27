@@ -1,4 +1,5 @@
 #include "axis_planner.hpp"
+#include "getnative/joining_thread.hpp"
 
 #include <algorithm>
 #include <array>
@@ -393,7 +394,7 @@ void test_session_cache_batch_publish_and_ready_reuse() {
     }
 
     std::vector<getnative::AxisPlanCacheBatchResult> concurrent(8U);
-    std::vector<std::jthread> threads;
+    std::vector<getnative::JoiningThread> threads;
     threads.reserve(concurrent.size());
     for (std::size_t thread = 0; thread < concurrent.size(); ++thread) {
         threads.emplace_back([&, thread] {
@@ -564,7 +565,7 @@ void test_failure_stops_claiming_and_joins_started_builds() {
     std::atomic_size_t hook_calls{0U};
     std::exception_ptr captured_failure;
 
-    std::jthread caller([&] {
+    getnative::JoiningThread caller([&] {
         try {
             (void)getnative::detail::build_axis_plans(requests, {
                 2U,

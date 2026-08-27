@@ -606,7 +606,7 @@ if(GETNATIVE_ENABLE_VULKAN)
             find_file(GETNATIVE_VULKAN_LOADER
                 NAMES libvulkan.so.1 libvulkan.so.1.4.357
                 HINTS "$ENV{VULKAN_SDK}"
-                PATHS /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib
+                PATHS /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib
                 PATH_SUFFIXES lib lib64 VulkanLoader/lib)
         endif()
         if(NOT GETNATIVE_VULKAN_INCLUDE_DIR OR NOT GETNATIVE_VULKAN_LOADER)
@@ -648,7 +648,7 @@ if(GETNATIVE_ENABLE_VULKAN)
         find_file(GETNATIVE_VULKAN_RUNTIME
             NAMES libvulkan.so.1
             HINTS "$ENV{VULKAN_SDK}/lib" "$ENV{VULKAN_SDK}/lib64"
-            PATHS /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib)
+            PATHS /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib)
         set(GETNATIVE_VULKAN_RUNTIME_NAME libvulkan.so.1)
     endif()
     if(NOT GETNATIVE_VULKAN_RUNTIME)
@@ -940,7 +940,7 @@ if(BUILD_TESTING)
     add_test(NAME getnative_plan_store_tests COMMAND getnative_plan_store_tests)
 
     add_executable(getnative_json_tests tests/json_test.cpp src/cli/json.cpp)
-    target_include_directories(getnative_json_tests PRIVATE src/cli)
+    target_include_directories(getnative_json_tests PRIVATE src/cli include)
     target_compile_features(getnative_json_tests PRIVATE cxx_std_23)
     getnative_enable_warnings(getnative_json_tests)
     add_test(NAME getnative_json_tests COMMAND getnative_json_tests)
