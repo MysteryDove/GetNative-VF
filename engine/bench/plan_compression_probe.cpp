@@ -38,9 +38,6 @@ void put_u64(std::vector<std::byte> &out, std::uint64_t value) {
         out.push_back(static_cast<std::byte>((value >> shift) & 0xFFU));
     }
 }
-void put_f32(std::vector<std::byte> &out, float value) {
-    put_u32(out, std::bit_cast<std::uint32_t>(value));
-}
 void put_varint(std::vector<std::byte> &out, std::uint64_t value) {
     while (value >= 0x80U) {
         out.push_back(static_cast<std::byte>((value & 0x7FU) | 0x80U));
@@ -114,10 +111,10 @@ std::vector<std::byte> serialize_cooked(const getnative::AxisPlan &plan,
         }
     }
 
-    out.push_back(std::byte{offsets_uniform ? 1U : 0U});
+    out.push_back(static_cast<std::byte>(offsets_uniform ? 1U : 0U));
     if (!offsets_uniform) put_span_raw(out, plan.forward_offsets);
 
-    out.push_back(std::byte{indices_runs ? 1U : 0U});
+    out.push_back(static_cast<std::byte>(indices_runs ? 1U : 0U));
     if (indices_runs) {
         for (std::int32_t row = 0; row < plan.source_size; ++row) {
             put_i32(out, plan.forward_indices[static_cast<std::size_t>(row)

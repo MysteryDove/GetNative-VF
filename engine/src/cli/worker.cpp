@@ -19,6 +19,7 @@
 #endif
 
 #include <atomic>
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cctype>
@@ -27,6 +28,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -149,7 +151,8 @@ std::int32_t optional_int(const JsonValue &object, std::string_view key, std::in
     return require_int(object, key);
 }
 
-std::optional<std::string> optional_string(const JsonValue &object, std::string_view key) {
+[[maybe_unused]] std::optional<std::string> optional_string(
+    const JsonValue &object, std::string_view key) {
     const JsonValue *value = object.find(key);
     if (!value || value->is_null()) return std::nullopt;
     if (value->type != JsonValue::Type::string) {
@@ -1072,8 +1075,11 @@ public:
                     + (info.st_size >= 0 ? std::to_string(static_cast<long long>(info.st_size))
                                          : std::string{"<stat failed>"}));
         }
-        void *mapped = ::mmap(nullptr, bytes_, PROT_READ,
-                              MAP_PRIVATE | MAP_POPULATE, fd, 0);
+        int mmap_flags = MAP_PRIVATE;
+#if defined(__linux__)
+        mmap_flags |= MAP_POPULATE;
+#endif
+        void *mapped = ::mmap(nullptr, bytes_, PROT_READ, mmap_flags, fd, 0);
         ::close(fd);
         if (mapped == MAP_FAILED) {
             throw WorkerError("frame_asset_error", "cannot map frame asset: " + asset.path, true);

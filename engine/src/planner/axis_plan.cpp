@@ -67,11 +67,15 @@ constexpr bool reuse_tap_weights = GETNATIVE_PLANNER_REUSE_TAPS != 0;
 constexpr bool fast_interior_indices = GETNATIVE_PLANNER_FAST_INTERIOR != 0;
 constexpr bool direct_transpose = GETNATIVE_PLANNER_DIRECT_TRANSPOSE != 0;
 
-[[nodiscard]] constexpr bool finite_binary64(double value) noexcept {
+[[nodiscard]] inline bool finite_binary64(double value) noexcept {
     static_assert(sizeof(double) == sizeof(std::uint64_t));
     static_assert(std::numeric_limits<double>::is_iec559);
     constexpr std::uint64_t exponent_mask = 0x7ff0000000000000ULL;
-    return (std::bit_cast<std::uint64_t>(value) & exponent_mask) != exponent_mask;
+    // Keep validation reliable in translation units that deliberately use
+    // -ffast-math for planner arithmetic: NaN/Inf are still valid inputs to
+    // reject, even though that mode permits the optimizer to assume otherwise.
+    volatile std::uint64_t bits = std::bit_cast<std::uint64_t>(value);
+    return (bits & exponent_mask) != exponent_mask;
 }
 
 [[nodiscard]] double round_half_up(double x) noexcept {

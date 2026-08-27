@@ -606,7 +606,7 @@ if(GETNATIVE_ENABLE_VULKAN)
             find_file(GETNATIVE_VULKAN_LOADER
                 NAMES libvulkan.so.1 libvulkan.so.1.4.357
                 HINTS "$ENV{VULKAN_SDK}"
-                PATHS /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib
+                PATHS /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib
                 PATH_SUFFIXES lib lib64 VulkanLoader/lib)
         endif()
         if(NOT GETNATIVE_VULKAN_INCLUDE_DIR OR NOT GETNATIVE_VULKAN_LOADER)
@@ -648,7 +648,7 @@ if(GETNATIVE_ENABLE_VULKAN)
         find_file(GETNATIVE_VULKAN_RUNTIME
             NAMES libvulkan.so.1
             HINTS "$ENV{VULKAN_SDK}/lib" "$ENV{VULKAN_SDK}/lib64"
-            PATHS /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib)
+            PATHS /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib)
         set(GETNATIVE_VULKAN_RUNTIME_NAME libvulkan.so.1)
     endif()
     if(NOT GETNATIVE_VULKAN_RUNTIME)
