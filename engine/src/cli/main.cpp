@@ -2,8 +2,8 @@
 #include "worker.hpp"
 
 #include "getnative/crop_geometry.hpp"
+#include "getnative/number_parse.hpp"
 #include "getnative/profile.hpp"
-#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
@@ -36,8 +36,7 @@ double required_double(const auto& options, std::string_view key) {
     }
     double value = 0.0;
     const auto& text = iterator->second;
-    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
-    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value)) {
+    if (!getnative::parse_finite_double(text, value)) {
         throw std::invalid_argument("invalid --" + std::string{key});
     }
     return value;

@@ -1,4 +1,5 @@
 #include "getnative/metal_analysis.hpp"
+#include "getnative/joining_thread.hpp"
 
 #include "getnative/filter.hpp"
 
@@ -740,7 +741,7 @@ void test_submitted_cancellation_drains_before_reuse() {
 
     getnative::MetalAnalysisEngine metal({1, 2, 0, true, 32});
     std::stop_source stop;
-    std::jthread canceller([&] {
+    getnative::JoiningThread canceller([&] {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         stop.request_stop();
     });

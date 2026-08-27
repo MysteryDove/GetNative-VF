@@ -1,4 +1,5 @@
 #include "axis_planner.hpp"
+#include "getnative/joining_thread.hpp"
 
 #include "axis_plan_key.hpp"
 
@@ -119,7 +120,7 @@ private:
     std::size_t generation_ = 0U;
     std::exception_ptr unexpected_failure_;
     bool stopping_ = false;
-    std::vector<std::jthread> workers_;
+    std::vector<JoiningThread> workers_;
 };
 
 [[nodiscard]] PlannerWorkerPool &planner_worker_pool() {
@@ -132,7 +133,7 @@ void run_worker_group(std::size_t worker_count, Function function) {
     if constexpr (persistent_workers) {
         if (planner_worker_pool().try_run(worker_count, function)) return;
     }
-    std::vector<std::jthread> workers;
+    std::vector<JoiningThread> workers;
     workers.reserve(worker_count);
     for (std::size_t worker = 0; worker < worker_count; ++worker) {
         workers.emplace_back([&, worker] { function(worker); });

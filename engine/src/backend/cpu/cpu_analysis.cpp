@@ -1,4 +1,5 @@
 #include "getnative/cpu_analysis.hpp"
+#include "getnative/joining_thread.hpp"
 
 #include "inverse_columns.hpp"
 
@@ -538,7 +539,7 @@ std::vector<CandidateResult> analyze_batch_impl(
     std::atomic_size_t cursor{0};
     std::exception_ptr failure;
     std::mutex failure_mutex;
-    std::vector<std::jthread> workers;
+    std::vector<JoiningThread> workers;
     workers.reserve(worker_count);
     for (std::size_t worker = 0; worker < worker_count; ++worker) {
         workers.emplace_back([&] {
@@ -581,7 +582,7 @@ std::vector<CandidateResult> analyze_batch_impl(
             }
         });
     }
-    workers.clear(); // jthread joins here, before failure is inspected.
+    workers.clear(); // JoiningThread joins here, before failure is inspected.
     if (failure) {
         std::rethrow_exception(failure);
     }

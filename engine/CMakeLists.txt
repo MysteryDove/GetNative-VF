@@ -940,7 +940,7 @@ if(BUILD_TESTING)
     add_test(NAME getnative_plan_store_tests COMMAND getnative_plan_store_tests)
 
     add_executable(getnative_json_tests tests/json_test.cpp src/cli/json.cpp)
-    target_include_directories(getnative_json_tests PRIVATE src/cli)
+    target_include_directories(getnative_json_tests PRIVATE src/cli include)
     target_compile_features(getnative_json_tests PRIVATE cxx_std_23)
     getnative_enable_warnings(getnative_json_tests)
     add_test(NAME getnative_json_tests COMMAND getnative_json_tests)
