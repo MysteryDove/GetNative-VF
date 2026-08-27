@@ -25,6 +25,8 @@
     {"id": "spline16", "type": "spline16"},
     {"id": "spline36", "type": "spline36"},
     {"id": "spline64", "type": "spline64"},
+    {"id": "spline64-blur125", "type": "spline64", "blur": 1.25},
+    {"id": "spline64-blur150", "type": "spline64", "blur": 1.5},
     {"id": "lanczos1", "type": "lanczos", "taps": 1},
     {"id": "lanczos2", "type": "lanczos", "taps": 2},
     {"id": "lanczos3", "type": "lanczos", "taps": 3},

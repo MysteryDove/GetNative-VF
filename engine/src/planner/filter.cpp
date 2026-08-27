@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numbers>
 #include <stdexcept>
 
@@ -37,8 +38,29 @@ std::int32_t Filter::support() const {
     throw std::invalid_argument("unknown filter type");
 }
 
+std::int32_t Filter::effective_support() const {
+    if (!(blur > 0.0) || !std::isfinite(blur)) {
+        throw std::invalid_argument("blur must be finite and greater than zero");
+    }
+    constexpr auto maximum_support =
+        (std::numeric_limits<std::int32_t>::max() - 1) / 2;
+    const std::int32_t base_support = support();
+    const double scaled_support = static_cast<double>(base_support) * blur;
+    if (!std::isfinite(scaled_support)
+        || scaled_support > static_cast<double>(maximum_support)) {
+        throw std::length_error("effective filter support is too large");
+    }
+    const double effective = std::ceil(scaled_support);
+    if (!(effective >= 1.0)
+        || effective > static_cast<double>(maximum_support)) {
+        throw std::length_error("effective filter support is too large");
+    }
+    return static_cast<std::int32_t>(effective);
+}
+
 double Filter::weight(double distance) const noexcept {
-    double x = std::abs(distance);
+    const double stretched = blur == 1.0 ? distance : distance / blur;
+    double x = std::abs(stretched);
     switch (type) {
     case KernelType::bilinear:
         return std::max(1.0 - x, 0.0);

@@ -50,6 +50,9 @@ using NamedFilter = std::pair<std::string, getnative::Filter>;
         {"spline16", getnative::Filter::spline16()},
         {"spline36", getnative::Filter::spline36()},
         {"spline64", getnative::Filter::spline64()},
+        {"bicubic-catrom-blur125", getnative::Filter::bicubic(0.0, 0.5, 1.25)},
+        {"spline64-blur125", getnative::Filter::spline64(1.25)},
+        {"spline64-blur150", getnative::Filter::spline64(1.5)},
     };
     for (std::int32_t taps = 1; taps <= 15; ++taps) {
         values.emplace_back(

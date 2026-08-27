@@ -101,7 +101,9 @@ struct ZimgKernel {
           q3((-filter.b - 6.0 * filter.c) / 6.0) {}
 
     [[nodiscard]] double weight(double distance) const noexcept {
-        double x = std::abs(distance);
+        const double stretched = filter.blur == 1.0
+            ? distance : distance / filter.blur;
+        double x = std::abs(stretched);
         switch (filter.type) {
         case KernelType::bilinear:
             return std::max(1.0 - x, 0.0);
@@ -202,11 +204,7 @@ private:
         throw std::invalid_argument(
             "active length and shift must be finite, with positive active length");
     }
-    const std::int32_t support = request.filter.support();
-    if (support > (std::numeric_limits<std::int32_t>::max() - 1) / 2) {
-        throw std::invalid_argument("filter support is too large");
-    }
-    return support;
+    return request.filter.effective_support();
 }
 
 [[nodiscard]] std::size_t checked_geometry_elements(
@@ -258,8 +256,8 @@ make_axis_plan_geometry(const AxisPlanRequest &request) {
 
     const double ratio = static_cast<double>(request.source_size)
         / request.active_length;
-    std::array<std::int32_t, 30> tap_indices{};
-    std::array<std::int32_t, 30> unique_indices{};
+    std::vector<std::int32_t> tap_indices(static_cast<std::size_t>(tap_count));
+    std::vector<std::int32_t> unique_indices(static_cast<std::size_t>(tap_count));
     for (std::int32_t row = 0; row < request.source_size; ++row) {
         const double position = (static_cast<double>(row) + 0.5) / ratio
             + request.shift;
@@ -471,10 +469,9 @@ void make_descale_matrix(DoubleCsrView result,
 
     std::vector<std::pair<std::int32_t, double>> row;
     row.reserve(static_cast<std::size_t>(2 * support));
-    // Filter::support() caps Lanczos at 15 taps, so the widest row has 30 taps.
-    std::array<double, 30> tap_weights{};
-    std::array<double, 30> coalesced_weights{};
-    std::array<bool, 30> coalesced_seen{};
+    std::vector<double> tap_weights(static_cast<std::size_t>(2 * support));
+    std::vector<double> coalesced_weights(static_cast<std::size_t>(2 * support));
+    std::vector<bool> coalesced_seen(static_cast<std::size_t>(2 * support));
     PeriodWeightCache period_cache;
     period_cache.enable(rows, request.active_length,
                         static_cast<std::size_t>(2 * support));
@@ -560,8 +557,8 @@ void make_descale_matrix(DoubleCsrView result,
         }
 
         if constexpr (ReuseGeometry) {
-            coalesced_weights.fill(0.0);
-            coalesced_seen.fill(false);
+            std::fill(coalesced_weights.begin(), coalesced_weights.end(), 0.0);
+            std::fill(coalesced_seen.begin(), coalesced_seen.end(), false);
         } else {
             row.clear();
         }
