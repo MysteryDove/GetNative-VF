@@ -13,6 +13,7 @@
 #include "getnative/cpu_analysis.hpp"
 #include "getnative/cpu_features.hpp"
 #include "getnative/filter.hpp"
+#include "getnative/joining_thread.hpp"
 
 #include "inverse_columns.hpp"
 
@@ -1311,7 +1312,7 @@ class PersistentFrameExecutor {
     std::condition_variable job_ready_;
     std::condition_variable job_finished_;
     std::condition_variable workers_ready_;
-    std::vector<std::jthread> threads_;
+    std::vector<getnative::JoiningThread> threads_;
     std::atomic_size_t cursor_{0};
     std::atomic_size_t processed_frames_{0};
     std::size_t job_end_ = 0;

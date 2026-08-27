@@ -3,6 +3,7 @@
 #include "getnative/axis_plan.hpp"
 #include "getnative/cpu_analysis.hpp"
 #include "getnative/cuda_analysis.hpp"
+#include "getnative/joining_thread.hpp"
 #include "getnative/filter.hpp"
 
 #include <algorithm>
@@ -950,7 +951,7 @@ struct WaveResult {
     std::barrier start_gate(
         static_cast<std::ptrdiff_t>(fixture.spec.concurrency + 1U));
     std::vector<std::exception_ptr> failures(fixture.spec.concurrency);
-    std::vector<std::jthread> workers;
+    std::vector<getnative::JoiningThread> workers;
     workers.reserve(fixture.spec.concurrency);
     for (std::size_t worker = 0; worker < fixture.spec.concurrency; ++worker) {
         workers.emplace_back([&, worker] {

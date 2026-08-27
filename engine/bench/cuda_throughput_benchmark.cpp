@@ -2,6 +2,7 @@
 
 #include "getnative/axis_plan.hpp"
 #include "getnative/cuda_analysis.hpp"
+#include "getnative/joining_thread.hpp"
 #include "getnative/filter.hpp"
 
 #include <algorithm>
@@ -282,7 +283,7 @@ struct WaveResult {
     std::vector<double> checksums(concurrency, 0.0);
     std::vector<std::vector<std::string>> rankings(concurrency);
     std::vector<std::exception_ptr> failures(concurrency);
-    std::vector<std::jthread> workers;
+    std::vector<getnative::JoiningThread> workers;
     workers.reserve(concurrency);
     for (std::size_t worker = 0; worker < concurrency; ++worker) {
         workers.emplace_back([&, worker] {
