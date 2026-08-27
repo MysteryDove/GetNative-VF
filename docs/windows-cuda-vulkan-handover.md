@@ -1,5 +1,49 @@
 # Windows x86 CPU / CUDA / Vulkan Compute 后端开发 Handover
 
+> **2026-08-27 implementation update**
+>
+> Vulkan backend 源码与 CMake 已完成，且本次跨平台补齐把 macOS ARM64、Linux
+> x86_64、Linux ARM64 纳入 CI。当前受支持构建矩阵和 CI 入口见仓库
+> `.github/workflows/engine-macos.yml`、`engine-linux.yml`；应用校验见
+> `app.yml`。Linux ARM64 使用 distro `glslang-tools`、`spirv-tools`、
+> `libvulkan-dev`，因为 LunarG 不提供 Linux ARM64 SDK。CMake 在 Vulkan
+> 开启时按 `/usr/lib/aarch64-linux-gnu`、`/usr/lib/x86_64-linux-gnu`、
+> `/usr/lib` 顺序探测 loader，并接受 `glslangValidator` 作为 `glslc` 回退。
+> SPIR-V 产物与宿主架构无关；无 GPU 时 `vulkan_analysis_tests` 通过既有
+> `SKIP:` 正则优雅跳过，CI 不引入 Lavapipe。
+>
+> capability schema 决策：继续使用 **schema v2**，在 `backends` 数组末尾追加
+> `vulkan` 条目。engine 与 Rust validator 始终锁步发布，旧的三项 v2 consumer
+> 不承诺兼容四项数组；不为本次最小跨平台纳入升级到 handover 早期预案中的 v3。
+>
+> 约束保持不变：CPU-only configure 不查找任何 Vulkan/Metal/CUDA SDK；GPU
+> kernel/analysis 源码不加入平台宏（仅 loader shim 做平台分支）；Windows CI、MoltenVK、Lavapipe 设备测试、树莓派
+> v3dv、Tauri ARM64 打包和 NEON hw=9 特化均不在本次范围。
+
+`engine/CMakeLists.txt` 的 hotpath evaluator 在
+`CMAKE_SYSTEM_PROCESSOR` 为 `arm64`/`aarch64` 时追加 `--required-simd`；这条
+分支保持源码不变。Linux ARM64 CI 只做 configure/build/单测，不运行依赖本地
+PNG fixture 的 benchmark evaluator；真实 fixture benchmark 仍是本地手动证据。
+
+### GitHub CI Vulkan 失败归因（复盘）
+
+已检查 `MysteryDove/GetNative-VF` 的历史 Package runs：
+
+- `32258369612`（Linux）并未进入 GetNative 编译，失败在
+  `humbletim/setup-vulkan-sdk` 读取仓库内 config 时把相对路径解析到 action
+  自身目录，导致 `Vulkan-Headers url=NOTFOUND`。
+- `32259362256`/`32267009990`（Windows）失败在同一 action 构建 Vulkan-Loader
+  的外部 MASM `unknown_ext_chain_masm.asm` custom step（`MSB8066`），不是
+  GetNative 的 C++ 或 shader 编译错误。`32267009990` 的 Linux GetNative
+  Vulkan configure/build 与 23 项测试实际完成，最终失败发生在 package 校验。
+
+上游 dsmvc 的可复用做法是：Linux/Windows 使用稳定的 Vulkan SDK action，
+CMake 通过 `find_package(Vulkan 1.2 REQUIRED)` 暴露 `Vulkan::Vulkan`，并单独
+检查 `glslc`、`spirv-val`；Linux 测试另外安装 validation layers，再用
+Lavapipe 做 runtime conformance。此次 GetNative 只需要 Linux distro 包，
+不复用会在 CI 内编译 Vulkan-Loader 的 action；运行时仍由自身 loader shim
+动态加载 `libvulkan.so.1`/`vulkan-1.dll`。
+
 ## 1. 任务目标和交付边界
 
 本文件用于把 GetNative VF 的 Windows backend 开发交给另一名 agent。目标不是写独立 SIMD/CUDA/Vulkan demo，而是在现有 C++23 engine 中交付一个可回退的 x86 CPU 优化路径，以及两个可选、可诊断、可测试的 strict GPU backend：
@@ -91,7 +135,7 @@ Get-FileHash -Path @(
 | React UI | geometry workbench；Analysis tab 由 `commands.analyze` 禁用；backend 行可通用展示 capability | `app/src/App.tsx:107`、`app/src/App.tsx:172`、`app/src/App.tsx:326-355` |
 | Product planner design | `DESIGN.md` 已定义 Height/Kernel/Verification、Recipe、RunGroup 和 math-mode 语义；GUI spec 给出交付切片，但这些尚未进入 React/Rust/CLI | `DESIGN.md:25-46`、`DESIGN.md:289-413`、`DESIGN.md:502-565`；`docs/gui-development-spec.md:120-161` |
 | CUDA | capability 占位，始终 `compiled=false` | `engine/src/cli/main.cpp:130` |
-| Vulkan | 源码、CMake option 和 capability 均不存在 | 当前 tree |
+| Vulkan | Windows/Linux optional backend；schema v2 capability 追加 `vulkan`；运行时动态加载 loader | `engine/src/backend/vulkan/`；`engine/CMakeLists.txt`；`engine/src/cli/main.cpp` |
 
 实现事实和未来产品契约使用两条不同的优先级，不能混在一起：
 
@@ -1096,7 +1140,10 @@ cpu, metal, cuda, vulkan
 - 已编译但无 device 时仍报告静态 axes/p/shape，并给具体 reason；
 - 不再按 `backends[0]`、`[1]`、`[2]` 解释。
 
-当前 schema v2 consumer 明确要求 backend 数组恰好为 `cpu, metal,cuda`；旧 consumer 收到额外 Vulkan entry 会拒绝。因此本 handover 规定：扩展为四个 backend 时把 capability schema 升到 v3，并让 engine、Rust validator、TypeScript types/tests 和 package 锁步升级。v3 validator 按 id map 校验，不依赖数组 index；不得向现有 v2 consumer 静默发送四项数组。只有项目另行建立并记录“engine/app 永远锁步、v2 不承诺向后兼容”的正式 schema policy，才可重新评估是否保留版本号。
+本项目已记录正式决策：schema v2 consumer 与 engine/app 永远锁步，`backends` 在
+末尾追加 `vulkan` 条目；不为此最小纳入升级 schema 版本。旧的三项数组 consumer
+不承诺向后兼容，Rust validator 按固定 id 顺序校验四项 contract。若未来需要
+独立发布、跨版本兼容的 consumer，另行设计 schema v3，不在本次 CI 补齐中混入。
 
 ### 14.3 CPU ISA、math mode 和 provenance
 
