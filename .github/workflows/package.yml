@@ -127,11 +127,41 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          require_file() {
+            if [[ ! -f "$2" ]]; then
+              printf 'package validation: %s is missing: %s\n' "$1" "$2" >&2
+              return 1
+            fi
+          }
+          require_empty() {
+            local label=$1
+            shift
+            if [[ -n "$*" ]]; then
+              printf 'package validation: forbidden %s found:\n%s\n' "$label" "$*" >&2
+              return 1
+            fi
+          }
+          require_nonempty() {
+            local label=$1 value=$2
+            if [[ -z "$value" ]]; then
+              printf 'package validation: %s was not found\n' "$label" >&2
+              return 1
+            fi
+          }
+          require_sha256() {
+            local label=$1 expected=$2 path=$3 actual
+            actual=$(sha256sum "$path" | cut -d' ' -f1)
+            if [[ "$actual" != "$expected" ]]; then
+              printf 'package validation: %s hash mismatch (%s): expected %s, got %s\n' \
+                "$label" "$path" "$expected" "$actual" >&2
+              return 1
+            fi
+          }
           bundle_root=app/src-tauri/target/release/bundle
           deb=$(find "$bundle_root/deb" -maxdepth 1 -type f -name '*.deb' -print -quit)
           appimage=$(find "$bundle_root/appimage" -maxdepth 1 -type f -name '*.AppImage' -print -quit)
-          test -n "$deb"
-          test -n "$appimage"
+          require_nonempty deb "$deb"
+          require_nonempty AppImage "$appimage"
 
           check_root=$(mktemp -d)
           trap 'rm -rf -- "$check_root"' EXIT
@@ -143,48 +173,81 @@ jobs:
           )
 
           for package_root in "$check_root/deb" "$check_root/appimage/squashfs-root"; do
-            test -z "$(find "$package_root" -type f \( \
+            forbidden=$(find "$package_root" -type f \( \
               -name ffmpeg -o -name ffprobe -o \
               -name ffmpeg.exe -o -name ffprobe.exe -o \
               -name nvcc -o -name cuobjdump -o \
               -name glslangValidator -o -name spirv-val -o \
               -name 'libavfilter.so*' -o -name 'libavdevice.so*' -o \
-              -name 'libswresample.so*' \) -print)"
+              -name 'libswresample.so*' \) -print)
+            require_empty "developer/media sidecars" "$forbidden"
             for library in libavformat.so.62 libavcodec.so.62 libavutil.so.60 libswscale.so.9; do
               expected=$(sha256sum ".deps/ffmpeg-linux-x64/lib/$library" | cut -d' ' -f1)
               matches=$(find "$package_root" -type f -name "$library" -print)
-              test -n "$matches"
+              require_nonempty "$library" "$matches"
               while IFS= read -r packaged_library; do
-                test "$(sha256sum "$packaged_library" | cut -d' ' -f1)" = "$expected"
+                require_sha256 "$library" "$expected" "$packaged_library"
               done <<< "$matches"
             done
             loader=$(find "$package_root" -type f -name libvulkan.so.1 -print)
-            test "$(printf '%s\n' "$loader" | sed '/^$/d' | wc -l)" -eq 1
-            test "$(sha256sum "$loader" | cut -d' ' -f1)" = \
-              "$(sha256sum "$VULKAN_SDK/lib/libvulkan.so.1" | cut -d' ' -f1)"
-            test "$(find "$package_root" -type f \
-              -path '*/share/getnative/licenses/vulkan-loader/LICENSE.txt' | wc -l)" -ge 1
-            test "$(find "$package_root" -type f \
-              -path '*/share/getnative/LICENSE.txt' | wc -l)" -ge 1
+            require_nonempty "Vulkan loader" "$loader"
+            expected_loader=$(sha256sum "$VULKAN_SDK/lib/libvulkan.so.1" | cut -d' ' -f1)
+            loader_match=0
+            while IFS= read -r packaged_loader; do
+              if [[ "$(sha256sum "$packaged_loader" | cut -d' ' -f1)" == "$expected_loader" ]]; then
+                loader_match=1
+              else
+                printf 'package validation: ignoring non-pinned system Vulkan loader: %s\n' "$packaged_loader"
+              fi
+            done <<< "$loader"
+            if [[ "$loader_match" -ne 1 ]]; then
+              printf 'package validation: no packaged Vulkan loader matches %s; found:\n%s\n' \
+                "$expected_loader" "$loader" >&2
+              exit 1
+            fi
+            license=$(find "$package_root" -type f \
+              -path '*/share/getnative/licenses/vulkan-loader/LICENSE.txt' -print -quit)
+            require_file "Vulkan loader license" "$license"
+            license=$(find "$package_root" -type f \
+              -path '*/share/getnative/LICENSE.txt' -print -quit)
+            require_file "project license" "$license"
           done
 
           for package_root in "$check_root/deb" "$check_root/appimage/squashfs-root"; do
             engine=$(find "$package_root" -type f -name getnative-engine -print -quit)
-            test -n "$engine"
+            require_nonempty "engine" "$engine"
             capabilities=$("$engine" capabilities)
-            printf '%s\n' "$capabilities" | grep -q '"id":"cuda","compiled":true'
-            printf '%s\n' "$capabilities" | grep -q '"id":"vulkan","compiled":true'
+            printf '%s\n' "$capabilities" | grep -q '"id":"cuda","compiled":true' || {
+              printf 'package validation: CUDA backend is not compiled in %s\n%s\n' "$engine" "$capabilities" >&2
+              exit 1
+            }
+            printf '%s\n' "$capabilities" | grep -q '"id":"vulkan","compiled":true' || {
+              printf 'package validation: Vulkan backend is not compiled in %s\n%s\n' "$engine" "$capabilities" >&2
+              exit 1
+            }
             provenance=$(find "$package_root" -type f -name build-provenance.json -print -quit)
-            test -n "$provenance"
-            grep -q '"linux_backends": "cuda-vulkan"' "$provenance"
-            grep -q '"cuda_enabled": true' "$provenance"
-            grep -q '"vulkan_enabled": true' "$provenance"
-            grep -q '"cuda_architectures": "75;86;89;120"' "$provenance"
-            grep -q "\"cuda_toolkit_version\": \"$CUDA_TOOLKIT_VERSION\"" "$provenance"
-            grep -q "\"vulkan_sdk_version\": \"$VULKAN_SDK_VERSION\"" "$provenance"
-            grep -q '"name": "libvulkan.so.1"' "$provenance"
+            require_nonempty "build provenance" "$provenance"
+            grep -q '"linux_backends": "cuda-vulkan"' "$provenance" || {
+              printf 'package validation: Linux backend selection is missing from %s\n' "$provenance" >&2
+              exit 1
+            }
+            for expected in \
+              '"cuda_enabled": true' \
+              '"vulkan_enabled": true' \
+              '"cuda_architectures": "75;86;89;120"' \
+              "\"cuda_toolkit_version\": \"$CUDA_TOOLKIT_VERSION\"" \
+              "\"vulkan_sdk_version\": \"$VULKAN_SDK_VERSION\"" \
+              '"name": "libvulkan.so.1"'; do
+              grep -q "$expected" "$provenance" || {
+                printf 'package validation: %s is missing from %s\n' "$expected" "$provenance" >&2
+                exit 1
+              }
+            done
             loader_hash=$(sha256sum "$VULKAN_SDK/lib/libvulkan.so.1" | cut -d' ' -f1)
-            grep -q "\"sha256\": \"$loader_hash\"" "$provenance"
+            grep -q "\"sha256\": \"$loader_hash\"" "$provenance" || {
+              printf 'package validation: Vulkan loader hash is missing from %s\n' "$provenance" >&2
+              exit 1
+            }
           done
       - name: Package checksums
         shell: bash
@@ -229,18 +292,15 @@ jobs:
             throw "cuda.h was not found under CUDA_PATH=$env:CUDA_PATH"
           }
           & (Join-Path $env:CUDA_PATH "bin\nvcc.exe") --version
-      - name: Resolve Vulkan SDK config path
-        id: vulkan-config
-        shell: pwsh
-        run: |
-          $path = (Resolve-Path ".github/vulkan-sdk/1.4.357.0-windows.json").Path.Replace("\", "/")
-          "path=$path" >> $env:GITHUB_OUTPUT
       - name: Install Vulkan SDK components
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        # Use LunarG's prebuilt Windows SDK. The source-build action can fail
+        # in Vulkan-Loader's MASM step even when the hosted MSVC toolchain is
+        # otherwise healthy.
+        uses: jakoch/install-vulkan-sdk-action@v1.6.0
         with:
-          vulkan-config-file: ${{ steps.vulkan-config.outputs.path }}
-          vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang, SPIRV-Tools
-          vulkan-use-cache: true
+          vulkan_version: ${{ env.VULKAN_SDK_VERSION }}
+          install_runtime: true
+          cache: true
       - name: Verify Vulkan SDK
         shell: pwsh
         run: |
@@ -255,17 +315,25 @@ jobs:
           if (-not $includeRoot) {
             throw "Vulkan SDK headers were not found under VULKAN_SDK=$env:VULKAN_SDK"
           }
-          if (-not $vulkanBin -or -not (Test-Path (Join-Path $vulkanBin "vulkan-1.dll"))) {
-            throw "Vulkan SDK loader was not found under VULKAN_SDK=$env:VULKAN_SDK"
+          if (-not $vulkanBin) {
+            throw "Vulkan SDK tools were not found under VULKAN_SDK=$env:VULKAN_SDK"
+          }
+          $loader = Join-Path $vulkanBin "vulkan-1.dll"
+          if (-not (Test-Path $loader)) {
+            $runtimeLoader = Join-Path $env:VULKAN_SDK "runtime\x64\vulkan-1.dll"
+            if (-not (Test-Path $runtimeLoader)) {
+              throw "Vulkan SDK loader was not found under VULKAN_SDK=$env:VULKAN_SDK"
+            }
+            Copy-Item -LiteralPath $runtimeLoader -Destination $loader
           }
           if (-not (Test-Path (Join-Path $vulkanBin "glslangValidator.exe")) -and
               -not (Test-Path (Join-Path $vulkanBin "glslc.exe"))) {
             throw "Vulkan SDK has no glslangValidator.exe or glslc.exe"
           }
-          Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_RUNTIME_PATH=$(Join-Path $vulkanBin 'vulkan-1.dll')"
+          Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_RUNTIME_PATH=$loader"
           Write-Host "VULKAN_SDK=$env:VULKAN_SDK"
           Write-Host "VULKAN_SDK_VERSION=$env:VULKAN_SDK_VERSION"
-          Write-Host "VULKAN_RUNTIME_PATH=$(Join-Path $vulkanBin 'vulkan-1.dll')"
+          Write-Host "VULKAN_RUNTIME_PATH=$loader"
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MSYS
