@@ -1,0 +1,31 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 1, std430) buffer SourceBuffer {
+    float source_data[];
+};
+layout(set = 0, binding = 4) uniform sampler2D luma_image;
+layout(push_constant, std430) uniform PushConstants {
+    uint value[32];
+} pc;
+
+void main() {
+    const uint x = gl_GlobalInvocationID.x;
+    const uint y = gl_GlobalInvocationID.y;
+    const uint width = pc.value[0];
+    const uint height = pc.value[1];
+    if (x >= width || y >= height) return;
+
+    const uint bit_depth = pc.value[13];
+    const uint normalized_bits = pc.value[14];
+    const float sampled = texelFetch(luma_image, ivec2(x, y), 0).r;
+    if (normalized_bits > 8U) {
+        source_data[y * width + x] = sampled;
+        return;
+    }
+    const float normalized_max = exp2(float(normalized_bits)) - 1.0;
+    const float code = round(sampled * normalized_max);
+    const float alignment = exp2(float(16U - bit_depth));
+    source_data[y * width + x] = code * alignment / 65535.0;
+}

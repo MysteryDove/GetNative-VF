@@ -26,17 +26,28 @@ struct CommandCapabilities {
 }
 
 #[derive(Deserialize)]
+struct BlurParameter {
+    kind: String,
+    default: f64,
+    gui_min: f64,
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum KernelParameters {
-    None,
+    None {
+        blur: BlurParameter,
+    },
     BicubicBc {
         finite: bool,
+        blur: BlurParameter,
     },
     IntegerTaps {
         gui_min: u32,
         gui_max: u32,
         core_min: u32,
         core_max: u32,
+        blur: BlurParameter,
     },
 }
 
@@ -165,9 +176,18 @@ fn validate_capabilities(payload: &Value) -> Result<(), String> {
         return Err("getnative-engine returned an unexpected kernel contract".to_owned());
     }
     for kernel in &capabilities.kernels {
-        match (&*kernel.id, &kernel.parameters) {
-            ("bilinear" | "spline16" | "spline36" | "spline64", KernelParameters::None) => {}
-            ("bicubic", KernelParameters::BicubicBc { finite: true }) => {}
+        let blur = match (&*kernel.id, &kernel.parameters) {
+            (
+                "bilinear" | "spline16" | "spline36" | "spline64",
+                KernelParameters::None { blur },
+            ) => blur,
+            (
+                "bicubic",
+                KernelParameters::BicubicBc {
+                    finite: true,
+                    blur,
+                },
+            ) => blur,
             (
                 "lanczos",
                 KernelParameters::IntegerTaps {
@@ -175,9 +195,16 @@ fn validate_capabilities(payload: &Value) -> Result<(), String> {
                     gui_max: 8,
                     core_min: 1,
                     core_max: 15,
+                    blur,
                 },
-            ) => {}
+            ) => blur,
             _ => return Err("getnative-engine returned invalid kernel parameters".to_owned()),
+        };
+        if blur.kind != "positive_scale"
+            || blur.default != 1.0
+            || blur.gui_min != 0.75
+        {
+            return Err("getnative-engine returned invalid blur parameters".to_owned());
         }
     }
 
@@ -186,7 +213,7 @@ fn validate_capabilities(payload: &Value) -> Result<(), String> {
         .iter()
         .map(|backend| backend.id.as_str())
         .collect::<Vec<_>>();
-    if backend_ids != ["cpu", "metal", "cuda"] {
+    if backend_ids != ["cpu", "metal", "cuda", "vulkan"] {
         return Err("getnative-engine returned an unexpected backend contract".to_owned());
     }
     let cpu = &capabilities.backends[0];
@@ -238,6 +265,27 @@ fn validate_capabilities(payload: &Value) -> Result<(), String> {
         || cuda.max_forward_width.is_some()
     {
         return Err("getnative-engine returned invalid CUDA capabilities".to_owned());
+    }
+    let vulkan = &capabilities.backends[3];
+    let valid_vulkan_shape = vulkan.axes == ["horizontal", "vertical", "both"]
+        && matches!(
+            vulkan.p_norms,
+            Some(PNormRange {
+                minimum: 1,
+                maximum: 1
+            })
+        )
+        && vulkan.max_half_bandwidth == Some(29)
+        && vulkan.max_forward_width == Some(30);
+    if vulkan.analysis_command_available
+        || (vulkan.device_available && (!vulkan.compiled || !valid_vulkan_shape))
+        || (!vulkan.compiled
+            && (!vulkan.axes.is_empty()
+                || vulkan.p_norms.is_some()
+                || vulkan.max_half_bandwidth.is_some()
+                || vulkan.max_forward_width.is_some()))
+    {
+        return Err("getnative-engine returned invalid Vulkan capabilities".to_owned());
     }
     let profile_contract = capabilities
         .profiles
@@ -375,17 +423,18 @@ mod tests {
             "engine": "getnative-engine",
             "commands": {"capabilities": true, "geometry": true, "analyze": false},
             "kernels": [
-                {"id": "bilinear", "parameters": {"kind": "none"}},
-                {"id": "bicubic", "parameters": {"kind": "bicubic_bc", "finite": true}},
-                {"id": "lanczos", "parameters": {"kind": "integer_taps", "gui_min": 1, "gui_max": 8, "core_min": 1, "core_max": 15}},
-                {"id": "spline16", "parameters": {"kind": "none"}},
-                {"id": "spline36", "parameters": {"kind": "none"}},
-                {"id": "spline64", "parameters": {"kind": "none"}}
+                {"id": "bilinear", "parameters": {"kind": "none", "blur": {"kind": "positive_scale", "default": 1.0, "gui_min": 0.75}}},
+                {"id": "bicubic", "parameters": {"kind": "bicubic_bc", "finite": true, "blur": {"kind": "positive_scale", "default": 1.0, "gui_min": 0.75}}},
+                {"id": "lanczos", "parameters": {"kind": "integer_taps", "gui_min": 1, "gui_max": 8, "core_min": 1, "core_max": 15, "blur": {"kind": "positive_scale", "default": 1.0, "gui_min": 0.75}}},
+                {"id": "spline16", "parameters": {"kind": "none", "blur": {"kind": "positive_scale", "default": 1.0, "gui_min": 0.75}}},
+                {"id": "spline36", "parameters": {"kind": "none", "blur": {"kind": "positive_scale", "default": 1.0, "gui_min": 0.75}}},
+                {"id": "spline64", "parameters": {"kind": "none", "blur": {"kind": "positive_scale", "default": 1.0, "gui_min": 0.75}}}
             ],
             "backends": [
                 {"id": "cpu", "compiled": true, "device_available": true, "analysis_command_available": false, "axes": ["horizontal", "vertical", "both"], "p_norms": {"minimum": 1, "maximum": 4294967295_u64}, "max_half_bandwidth": 29, "max_forward_width": 30},
                 {"id": "metal", "compiled": true, "device_available": true, "analysis_command_available": false, "axes": ["horizontal", "vertical", "both"], "p_norms": {"minimum": 1, "maximum": 1}, "max_half_bandwidth": 15, "max_forward_width": 16},
-                {"id": "cuda", "compiled": false, "device_available": false, "analysis_command_available": false, "axes": [], "p_norms": null, "max_half_bandwidth": null, "max_forward_width": null}
+                {"id": "cuda", "compiled": false, "device_available": false, "analysis_command_available": false, "axes": [], "p_norms": null, "max_half_bandwidth": null, "max_forward_width": null},
+                {"id": "vulkan", "compiled": false, "device_available": false, "analysis_command_available": false, "axes": [], "p_norms": null, "max_half_bandwidth": null, "max_forward_width": null}
             ],
             "profiles": [
                 {"id": "muf-d278cd3", "default_crop": 5},

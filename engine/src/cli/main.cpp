@@ -3,7 +3,11 @@
 #if defined(GETNATIVE_HAS_METAL)
 #include "getnative/metal_analysis.hpp"
 #endif
+#if defined(GETNATIVE_HAS_VULKAN)
+#include "getnative/vulkan_analysis.hpp"
+#endif
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
@@ -62,7 +66,7 @@ std::string number(double value) {
     return stream.str();
 }
 
-#if defined(GETNATIVE_HAS_METAL)
+#if defined(GETNATIVE_HAS_METAL) || defined(GETNATIVE_HAS_VULKAN)
 std::string json_string(std::string_view value) {
     std::string result;
     result.reserve(value.size() + 2U);
@@ -86,14 +90,20 @@ void print_capabilities() {
     std::cout << "{\"schema_version\":2,\"engine\":\"getnative-engine\",\"version\":\"0.1.0\","
                  "\"commands\":{\"capabilities\":true,\"geometry\":true,\"analyze\":false},"
                  "\"kernels\":["
-                 "{\"id\":\"bilinear\",\"parameters\":{\"kind\":\"none\"}},"
-                 "{\"id\":\"bicubic\",\"parameters\":{\"kind\":\"bicubic_bc\",\"finite\":true}},"
+                 "{\"id\":\"bilinear\",\"parameters\":{\"kind\":\"none\","
+                 "\"blur\":{\"kind\":\"positive_scale\",\"default\":1.0,\"gui_min\":0.75}}},"
+                 "{\"id\":\"bicubic\",\"parameters\":{\"kind\":\"bicubic_bc\",\"finite\":true,"
+                 "\"blur\":{\"kind\":\"positive_scale\",\"default\":1.0,\"gui_min\":0.75}}},"
                  "{\"id\":\"lanczos\",\"parameters\":{\"kind\":\"integer_taps\","
-                 "\"gui_min\":1,\"gui_max\":8,\"core_min\":1,\"core_max\":15}},"
-                 "{\"id\":\"spline16\",\"parameters\":{\"kind\":\"none\"}},"
-                 "{\"id\":\"spline36\",\"parameters\":{\"kind\":\"none\"}},"
-                 "{\"id\":\"spline64\",\"parameters\":{\"kind\":\"none\"}}],"
-                 "\"unsupported_features\":[\"blur\",\"spline32\"],"
+                 "\"gui_min\":1,\"gui_max\":8,\"core_min\":1,\"core_max\":15,"
+                 "\"blur\":{\"kind\":\"positive_scale\",\"default\":1.0,\"gui_min\":0.75}}},"
+                 "{\"id\":\"spline16\",\"parameters\":{\"kind\":\"none\","
+                 "\"blur\":{\"kind\":\"positive_scale\",\"default\":1.0,\"gui_min\":0.75}}},"
+                 "{\"id\":\"spline36\",\"parameters\":{\"kind\":\"none\","
+                 "\"blur\":{\"kind\":\"positive_scale\",\"default\":1.0,\"gui_min\":0.75}}},"
+                 "{\"id\":\"spline64\",\"parameters\":{\"kind\":\"none\","
+                 "\"blur\":{\"kind\":\"positive_scale\",\"default\":1.0,\"gui_min\":0.75}}}],"
+                 "\"unsupported_features\":[\"spline32\"],"
                  "\"backends\":["
                  "{\"id\":\"cpu\",\"compiled\":true,\"device_available\":true,"
                  "\"analysis_command_available\":false,"
@@ -131,6 +141,45 @@ void print_capabilities() {
                  "\"analysis_command_available\":false,\"axes\":[],\"p_norms\":null,"
                  "\"max_half_bandwidth\":null,\"max_forward_width\":null,"
                  "\"reason\":\"not compiled\"}";
+#if defined(GETNATIVE_HAS_VULKAN)
+    const auto vulkan_probe = getnative::vulkan_runtime_probe();
+    if (vulkan_probe.device_available) {
+        const auto selected = getnative::select_default_vulkan_device_index(
+            vulkan_probe.devices);
+        const auto device = std::find_if(
+            vulkan_probe.devices.begin(), vulkan_probe.devices.end(),
+            [selected](const auto& value) { return value.index == selected; });
+        if (device == vulkan_probe.devices.end()) {
+            throw std::runtime_error("Vulkan default device selection failed");
+        }
+        std::cout << ",{\"id\":\"vulkan\",\"compiled\":true,\"device_available\":true,"
+                     "\"analysis_command_available\":false,"
+                     "\"axes\":[\"horizontal\",\"vertical\",\"both\"],"
+                     "\"p_norms\":{\"minimum\":1,\"maximum\":1},"
+                     "\"max_half_bandwidth\":15,\"max_forward_width\":16,\"device\":"
+                  << json_string(device->name)
+                  << ",\"float32_controls\":{\"signed_zero_inf_nan_preserve\":"
+                  << (device->shader_signed_zero_inf_nan_preserve_float32
+                          ? "true" : "false")
+                  << ",\"denorm_preserve\":"
+                  << (device->shader_denorm_preserve_float32 ? "true" : "false")
+                  << ",\"rounding_mode_rte\":"
+                  << (device->shader_rounding_mode_rte_float32 ? "true" : "false")
+                  << ",\"rounding_mode_rtz\":"
+                  << (device->shader_rounding_mode_rtz_float32 ? "true" : "false")
+                  << "}}";
+    } else {
+        std::cout << ",{\"id\":\"vulkan\",\"compiled\":true,\"device_available\":false,"
+                     "\"analysis_command_available\":false,\"axes\":[],\"p_norms\":null,"
+                     "\"max_half_bandwidth\":null,\"max_forward_width\":null,"
+                     "\"reason\":" << json_string(vulkan_probe.reason) << '}';
+    }
+#else
+    std::cout << ",{\"id\":\"vulkan\",\"compiled\":false,\"device_available\":false,"
+                 "\"analysis_command_available\":false,\"axes\":[],\"p_norms\":null,"
+                 "\"max_half_bandwidth\":null,\"max_forward_width\":null,"
+                 "\"reason\":\"not compiled\"}";
+#endif
     std::cout << "],\"profiles\":[";
     bool first = true;
     for (const auto& value : getnative::profiles()) {

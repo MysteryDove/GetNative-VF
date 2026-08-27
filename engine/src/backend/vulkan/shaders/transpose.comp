@@ -1,0 +1,37 @@
+#version 450
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 1, std430) buffer SourceBuffer {
+    float source_data[];
+};
+layout(push_constant, std430) uniform PushConstants {
+    uint value[32];
+} pc;
+
+shared float tile[32][33];
+
+void main() {
+    const uint width = pc.value[0];
+    const uint height = pc.value[1];
+    const uint source_elements = pc.value[2];
+    const uint x = gl_WorkGroupID.x * 32U + gl_LocalInvocationID.x;
+    const uint y = gl_WorkGroupID.y * 32U + gl_LocalInvocationID.y;
+
+    for (uint offset = 0U; offset < 32U; offset += 8U) {
+        if (x < width && y + offset < height) {
+            tile[gl_LocalInvocationID.y + offset][gl_LocalInvocationID.x] =
+                source_data[(y + offset) * width + x];
+        }
+    }
+    barrier();
+
+    const uint output_x = gl_WorkGroupID.y * 32U + gl_LocalInvocationID.x;
+    const uint output_y = gl_WorkGroupID.x * 32U + gl_LocalInvocationID.y;
+    for (uint offset = 0U; offset < 32U; offset += 8U) {
+        if (output_x < height && output_y + offset < width) {
+            source_data[source_elements + (output_y + offset) * height + output_x] =
+                tile[gl_LocalInvocationID.x][gl_LocalInvocationID.y + offset];
+        }
+    }
+}

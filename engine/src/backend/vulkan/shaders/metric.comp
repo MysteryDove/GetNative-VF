@@ -1,0 +1,110 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer PlanBuffer {
+    uint plan_data[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer SourceBuffer {
+    float source_data[];
+};
+layout(set = 0, binding = 2, std430) readonly buffer WorkspaceBuffer {
+    float workspace_data[];
+};
+layout(set = 0, binding = 3, std430) buffer PartialBuffer {
+    float partial_data[];
+};
+layout(push_constant, std430) uniform PushConstants {
+    uint value[32];
+} pc;
+
+const uint HORIZONTAL_AXES = 0U;
+const uint VERTICAL_AXES = 1U;
+const uint VERTICAL_FIRST = 1U;
+const uint CANDIDATE_WORDS = 29U;
+shared float reduction[256];
+
+uint candidate_word(uint candidate, uint field) {
+    return plan_data[candidate * CANDIDATE_WORDS + field];
+}
+
+uint axis_word(uint candidate, bool vertical, uint field) {
+    return candidate_word(candidate, (vertical ? 12U : 0U) + field);
+}
+
+float forward_point(uint candidate, bool vertical, uint row,
+                    uint input_base, uint input_stride) {
+    const uint source_size = axis_word(candidate, vertical, 0U);
+    const uint width = axis_word(candidate, vertical, 3U);
+    const uint left_base = axis_word(candidate, vertical, 4U);
+    const uint weights_base = axis_word(candidate, vertical, 5U);
+    const int left = int(plan_data[left_base + row]);
+    precise float sum = 0.0;
+    for (uint tap = 0U; tap < width; ++tap) {
+        sum += uintBitsToFloat(
+            plan_data[weights_base + tap * source_size + row])
+            * workspace_data[
+                input_base + uint(left + int(tap)) * input_stride];
+    }
+    return sum;
+}
+
+void main() {
+    const uint local_candidate = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    if (local_candidate >= pc.value[4]) return;
+    const uint candidate = pc.value[3] + local_candidate;
+    const uint axes = candidate_word(candidate, 24U);
+    const uint width = pc.value[0];
+    const uint height = pc.value[1];
+    const uint crop_left = pc.value[7];
+    const uint crop_right = pc.value[8];
+    const uint crop_top = pc.value[9];
+    const uint crop_bottom = pc.value[10];
+    const float threshold = uintBitsToFloat(pc.value[11]);
+    const uint crop_width = width - crop_left - crop_right;
+    const uint crop_height = height - crop_top - crop_bottom;
+    const uint pixel_count = crop_width * crop_height;
+    const uint metric_groups = pc.value[6];
+    const uint workspace_base = candidate_word(candidate, 26U);
+    const uint intermediate_elements = candidate_word(candidate, 27U);
+    const uint native_base = workspace_base + intermediate_elements;
+
+    precise float sum = 0.0;
+    for (uint linear = gl_WorkGroupID.x * 256U + lane;
+         linear < pixel_count;
+         linear += metric_groups * 256U) {
+        const uint local_row = linear / crop_width;
+        const uint local_column = linear - local_row * crop_width;
+        const uint row = crop_top + local_row;
+        const uint column = crop_left + local_column;
+        float reconstructed;
+        if (axes == HORIZONTAL_AXES) {
+            reconstructed = forward_point(
+                candidate, false, column, workspace_base + row, height);
+        } else if (axes == VERTICAL_AXES) {
+            reconstructed = forward_point(
+                candidate, true, row, native_base + column, width);
+        } else if (candidate_word(candidate, 25U) == VERTICAL_FIRST) {
+            const uint native_width = axis_word(candidate, false, 1U);
+            reconstructed = forward_point(
+                candidate, false, column,
+                workspace_base + row * native_width, 1U);
+        } else {
+            reconstructed = forward_point(
+                candidate, true, row, workspace_base + column, width);
+        }
+        const float difference = abs(source_data[row * width + column] - reconstructed);
+        if (difference > threshold) sum += difference;
+    }
+
+    reduction[lane] = sum;
+    barrier();
+    for (uint offset = 128U; offset > 0U; offset >>= 1U) {
+        if (lane < offset) reduction[lane] += reduction[lane + offset];
+        barrier();
+    }
+    if (lane == 0U) {
+        partial_data[candidate * metric_groups + gl_WorkGroupID.x] = reduction[0];
+    }
+}

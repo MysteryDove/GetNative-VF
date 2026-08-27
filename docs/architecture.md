@@ -43,11 +43,11 @@ not the default profile.
 
 - No VapourSynth API, Python module, plugin loader, or `.vpy` execution in any
   release binary.
-- One shared mathematical plan format for CPU, Metal, and CUDA.
+- One shared mathematical plan format for CPU, Metal, CUDA, and Vulkan.
 - GPU execution must batch candidates and must not materialize every full
   reconstructed frame at once.
 - CPU is the deterministic compatibility oracle and fallback.
-- Metal and CUDA are optional runtime backends. Missing GPU support must not
+- Metal, CUDA, and Vulkan are optional runtime backends. Missing GPU support must not
   prevent the application from starting.
 - Results must carry enough provenance to reproduce the run: source identity,
   frame timestamp/index, color interpretation, profile, candidate grid, kernel,
@@ -143,7 +143,8 @@ getnative-engine worker / CLI
   |-- scheduler: candidate grouping, tiling, cancellation, provenance
   |-- CPU backend: deterministic oracle and fallback
   |-- Metal backend: macOS Apple GPU
-  `-- CUDA backend: NVIDIA driver backend
+  |-- CUDA backend: NVIDIA driver backend
+  `-- Vulkan backend: Windows/Linux compute backend
 ```
 
 No local TCP server is used. The worker process provides crash isolation from
@@ -166,6 +167,7 @@ engine/
   src/backend/cpu/           deterministic scalar/SIMD executor
   src/backend/metal/         Objective-C++ host + .metal kernels
   src/backend/cuda/          CUDA driver host + .cu kernels
+  src/backend/vulkan/        Vulkan host dispatch + embedded SPIR-V kernels
   src/export/                JSON, CSV, legacy TXT, SVG/PNG data model
   tests/                     unit, golden, integration, and benchmarks
 protocol/                    versioned JSON schemas and examples
@@ -231,17 +233,24 @@ reference implementation allocates dense intermediate matrices even though the
 result is banded; eliminating that work is the first optimization and benefits
 all execution backends.
 
-## Metal Batch Design And CUDA Target
+## GPU Batch Design
 
 - The CPU planner owns all Float64 coefficient generation. GPU kernels receive
   the same packed Float32 `AxisPlan` buffers.
+- Filter blur is a plan-time kernel stretch, not a frame-time blur pass:
+  effective support is `ceil(base_support * blur)` and both inverse and forward
+  coefficients evaluate the kernel at `distance / blur`. Exact unity blur uses
+  the original arithmetic path. Lanczos uses expanded coverage while retaining
+  its unscaled taps as the window parameter.
 - Candidates are grouped by output canvas dimensions, kernel support, and
   bandwidth, while retaining candidate-specific shift, active dimension, and
   coefficients.
 - Horizontal solves map independent rows across lanes; vertical solves map
   independent columns. The solve direction itself remains ordered.
-- Specialized bandwidth-3 and bandwidth-7 kernels cover bilinear and bicubic.
-  A generic kernel covers Lanczos and spline modes.
+- Metal specializes bandwidth 3 and 7 and retains its generic kernel for other
+  supported shapes. Vulkan specializes bandwidth 1, 3, 5, 7, 9, and 11 with a
+  fixed-size register window; its generic kernel covers the remaining shapes
+  through half-bandwidth 15.
 - Forward reconstruction uses the retained `A` weights.
 - The final forward pass fuses thresholding, crop checks, and block reduction.
   Full reconstructed frames are not written to host memory.
@@ -256,6 +265,21 @@ all execution backends.
 The current Metal runtime reuses tiled command-buffer arenas backed by shared
 `MTLBuffer`s, which fits unified-memory Apple Silicon and avoids redundant host
 staging. Private-buffer staging remains a benchmark-driven future option.
+
+The Vulkan runtime consumes the same CPU-generated Float32 `AxisPlan` data. It
+groups tiles by horizontal/vertical bandwidth before fixed-pipeline dispatch,
+keeps packed batch plans in a bounded device-resident LRU, and uploads a cold
+plan once. Timeline-capable devices use pooled host-visible staging recorded in
+the execution command; Vulkan 1.2 devices without timeline semaphores use an
+independent upload command and fence before the plan becomes reusable. The host
+adapter is compiled with `VK_NO_PROTOTYPES` and resolves global, instance, and
+device functions from `vulkan-1.dll` or `libvulkan.so.1` at runtime.
+
+Strict Vulkan shaders use explicit multiply/add/sub operations with
+`NoContraction`, fixed reduction order, and no subgroup or Float16 path.
+Capability probing records Float32 controls, creates every required pipeline,
+and runs a small CPU-oracle H+V conformance check before reporting the device
+available. NVIDIA validation is not evidence of AMD behavior.
 
 CUDA is a future backend design, not an implemented runtime. The intended host
 adapter uses the driver API so the main executable can start without a CUDA
