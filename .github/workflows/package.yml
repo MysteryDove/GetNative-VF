@@ -303,6 +303,9 @@ jobs:
           runtime_test=$(find build/engine -type f -name getnative_vulkan_analysis_tests \
             -perm -u+x -print -quit)
           require_nonempty "Vulkan runtime test" "$runtime_test"
+          preload_root="$check_root/preload"
+          mkdir -p "$preload_root"
+          runtime_index=0
           for package_root in "$deb_root" "$appimage_root"; do
             engine=$(find "$package_root" -type f -name getnative-engine -print -quit)
             require_nonempty "engine" "$engine"
@@ -339,9 +342,11 @@ jobs:
             }
             packaged_loader=$(find "$package_root" -type f -path '*/bin/libvulkan.so.1' -print -quit)
             require_file "packaged application Vulkan loader" "$packaged_loader"
+            preload_loader="$preload_root/libvulkan-$runtime_index.so.1"
+            cp -- "$packaged_loader" "$preload_loader"
             runtime_output=$(
-              LD_PRELOAD="$packaged_loader" \
-              LD_LIBRARY_PATH="$(dirname "$packaged_loader"):${LD_LIBRARY_PATH:-}" \
+              LD_PRELOAD="$preload_loader" \
+              LD_LIBRARY_PATH="$preload_root:${LD_LIBRARY_PATH:-}" \
                 "$runtime_test"
             )
             printf '%s\n' "$runtime_output"
@@ -355,6 +360,7 @@ jobs:
               printf 'package validation: Vulkan validation layer subcase was skipped\n' >&2
               exit 1
             fi
+            runtime_index=$((runtime_index + 1))
           done
       - name: Package checksums
         shell: bash
