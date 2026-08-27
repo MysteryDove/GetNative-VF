@@ -342,11 +342,13 @@ jobs:
             }
             packaged_loader=$(find "$package_root" -type f -path '*/bin/libvulkan.so.1' -print -quit)
             require_file "packaged application Vulkan loader" "$packaged_loader"
-            preload_loader="$preload_root/libvulkan-$runtime_index.so.1"
+            package_preload_root="$preload_root/$runtime_index"
+            mkdir -p "$package_preload_root"
+            preload_loader="$package_preload_root/libvulkan.so.1"
             cp -- "$packaged_loader" "$preload_loader"
             runtime_output=$(
               LD_PRELOAD="$preload_loader" \
-              LD_LIBRARY_PATH="$preload_root:${LD_LIBRARY_PATH:-}" \
+              LD_LIBRARY_PATH="$package_preload_root:${LD_LIBRARY_PATH:-}" \
                 "$runtime_test"
             )
             printf '%s\n' "$runtime_output"
