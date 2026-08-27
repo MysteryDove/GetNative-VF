@@ -150,6 +150,8 @@ void test_dual_axis_filter_families_and_forward_orders() {
         {"spline16", getnative::Filter::spline16()},
         {"spline36", getnative::Filter::spline36()},
         {"spline64", getnative::Filter::spline64()},
+        {"spline64-blur125", getnative::Filter::spline64(1.25)},
+        {"spline64-blur150", getnative::Filter::spline64(1.5)},
     };
     getnative::AxisPlanCache cache;
     getnative::MetalAnalysisEngine metal({4, 8, 0});
