@@ -1,0 +1,90 @@
+name: Engine Linux
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    name: ${{ matrix.os }} CPU-only
+    runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure CPU-only
+        run: >-
+          cmake -S engine -B build/engine-linux-cpu -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DGETNATIVE_ENABLE_MEDIA=OFF
+          -DGETNATIVE_ENABLE_METAL=OFF
+          -DGETNATIVE_ENABLE_CUDA=OFF
+          -DGETNATIVE_ENABLE_VULKAN=OFF
+          -DBUILD_TESTING=ON
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+      - name: Build
+        run: cmake --build build/engine-linux-cpu --parallel
+      - name: Test
+        run: ctest --test-dir build/engine-linux-cpu --output-on-failure
+
+  vulkan:
+    name: ${{ matrix.os }} Vulkan build and SPIR-V validation
+    runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    # ubuntu-24.04-arm is the native evidence path. QEMU cross-build is a
+    # documented fallback only if an account cannot obtain native arm runners.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: v0.17.0
+      - name: Install distro Vulkan toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools spirv-tools libvulkan-dev
+      - name: Verify distro tools
+        run: |
+          command -v glslangValidator
+          command -v spirv-val
+          test -f /usr/include/vulkan/vulkan.h
+          uname -m
+      - name: Configure Vulkan
+        run: >-
+          cmake -S engine -B build/engine-linux-vulkan -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DGETNATIVE_ENABLE_MEDIA=OFF
+          -DGETNATIVE_ENABLE_METAL=OFF
+          -DGETNATIVE_ENABLE_CUDA=OFF
+          -DGETNATIVE_ENABLE_VULKAN=ON
+          -DBUILD_TESTING=ON
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+      - name: Build Vulkan and embedded SPIR-V
+        run: cmake --build build/engine-linux-vulkan --parallel
+      - name: Validate SPIR-V and run tests
+        run: ctest --test-dir build/engine-linux-vulkan --output-on-failure
