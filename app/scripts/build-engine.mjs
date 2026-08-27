@@ -140,7 +140,7 @@ function stagedVulkanRuntime() {
   if (!existsSync(runtime)) fail(`staged Vulkan loader was not found: ${runtime}`);
   return [{
     name,
-    sha256: createHash("sha256").update(readFileSync(runtime)).digest("hex"),
+    source_sha256: createHash("sha256").update(readFileSync(runtime)).digest("hex"),
   }];
 }
 

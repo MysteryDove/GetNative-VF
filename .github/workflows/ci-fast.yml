@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ci-fast-${{ github.ref }}
@@ -13,17 +14,133 @@ permissions:
   contents: read
 
 jobs:
-  engine:
-    name: Engine CPU (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-2022]
-    runs-on: ${{ matrix.os }}
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-24.04
+    outputs:
+      frontend: ${{ steps.filter.outputs.frontend }}
+      rust: ${{ steps.filter.outputs.rust }}
+      engine: ${{ steps.filter.outputs.engine }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: ilammy/msvc-dev-cmd@v1
-        if: runner.os == 'Windows'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        id: filter
+        with:
+          filters: |
+            frontend:
+              - 'app/src/**'
+              - 'app/index.html'
+              - 'app/package.json'
+              - 'app/pnpm-lock.yaml'
+              - 'app/tsconfig*.json'
+              - 'app/vite.config.*'
+            rust:
+              - 'app/src-tauri/src/**'
+              - 'app/src-tauri/build.rs'
+              - 'app/src-tauri/Cargo.toml'
+              - 'app/src-tauri/Cargo.lock'
+              - 'app/src-tauri/tauri.conf.json'
+            engine:
+              - 'engine/**'
+              - 'app/scripts/build-engine.mjs'
+              - 'scripts/check-local.sh'
+              - '.github/workflows/ci-fast.yml'
+
+  frontend:
+    name: Frontend checks
+    needs: changes
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - name: Install JavaScript dependencies
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+      - name: Test and build frontend
+        working-directory: app
+        run: |
+          pnpm test
+          pnpm test:locale
+          pnpm build
+
+  tauri:
+    name: Rust and Tauri checks
+    needs: changes
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      needs.changes.outputs.rust == 'true' ||
+      needs.changes.outputs.engine == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Tauri dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          build-essential ninja-build pkg-config
+          libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+          libxdo-dev libssl-dev
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable # tracks current stable Rust by design
+        with:
+          components: rustfmt, clippy
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: app/src-tauri
+      - name: Install JavaScript dependencies
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+      - name: Stage debug CPU engine
+        working-directory: app
+        env:
+          GETNATIVE_LINUX_BACKENDS: cpu
+        run: pnpm build:engine:debug
+      - name: Rust checks
+        working-directory: app
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+  windows-engine:
+    name: Windows CPU portability
+    needs: changes
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      needs.changes.outputs.engine == 'true'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
       - name: Configure
@@ -38,53 +155,23 @@ jobs:
       - name: Test
         run: ctest --test-dir build/ci-fast --output-on-failure
 
-  app:
-    name: Frontend and Tauri checks
+  gate:
+    name: CI Fast gate
+    if: always()
+    needs: [changes, frontend, tauri, windows-engine]
     runs-on: ubuntu-24.04
-    env:
-      SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Tauri dependencies
-        run: >-
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends
-          build-essential ninja-build pkg-config
-          libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
-          libxdo-dev libssl-dev
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.20.0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: app/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
-        with:
-          version: v0.17.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: app/src-tauri
-      - name: Install JavaScript dependencies
-        working-directory: app
-        run: pnpm install --frozen-lockfile
-      - name: Stage debug CPU engine
-        working-directory: app
+      - name: Require all selected checks
         env:
-          GETNATIVE_LINUX_BACKENDS: cpu
-        run: pnpm build:engine:debug
-      - name: Frontend checks
-        working-directory: app
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          FRONTEND_RESULT: ${{ needs.frontend.result }}
+          TAURI_RESULT: ${{ needs.tauri.result }}
+          WINDOWS_RESULT: ${{ needs.windows-engine.result }}
         run: |
-          pnpm test
-          pnpm test:locale
-          pnpm build
-      - name: Rust checks
-        working-directory: app
-        run: |
-          cargo test --manifest-path src-tauri/Cargo.toml
-          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+          for result in \
+            "$CHANGES_RESULT" "$FRONTEND_RESULT" "$TAURI_RESULT" "$WINDOWS_RESULT"; do
+            case "$result" in
+              success|skipped) ;;
+              *) exit 1 ;;
+            esac
+          done

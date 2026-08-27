@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+    paths:
+      - 'engine/**'
+      - 'app/scripts/build-engine.mjs'
+      - '.github/workflows/engine-linux.yml'
   workflow_dispatch:
 
 permissions:
@@ -16,6 +20,7 @@ concurrency:
 jobs:
   cpu:
     name: ${{ matrix.os }} CPU-only
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -24,10 +29,10 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
       - name: Configure CPU-only
@@ -54,14 +59,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["ubuntu-24.04", "ubuntu-24.04-arm"]') }}
     # ubuntu-24.04-arm is the native evidence path. QEMU cross-build is a
     # documented fallback only if an account cannot obtain native arm runners.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
       - name: Install distro Vulkan toolchain
