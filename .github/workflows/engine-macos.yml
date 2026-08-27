@@ -44,16 +44,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          component_json="$(mktemp)"
-          trap 'rm -f "$component_json"' EXIT
-          xcodebuild -showComponent MetalToolchain -json > "$component_json"
-          metal_status="$(plutil -extract status raw -o - "$component_json")"
-          if [[ "$metal_status" != installed ]]; then
-            xcode_build="$(xcodebuild -version | awk '/Build version/ {print $3}')"
-            xcodebuild -downloadComponent MetalToolchain -buildVersion "$xcode_build"
+          if ! xcrun --find metal >/dev/null 2>&1 || ! xcrun --find metallib >/dev/null 2>&1; then
+            if xcodebuild -help 2>&1 | grep -q -- '-downloadComponent'; then
+              xcode_build="$(xcodebuild -version | awk '/Build version/ {print $3}')"
+              xcodebuild -downloadComponent MetalToolchain -buildVersion "$xcode_build"
+            else
+              echo "Metal compiler tools are unavailable and this Xcode cannot download MetalToolchain" >&2
+              exit 1
+            fi
           fi
-          xcodebuild -showComponent MetalToolchain -json > "$component_json"
-          test "$(plutil -extract status raw -o - "$component_json")" = installed
           test "$(uname -m)" = arm64
           xcrun --find metal
           xcrun --find metallib
@@ -101,15 +100,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          component_json="$(mktemp)"
-          trap 'rm -f "$component_json"' EXIT
-          xcodebuild -showComponent MetalToolchain -json > "$component_json"
-          if [[ "$(plutil -extract status raw -o - "$component_json")" != installed ]]; then
-            xcode_build="$(xcodebuild -version | awk '/Build version/ {print $3}')"
-            xcodebuild -downloadComponent MetalToolchain -buildVersion "$xcode_build"
+          if ! xcrun --find metal >/dev/null 2>&1 || ! xcrun --find metallib >/dev/null 2>&1; then
+            if xcodebuild -help 2>&1 | grep -q -- '-downloadComponent'; then
+              xcode_build="$(xcodebuild -version | awk '/Build version/ {print $3}')"
+              xcodebuild -downloadComponent MetalToolchain -buildVersion "$xcode_build"
+            else
+              echo "Metal compiler tools are unavailable and this Xcode cannot download MetalToolchain" >&2
+              exit 1
+            fi
           fi
-          xcodebuild -showComponent MetalToolchain -json > "$component_json"
-          test "$(plutil -extract status raw -o - "$component_json")" = installed
           xcrun --find metal
           xcrun --find metallib
       - uses: mozilla-actions/sccache-action@v0.0.11
