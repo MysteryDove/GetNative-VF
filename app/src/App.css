@@ -1481,6 +1481,12 @@ button {
   padding-left: 0;
 }
 
+/* Params-panel hints follow the same 10px block rhythm instead of the
+   generic card padding. */
+.analyze-params .help-copy {
+  padding: 0 0 10px;
+}
+
 .recent-table {
   display: grid;
   gap: 0;
@@ -2865,11 +2871,18 @@ button {
   stroke-width: 1.6;
 }
 
-.analyze-params label.block {
+/* All params blocks — label-wrapped inputs and bare div radio groups alike —
+   share one vertical rhythm and label typography. */
+.analyze-params .block {
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  margin-bottom: 6px;
+  gap: 4px;
+  margin-bottom: 10px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.analyze-params .block > span {
   font-size: 11px;
   color: var(--text-faint);
 }
@@ -2933,6 +2946,11 @@ button {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 6px 8px;
+}
+
+/* Grid supplies the spacing; block margins would double it. */
+.metric-grid .block {
+  margin-bottom: 0;
 }
 
 .analyze-run-block {
