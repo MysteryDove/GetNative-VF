@@ -28,6 +28,8 @@ constexpr std::uint32_t bit(std::uint32_t index) noexcept {
     return std::uint32_t{1} << index;
 }
 
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86)) \
+    || defined(__i386__) || defined(__x86_64__)
 [[nodiscard]] CpuIdRegisters cpuid(std::uint32_t leaf, std::uint32_t subleaf) noexcept {
     CpuIdRegisters result{};
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
@@ -71,6 +73,7 @@ void decode_signature(CpuFeatureSnapshot &snapshot) noexcept {
         ? base_model + (extended_model << 4U) : base_model;
     snapshot.stepping = signature & 0xFU;
 }
+#endif
 
 [[nodiscard]] CpuIsa requested_isa(CpuIsaRequest request) noexcept {
     switch (request) {

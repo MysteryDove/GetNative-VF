@@ -128,6 +128,8 @@ struct ProfileKernelCapability {
 struct FeatureCapabilities {
     #[serde(default)]
     verify_engine_decode: bool,
+    #[serde(default)]
+    verify_metal_zero_copy: bool,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +138,8 @@ struct DecodeBackendCapability {
     compiled: bool,
     runtime_device: bool,
     codecs: Vec<String>,
+    #[serde(default)]
+    surface_formats: Vec<String>,
     zero_copy: bool,
     #[serde(default)]
     reason: Option<String>,
@@ -177,7 +181,9 @@ fn engine_candidates(app: &AppHandle) -> Vec<PathBuf> {
     if let Ok(current_dir) = env::current_dir() {
         for build_root in [
             current_dir.join("../build/engine"),
+            current_dir.join("../build/engine-debug"),
             current_dir.join("build/engine"),
+            current_dir.join("build/engine-debug"),
         ] {
             paths.push(build_root.join(&engine_name));
             paths.push(build_root.join("Debug").join(&engine_name));
@@ -215,7 +221,35 @@ pub(crate) fn engine_command(path: &Path) -> Command {
     }
     #[cfg(not(windows))]
     {
-        Command::new(path)
+        let mut command = Command::new(path);
+        #[cfg(target_os = "macos")]
+        {
+            let runtime = env::var_os("GETNATIVE_FFMPEG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    path.parent()
+                        .map(|dir| dir.join("../../../../.deps/ffmpeg-macos-vt/lib"))
+                })
+                .or_else(|| {
+                    env::current_dir()
+                        .ok()
+                        .map(|dir| dir.join("../.deps/ffmpeg-macos-vt/lib"))
+                })
+                .filter(|dir| dir.is_dir());
+            if let Some(runtime) = runtime {
+                let existing = env::var_os("DYLD_LIBRARY_PATH").unwrap_or_default();
+                let value = if existing.is_empty() {
+                    runtime.into_os_string()
+                } else {
+                    let mut value = runtime.into_os_string();
+                    value.push(":");
+                    value.push(existing);
+                    value
+                };
+                command.env("DYLD_LIBRARY_PATH", value);
+            }
+        }
+        command
     }
 }
 
@@ -247,30 +281,56 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
         return Err("getnative-engine returned an unsupported capability schema".to_owned());
     }
     if !capabilities.decode_backends.is_empty() {
-        let expected = ["software", "nvdec", "vulkan_video"];
-        if capabilities.decode_backends.len() != expected.len()
+        let expected = if capabilities.decode_backends.len() == 3 {
+            ["software", "nvdec", "vulkan_video", ""]
+        } else {
+            ["software", "nvdec", "vulkan_video", "videotoolbox"]
+        };
+        if capabilities.decode_backends.len() < 3
+            || capabilities.decode_backends.len() > expected.len()
             || capabilities
                 .decode_backends
                 .iter()
-                .zip(expected)
+                .zip(expected.into_iter())
                 .any(|(backend, id)| {
                     backend.id != id
                         || backend.runtime_device && !backend.compiled
                         || backend.zero_copy && !backend.runtime_device
-                        || backend.compiled && backend.codecs.is_empty()
-                        || !backend.compiled
-                            && backend.reason.as_deref().is_none_or(str::is_empty)
+                        || backend.compiled && backend.id != "software" && backend.codecs.is_empty()
+                        || !backend.compiled && backend.reason.as_deref().is_none_or(str::is_empty)
                 })
         {
             return Err("getnative-engine returned invalid decode capabilities".to_owned());
+        }
+        if let Some(videotoolbox) = capabilities
+            .decode_backends
+            .iter()
+            .find(|item| item.id == "videotoolbox")
+        {
+            if videotoolbox.compiled
+                && videotoolbox
+                    .surface_formats
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    != ["420v", "420f", "x420", "xf20"]
+            {
+                return Err(
+                    "getnative-engine returned invalid VideoToolbox surface capabilities"
+                        .to_owned(),
+                );
+            }
+            if capabilities.features.verify_metal_zero_copy
+                && !(videotoolbox.compiled && videotoolbox.runtime_device && videotoolbox.zero_copy)
+            {
+                return Err("getnative-engine Metal decode feature is inconsistent".to_owned());
+            }
         }
         let software = &capabilities.decode_backends[0];
         if capabilities.features.verify_engine_decode
             != (software.compiled && software.runtime_device)
         {
-            return Err(
-                "getnative-engine media decode feature is inconsistent".to_owned(),
-            );
+            return Err("getnative-engine media decode feature is inconsistent".to_owned());
         }
     } else if capabilities.features.verify_engine_decode {
         return Err("getnative-engine omitted decode capabilities".to_owned());
@@ -288,7 +348,9 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
         .media
         .as_ref()
         .is_some_and(|media| media.available);
-    if media_commands.iter().any(|available| *available != media_available)
+    if media_commands
+        .iter()
+        .any(|available| *available != media_available)
         || capabilities.features.verify_engine_decode != media_available
     {
         return Err("getnative-engine media command availability is inconsistent".to_owned());
@@ -298,8 +360,7 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
             || (media.available
                 && (media.ffmpeg_abi.as_deref().is_none_or(str::is_empty)
                     || media.index_version != Some(3)))
-            || (!media.available
-                && (media.ffmpeg_abi.is_some() || media.index_version.is_some()))
+            || (!media.available && (media.ffmpeg_abi.is_some() || media.index_version.is_some()))
         {
             return Err("getnative-engine media capability schema is invalid".to_owned());
         }
@@ -365,15 +426,21 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
         || cpu.max_forward_width != Some(30)
         || cpu.compiled_isa.as_deref().is_none_or(|values| {
             values.first().map(String::as_str) != Some("scalar")
-                || values
-                    .iter()
-                    .any(|value| !matches!(value.as_str(), "scalar" | "sse2" | "avx2" | "avx512" | "neon"))
+                || values.iter().any(|value| {
+                    !matches!(
+                        value.as_str(),
+                        "scalar" | "sse2" | "avx2" | "avx512" | "neon"
+                    )
+                })
         })
         || cpu.available_isa.as_deref().is_none_or(|values| {
             values.first().map(String::as_str) != Some("scalar")
-                || values
-                    .iter()
-                    .any(|value| !matches!(value.as_str(), "scalar" | "sse2" | "avx2" | "avx512" | "neon"))
+                || values.iter().any(|value| {
+                    !matches!(
+                        value.as_str(),
+                        "scalar" | "sse2" | "avx2" | "avx512" | "neon"
+                    )
+                })
         })
         || !matches!(
             cpu.selected_isa.as_deref(),
@@ -426,7 +493,10 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
             _ => true,
         };
         let valid_device = !backend.device_available
-            || backend.device.as_deref().is_some_and(|device| !device.is_empty());
+            || backend
+                .device
+                .as_deref()
+                .is_some_and(|device| !device.is_empty());
         let valid_device_type = match id {
             "vulkan" => backend.device_type.as_deref().is_none_or(|device_type| {
                 matches!(
@@ -477,22 +547,26 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
         ("modern", "decimal_fixed_point", "1", 5),
     ];
     if capabilities.profiles.len() != expected_profiles.len()
-        || capabilities.profiles.iter().zip(expected_profiles).any(|(profile, expected)| {
-            profile.id != expected.0
-                || profile.grid_semantics != expected.1
-                || profile.default_grid.start != "500"
-                || profile.default_grid.stop != "1000"
-                || profile.default_grid.step != expected.2
-                || profile.default_grid.endpoint_rule != "inclusive"
-                || profile.default_axis_mode != "h_plus_w"
-                || profile.default_crop != expected.3
-                || (profile.default_threshold - 0.015).abs() > f64::EPSILON
-                || profile.threshold_comparison != "strict_greater_than"
-                || profile.default_kernel.id != "bicubic"
-                || profile.default_kernel.b != 0.0
-                || profile.default_kernel.c != 0.5
-                || profile.default_kernel.taps != 3
-        })
+        || capabilities
+            .profiles
+            .iter()
+            .zip(expected_profiles)
+            .any(|(profile, expected)| {
+                profile.id != expected.0
+                    || profile.grid_semantics != expected.1
+                    || profile.default_grid.start != "500"
+                    || profile.default_grid.stop != "1000"
+                    || profile.default_grid.step != expected.2
+                    || profile.default_grid.endpoint_rule != "inclusive"
+                    || profile.default_axis_mode != "h_plus_w"
+                    || profile.default_crop != expected.3
+                    || (profile.default_threshold - 0.015).abs() > f64::EPSILON
+                    || profile.threshold_comparison != "strict_greater_than"
+                    || profile.default_kernel.id != "bicubic"
+                    || profile.default_kernel.b != 0.0
+                    || profile.default_kernel.c != 0.5
+                    || profile.default_kernel.taps != 3
+            })
     {
         return Err("getnative-engine returned an unexpected profile contract".to_owned());
     }

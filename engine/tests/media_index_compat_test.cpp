@@ -275,6 +275,7 @@ void verify_indexed_matcher_and_streaming(const std::string &media_path) {
         stopped = std::string_view{error.what()} == "streaming-stop";
     }
     assert(stopped && streamed == 3U);
+    (void)stopped;
     assert(streaming_telemetry.decoded_frames < index.frames.size() / 2U);
 
     MediaIndex duplicate = index;
@@ -294,6 +295,7 @@ void verify_indexed_matcher_and_streaming(const std::string &media_path) {
         duplicate_rejected = true;
     }
     assert(duplicate_rejected && duplicate_outputs == 0U);
+    (void)duplicate_rejected;
 
     MediaIndex mixed = index;
     mixed.frames[target_ordinal].pts.reset();
@@ -364,6 +366,7 @@ int main(int argc, char **argv) {
             assert(frame.picture_type == "I");
         }
         assert(rap_count > 0U);
+        (void)rap_count;
 
         TemporaryDirectory cache;
         getnative::media::DecoderOptions decoder_options;

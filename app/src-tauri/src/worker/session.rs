@@ -47,7 +47,10 @@ impl WorkerSession {
     }
 
     pub(crate) fn next_request_id(&self) -> String {
-        format!("tauri-internal-{}", self.next_internal_request.fetch_add(1, Ordering::Relaxed))
+        format!(
+            "tauri-internal-{}",
+            self.next_internal_request.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     pub(crate) fn write_command(&mut self, command: &Value) -> Result<(), String> {
@@ -57,7 +60,9 @@ impl WorkerSession {
             .write_all(line.as_bytes())
             .and_then(|()| self.stdin.write_all(b"\n"))
             .and_then(|()| self.stdin.flush())
-            .map_err(|error| format!("worker_io_error: failed to send command to the engine worker: {error}"))
+            .map_err(|error| {
+                format!("worker_io_error: failed to send command to the engine worker: {error}")
+            })
     }
 
     /// Send a command and wait for the event that carries its request id.
@@ -71,7 +76,9 @@ impl WorkerSession {
             .insert(request_id.clone(), tx);
         let result = self.write_command(&command).and_then(|()| {
             rx.recv_timeout(RESPONSE_TIMEOUT).map_err(|_| {
-                format!("worker_timeout: the engine worker did not answer within {RESPONSE_TIMEOUT:?}")
+                format!(
+                    "worker_timeout: the engine worker did not answer within {RESPONSE_TIMEOUT:?}"
+                )
             })
         });
         if result.is_err() {
@@ -81,7 +88,10 @@ impl WorkerSession {
         }
         let response = result?;
         if response.get("type").and_then(Value::as_str) == Some("error") {
-            let code = response.get("code").and_then(Value::as_str).unwrap_or("internal");
+            let code = response
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("internal");
             let message = response
                 .get("message")
                 .and_then(Value::as_str)
@@ -157,7 +167,9 @@ pub(crate) fn spawn_session(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("worker_spawn_error: failed to start the engine worker: {error}"))?;
+        .map_err(|error| {
+            format!("worker_spawn_error: failed to start the engine worker: {error}")
+        })?;
 
     let stdin = child
         .stdin
@@ -370,6 +382,7 @@ mod tests {
                 b: Some(0.0),
                 c: Some(0.5),
                 taps: None,
+                blur: None,
             }),
             kernels: None,
             candidates: (200..=220).map(|height| height.to_string()).collect(),
@@ -405,7 +418,9 @@ mod tests {
                     Some("accepted") => {
                         saw_accepted = true;
                         assert_eq!(value["request_id"], json!("gui-req-1"));
-                        assert!(value["job_id"].as_str().is_some_and(|id| id.starts_with("job-")));
+                        assert!(value["job_id"]
+                            .as_str()
+                            .is_some_and(|id| id.starts_with("job-")));
                     }
                     Some("progress") => saw_progress = true,
                     Some("result") => result = Some(value),
@@ -438,7 +453,10 @@ mod tests {
                     let hits = value["payload"]["telemetry"]["plan_cache_hits"]
                         .as_u64()
                         .unwrap();
-                    assert!(hits >= 1, "second job must hit the session plan cache: {value}");
+                    assert!(
+                        hits >= 1,
+                        "second job must hit the session plan cache: {value}"
+                    );
                     break;
                 }
                 Ok(WorkerOutput::Event(_)) => {}
@@ -512,6 +530,7 @@ mod tests {
                 b: Some(0.0),
                 c: Some(0.5),
                 taps: None,
+                blur: None,
             }),
             kernels: None,
             candidates: vec!["220".to_owned(), "221".to_owned(), "222".to_owned()],
@@ -603,15 +622,16 @@ mod tests {
         let capabilities = session
             .roundtrip(json!({"protocol_version": 1, "type": "capabilities"}))
             .unwrap();
-        let cuda_available = capabilities["payload"]["backends"]
-            .as_array()
-            .is_some_and(|backends| {
-                backends.iter().any(|backend| {
-                    backend["id"] == "cuda"
-                        && backend["compiled"] == true
-                        && backend["device_available"] == true
-                })
-            });
+        let cuda_available =
+            capabilities["payload"]["backends"]
+                .as_array()
+                .is_some_and(|backends| {
+                    backends.iter().any(|backend| {
+                        backend["id"] == "cuda"
+                            && backend["compiled"] == true
+                            && backend["device_available"] == true
+                    })
+                });
         let backends: &[&str] = if cuda_available {
             &["cpu", "cuda"]
         } else {
@@ -691,10 +711,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dead_worker_surfaces_exit_and_fails_pending_commands() {
-        let script = std::env::temp_dir().join(format!(
-            "getnative_fake_worker_{}.sh",
-            std::process::id()
-        ));
+        let script =
+            std::env::temp_dir().join(format!("getnative_fake_worker_{}.sh", std::process::id()));
         std::fs::write(
             &script,
             "#!/bin/sh\nread line\necho '{\"protocol_version\":1,\"type\":\"hello_ok\",\"request_id\":\"tauri-internal-1\",\"timestamp_ms\":0,\"engine_version\":\"fake\",\"commands\":{\"analyze\":true,\"cancel\":true}}'\n",

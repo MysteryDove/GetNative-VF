@@ -167,7 +167,7 @@ async function runEngineMediaVerifyMember(
   try {
     let acceptedPromise: ReturnType<EngineWorkerClient["waitAccepted"]> | null = null;
     const backend = member.request.backendPreference;
-    const wireBackend = backend === "cpu" || backend === "cuda" || backend === "vulkan"
+    const wireBackend = backend === "cpu" || backend === "cuda" || backend === "vulkan" || backend === "metal"
       ? backend
       : "auto";
     const submitted = await deps.worker.verifyMediaBegin({

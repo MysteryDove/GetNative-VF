@@ -39,6 +39,39 @@ struct AnalysisJob {
     uint maximum_vector_count;
 };
 
+struct LumaNormalizeJob {
+    uint width;
+    uint height;
+    uint bit_depth;
+    uint full_range;
+};
+
+kernel void normalize_luma_r8(
+    texture2d<float, access::read> source [[texture(0)]],
+    device float *destination [[buffer(0)]],
+    constant LumaNormalizeJob &job [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= job.width || gid.y >= job.height) return;
+    float value = source.read(gid).r;
+    if (job.full_range == 0u) value = max(0.0f, (value * 255.0f - 16.0f) / 219.0f);
+    destination[gid.y * job.width + gid.x] = clamp(value, 0.0f, 1.0f);
+}
+
+kernel void normalize_luma_r16(
+    texture2d<float, access::read> source [[texture(0)]],
+    device float *destination [[buffer(0)]],
+    constant LumaNormalizeJob &job [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= job.width || gid.y >= job.height) return;
+    // VideoToolbox 10-bit bi-planar samples are stored left-aligned in a
+    // 16-bit plane. R16Unorm has already divided by 65535, so multiplying by
+    // 1023 reconstructs the logical 10-bit code without a host conversion.
+    float code = source.read(gid).r * 1023.0f;
+    float value = code / 1023.0f;
+    if (job.full_range == 0u) value = max(0.0f, (value * 1023.0f - 64.0f) / 876.0f);
+    destination[gid.y * job.width + gid.x] = clamp(value, 0.0f, 1.0f);
+}
+
 static inline uint image_index(uint direction, uint vector, uint axis_index, uint width) {
     return direction == horizontal_axis ? vector * width + axis_index
                                         : axis_index * width + vector;

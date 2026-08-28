@@ -53,7 +53,6 @@ namespace {
 
 constexpr std::uint32_t kMagic = 0x4B504E47U; // "GNPK" little-endian
 constexpr std::uint32_t kFormatVersion = 5;
-constexpr std::uint32_t kCodecZstd = 0;
 constexpr std::uint32_t kCodecLz4 = 1;
 constexpr std::uint32_t kDefaultCodec = kCodecLz4;
 constexpr std::size_t kChunkSize = 64;

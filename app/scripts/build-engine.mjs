@@ -21,7 +21,7 @@ const stageDirectory = join(appDirectory, "src-tauri", "bundle-stage");
 const defaultFfmpegRuntimeDirectory = join(appDirectory, "src-tauri", "ffmpeg-runtime");
 // Local macOS SDK produced by scripts/build-ffmpeg-macos.sh; used when the
 // GETNATIVE_FFMPEG_* environment overrides are not set.
-const autoMacosFfmpegSdkDirectory = join(repositoryDirectory, ".deps", "ffmpeg-macos");
+const autoMacosFfmpegSdkDirectory = join(repositoryDirectory, ".deps", "ffmpeg-macos-vt");
 const autoMacosFfmpegSdkAvailable = process.platform === "darwin"
   && existsSync(join(autoMacosFfmpegSdkDirectory, "include"))
   && existsSync(join(autoMacosFfmpegSdkDirectory, "lib"));

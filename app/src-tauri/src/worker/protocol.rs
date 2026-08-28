@@ -31,6 +31,7 @@ pub struct KernelCommand {
     pub b: Option<f64>,
     pub c: Option<f64>,
     pub taps: Option<u32>,
+    pub blur: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +101,12 @@ pub struct WorkerAnalyzeRequest {
 }
 
 fn validate_kernel_command(kernel: &KernelCommand) -> Result<(), String> {
+    if kernel
+        .blur
+        .is_some_and(|blur| !blur.is_finite() || blur <= 0.0)
+    {
+        return Err("bad_request: blur must be finite and greater than zero".to_owned());
+    }
     match kernel.id.as_str() {
         "bilinear" | "spline16" | "spline36" | "spline64" => {}
         "bicubic" => {
@@ -145,34 +152,42 @@ fn validate_geometry(geometry: &GeometryCommand, label: &str) -> Result<(), Stri
         ("srcHeight", geometry.src_height),
     ] {
         if !value.is_finite() || (name == "srcWidth" || name == "srcHeight") && value <= 0.0 {
-            return Err(format!("bad_request: geometry {name} must be finite and positive"));
+            return Err(format!(
+                "bad_request: geometry {name} must be finite and positive"
+            ));
         }
     }
-    if geometry.src_left < 0.0 || geometry.src_top < 0.0
+    if geometry.src_left < 0.0
+        || geometry.src_top < 0.0
         || geometry.src_left + geometry.src_width > geometry.width as f64 + 1e-9
         || geometry.src_top + geometry.src_height > geometry.height as f64 + 1e-9
     {
         return Err("bad_request: geometry source rectangle exceeds canvas".to_owned());
     }
-    if geometry.base_width.is_some_and(|value| value == 0 || value > MAX_FRAME_AXIS)
-        || geometry.base_height.is_some_and(|value| value == 0 || value > MAX_FRAME_AXIS)
+    if geometry
+        .base_width
+        .is_some_and(|value| value == 0 || value > MAX_FRAME_AXIS)
+        || geometry
+            .base_height
+            .is_some_and(|value| value == 0 || value > MAX_FRAME_AXIS)
     {
         return Err("bad_request: geometry base dimensions must be within 1..=65536".to_owned());
     }
     Ok(())
 }
 
-/// Backend + p_norm rule set shared by analyze and media verify: the backend
-/// must be cpu/cuda/vulkan/auto, CUDA caps p_norm at `CUDA_MAXIMUM_P_NORM`,
-/// and Vulkan requires p_norm=1. `unknown_message` and `scope` preserve each
+/// Backend + p_norm rule set shared by analyze and media verify. `unknown_message`
+/// and `scope` preserve each
 /// call site's error wording (scope is "" for analyze, " verify" for verify).
 fn validate_backend(
     backend: &str,
     p_norm: Option<u32>,
+    allow_metal: bool,
     unknown_message: impl FnOnce(&str) -> String,
     scope: &str,
 ) -> Result<(), String> {
-    if !matches!(backend, "cpu" | "cuda" | "vulkan" | "auto") {
+    if !(matches!(backend, "cpu" | "cuda" | "vulkan" | "auto") || allow_metal && backend == "metal")
+    {
         return Err(unknown_message(backend));
     }
     let p_norm = u64::from(p_norm.unwrap_or(1));
@@ -184,6 +199,11 @@ fn validate_backend(
     if backend == "vulkan" && p_norm != 1 {
         return Err(format!(
             "unsupported: Vulkan{scope} currently supports only p_norm=1"
+        ));
+    }
+    if backend == "metal" && p_norm != 1 {
+        return Err(format!(
+            "unsupported: Metal{scope} currently supports only p_norm=1"
         ));
     }
     Ok(())
@@ -214,15 +234,24 @@ pub(crate) fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), Str
         validate_geometry(geometry, "geometry canvas")?;
     }
     if !matches!(request.axis_mode.as_str(), "h_only" | "w_only" | "h_plus_w") {
-        return Err(format!("bad_request: unknown axisMode {}", request.axis_mode));
+        return Err(format!(
+            "bad_request: unknown axisMode {}",
+            request.axis_mode
+        ));
     }
     if !matches!(
         request.profile_id.as_str(),
         "muf-d278cd3" | "getfnative-44c8d0f" | "modern"
     ) {
-        return Err(format!("bad_request: unknown profileId {}", request.profile_id));
+        return Err(format!(
+            "bad_request: unknown profileId {}",
+            request.profile_id
+        ));
     }
-    if !matches!(request.endpoint_rule.as_str(), "inclusive" | "exclusive_stop") {
+    if !matches!(
+        request.endpoint_rule.as_str(),
+        "inclusive" | "exclusive_stop"
+    ) {
         return Err(format!(
             "bad_request: unknown endpointRule {}",
             request.endpoint_rule
@@ -233,9 +262,9 @@ pub(crate) fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), Str
         ("baseWidth", request.base_width.as_deref()),
     ] {
         if let Some(value) = value {
-            let parsed = value.parse::<u32>().map_err(|_| {
-                format!("bad_request: {label} must be a positive integer decimal")
-            })?;
+            let parsed = value
+                .parse::<u32>()
+                .map_err(|_| format!("bad_request: {label} must be a positive integer decimal"))?;
             if parsed == 0 || parsed > MAX_FRAME_AXIS {
                 return Err(format!(
                     "bad_request: {label} must be within 1..={MAX_FRAME_AXIS}"
@@ -285,9 +314,9 @@ pub(crate) fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), Str
                 ("grid.stop", grid.stop.as_str()),
                 ("grid.step", grid.step.as_str()),
             ] {
-                let parsed = value.parse::<f64>().map_err(|_| {
-                    format!("bad_request: {label} must be a decimal")
-                })?;
+                let parsed = value
+                    .parse::<f64>()
+                    .map_err(|_| format!("bad_request: {label} must be a decimal"))?;
                 if !parsed.is_finite() {
                     return Err(format!("bad_request: {label} must be finite"));
                 }
@@ -303,7 +332,9 @@ pub(crate) fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), Str
     }
     for candidate in &request.candidates {
         let Ok(value) = candidate.parse::<f64>() else {
-            return Err(format!("bad_request: candidate {candidate:?} is not a decimal"));
+            return Err(format!(
+                "bad_request: candidate {candidate:?} is not a decimal"
+            ));
         };
         if !value.is_finite() || value < 2.0 {
             return Err(format!(
@@ -324,9 +355,10 @@ pub(crate) fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), Str
     validate_backend(
         &request.backend,
         request.metric.p_norm,
+        true,
         |backend| {
             format!(
-                "unsupported: backend must be one of cpu/cuda/vulkan/auto in worker protocol v1, got {backend}"
+                "unsupported: backend must be one of cpu/cuda/vulkan/metal/auto in worker protocol v1, got {backend}"
             )
         },
         "",
@@ -349,6 +381,9 @@ pub(crate) fn kernel_json(kernel: &KernelCommand) -> Value {
         if let Some(taps) = kernel.taps {
             object.insert("taps".to_owned(), json!(taps));
         }
+    }
+    if let Some(blur) = kernel.blur {
+        object.insert("blur".to_owned(), json!(blur));
     }
     Value::Object(object)
 }
@@ -478,7 +513,10 @@ pub(crate) fn validate_verify_media_begin(request: &VerifyMediaBeginRequest) -> 
         validate_geometry(geometry, "verify geometry canvas")?;
     }
     if !matches!(request.axis_mode.as_str(), "h_only" | "w_only" | "h_plus_w") {
-        return Err(format!("bad_request: unknown axisMode {}", request.axis_mode));
+        return Err(format!(
+            "bad_request: unknown axisMode {}",
+            request.axis_mode
+        ));
     }
     validate_kernel_command(&request.kernel)?;
     let candidate = request
@@ -491,8 +529,9 @@ pub(crate) fn validate_verify_media_begin(request: &VerifyMediaBeginRequest) -> 
     validate_backend(
         &request.backend,
         request.metric.p_norm,
+        true,
         |backend| {
-            format!("unsupported: media verify backend must be cpu/cuda/vulkan/auto, got {backend}")
+            format!("unsupported: media verify backend must be cpu/cuda/vulkan/metal/auto, got {backend}")
         },
         " verify",
     )?;
@@ -502,9 +541,7 @@ pub(crate) fn validate_verify_media_begin(request: &VerifyMediaBeginRequest) -> 
     match request.selection.as_str() {
         "all" | "decoded_i_picture" => {}
         "every_n" if request.every_n.is_some_and(|value| value >= 1) => {}
-        "every_n" => {
-            return Err("bad_request: every-N selection requires everyN >= 1".to_owned())
-        }
+        "every_n" => return Err("bad_request: every-N selection requires everyN >= 1".to_owned()),
         other => return Err(format!("bad_request: unknown selection rule {other}")),
     }
     if request
@@ -592,7 +629,10 @@ mod tests {
         assert_eq!(command["type"], json!("analyze"));
         assert_eq!(command["request_id"], json!("req-1"));
         assert_eq!(command["frame_asset"]["format"], json!("f32le"));
-        assert_eq!(command["kernel"], json!({"id": "bicubic", "b": 0.0, "c": 0.5}));
+        assert_eq!(
+            command["kernel"],
+            json!({"id": "bicubic", "b": 0.0, "c": 0.5})
+        );
         assert_eq!(command["metric"]["p_norm"], json!(1));
         assert_eq!(command["profile_id"], json!("getfnative-44c8d0f"));
         assert_eq!(command["endpoint_rule"], json!("exclusive_stop"));
@@ -613,6 +653,7 @@ mod tests {
             b: Some(9.0),
             c: Some(9.0),
             taps: Some(3),
+            blur: None,
         });
         let command = analyze_command(&request).unwrap();
         assert_eq!(command["kernel"], json!({"id": "lanczos", "taps": 3}));
@@ -694,7 +735,9 @@ mod tests {
     fn analyze_validation_rejects_out_of_contract_shapes() {
         let mut request = analyze_request();
         request.mode = "width".to_owned();
-        assert!(validate_analyze(&request).unwrap_err().contains("unsupported"));
+        assert!(validate_analyze(&request)
+            .unwrap_err()
+            .contains("unsupported"));
 
         let mut request = analyze_request();
         request.frame_asset.format = "f64le".to_owned();
@@ -720,6 +763,8 @@ mod tests {
 
         let mut request = analyze_request();
         request.backend = "metal".to_owned();
+        assert!(validate_analyze(&request).is_ok());
+        request.metric.p_norm = Some(2);
         assert!(validate_analyze(&request).is_err());
 
         let mut request = analyze_request();
@@ -747,6 +792,19 @@ mod tests {
     }
 
     #[test]
+    fn analyze_command_validates_and_serializes_blur() {
+        let mut request = analyze_request();
+        request.kernel.as_mut().unwrap().blur = Some(1.25);
+        let command = analyze_command(&request).unwrap();
+        assert_eq!(command["kernel"]["blur"], json!(1.25));
+
+        request.kernel.as_mut().unwrap().blur = Some(0.0);
+        assert!(validate_analyze(&request).is_err());
+        request.kernel.as_mut().unwrap().blur = Some(f64::NAN);
+        assert!(validate_analyze(&request).is_err());
+    }
+
+    #[test]
     fn media_verify_concurrency_defaults_and_validates() {
         let value = json!({
             "requestId": "verify-media-1",
@@ -765,23 +823,34 @@ mod tests {
             "metric": {"pNorm": 1},
             "backend": "cpu"
         });
-        let request: VerifyMediaBeginRequest =
-            serde_json::from_value(value.clone()).unwrap();
+        let request: VerifyMediaBeginRequest = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(request.concurrency, 2);
+        assert!(validate_verify_media_begin(&request).is_ok());
+
+        let mut blurred = value.clone();
+        blurred["kernel"]["blur"] = json!(1.25);
+        let request: VerifyMediaBeginRequest = serde_json::from_value(blurred).unwrap();
+        assert!(validate_verify_media_begin(&request).is_ok());
+        assert_eq!(
+            verify_media_begin_command(&request, Path::new("/tmp/cache"))["kernel"]["blur"],
+            json!(1.25)
+        );
+
+        let mut metal = value.clone();
+        metal["backend"] = json!("metal");
+        let request: VerifyMediaBeginRequest = serde_json::from_value(metal).unwrap();
         assert!(validate_verify_media_begin(&request).is_ok());
 
         for concurrency in 1..=8 {
             let mut accepted = value.clone();
             accepted["concurrency"] = json!(concurrency);
-            let request: VerifyMediaBeginRequest =
-                serde_json::from_value(accepted).unwrap();
+            let request: VerifyMediaBeginRequest = serde_json::from_value(accepted).unwrap();
             assert!(validate_verify_media_begin(&request).is_ok());
         }
         for concurrency in [0, 9] {
             let mut rejected = value.clone();
             rejected["concurrency"] = json!(concurrency);
-            let request: VerifyMediaBeginRequest =
-                serde_json::from_value(rejected).unwrap();
+            let request: VerifyMediaBeginRequest = serde_json::from_value(rejected).unwrap();
             assert!(validate_verify_media_begin(&request).is_err());
         }
         for invalid in [json!(-1), json!(1.5), json!("two")] {

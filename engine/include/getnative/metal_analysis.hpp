@@ -51,6 +51,7 @@ struct MetalRuntimeTelemetry {
     double buffer_wiring_ms = 0.0;
     double pipeline_creation_ms = 0.0;
     double gpu_execution_ms = 0.0;
+    double execution_slot_wait_ms = 0.0;
     std::vector<std::string> created_pipeline_names;
 };
 
@@ -66,6 +67,16 @@ struct MetalAnalysisOptions {
     bool reuse_working_buffers = true;
     std::size_t retained_working_buffer_limit_bytes =
         2ULL * 1024ULL * 1024ULL * 1024ULL;
+    std::size_t execution_slots = 2U;
+};
+
+struct MetalLumaFrameView {
+    std::uintptr_t pixel_buffer = 0U;
+    std::int32_t width = 0;
+    std::int32_t height = 0;
+    std::int32_t bit_depth = 8;
+    std::string surface_format;
+    std::string range = "unknown";
 };
 
 [[nodiscard]] bool metal_backend_available() noexcept;
@@ -94,8 +105,18 @@ public:
     // analysis finishes before the buffers are released.
     void trim_working_buffers();
 
+    void preflight_axis_batch(
+        ConstImageView dimensions,
+        std::span<const CandidateAnalysis> candidates,
+        const MetricSpec &metric, std::size_t concurrency) const;
+
     [[nodiscard]] std::vector<CandidateResult> analyze_axis_batch_f32(
         ConstImageView source, std::span<const CandidateAnalysis> candidates,
+        const MetricSpec &metric, std::stop_token stop = {});
+
+    [[nodiscard]] std::vector<CandidateResult> analyze_axis_batch_metal_luma(
+        const MetalLumaFrameView &source,
+        std::span<const CandidateAnalysis> candidates,
         const MetricSpec &metric, std::stop_token stop = {});
 
 private:

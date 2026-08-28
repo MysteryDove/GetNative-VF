@@ -48,6 +48,7 @@ cd "${work_dir}/ffmpeg-${ffmpeg_version}"
   --disable-programs \
   --disable-static \
   --enable-shared \
+  --enable-videotoolbox \
   --disable-avdevice \
   --disable-swresample \
   --disable-everything \
@@ -61,6 +62,7 @@ cd "${work_dir}/ffmpeg-${ffmpeg_version}"
   --enable-protocol=file,pipe \
   --enable-demuxer=avi,flv,h264,matroska,mov,mpegps,mpegts,mpegvideo,ogg,rawvideo \
   --enable-decoder=av1,bmp,ffv1,gif,h264,hevc,huffyuv,mjpeg,mpeg1video,mpeg2video,mpeg4,png,prores,qtrle,rawvideo,theora,tiff,v210,vc1,vp8,vp9,webp,wmv3 \
+  --enable-hwaccel=h264_videotoolbox,hevc_videotoolbox,prores_videotoolbox,vp9_videotoolbox,av1_videotoolbox,mpeg1_videotoolbox,mpeg2_videotoolbox,mpeg4_videotoolbox \
   --enable-parser=av1,h264,hevc,mjpeg,mpeg4video,mpegvideo,png,vp8,vp9 \
   --enable-filter=scale,select \
   --enable-encoder=png \
@@ -101,6 +103,13 @@ for library in $libraries; do
 done
 test ! -e "${sdk_dir}/bin/ffmpeg"
 test ! -e "${sdk_dir}/bin/ffprobe"
+
+# Fail the SDK build closed if VideoToolbox was silently omitted by configure.
+grep -Eq '^CONFIG_VIDEOTOOLBOX=yes$' "${legal_dir}/BUILD_INFO.txt"
+for hwaccel in av1 h264 hevc mpeg1 mpeg2 mpeg4 prores vp9; do
+  upper=$(printf '%s' "${hwaccel}" | tr '[:lower:]' '[:upper:]')
+  grep -Eq "^CONFIG_${upper}_VIDEOTOOLBOX_HWACCEL=yes$" "${legal_dir}/BUILD_INFO.txt"
+done
 
 # Only indented lines are real dependency entries; otool also echoes the
 # input paths as unindented headers, which would match the patterns below.

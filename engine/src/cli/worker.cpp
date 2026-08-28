@@ -1679,7 +1679,7 @@ public:
             resident_vulkan_error = error.what();
         }
 #endif
-#if defined(GETNATIVE_HAS_CUDA) || defined(GETNATIVE_HAS_VULKAN)
+#if defined(GETNATIVE_HAS_CUDA) || defined(GETNATIVE_HAS_VULKAN) || defined(GETNATIVE_HAS_METAL)
         write_capabilities(payload, true
 #if defined(GETNATIVE_HAS_CUDA)
                            , resident_cuda, resident_cuda_error
@@ -2597,7 +2597,9 @@ private:
         const std::scoped_lock lock(metal_init_mutex_);
         if (!metal_engine_) {
             log_ << "worker: initializing Metal analysis engine...\n";
-            metal_engine_.emplace();
+            MetalAnalysisOptions options;
+            options.execution_slots = kMediaVerifyMaximumConcurrency;
+            metal_engine_.emplace(std::move(options));
             log_ << "worker: Metal analysis engine initialized on "
                  << metal_engine_->device_info().name << '\n';
         }
@@ -3648,6 +3650,11 @@ private:
 #endif
 #if defined(GETNATIVE_HAS_METAL)
         if (spec.backend == BackendChoice::metal) {
+            resident_metal_engine().reset_analysis_telemetry();
+        }
+#endif
+#if defined(GETNATIVE_HAS_METAL)
+        if (spec.backend == BackendChoice::metal) {
             try {
                 (void)resident_metal_engine();
             } catch (const std::exception &error) {
@@ -4033,7 +4040,6 @@ private:
                 JsonValue::string(vulkan_engine_->device_info().name));
         }
 #endif
-
         std::vector<JsonValue> candidate_values;
         candidate_values.reserve(results.size());
         for (const CandidateResult &result : results) {
@@ -4160,14 +4166,18 @@ private:
         }
         check_cancelled(job);
 
+
         const auto index_start = std::chrono::steady_clock::now();
         media::MediaIndex index;
         media::DecoderOptions cuda_decoder_options;
         media::DecoderOptions vulkan_decoder_options;
+        media::DecoderOptions metal_decoder_options;
         cuda_decoder_options.frame_concurrency = spec.concurrency;
         vulkan_decoder_options.frame_concurrency = spec.concurrency;
+        metal_decoder_options.frame_concurrency = spec.concurrency;
         bool use_cuda_decode = false;
         bool use_vulkan_decode = false;
+        bool use_metal_decode = false;
 #if !defined(GETNATIVE_HAS_CUDA)
         (void)use_cuda_decode;
 #endif
@@ -4253,6 +4263,20 @@ private:
                               0U, 0U, JsonValue::array());
             }
         };
+        if (spec.backend == BackendChoice::metal) {
+#if defined(__APPLE__) && defined(GETNATIVE_HAS_MEDIA) && defined(GETNATIVE_HAS_METAL)
+            metal_decoder_options.backend = media::DecoderOptions::Backend::videotoolbox;
+            try {
+                index = media::ensure_index(input.path, input.stream_index, input.cache_directory,
+                                            metal_decoder_options, job.stop_source.get_token(), index_progress).index;
+                use_metal_decode = true;
+            } catch (const std::exception &error) {
+                throw WorkerError("metal_zero_copy_unsupported", error.what());
+            }
+#else
+            throw WorkerError("metal_zero_copy_unsupported", "VideoToolbox Metal Verify is unavailable");
+#endif
+        }
         try {
             if (cuda_decoder_options.backend
                 == media::DecoderOptions::Backend::cuda) {
@@ -4298,7 +4322,7 @@ private:
                         media::DecoderOptions{}, job.stop_source.get_token(),
                         index_progress).index;
                 }
-            } else {
+            } else if (spec.backend != BackendChoice::metal) {
                 index = media::ensure_index(
                     input.path, input.stream_index, input.cache_directory,
                     media::DecoderOptions{}, job.stop_source.get_token(),
@@ -4410,10 +4434,18 @@ private:
         const std::array<CandidateAnalysis, 1U> candidates{candidate};
         std::atomic<double> compute_ms{0.0};
 
+#if defined(GETNATIVE_HAS_CUDA) || defined(GETNATIVE_HAS_VULKAN) || defined(GETNATIVE_HAS_METAL)
         const ConstImageView preflight_dimensions{
             reinterpret_cast<const float *>(std::uintptr_t{1}),
             spec.width, spec.height, spec.width};
+#endif
         try {
+#if defined(GETNATIVE_HAS_METAL)
+            if (spec.backend == BackendChoice::metal) {
+                resident_metal_engine().preflight_axis_batch(
+                    preflight_dimensions, candidates, spec.metric, spec.concurrency);
+            }
+#endif
 #if defined(GETNATIVE_HAS_CUDA)
             if (spec.backend == BackendChoice::cuda) {
                 resident_cuda_engine().preflight_axis_batch(
@@ -4727,6 +4759,45 @@ private:
                 }
             }
 #endif
+#if defined(__APPLE__) && defined(GETNATIVE_HAS_METAL)
+            if (spec.backend == BackendChoice::metal && use_metal_decode) {
+                MetalAnalysisEngine &metal = resident_metal_engine();
+                MediaVerifyPipeline<media::MetalFrame> pipeline{
+                    spec.concurrency, job.stop_source.get_token(),
+                    [&](const media::MetalFrame &frame) {
+                        if (frame.width != spec.width || frame.height != spec.height) {
+                            throw WorkerError("media_resolution_changed", "decoded media resolution changed during verification");
+                        }
+                        MetalLumaFrameView view{frame.pixel_buffer, frame.width, frame.height,
+                                                frame.bit_depth, frame.surface_format, frame.range};
+                        const auto start = std::chrono::steady_clock::now();
+                        const double error = metal.analyze_axis_batch_metal_luma(
+                            view, candidates, spec.metric, job.stop_source.get_token()).front().error;
+                        compute_ms.fetch_add(elapsed_ms(start), std::memory_order_relaxed);
+                        return error;
+                    },
+                    [&](std::uint64_t seq, const media::FrameIdentity &identity, double error, std::uint64_t analyzed) {
+                        append_result(seq, identity, error, analyzed);
+                    },
+                    [&] { job.stop_source.request_stop(); }};
+                pipeline.run([&](auto consume) {
+                    media::decode_selected_metal(input.path, index, selected, metal_decoder_options,
+                                                 job.stop_source.get_token(), std::move(consume), &decode_telemetry);
+                });
+                max_inflight = std::max(max_inflight, pipeline.max_inflight());
+                surface_lease_peak = std::max(surface_lease_peak, pipeline.max_inflight());
+                queue_wait_ms += pipeline.queue_wait_ms();
+                actual_decoder = "videotoolbox";
+                zero_copy = true;
+                if (decode_telemetry.host_frame_bytes != 0U
+                    || decode_telemetry.conversion_bytes != 0U) {
+                    throw WorkerError(
+                        "metal_zero_copy_unsupported",
+                        "Metal Verify produced host frame or conversion bytes");
+                }
+                decoded = true;
+            }
+#endif
             if (!decoded) {
                 media::DecodeTelemetry software_telemetry;
                 const std::size_t resume = static_cast<std::size_t>(completed);
@@ -4817,6 +4888,14 @@ private:
             device_convert_ms = gpu.source_conversion_ms;
             upload_ms = gpu.host_pack_ms;
             readback_ms = 0.0;
+            execution_slot_wait_ms = gpu.execution_slot_wait_ms;
+        }
+#endif
+#if defined(GETNATIVE_HAS_METAL)
+        if (spec.backend == BackendChoice::metal) {
+            const MetalRuntimeTelemetry gpu = resident_metal_engine().runtime_telemetry();
+            plan_upload_bytes = gpu.plan_upload_bytes;
+            upload_ms = gpu.plan_upload_ms;
             execution_slot_wait_ms = gpu.execution_slot_wait_ms;
         }
 #endif

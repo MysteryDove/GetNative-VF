@@ -4,14 +4,18 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <CoreVideo/CoreVideo.h>
+#import <IOSurface/IOSurface.h>
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -46,6 +50,13 @@ enum class PipelineStage : std::uint8_t {
     matrix_inverse,
     matrix_forward,
     horizontal_first_metric,
+};
+
+struct LumaNormalizeJob {
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t bit_depth;
+    std::uint32_t full_range;
 };
 
 constexpr std::array all_pipeline_stages{
@@ -462,6 +473,17 @@ struct WorkingBufferSet {
     std::size_t resident_bytes = 0;
 };
 
+struct MetalExecutionSlot {
+    id<MTLCommandQueue> queue = nil;
+    id<MTLBuffer> retained_source_buffer = nil;
+    id<MTLBuffer> retained_workspace_buffer = nil;
+    id<MTLBuffer> retained_partial_buffer = nil;
+    id<MTLBuffer> external_source_buffer = nil;
+    std::size_t external_source_bytes = 0U;
+};
+
+thread_local MetalExecutionSlot *active_slot = nullptr;
+
 } // namespace
 
 struct MetalAnalysisEngine::Impl {
@@ -472,6 +494,9 @@ struct MetalAnalysisEngine::Impl {
         }
         if (options.tile_size > std::numeric_limits<std::uint32_t>::max()) {
             throw std::invalid_argument("Metal tile size exceeds the supported range");
+        }
+        if (options.execution_slots == 0U || options.execution_slots > 8U) {
+            throw std::invalid_argument("Metal execution_slots must be in [1, 8]");
         }
         if (options.reduction_groups_per_candidate > maximum_reduction_groups) {
             throw std::invalid_argument("Metal reduction group count exceeds the 32-bit schedule range");
@@ -487,9 +512,17 @@ struct MetalAnalysisEngine::Impl {
                 throw std::runtime_error("no Metal device is available");
             }
             queue = [device newCommandQueue];
-            if (queue == nil) {
-                throw std::runtime_error("Metal command queue creation failed");
+            if (queue == nil) throw std::runtime_error("Metal command queue creation failed");
+            slots.reserve(options.execution_slots);
+            for (std::size_t index = 0U; index < options.execution_slots; ++index) {
+                auto slot = std::make_unique<MetalExecutionSlot>();
+                slot->queue = [device newCommandQueue];
+                if (slot->queue == nil) {
+                    throw std::runtime_error("Metal slot command queue creation failed");
+                }
+                slots.push_back(std::move(slot));
             }
+            slot_busy.assign(options.execution_slots, false);
 
             dispatch_data_t library_data = dispatch_data_create(
                 getnative_metallib, getnative_metallib_size,
@@ -500,6 +533,8 @@ struct MetalAnalysisEngine::Impl {
             if (library == nil) {
                 throw std::runtime_error(ns_error(error, "embedded Metal library could not be loaded"));
             }
+            luma_normalize_r8 = make_pipeline(device, library, @"normalize_luma_r8");
+            luma_normalize_r16 = make_pipeline(device, library, @"normalize_luma_r16");
             for (const PipelineStage stage : all_pipeline_stages) {
                 (void)pipeline(KernelShape::generic, stage);
             }
@@ -523,15 +558,19 @@ struct MetalAnalysisEngine::Impl {
     MetalDeviceInfo info;
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
+    std::vector<std::unique_ptr<MetalExecutionSlot>> slots;
+    std::vector<bool> slot_busy;
+    std::mutex slot_mutex;
+    std::condition_variable slot_available;
+    std::mutex pipeline_mutex;
     id<MTLLibrary> library;
     ShapePipelines bandwidth3;
     ShapePipelines bandwidth7;
     ShapePipelines bandwidth11;
     ShapePipelines bandwidth15;
     ShapePipelines generic;
-    id<MTLBuffer> retained_source_buffer = nil;
-    id<MTLBuffer> retained_workspace_buffer = nil;
-    id<MTLBuffer> retained_partial_buffer = nil;
+    id<MTLComputePipelineState> luma_normalize_r8;
+    id<MTLComputePipelineState> luma_normalize_r16;
     std::size_t peak_workspace_elements = 0;
     std::size_t peak_working_set_bytes = 0;
     std::size_t buffer_allocation_count = 0;
@@ -555,17 +594,47 @@ struct MetalAnalysisEngine::Impl {
     double buffer_wiring_ms = 0.0;
     double pipeline_creation_ms = 0.0;
     double gpu_execution_ms = 0.0;
+    double execution_slot_wait_ms = 0.0;
     std::vector<std::string> created_pipeline_names;
-    mutable std::mutex mutex;
+    mutable std::recursive_mutex mutex;
+
+    [[nodiscard]] std::size_t acquire_slot(std::stop_token stop) {
+        std::unique_lock lock(slot_mutex);
+        for (;;) {
+            for (std::size_t index = 0U; index < slots.size(); ++index) {
+                if (!slot_busy[index]) {
+                    slot_busy[index] = true;
+                    return index;
+                }
+            }
+            if (stop.stop_requested()) {
+                throw std::runtime_error("Metal analysis cancelled while waiting for a slot");
+            }
+            slot_available.wait_for(lock, std::chrono::milliseconds(2));
+        }
+    }
+
+    void release_slot(std::size_t index) noexcept {
+        {
+            const std::scoped_lock lock(slot_mutex);
+            slot_busy[index] = false;
+        }
+        slot_available.notify_one();
+    }
+
+    [[nodiscard]] id<MTLCommandQueue> active_queue() const noexcept {
+        return active_slot != nullptr ? active_slot->queue : queue;
+    }
 
     [[nodiscard]] static std::size_t buffer_bytes(id<MTLBuffer> buffer) noexcept {
         return buffer == nil ? 0 : static_cast<std::size_t>(buffer.length);
     }
 
-    [[nodiscard]] std::size_t retained_working_buffer_bytes() const {
-        const std::size_t source_bytes = buffer_bytes(retained_source_buffer);
-        const std::size_t workspace_bytes = buffer_bytes(retained_workspace_buffer);
-        const std::size_t partial_bytes = buffer_bytes(retained_partial_buffer);
+    [[nodiscard]] std::size_t retained_working_buffer_bytes_for(
+        const MetalExecutionSlot &slot) const {
+        const std::size_t source_bytes = buffer_bytes(slot.retained_source_buffer);
+        const std::size_t workspace_bytes = buffer_bytes(slot.retained_workspace_buffer);
+        const std::size_t partial_bytes = buffer_bytes(slot.retained_partial_buffer);
         if (source_bytes > std::numeric_limits<std::size_t>::max() - workspace_bytes
             || source_bytes + workspace_bytes
                 > std::numeric_limits<std::size_t>::max() - partial_bytes) {
@@ -574,7 +643,20 @@ struct MetalAnalysisEngine::Impl {
         return source_bytes + workspace_bytes + partial_bytes;
     }
 
+    [[nodiscard]] std::size_t retained_working_buffer_bytes() const {
+        std::size_t total = 0U;
+        for (const auto &slot : slots) {
+            const std::size_t bytes = retained_working_buffer_bytes_for(*slot);
+            if (bytes > std::numeric_limits<std::size_t>::max() - total) {
+                throw std::length_error("Metal retained-buffer telemetry overflow");
+            }
+            total += bytes;
+        }
+        return total;
+    }
+
     void record_buffer(id<MTLBuffer> buffer, double elapsed_ms, bool working_buffer) {
+        const std::scoped_lock lock(mutex);
         const std::size_t bytes = static_cast<std::size_t>(buffer.length);
         if (bytes > std::numeric_limits<std::size_t>::max() - buffer_allocation_bytes) {
             throw std::length_error("Metal allocation telemetry overflow");
@@ -650,6 +732,7 @@ struct MetalAnalysisEngine::Impl {
     [[nodiscard]] PlanArena allocate_plan_arena(
         const std::array<std::pair<const void *, std::size_t>, 9> &regions,
         const std::array<std::string_view, 9> &names) {
+        const std::scoped_lock lock(mutex);
         constexpr std::size_t alignment = 16;
         PlanArena arena;
         std::size_t cursor = 0;
@@ -682,6 +765,7 @@ struct MetalAnalysisEngine::Impl {
     [[nodiscard]] id<MTLBuffer> acquire_retained_buffer(id<MTLBuffer> __strong &buffer,
                                                          std::size_t required_bytes,
                                                          NSString *label) {
+        const std::scoped_lock lock(mutex);
         if (buffer != nil && buffer_bytes(buffer) >= required_bytes) {
             ++working_buffer_reuse_count;
             return buffer;
@@ -692,15 +776,21 @@ struct MetalAnalysisEngine::Impl {
         return buffer;
     }
 
+    void clear_retained_working_buffers(MetalExecutionSlot &slot) noexcept {
+        slot.retained_source_buffer = nil;
+        slot.retained_workspace_buffer = nil;
+        slot.retained_partial_buffer = nil;
+    }
+
     void clear_retained_working_buffers() noexcept {
-        retained_source_buffer = nil;
-        retained_workspace_buffer = nil;
-        retained_partial_buffer = nil;
+        for (const auto &slot : slots) clear_retained_working_buffers(*slot);
     }
 
     [[nodiscard]] WorkingBufferSet prepare_working_buffers(
+        MetalExecutionSlot &slot,
         std::size_t source_bytes, std::size_t workspace_bytes,
         std::size_t partial_bytes, const float *source_data) {
+        const std::scoped_lock lock(mutex);
         if (source_bytes > std::numeric_limits<std::size_t>::max() - workspace_bytes
             || source_bytes + workspace_bytes
                 > std::numeric_limits<std::size_t>::max() - partial_bytes) {
@@ -712,14 +802,26 @@ struct MetalAnalysisEngine::Impl {
             working_buffer_peak_active_bytes, active_bytes);
 
         WorkingBufferSet result;
+        if (slot.external_source_buffer != nil) {
+            if (slot.external_source_bytes != source_bytes) {
+                throw std::logic_error("Metal external source-buffer size mismatch");
+            }
+            result.source = slot.external_source_buffer;
+            result.workspace = allocate_empty_buffer(
+                workspace_bytes, @"GetNative Metal workspace", true);
+            result.partials = allocate_empty_buffer(
+                partial_bytes, @"GetNative metric partials", true);
+            result.resident_bytes = source_bytes + workspace_bytes + partial_bytes;
+            return result;
+        }
         bool retain = options.reuse_working_buffers;
         if (retain) {
             const std::size_t desired_source = std::max(
-                source_bytes, buffer_bytes(retained_source_buffer));
+                source_bytes, buffer_bytes(slot.retained_source_buffer));
             const std::size_t desired_workspace = std::max(
-                workspace_bytes, buffer_bytes(retained_workspace_buffer));
+                workspace_bytes, buffer_bytes(slot.retained_workspace_buffer));
             const std::size_t desired_partials = std::max(
-                partial_bytes, buffer_bytes(retained_partial_buffer));
+                partial_bytes, buffer_bytes(slot.retained_partial_buffer));
             if (desired_source > std::numeric_limits<std::size_t>::max() - desired_workspace
                 || desired_source + desired_workspace
                     > std::numeric_limits<std::size_t>::max() - desired_partials) {
@@ -731,18 +833,18 @@ struct MetalAnalysisEngine::Impl {
 
         if (retain) {
             result.source = acquire_retained_buffer(
-                retained_source_buffer, source_bytes, @"GetNative source");
+                slot.retained_source_buffer, source_bytes, @"GetNative source");
             result.workspace = acquire_retained_buffer(
-                retained_workspace_buffer, workspace_bytes,
+                slot.retained_workspace_buffer, workspace_bytes,
                 @"GetNative Metal workspace");
             result.partials = acquire_retained_buffer(
-                retained_partial_buffer, partial_bytes,
+                slot.retained_partial_buffer, partial_bytes,
                 @"GetNative metric partials");
-            result.resident_bytes = retained_working_buffer_bytes();
+            result.resident_bytes = retained_working_buffer_bytes_for(slot);
             working_buffer_peak_retained_bytes = std::max(
                 working_buffer_peak_retained_bytes, result.resident_bytes);
         } else {
-            clear_retained_working_buffers();
+            clear_retained_working_buffers(slot);
             result.source = allocate_empty_buffer(
                 source_bytes, @"GetNative source", true);
             result.workspace = allocate_empty_buffer(
@@ -763,6 +865,7 @@ struct MetalAnalysisEngine::Impl {
     void record_buffer_wiring(Function &&function) {
         const auto start = std::chrono::steady_clock::now();
         std::forward<Function>(function)();
+        const std::scoped_lock lock(mutex);
         buffer_wiring_ms += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - start).count();
     }
@@ -828,6 +931,7 @@ struct MetalAnalysisEngine::Impl {
 
     [[nodiscard]] id<MTLComputePipelineState> pipeline(KernelShape shape,
                                                        PipelineStage stage) {
+        const std::scoped_lock lock(pipeline_mutex);
         ShapePipelines &shape_pipelines = pipelines(shape);
         id<MTLComputePipelineState> result = existing_pipeline(shape_pipelines, stage);
         if (result != nil) return result;
@@ -840,14 +944,20 @@ struct MetalAnalysisEngine::Impl {
         const auto start = std::chrono::steady_clock::now();
         result = make_pipeline(device, library, function_name);
         const auto elapsed = std::chrono::steady_clock::now() - start;
-        pipeline_creation_ms += std::chrono::duration<double, std::milli>(elapsed).count();
+        {
+            const std::scoped_lock telemetry_lock(mutex);
+            pipeline_creation_ms += std::chrono::duration<double, std::milli>(elapsed).count();
+        }
         if ((stage == PipelineStage::metric
              || stage == PipelineStage::horizontal_first_metric)
             && result.maxTotalThreadsPerThreadgroup < reduction_width) {
             throw std::runtime_error("Metal device cannot run the 256-thread reduction kernels");
         }
         store_pipeline(shape_pipelines, stage, result);
-        created_pipeline_names.push_back(std::move(name));
+        {
+            const std::scoped_lock telemetry_lock(mutex);
+            created_pipeline_names.push_back(std::move(name));
+        }
         return result;
     }
 };
@@ -898,6 +1008,7 @@ MetalRuntimeTelemetry MetalAnalysisEngine::runtime_telemetry() const {
     result.buffer_wiring_ms = impl_->buffer_wiring_ms;
     result.pipeline_creation_ms = impl_->pipeline_creation_ms;
     result.gpu_execution_ms = impl_->gpu_execution_ms;
+    result.execution_slot_wait_ms = impl_->execution_slot_wait_ms;
     result.created_pipeline_names = impl_->created_pipeline_names;
     return result;
 }
@@ -923,6 +1034,7 @@ void MetalAnalysisEngine::reset_analysis_telemetry() {
     impl_->plan_upload_ms = 0.0;
     impl_->buffer_wiring_ms = 0.0;
     impl_->gpu_execution_ms = 0.0;
+    impl_->execution_slot_wait_ms = 0.0;
 }
 
 void MetalAnalysisEngine::trim_working_buffers() {
@@ -930,10 +1042,64 @@ void MetalAnalysisEngine::trim_working_buffers() {
     impl_->clear_retained_working_buffers();
 }
 
+void MetalAnalysisEngine::preflight_axis_batch(
+    ConstImageView dimensions, std::span<const CandidateAnalysis> candidates,
+    const MetricSpec &metric, std::size_t concurrency) const {
+    if (dimensions.width <= 0 || dimensions.height <= 0
+        || dimensions.stride < dimensions.width) {
+        throw std::invalid_argument("invalid Metal preflight dimensions");
+    }
+    if (concurrency == 0U || concurrency > impl_->options.execution_slots) {
+        throw std::length_error("Metal execution slots cannot satisfy requested concurrency");
+    }
+    if (metric.norm != 1U) {
+        throw std::invalid_argument("Metal currently supports only p=1 metrics");
+    }
+    if (candidates.empty()) return;
+    const std::size_t elements = checked_product(
+        static_cast<std::size_t>(dimensions.width),
+        static_cast<std::size_t>(dimensions.height), "Metal preflight source");
+    const std::size_t source_bytes = checked_product(elements, sizeof(float), "Metal preflight source");
+    const std::size_t groups = impl_->options.reduction_groups_per_candidate;
+    const std::size_t partial_bytes = checked_product(
+        checked_product(candidates.size(), groups, "Metal preflight partials"),
+        sizeof(float), "Metal preflight partials");
+    std::size_t workspace = 0U;
+    for (const CandidateAnalysis &candidate : candidates) {
+        workspace = std::max(workspace, candidate_workspace_elements(
+            dimensions, candidate, impl_->options.kernel_dispatch));
+    }
+    const std::size_t workspace_bytes = checked_product(workspace, sizeof(float), "Metal preflight workspace");
+    const std::size_t per_slot = source_bytes + partial_bytes + workspace_bytes;
+    if (source_bytes > impl_->info.maximum_buffer_bytes
+        || partial_bytes > impl_->info.maximum_buffer_bytes
+        || workspace_bytes > impl_->info.maximum_buffer_bytes
+        || checked_product(per_slot, concurrency, "Metal concurrent working set")
+               > impl_->options.retained_working_buffer_limit_bytes) {
+        throw std::length_error("Metal device memory cannot satisfy requested concurrency");
+    }
+}
+
 std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
     ConstImageView source, std::span<const CandidateAnalysis> candidates,
     const MetricSpec &metric, std::stop_token stop) {
-    const std::scoped_lock call_lock(impl_->mutex);
+    std::unique_ptr<MetalExecutionSlot, std::function<void(MetalExecutionSlot *)>> slot_guard(
+        nullptr, [](MetalExecutionSlot *) {});
+    if (active_slot == nullptr) {
+        const auto slot_wait_start = std::chrono::steady_clock::now();
+        const std::size_t slot_index = impl_->acquire_slot(stop);
+        {
+            const std::scoped_lock lock(impl_->mutex);
+            impl_->execution_slot_wait_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - slot_wait_start).count();
+        }
+        active_slot = impl_->slots[slot_index].get();
+        slot_guard = decltype(slot_guard)(active_slot,
+            [impl = impl_.get(), slot_index](MetalExecutionSlot *) {
+                active_slot = nullptr;
+                impl->release_slot(slot_index);
+            });
+    }
     if (source.data == nullptr || source.width <= 0 || source.height <= 0
         || source.stride < source.width) {
         throw std::invalid_argument("invalid Metal source image");
@@ -1030,8 +1196,11 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
             tile_begin = tile_end;
         }
 
-        impl_->peak_workspace_elements = std::max(
-            impl_->peak_workspace_elements, maximum_workspace_elements);
+        {
+            const std::scoped_lock lock(impl_->mutex);
+            impl_->peak_workspace_elements = std::max(
+                impl_->peak_workspace_elements, maximum_workspace_elements);
+        }
         const std::size_t workspace_buffer_bytes = checked_product(
             maximum_workspace_elements, sizeof(float), "GetNative Metal workspace");
         const std::size_t partial_count = checked_product(
@@ -1039,7 +1208,7 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
         const std::size_t partial_buffer_bytes = checked_product(
             partial_count, sizeof(float), "GetNative metric partials");
         const WorkingBufferSet working_buffers = impl_->prepare_working_buffers(
-            source_bytes, workspace_buffer_bytes, partial_buffer_bytes, source_data);
+            *active_slot, source_bytes, workspace_buffer_bytes, partial_buffer_bytes, source_data);
         id<MTLBuffer> source_buffer = working_buffers.source;
         id<MTLBuffer> workspace_buffer = working_buffers.workspace;
         id<MTLBuffer> partial_buffer = working_buffers.partials;
@@ -1051,7 +1220,10 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
             std::string command_error;
             for (id<MTLCommandBuffer> command in commands) {
                 [command waitUntilCompleted];
-                ++impl_->command_buffer_completion_count;
+                {
+                    const std::scoped_lock lock(impl_->mutex);
+                    ++impl_->command_buffer_completion_count;
+                }
                 if (command.status == MTLCommandBufferStatusError &&
                     command_error.empty()) {
                     command_error = ns_error(command.error,
@@ -1062,8 +1234,8 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     const double gpu_end = command.GPUEndTime;
                     if (std::isfinite(gpu_start) && std::isfinite(gpu_end) &&
                         gpu_end >= gpu_start) {
-                        impl_->gpu_execution_ms +=
-                            (gpu_end - gpu_start) * 1000.0;
+                        const std::scoped_lock lock(impl_->mutex);
+                        impl_->gpu_execution_ms += (gpu_end - gpu_start) * 1000.0;
                     }
                 }
             }
@@ -1076,19 +1248,25 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
         std::size_t queued_plan_bytes = 0;
         const std::size_t persistent_metal_bytes =
             working_buffers.resident_bytes;
-        impl_->peak_working_set_bytes = std::max(
-            impl_->peak_working_set_bytes, persistent_metal_bytes);
+        {
+            const std::scoped_lock lock(impl_->mutex);
+            impl_->peak_working_set_bytes = std::max(
+                impl_->peak_working_set_bytes, persistent_metal_bytes);
+        }
 
         const auto process_tile = [&](const TileRange &tile) {
             if (stop.stop_requested()) {
                 throw std::runtime_error("Metal analysis cancelled");
             }
             @autoreleasepool {
-                ++impl_->analyzed_tile_count;
-                if (uses_specialized_pipeline(tile.signature)) {
-                    ++impl_->specialized_tile_count;
-                } else {
-                    ++impl_->generic_tile_count;
+                {
+                    const std::scoped_lock lock(impl_->mutex);
+                    ++impl_->analyzed_tile_count;
+                    if (uses_specialized_pipeline(tile.signature)) {
+                        ++impl_->specialized_tile_count;
+                    } else {
+                        ++impl_->generic_tile_count;
+                    }
                 }
                 PackedTile packed;
                 const std::size_t tile_candidate_count = tile.end - tile.begin;
@@ -1176,9 +1354,12 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                                             - persistent_metal_bytes) {
                     throw std::length_error("Metal total working set overflow");
                 }
-                impl_->peak_working_set_bytes = std::max(
-                    impl_->peak_working_set_bytes,
-                    persistent_metal_bytes + queued_plan_bytes);
+                {
+                    const std::scoped_lock lock(impl_->mutex);
+                    impl_->peak_working_set_bytes = std::max(
+                        impl_->peak_working_set_bytes,
+                        persistent_metal_bytes + queued_plan_bytes);
+                }
                 const std::size_t tile_partial_count = checked_product(
                     tile_candidate_count, groups, "Metal tile partial results");
                 const std::size_t partial_offset_elements = checked_product(
@@ -1187,7 +1368,7 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     partial_offset_elements, sizeof(float), "Metal partial result byte offset");
 
                 const auto make_command = [&](NSString *label) {
-                    id<MTLCommandBuffer> command = [impl_->queue commandBuffer];
+                    id<MTLCommandBuffer> command = [impl_->active_queue() commandBuffer];
                     if (command == nil) {
                         throw std::runtime_error("Metal command buffer creation failed");
                     }
@@ -1319,7 +1500,10 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                 const auto submit = [&](id<MTLCommandBuffer> command) {
                     [command commit];
                     [commands addObject:command];
-                    ++impl_->command_buffer_submission_count;
+                    {
+                        const std::scoped_lock lock(impl_->mutex);
+                        ++impl_->command_buffer_submission_count;
+                    }
                 };
 
                 if (tile.signature.axes != AnalysisAxes::both) {
@@ -1462,6 +1646,121 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
             results[index] = {candidates[index].id, sum / pixel_count};
         }
         return results;
+    }
+}
+
+std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_metal_luma(
+    const MetalLumaFrameView &source,
+    std::span<const CandidateAnalysis> candidates,
+    const MetricSpec &metric, std::stop_token stop) {
+    if (source.pixel_buffer == 0U || source.width <= 0 || source.height <= 0) {
+        throw std::invalid_argument("metal_zero_copy_unsupported: invalid CVPixelBuffer");
+    }
+    if (source.surface_format != "420v" && source.surface_format != "420f"
+        && source.surface_format != "x420" && source.surface_format != "xf20") {
+        throw std::invalid_argument("metal_zero_copy_unsupported: unsupported CVPixelBuffer surface");
+    }
+    if (stop.stop_requested()) {
+        throw std::runtime_error("Metal analysis cancelled");
+    }
+    std::unique_ptr<MetalExecutionSlot, std::function<void(MetalExecutionSlot *)>> slot_guard(
+        nullptr, [](MetalExecutionSlot *) {});
+    if (active_slot == nullptr) {
+        const auto slot_wait_start = std::chrono::steady_clock::now();
+        const std::size_t slot_index = impl_->acquire_slot(stop);
+        {
+            const std::scoped_lock lock(impl_->mutex);
+            impl_->execution_slot_wait_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - slot_wait_start).count();
+        }
+        active_slot = impl_->slots[slot_index].get();
+        slot_guard = decltype(slot_guard)(active_slot,
+            [impl = impl_.get(), slot_index](MetalExecutionSlot *) {
+                active_slot = nullptr;
+                impl->release_slot(slot_index);
+            });
+    }
+    @autoreleasepool {
+        CVPixelBufferRef pixel_buffer = reinterpret_cast<CVPixelBufferRef>(source.pixel_buffer);
+        if (CVPixelBufferGetIOSurface(pixel_buffer) == nullptr) {
+            throw std::runtime_error("metal_zero_copy_unsupported: CVPixelBuffer has no IOSurface backing");
+        }
+        const bool ten_bit = source.bit_depth > 8;
+        const OSType format = CVPixelBufferGetPixelFormatType(pixel_buffer);
+        const bool format_is_10_bit =
+            format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
+        if (format_is_10_bit != ten_bit) {
+            throw std::runtime_error("metal_zero_copy_unsupported: CVPixelBuffer bit depth mismatch");
+        }
+        const bool full_range =
+            format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
+        const std::string_view expected_surface = ten_bit
+            ? (full_range ? "xf20" : "x420")
+            : (full_range ? "420f" : "420v");
+        if (source.surface_format != expected_surface) {
+            throw std::runtime_error("metal_zero_copy_unsupported: CVPixelBuffer surface metadata mismatch");
+        }
+        CVMetalTextureCacheRef cache = nullptr;
+        if (CVMetalTextureCacheCreate(kCFAllocatorDefault, nullptr,
+                                      impl_->device, nullptr, &cache) != kCVReturnSuccess) {
+            throw std::runtime_error("metal_zero_copy_unsupported: texture cache creation failed");
+        }
+        const std::size_t width = static_cast<std::size_t>(source.width);
+        const std::size_t height = static_cast<std::size_t>(source.height);
+        const std::size_t elements = checked_product(width, height, "Metal luma frame");
+        id<MTLBuffer> normalized = impl_->allocate_empty_buffer(
+            checked_product(elements, sizeof(float), "Metal normalized luma"),
+            @"GetNative normalized luma", true);
+        CVMetalTextureRef cv_texture = nullptr;
+        const MTLPixelFormat texture_format = ten_bit ? MTLPixelFormatR16Unorm : MTLPixelFormatR8Unorm;
+        const CVReturn texture_result = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, cache, pixel_buffer, nullptr, texture_format,
+            width, height, 0, &cv_texture);
+        if (texture_result != kCVReturnSuccess || cv_texture == nullptr) {
+            CFRelease(cache);
+            throw std::runtime_error("metal_zero_copy_unsupported: luma texture import failed");
+        }
+        id<MTLCommandBuffer> command = [active_slot->queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = command == nil ? nil : [command computeCommandEncoder];
+        if (encoder == nil) {
+            CFRelease(cv_texture); CFRelease(cache);
+            throw std::runtime_error("metal_zero_copy_unsupported: normalization encoder creation failed");
+        }
+        LumaNormalizeJob normalize_job{
+            static_cast<std::uint32_t>(source.width),
+            static_cast<std::uint32_t>(source.height),
+            static_cast<std::uint32_t>(source.bit_depth),
+            static_cast<std::uint32_t>(source.surface_format == "420f"
+                                       || source.surface_format == "xf20")};
+        [encoder setComputePipelineState:ten_bit ? impl_->luma_normalize_r16
+                                                  : impl_->luma_normalize_r8];
+        [encoder setTexture:CVMetalTextureGetTexture(cv_texture) atIndex:0];
+        [encoder setBuffer:normalized offset:0 atIndex:0];
+        [encoder setBytes:&normalize_job length:sizeof(normalize_job) atIndex:1];
+        [encoder dispatchThreads:MTLSizeMake(width, height, 1)
+            threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        [encoder endEncoding];
+        [command commit];
+        [command waitUntilCompleted];
+        CFRelease(cv_texture); CFRelease(cache);
+        if (command.status == MTLCommandBufferStatusError) {
+            throw std::runtime_error("metal_zero_copy_unsupported: luma normalization failed");
+        }
+        struct ExternalSourceReset {
+            MetalExecutionSlot *slot;
+            ~ExternalSourceReset() {
+                slot->external_source_buffer = nil;
+                slot->external_source_bytes = 0;
+            }
+        } reset{active_slot};
+        active_slot->external_source_buffer = normalized;
+        active_slot->external_source_bytes = elements * sizeof(float);
+        ConstImageView view{
+            reinterpret_cast<const float *>(std::uintptr_t{1}),
+            source.width, source.height, source.width};
+        return analyze_axis_batch_f32(view, candidates, metric, stop);
     }
 }
 

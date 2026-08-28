@@ -45,11 +45,13 @@ export function verifySelectableBackends(
   // The legacy frame-asset verify is CPU-only. Engine-side media verify
   // (verify_engine_decode) supports explicit CUDA/Vulkan — the engine
   // validates p_norm constraints and runs its own auto fallback chain.
-  // Metal is analyze-only: verify_begin does not accept it engine-side.
   if (capabilities?.payload.features?.verify_engine_decode !== true) {
     return ["auto", "cpu"];
   }
-  return selectableBackends(capabilities).filter((backend) => backend !== "metal");
+  const metal = capabilities?.payload.decode_backends?.find((item) => item.id === "videotoolbox");
+  const metalReady = capabilities?.payload.features?.verify_metal_zero_copy === true
+    && metal?.compiled === true && metal.runtime_device === true && metal.zero_copy === true;
+  return selectableBackends(capabilities).filter((backend) => backend !== "metal" || metalReady);
 }
 
 export function resolveBackendPreference(

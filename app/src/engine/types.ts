@@ -63,10 +63,11 @@ export type BackendCapability = {
 };
 
 export type DecodeBackendCapability = {
-  id: "software" | "nvdec" | "vulkan_video";
+  id: "software" | "nvdec" | "vulkan_video" | "videotoolbox";
   compiled: boolean;
   runtime_device: boolean;
   codecs: string[];
+  surface_formats?: string[];
   zero_copy: boolean;
   reason?: string;
 };
@@ -96,6 +97,7 @@ export type EngineEnvelope = {
       verify_frame_ring?: boolean;
       media_frame_batch?: boolean;
       verify_engine_decode?: boolean;
+      verify_metal_zero_copy?: boolean;
       media_verify_concurrency?: {
         min: number;
         max: number;
