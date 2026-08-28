@@ -39,20 +39,22 @@ std::int32_t Filter::support() const {
 }
 
 std::int32_t Filter::effective_support() const {
-    if (!(blur > 0.0) || !std::isfinite(blur)) {
+    // Relational checks only: std::isfinite folds to a constant under the
+    // planner's -ffast-math mode, so non-finite blur must be rejected via
+    // comparisons the optimizer cannot assume away.
+    if (!(blur > 0.0) || !(blur <= std::numeric_limits<double>::max())) {
         throw std::invalid_argument("blur must be finite and greater than zero");
     }
     constexpr auto maximum_support =
         (std::numeric_limits<std::int32_t>::max() - 1) / 2;
     const std::int32_t base_support = support();
     const double scaled_support = static_cast<double>(base_support) * blur;
-    if (!std::isfinite(scaled_support)
-        || scaled_support > static_cast<double>(maximum_support)) {
+    if (!(scaled_support <= static_cast<double>(maximum_support))) {
         throw std::length_error("effective filter support is too large");
     }
     const double effective = std::ceil(scaled_support);
     if (!(effective >= 1.0)
-        || effective > static_cast<double>(maximum_support)) {
+        || !(effective <= static_cast<double>(maximum_support))) {
         throw std::length_error("effective filter support is too large");
     }
     return static_cast<std::int32_t>(effective);

@@ -125,6 +125,7 @@ std::vector<std::byte> serialize_plan_cooked(
     put_f64(out, plan.shift);
     put_f64(out, request.filter.b);
     put_f64(out, request.filter.c);
+    put_f64(out, request.filter.blur);
 
     // Structural invariants verified against every plan the planner emits;
     // the flags keep the format honest if a future planner breaks them.
@@ -196,6 +197,7 @@ AxisPlan deserialize_plan_cooked(
     plan.shift = reader.f64();
     const double b = reader.f64();
     const double c = reader.f64();
+    const double blur = reader.f64();
 
     if (plan.source_size < 2 || plan.source_size > kMaxAxisLength
         || plan.destination_size < 2 || plan.destination_size > kMaxAxisLength
@@ -207,7 +209,8 @@ AxisPlan deserialize_plan_cooked(
         || kernel > 5U || border > 2U
         || !std::isfinite(plan.active_length) || plan.active_length <= 0.0
         || !std::isfinite(plan.shift)
-        || !std::isfinite(b) || !std::isfinite(c)) {
+        || !std::isfinite(b) || !std::isfinite(c)
+        || !(blur > 0.0) || !(blur <= std::numeric_limits<double>::max())) {
         throw PlanStoreError("cooked plan header is out of bounds");
     }
 
@@ -294,6 +297,7 @@ AxisPlan deserialize_plan_cooked(
         filter.b = b;
         filter.c = c;
         filter.taps = taps;
+        filter.blur = blur;
         request_out->source_size = plan.source_size;
         request_out->destination_size = plan.destination_size;
         request_out->active_length = plan.active_length;

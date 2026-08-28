@@ -28,7 +28,7 @@ namespace {
 // GNPK v4 layout (little-endian throughout)
 // ---------------------------------------------------------------------------
 //
-//   magic "GNPK" u32 | format_version u32 (=4)
+//   magic "GNPK" u32 | format_version u32 (=5)
 //   grid_hash u64 | build_fingerprint u64
 //   plan_count u32 | chunk_size u32 | chunk_count u32 | codec u32
 //   plan index[plan_count]: {key_hash u64, chunk_ordinal u32,
@@ -52,7 +52,7 @@ namespace {
 // v3 packs are rejected and rebuilt (same policy as v2 -> v3).
 
 constexpr std::uint32_t kMagic = 0x4B504E47U; // "GNPK" little-endian
-constexpr std::uint32_t kFormatVersion = 4;
+constexpr std::uint32_t kFormatVersion = 5;
 constexpr std::uint32_t kCodecZstd = 0;
 constexpr std::uint32_t kCodecLz4 = 1;
 constexpr std::uint32_t kDefaultCodec = kCodecLz4;
@@ -121,7 +121,7 @@ private:
 // Canonical key serialization: fixed little-endian fields, no struct
 // padding. Used for both grid hashing and index key hashes.
 struct KeyBytes {
-    std::array<std::byte, 46> bytes{};
+    std::array<std::byte, 54> bytes{};
     friend bool operator<(const KeyBytes &lhs, const KeyBytes &rhs) {
         return lhs.bytes < rhs.bytes;
     }
@@ -161,6 +161,7 @@ KeyBytes key_bytes(const detail::PlanKey &key) {
     result.bytes[offset++] = static_cast<std::byte>(key.type);
     put_f64(key.b);
     put_f64(key.c);
+    put_f64(key.blur);
     put_i32(key.taps);
     result.bytes[offset++] = static_cast<std::byte>(key.border);
     return result;
