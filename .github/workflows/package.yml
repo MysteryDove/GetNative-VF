@@ -187,6 +187,19 @@ jobs:
             objcopy --dump-section ".text=$output" "$path"
             sha256sum "$output" | cut -d' ' -f1
           }
+          # Re-run a crashed command under gdb so the failing .so and call
+          # stack land in the log instead of a bare exit code 139.
+          diagnose_crash() {
+            local label=$1
+            shift
+            if ! command -v gdb >/dev/null 2>&1; then
+              sudo apt-get update -qq >/dev/null 2>&1 || true
+              sudo apt-get install -y -qq gdb >/dev/null 2>&1 || true
+            fi
+            command -v gdb >/dev/null 2>&1 || return 0
+            printf '=== gdb backtrace for %s ===\n' "$label" >&2
+            gdb -batch -ex run -ex bt -ex quit --args "$@" >&2 || true
+          }
           verify_loader_elf() {
             local label=$1 path=$2
             readelf -h "$path" | grep -q 'Class:[[:space:]]*ELF64' || {
@@ -309,7 +322,18 @@ jobs:
           for package_root in "$deb_root" "$appimage_root"; do
             engine=$(find "$package_root" -type f -name getnative-engine -print -quit)
             require_nonempty "engine" "$engine"
+            printf 'package validation: [%d] probing engine capabilities: %s\n' \
+              "$runtime_index" "$engine"
+            set +e
             capabilities=$("$engine" capabilities)
+            capabilities_status=$?
+            set -e
+            if (( capabilities_status != 0 )); then
+              printf 'package validation: engine capabilities exited %d: %s\n' \
+                "$capabilities_status" "$engine" >&2
+              diagnose_crash "engine capabilities ($engine)" "$engine" capabilities
+              exit 1
+            fi
             printf '%s\n' "$capabilities" | grep -q '"id":"cuda","compiled":true' || {
               printf 'package validation: CUDA backend is not compiled in %s\n%s\n' "$engine" "$capabilities" >&2
               exit 1
@@ -346,12 +370,26 @@ jobs:
             mkdir -p "$package_preload_root"
             preload_loader="$package_preload_root/libvulkan.so.1"
             cp -- "$packaged_loader" "$preload_loader"
+            printf 'package validation: [%d] running Vulkan runtime conformance with %s\n' \
+              "$runtime_index" "$packaged_loader"
+            set +e
             runtime_output=$(
               LD_PRELOAD="$preload_loader" \
               LD_LIBRARY_PATH="$package_preload_root:${LD_LIBRARY_PATH:-}" \
-                "$runtime_test"
+                "$runtime_test" 2>&1
             )
+            runtime_status=$?
+            set -e
             printf '%s\n' "$runtime_output"
+            if (( runtime_status != 0 )); then
+              printf 'package validation: Vulkan runtime test exited %d for %s (loader: %s)\n' \
+                "$runtime_status" "$package_root" "$packaged_loader" >&2
+              diagnose_crash "Vulkan runtime test ($package_root)" \
+                env LD_PRELOAD="$preload_loader" \
+                  LD_LIBRARY_PATH="$package_preload_root:${LD_LIBRARY_PATH:-}" \
+                  "$runtime_test"
+              exit 1
+            fi
             printf '%s\n' "$runtime_output" | \
               grep -q 'Vulkan analysis conformance passed on' || {
                 printf 'package validation: packaged Vulkan loader runtime test did not execute\n' >&2
