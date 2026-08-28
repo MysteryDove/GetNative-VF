@@ -48,7 +48,7 @@ jobs:
       - name: Resolve Vulkan SDK config path
         id: vulkan-config
         shell: bash
-        run: echo "path=$(realpath .github/vulkan-sdk/1.4.357.0-linux.json)" >> "$GITHUB_OUTPUT"
+        run: echo "path=$(realpath ".github/vulkan-sdk/${VULKAN_SDK_VERSION}-linux.json")" >> "$GITHUB_OUTPUT"
       - name: Install Vulkan SDK components
         uses: humbletim/setup-vulkan-sdk@c25f41106918cde0bf347e6f201277392b3a9e9d # v1.2.1
         with:
@@ -371,40 +371,50 @@ jobs:
             }
             packaged_loader=$(find "$package_root" -type f -path '*/bin/libvulkan.so.1' -print -quit)
             require_file "packaged application Vulkan loader" "$packaged_loader"
-            package_preload_root="$preload_root/$runtime_index"
-            mkdir -p "$package_preload_root"
-            preload_loader="$package_preload_root/libvulkan.so.1"
-            cp -- "$packaged_loader" "$preload_loader"
-            printf 'package validation: [%d] running Vulkan runtime conformance with %s\n' \
-              "$runtime_index" "$packaged_loader"
-            set +e
-            runtime_output=$(
-              LD_PRELOAD="$preload_loader" \
-              LD_LIBRARY_PATH="$package_preload_root:${LD_LIBRARY_PATH:-}" \
-                "$runtime_test" 2>&1
-            )
-            runtime_status=$?
-            set -e
-            printf '%s\n' "$runtime_output"
-            if (( runtime_status != 0 )); then
-              printf 'package validation: Vulkan runtime test exited %d for %s (loader: %s)\n' \
-                "$runtime_status" "$package_root" "$packaged_loader" >&2
-              diagnose_crash "Vulkan runtime test ($package_root)" \
-                env LD_PRELOAD="$preload_loader" \
-                  LD_LIBRARY_PATH="$package_preload_root:${LD_LIBRARY_PATH:-}" \
-                  "$runtime_test"
-              exit 1
+            loaders_under_test=("$packaged_loader")
+            if [[ "$package_root" == "$appimage_root" ]]; then
+              # The AppImage GUI loads the linuxdeploy-bundled usr/lib copy, not
+              # the staged bin/ copy. Both are ELF-rewritten, so smoke-test both.
+              loaders_under_test+=("$app_dependency_loader")
             fi
-            printf '%s\n' "$runtime_output" | \
-              grep -q 'Vulkan analysis conformance passed on' || {
-                printf 'package validation: packaged Vulkan loader runtime test did not execute\n' >&2
+            loader_index=0
+            for loader_under_test in "${loaders_under_test[@]}"; do
+              package_preload_root="$preload_root/$runtime_index.$loader_index"
+              mkdir -p "$package_preload_root"
+              preload_loader="$package_preload_root/libvulkan.so.1"
+              cp -- "$loader_under_test" "$preload_loader"
+              printf 'package validation: [%d.%d] running Vulkan runtime conformance with %s\n' \
+                "$runtime_index" "$loader_index" "$loader_under_test"
+              set +e
+              runtime_output=$(
+                LD_PRELOAD="$preload_loader" \
+                LD_LIBRARY_PATH="$package_preload_root:${LD_LIBRARY_PATH:-}" \
+                  "$runtime_test" 2>&1
+              )
+              runtime_status=$?
+              set -e
+              printf '%s\n' "$runtime_output"
+              if (( runtime_status != 0 )); then
+                printf 'package validation: Vulkan runtime test exited %d for %s (loader: %s)\n' \
+                  "$runtime_status" "$package_root" "$loader_under_test" >&2
+                diagnose_crash "Vulkan runtime test ($package_root)" \
+                  env LD_PRELOAD="$preload_loader" \
+                    LD_LIBRARY_PATH="$package_preload_root:${LD_LIBRARY_PATH:-}" \
+                    "$runtime_test"
                 exit 1
-              }
-            if printf '%s\n' "$runtime_output" | \
-                grep -q 'validation-only subcase skipped'; then
-              printf 'package validation: Vulkan validation layer subcase was skipped\n' >&2
-              exit 1
-            fi
+              fi
+              printf '%s\n' "$runtime_output" | \
+                grep -q 'Vulkan analysis conformance passed on' || {
+                  printf 'package validation: packaged Vulkan loader runtime test did not execute\n' >&2
+                  exit 1
+                }
+              if printf '%s\n' "$runtime_output" | \
+                  grep -q 'validation-only subcase skipped'; then
+                printf 'package validation: Vulkan validation layer subcase was skipped\n' >&2
+                exit 1
+              fi
+              loader_index=$((loader_index + 1))
+            done
             runtime_index=$((runtime_index + 1))
           done
       - name: Package checksums
