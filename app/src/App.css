@@ -2715,13 +2715,54 @@ button {
 }
 
 .kernel-compare-list {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
 }
 
-.kernel-compare-list .checkbox-row {
-  margin: 0;
+.kernel-compare-option {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 0;
+  height: 26px;
+  padding: 0 7px;
+  overflow: hidden;
+  border: 1px solid var(--border-control);
+  border-radius: 4px;
+  color: var(--text-subtle);
+  background: var(--surface-inset);
+  font: inherit;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.kernel-compare-check {
+  flex: 0 0 auto;
+  opacity: 0;
+}
+
+.kernel-compare-option:hover {
+  color: var(--text-secondary);
+  background: var(--surface-active);
+}
+
+.kernel-compare-option.active {
+  border-color: var(--primary-border);
+  color: var(--primary-text);
+  background: var(--primary-bg);
+}
+
+.kernel-compare-option.active .kernel-compare-check {
+  opacity: 1;
+}
+
+.kernel-compare-option:focus-visible {
+  outline: 2px solid var(--input-focus);
+  outline-offset: 1px;
 }
 
 .result-table-row {
@@ -2957,7 +2998,7 @@ button {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin-top: 8px;
+  margin-top: 10px;
 }
 
 .analyze-run-block .primary-button {
@@ -2965,6 +3006,33 @@ button {
   align-items: center;
   justify-content: center;
   gap: 6px;
+  width: 100%;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--primary-border);
+  border-radius: 5px;
+  color: var(--primary-text);
+  background: var(--primary-bg);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.analyze-run-block .primary-button:hover:not(:disabled) {
+  background: var(--success-bg);
+}
+
+.analyze-run-block .primary-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.profile-defaults-button {
+  height: 28px;
+  margin: 0 0 10px;
+  padding: 0 9px;
+  font-size: 11px;
 }
 
 .empty-inline {
@@ -4042,6 +4110,24 @@ button {
   gap: 10px;
   border-top: 1px solid var(--border);
   padding-top: 12px;
+}
+
+.confirm-dialog-copy {
+  margin: 0;
+  color: var(--text-subtle);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.danger-button {
+  color: var(--danger-text);
+  border-color: var(--danger-hover-border);
+  background: var(--chip-error-bg);
+}
+
+.danger-button:hover:not(:disabled) {
+  color: var(--danger-hover-text);
+  background: var(--surface-hover);
 }
 
 .geometry-axis {

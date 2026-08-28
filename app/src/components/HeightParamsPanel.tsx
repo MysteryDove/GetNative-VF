@@ -1,4 +1,4 @@
-import { RotateCcw, SlidersHorizontal } from "lucide-react";
+import { Check, RotateCcw, SlidersHorizontal } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
 import { kernelDisplayName, profileDisplayName } from "../engine/displayNames";
@@ -327,25 +327,25 @@ export function HeightParamsPanel({
                   );
                   const name = kernelDisplayName(t, kernel.id);
                   return (
-                    <label
+                    <button
                       key={taps != null ? `${kernel.id}@${taps}` : kernel.id}
-                      className="checkbox-row"
+                      className={checked ? "kernel-compare-option active" : "kernel-compare-option"}
+                      type="button"
+                      aria-pressed={checked}
+                      title={taps != null ? `${name} ${taps}` : name}
+                      onClick={() =>
+                        onPatch({
+                          compareKernels: checked
+                            ? draft.compareKernels.filter(
+                                (item) => kernelSignature(item) !== signature,
+                              )
+                            : [...draft.compareKernels, candidate],
+                        })
+                      }
                     >
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={(event) =>
-                          onPatch({
-                            compareKernels: event.target.checked
-                              ? [...draft.compareKernels, candidate]
-                              : draft.compareKernels.filter(
-                                  (item) => kernelSignature(item) !== signature,
-                                ),
-                          })
-                        }
-                      />
+                      <Check className="kernel-compare-check" size={12} aria-hidden="true" />
                       <span>{taps != null ? `${name} ${taps}` : name}</span>
-                    </label>
+                    </button>
                   );
                 });
               })}
@@ -376,7 +376,7 @@ export function HeightParamsPanel({
         </select>
       </label>
       <button
-        className="secondary-button"
+        className="secondary-button profile-defaults-button"
         type="button"
         title={t("analyze.applyProfileDefaults")}
         onClick={onResetProfileDefaults}
