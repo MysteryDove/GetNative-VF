@@ -23,6 +23,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
@@ -37,6 +39,8 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install build and bundle dependencies
         run: >-
           sudo apt-get update && sudo apt-get install -y --no-install-recommends
@@ -126,6 +130,48 @@ jobs:
           GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}/.deps/ffmpeg-linux-x64
           GETNATIVE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/.deps/ffmpeg-linux-x64/lib
         run: pnpm tauri build --bundles deb
+      - name: Stage verified AppImage tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          # tauri-bundler skips any tool already present in ~/.cache/tauri, so
+          # pre-stage sha256-verified copies there. Otherwise the bundler
+          # downloads them mid-build from mutable sources (raw master branches
+          # and rolling release tags) without any integrity check. Hashes are
+          # trust-on-first-use from 2026-08-28; bump them in a reviewed PR when
+          # upstream legitimately changes.
+          tools_dir="$HOME/.cache/tauri"
+          mkdir -p "$tools_dir"
+          stage_tool() {
+            local name=$1 url=$2 expected=$3 path actual
+            path="$tools_dir/$name"
+            if [[ ! -f "$path" ]] || \
+                [[ "$(sha256sum "$path" | cut -d' ' -f1)" != "$expected" ]]; then
+              curl --fail --location --retry 3 --retry-all-errors -o "$path" "$url"
+            fi
+            actual=$(sha256sum "$path" | cut -d' ' -f1)
+            if [[ "$actual" != "$expected" ]]; then
+              printf 'AppImage tooling checksum mismatch for %s: got %s, expected %s\n' \
+                "$name" "$actual" "$expected" >&2
+              exit 1
+            fi
+            chmod +x "$path"
+          }
+          stage_tool AppRun-x86_64 \
+            https://github.com/tauri-apps/binary-releases/releases/download/apprun-old/AppRun-x86_64 \
+            f30140a43a0a59e46db21bdefdf749b9e9f2c6946e92afabbacf98b8ae73fb4f
+          stage_tool linuxdeploy-x86_64.AppImage \
+            https://github.com/tauri-apps/binary-releases/releases/download/linuxdeploy/linuxdeploy-x86_64.AppImage \
+            e762bea85c8eb0d4b3508d46e5c1f037f717d0f9303ae3b4aafc8b04991fa1ef
+          stage_tool linuxdeploy-plugin-gtk.sh \
+            https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh \
+            cb379f9b0733e9ad9f8bd78f8c2fa038aef2478523bb7d4c8e64ff6a1ea3501a
+          stage_tool linuxdeploy-plugin-gstreamer.sh \
+            https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gstreamer/master/linuxdeploy-plugin-gstreamer.sh \
+            c107b49d84edbffc6ab226ed1007e0626a4f7aa2c3a36b7782bef62351d49e94
+          stage_tool linuxdeploy-plugin-appimage.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage \
+            a45d3e227bc7f397e9cf6bfa4c9507494efa2293357b6e86690a3de2ca992e79
       - name: Build AppImage
         working-directory: app
         env:
@@ -440,6 +486,8 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
