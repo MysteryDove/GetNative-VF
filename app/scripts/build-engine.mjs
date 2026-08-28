@@ -17,10 +17,18 @@ const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const appDirectory = resolve(scriptDirectory, "..");
 const repositoryDirectory = resolve(appDirectory, "..");
 const sourceDirectory = join(repositoryDirectory, "engine");
-const buildDirectory = join(repositoryDirectory, "build", "engine");
 const stageDirectory = join(appDirectory, "src-tauri", "bundle-stage");
 const defaultFfmpegRuntimeDirectory = join(appDirectory, "src-tauri", "ffmpeg-runtime");
+// Local macOS SDK produced by scripts/build-ffmpeg-macos.sh; used when the
+// GETNATIVE_FFMPEG_* environment overrides are not set.
+const autoMacosFfmpegSdkDirectory = join(repositoryDirectory, ".deps", "ffmpeg-macos");
+const autoMacosFfmpegSdkAvailable = process.platform === "darwin"
+  && existsSync(join(autoMacosFfmpegSdkDirectory, "include"))
+  && existsSync(join(autoMacosFfmpegSdkDirectory, "lib"));
 const debug = process.argv.includes("--debug");
+// Debug and release use separate build trees so switching dev modes never
+// forces a full rebuild of the other configuration.
+const buildDirectory = join(repositoryDirectory, "build", debug ? "engine-debug" : "engine");
 const skipTests = process.argv.includes("--skip-tests");
 const buildType = debug ? "Debug" : "Release";
 const ffmpegRuntimePatterns = process.platform === "win32"
@@ -146,7 +154,8 @@ function stagedVulkanRuntime() {
 
 function stageFfmpegRuntime() {
   const runtimeDirectory = process.env.GETNATIVE_FFMPEG_RUNTIME_DIR
-    || (existsSync(defaultFfmpegRuntimeDirectory) ? defaultFfmpegRuntimeDirectory : null);
+    || (existsSync(defaultFfmpegRuntimeDirectory) ? defaultFfmpegRuntimeDirectory : null)
+    || (autoMacosFfmpegSdkAvailable ? join(autoMacosFfmpegSdkDirectory, "lib") : null);
   if (!runtimeDirectory) {
     if (!debug) {
       fail("Release packaging requires GETNATIVE_FFMPEG_RUNTIME_DIR or src-tauri/ffmpeg-runtime");
@@ -237,13 +246,17 @@ function visualStudioEnvironment(baseEnvironment) {
 }
 
 let environment = { ...process.env };
-if (process.env.GETNATIVE_FFMPEG_RUNTIME_DIR) {
-  const runtimeDirectory = resolve(process.env.GETNATIVE_FFMPEG_RUNTIME_DIR);
+const ffmpegLoaderDirectory = process.env.GETNATIVE_FFMPEG_RUNTIME_DIR
+  ? resolve(process.env.GETNATIVE_FFMPEG_RUNTIME_DIR)
+  : autoMacosFfmpegSdkAvailable
+    ? join(autoMacosFfmpegSdkDirectory, "lib")
+    : null;
+if (ffmpegLoaderDirectory) {
   if (process.platform === "win32") {
     replaceEnvironmentEntry(
       environment,
       "PATH",
-      `${runtimeDirectory}${delimiter}${environmentEntry(environment, "PATH") || ""}`,
+      `${ffmpegLoaderDirectory}${delimiter}${environmentEntry(environment, "PATH") || ""}`,
     );
   } else {
     const loaderVariable = process.platform === "darwin"
@@ -252,7 +265,7 @@ if (process.env.GETNATIVE_FFMPEG_RUNTIME_DIR) {
     replaceEnvironmentEntry(
       environment,
       loaderVariable,
-      `${runtimeDirectory}${delimiter}${environmentEntry(environment, loaderVariable) || ""}`,
+      `${ffmpegLoaderDirectory}${delimiter}${environmentEntry(environment, loaderVariable) || ""}`,
     );
   }
 }
@@ -265,9 +278,11 @@ const configureArguments = [
   buildDirectory,
   `-DCMAKE_BUILD_TYPE=${buildType}`,
 ];
-if (process.env.GETNATIVE_FFMPEG_ROOT) {
+const ffmpegRoot = process.env.GETNATIVE_FFMPEG_ROOT
+  || (autoMacosFfmpegSdkAvailable ? autoMacosFfmpegSdkDirectory : null);
+if (ffmpegRoot) {
   configureArguments.push(
-    `-DGETNATIVE_FFMPEG_ROOT=${resolve(process.env.GETNATIVE_FFMPEG_ROOT)}`,
+    `-DGETNATIVE_FFMPEG_ROOT=${resolve(ffmpegRoot)}`,
   );
 }
 

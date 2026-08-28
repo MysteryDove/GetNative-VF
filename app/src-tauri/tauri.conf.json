@@ -4,7 +4,7 @@
   "version": "0.2.1",
   "identifier": "io.getnative.vf",
   "build": {
-    "beforeDevCommand": "npm run build:engine:debug && npm run dev",
+    "beforeDevCommand": "npm run build:engine && npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build:engine && npm run build",
     "frontendDist": "../dist"

@@ -60,7 +60,7 @@ cd "$source_dir"
   --enable-swscale \
   --enable-zlib \
   --enable-protocol=file,pipe \
-  --enable-demuxer=avi,flv,matroska,mov,mpegps,mpegts,mpegvideo,ogg,rawvideo \
+  --enable-demuxer=avi,flv,h264,matroska,mov,mpegps,mpegts,mpegvideo,ogg,rawvideo \
   --enable-decoder=av1,bmp,ffv1,gif,h264,hevc,huffyuv,mjpeg,mpeg1video,mpeg2video,mpeg4,png,prores,qtrle,rawvideo,theora,tiff,v210,vc1,vp8,vp9,webp,wmv3 \
   --enable-parser=av1,h264,hevc,mjpeg,mpeg4video,mpegvideo,png,vp8,vp9 \
   --enable-filter=scale,select \
