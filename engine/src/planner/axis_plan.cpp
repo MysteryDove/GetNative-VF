@@ -314,9 +314,11 @@ make_axis_plan_geometry(const AxisPlanRequest &request) {
             geometry->descale_unique_indices.size()));
     }
 
-    const double scale = static_cast<double>(request.source_size)
+    // Keep the scale division from being reassociated under -ffast-math;
+    // exact rational phases must retain zimg's half-pixel tie behavior.
+    volatile const double scale = static_cast<double>(request.source_size)
         / request.active_length;
-    geometry->forward_step = std::min(scale, 1.0);
+    geometry->forward_step = std::min(static_cast<double>(scale), 1.0);
     const double expanded_support = static_cast<double>(support)
         / geometry->forward_step;
     if (!finite_binary64(expanded_support)
@@ -336,7 +338,8 @@ make_axis_plan_geometry(const AxisPlanRequest &request) {
         static_cast<double>(request.destination_size),
         -std::numeric_limits<double>::max());
     for (std::int32_t row = 0; row < request.source_size; ++row) {
-        const double position = (static_cast<double>(row) + 0.5) / scale
+        const double position = (static_cast<double>(row) + 0.5)
+            / static_cast<double>(scale)
             + request.shift;
         const double begin = round_half_up(
             position - static_cast<double>(geometry->forward_filter_size) / 2.0)
@@ -641,8 +644,10 @@ void make_zimg_forward(DoubleCsrView result,
                        const detail::AxisPlanGeometry *geometry = nullptr) {
     const std::int32_t rows = request.source_size;
     const std::int32_t columns = request.destination_size;
-    const double scale = static_cast<double>(rows) / request.active_length;
-    double step = std::min(scale, 1.0);
+    // Keep the scale division from being reassociated under -ffast-math.
+    // Exact rational phases must retain zimg's half-pixel tie behavior.
+    volatile const double scale = static_cast<double>(rows) / request.active_length;
+    double step = std::min(static_cast<double>(scale), 1.0);
     std::int32_t filter_size = 0;
     if constexpr (ReuseGeometry) {
         if (geometry == nullptr || !geometry_matches(*geometry, request, support)) {
@@ -684,7 +689,8 @@ void make_zimg_forward(DoubleCsrView result,
         double position = 0.0;
         double begin = 0.0;
         if constexpr (!ReuseGeometry) {
-            position = (static_cast<double>(row) + 0.5) / scale + request.shift;
+            position = (static_cast<double>(row) + 0.5) / static_cast<double>(scale)
+                + request.shift;
             begin = round_half_up(
                 position - static_cast<double>(filter_size) / 2.0) + 0.5;
         }
