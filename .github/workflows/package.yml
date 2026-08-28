@@ -132,6 +132,11 @@ jobs:
           GETNATIVE_LINUX_BACKENDS: cuda-vulkan
           GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}/.deps/ffmpeg-linux-x64
           GETNATIVE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/.deps/ffmpeg-linux-x64/lib
+          # linuxdeploy's bundled patchelf predates modern ELF layouts and
+          # corrupts libvulkan's program headers (.bss globals stay unzeroed,
+          # crashing loader_initialize with free() of a garbage pointer).
+          # Point linuxdeploy at the system patchelf instead.
+          PATCHELF: /usr/bin/patchelf
         run: |
           for attempt in 1 2 3; do
             pnpm tauri build --bundles appimage && exit 0
