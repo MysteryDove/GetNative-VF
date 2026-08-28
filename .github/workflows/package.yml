@@ -737,10 +737,152 @@ jobs:
           path: artifacts/windows-x64
           if-no-files-found: error
 
+  macos-package:
+    name: macOS arm64 package
+    needs: version
+    runs-on: macos-15
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}/.deps/ffmpeg-macos-arm64
+      GETNATIVE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/.deps/ffmpeg-macos-arm64/lib
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify Apple Silicon runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          rustc -vV
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable # tracks current stable Rust by design
+        with:
+          targets: aarch64-apple-darwin
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: app/src-tauri
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: ffmpeg-cache
+        with:
+          path: .deps/ffmpeg-macos-arm64
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-macos-arm64-${{ hashFiles('scripts/build-ffmpeg-macos.sh') }}
+      - name: Build pinned FFmpeg SDK
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: scripts/build-ffmpeg-macos.sh .deps/ffmpeg-macos-arm64
+      - name: Verify FFmpeg SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk="$GETNATIVE_FFMPEG_ROOT"
+          test -f "$sdk/include/libavformat/avformat.h"
+          test -f "$sdk/share/ffmpeg/BUILD_INFO.txt"
+          for library in \
+            libavformat.62.dylib libavcodec.62.dylib \
+            libavutil.60.dylib libavfilter.11.dylib libswscale.9.dylib; do
+            test -f "$sdk/lib/$library"
+            if otool -L "$sdk/lib/$library" | tail -n +2 | \
+                grep -Eq "${sdk}|/opt/homebrew|/usr/local|@rpath"; then
+              echo "FFmpeg SDK has a non-self-contained dependency: $library" >&2
+              exit 1
+            fi
+          done
+          grep -Eq '^CONFIG_VIDEOTOOLBOX=yes$' "$sdk/share/ffmpeg/BUILD_INFO.txt"
+      - name: Install JavaScript dependencies
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+      - name: Build macOS application bundle
+        working-directory: app
+        run: pnpm tauri build --bundles app --ci
+      - name: Verify macOS application bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_root="app/src-tauri/target/release/bundle/macos"
+          app_count=$(find "$bundle_root" -maxdepth 1 -type d -name '*.app' -print | wc -l | tr -d ' ')
+          test "$app_count" -eq 1
+          app_bundle=$(find "$bundle_root" -maxdepth 1 -type d -name '*.app' -print -quit)
+          contents="$app_bundle/Contents"
+          engine="$contents/Resources/bin/getnative-engine"
+          gui="$contents/MacOS/getnative-gui"
+          test -x "$gui"
+          test -x "$engine"
+          for library in \
+            libavformat.62.dylib libavcodec.62.dylib \
+            libavutil.60.dylib libswscale.9.dylib; do
+            test -f "$contents/Resources/bin/$library"
+          done
+          test -f "$contents/Resources/build-provenance.json"
+          test -f "$contents/Resources/share/ffmpeg/BUILD_INFO.txt"
+          test -f "$contents/Resources/share/getnative/LICENSE.txt"
+          test -f "$contents/Resources/share/getnative/THIRD_PARTY_NOTICES.md"
+          if find "$contents/Resources" -type f \( -name ffmpeg -o -name ffprobe \) -print | grep -q .; then
+            echo "external FFmpeg executable entered the app bundle" >&2
+            exit 1
+          fi
+          file -b "$engine" | grep -q 'Mach-O 64-bit executable arm64'
+          while IFS= read -r dependency; do
+            case "$dependency" in
+              *"$GITHUB_WORKSPACE"*|*"/opt/homebrew"*|*"/usr/local"*|*"@rpath"*)
+                echo "non-self-contained dependency: $dependency" >&2
+                exit 1
+                ;;
+            esac
+          done < <(otool -L "$engine" | tail -n +2)
+          capabilities=$(mktemp)
+          "$engine" capabilities > "$capabilities"
+          node - "$capabilities" <<'NODE'
+          const fs = require("node:fs");
+          const capabilities = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          if (capabilities.media?.ffmpeg_abi !== "62.62.60.9") {
+            throw new Error("unexpected FFmpeg ABI");
+          }
+          const metal = capabilities.backends?.find(({ id }) => id === "metal");
+          if (!metal?.compiled || !metal.device_available) {
+            throw new Error("Metal backend is not available in the packaged engine");
+          }
+          NODE
+          node - "$contents/Resources/build-provenance.json" <<'NODE'
+          const fs = require("node:fs");
+          const provenance = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          if (provenance.platform !== "darwin" || !provenance.ctest_passed ||
+              provenance.cuda_enabled || provenance.vulkan_enabled) {
+            throw new Error("unexpected macOS build provenance");
+          }
+          NODE
+      - name: Assemble macOS arm64 archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "JSON.parse(require('fs').readFileSync('app/src-tauri/tauri.conf.json', 'utf8')).version")
+          bundle_root="app/src-tauri/target/release/bundle/macos"
+          app_bundle=$(find "$bundle_root" -maxdepth 1 -type d -name '*.app' -print -quit)
+          artifact_root="artifacts/macos-arm64"
+          archive="$artifact_root/GetNative VF_${version}_arm64.app.zip"
+          mkdir -p "$artifact_root"
+          ditto -c -k --sequesterRsrc --keepParent "$app_bundle" "$archive"
+          (cd "$artifact_root" && shasum -a 256 "$(basename "$archive")" > SHA256SUMS-macos-arm64.txt)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: getnative-vf-macos-arm64
+          path: artifacts/macos-arm64
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
     if: github.event_name == 'push'
-    needs: [linux-package, windows-package]
+    needs: [linux-package, windows-package, macos-package]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
