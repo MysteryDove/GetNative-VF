@@ -9,6 +9,9 @@ namespace getnative::detail {
 void inverse_columns_neon_f32(
     const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
     float *output, std::ptrdiff_t output_row_stride, std::int32_t column_count) noexcept;
+void inverse_rows_neon_f32(
+    const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
+    float *output, std::ptrdiff_t output_row_stride, std::int32_t row_count) noexcept;
 #endif
 #if GETNATIVE_X86_SSE2_COMPILED
 void inverse_columns_sse2_f32(
@@ -263,6 +266,32 @@ void inverse_columns_f32(
 #endif
     }
     throw std::runtime_error("selected CPU ISA has no compiled column kernel");
+}
+
+void inverse_rows_f32(
+    const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
+    float *output, std::ptrdiff_t output_row_stride, std::int32_t row_count,
+    ColumnDispatchPolicy policy) {
+    if (!plan.valid() || input == nullptr || output == nullptr || row_count < 0) {
+        throw std::invalid_argument("invalid inverse rows arguments");
+    }
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    if (policy == ColumnDispatchPolicy::automatic
+        || policy == ColumnDispatchPolicy::required_simd) {
+        inverse_rows_neon_f32(
+            plan, input, input_row_stride, output, output_row_stride, row_count);
+        return;
+    }
+#endif
+    // x86 has no row-batched kernel (and scalar_only never batches): the
+    // per-row scalar loop is the reference path the NEON kernel mirrors.
+    for (std::int32_t row = 0; row < row_count; ++row) {
+        inverse_axis_f32(plan,
+                         input + static_cast<std::ptrdiff_t>(row) * input_row_stride,
+                         1,
+                         output + static_cast<std::ptrdiff_t>(row) * output_row_stride,
+                         1);
+    }
 }
 
 } // namespace getnative::detail

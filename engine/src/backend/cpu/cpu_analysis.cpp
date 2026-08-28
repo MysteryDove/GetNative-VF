@@ -317,12 +317,9 @@ void descale_2d_f32(ConstImageView source, const AxisPlan &horizontal,
     workspace.reserve(source.width, source.height, native_output.width, native_output.height,
                       AnalysisAxes::both);
     const std::ptrdiff_t intermediate_stride = native_output.width;
-    for (std::int32_t y = 0; y < source.height; ++y) {
-        inverse_axis_f32(horizontal,
-                         source.data + static_cast<std::ptrdiff_t>(y) * source.stride, 1,
-                         workspace.intermediate.data()
-                             + static_cast<std::ptrdiff_t>(y) * intermediate_stride, 1);
-    }
+    detail::inverse_rows_f32(
+        horizontal, source.data, source.stride,
+        workspace.intermediate.data(), intermediate_stride, source.height);
     detail::inverse_columns_f32(
         vertical, workspace.intermediate.data(), intermediate_stride,
         native_output.data, native_output.stride, native_output.width);
@@ -413,12 +410,10 @@ double analyze_candidate_impl(ConstImageView source, const AxisPlan &horizontal,
                       horizontal.destination_size, vertical.destination_size,
                       AnalysisAxes::both);
     const std::ptrdiff_t horizontal_stride = horizontal.destination_size;
-    for (std::int32_t y = 0; y < source.height; ++y) {
-        inverse_axis_f32(horizontal,
-                         source.data + static_cast<std::ptrdiff_t>(y) * source.stride, 1,
-                         workspace.intermediate.data()
-                             + static_cast<std::ptrdiff_t>(y) * horizontal_stride, 1);
-    }
+    detail::inverse_rows_f32(
+        horizontal, source.data, source.stride,
+        workspace.intermediate.data(), horizontal_stride, source.height,
+        column_policy);
     const std::ptrdiff_t native_stride = horizontal.destination_size;
     detail::inverse_columns_f32(
         vertical, workspace.intermediate.data(), horizontal_stride,
