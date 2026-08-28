@@ -637,6 +637,48 @@ struct MetalAnalysisEngine::Impl {
         return buffer;
     }
 
+    // One plan arena per tile instead of nine separate MTLBuffers: all plan
+    // arrays are packed into a single shared allocation with 16-byte-aligned
+    // regions, turning 9 allocations into 1 while the descriptor/base-offset
+    // addressing the kernels already use stays unchanged.
+    struct PlanArena {
+        id<MTLBuffer> buffer;
+        std::array<std::size_t, 9> offsets{};
+        std::size_t total_bytes = 0;
+    };
+
+    [[nodiscard]] PlanArena allocate_plan_arena(
+        const std::array<std::pair<const void *, std::size_t>, 9> &regions,
+        const std::array<std::string_view, 9> &names) {
+        constexpr std::size_t alignment = 16;
+        PlanArena arena;
+        std::size_t cursor = 0;
+        for (std::size_t index = 0; index < regions.size(); ++index) {
+            if (regions[index].second == 0) {
+                throw std::invalid_argument(std::string{names[index]} + " must not be empty");
+            }
+            arena.offsets[index] = (cursor + alignment - 1) / alignment * alignment;
+            cursor = arena.offsets[index] + regions[index].second;
+        }
+        arena.total_bytes = cursor;
+        const std::string label_text{"GetNative plan arena"};
+        arena.buffer = allocate_empty_buffer(
+            cursor, [NSString stringWithUTF8String:label_text.c_str()], false);
+        const auto upload_start = std::chrono::steady_clock::now();
+        auto *base = static_cast<char *>(arena.buffer.contents);
+        for (std::size_t index = 0; index < regions.size(); ++index) {
+            std::memcpy(base + arena.offsets[index], regions[index].first,
+                        regions[index].second);
+        }
+        plan_upload_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - upload_start).count();
+        if (arena.total_bytes > std::numeric_limits<std::size_t>::max() - plan_upload_bytes) {
+            throw std::length_error("Metal plan-upload telemetry overflow");
+        }
+        plan_upload_bytes += arena.total_bytes;
+        return arena;
+    }
+
     [[nodiscard]] id<MTLBuffer> acquire_retained_buffer(id<MTLBuffer> __strong &buffer,
                                                          std::size_t required_bytes,
                                                          NSString *label) {
@@ -1094,34 +1136,38 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     packed.maximum_vector_count,
                 };
 
-                id<MTLBuffer> descriptor_buffer = impl_->allocate_plan_buffer(
-                    packed.descriptors, "GetNative plan descriptors");
-                id<MTLBuffer> transpose_offset_buffer = impl_->allocate_plan_buffer(
-                    packed.transpose_offsets, "GetNative transpose offsets");
-                id<MTLBuffer> transpose_index_buffer = impl_->allocate_plan_buffer(
-                    packed.transpose_indices, "GetNative transpose indices");
-                id<MTLBuffer> transpose_weight_buffer = impl_->allocate_plan_buffer(
-                    packed.transpose_weights, "GetNative transpose weights");
-                id<MTLBuffer> lower_buffer = impl_->allocate_plan_buffer(
-                    packed.lower_ld, "GetNative lower factors");
-                id<MTLBuffer> upper_buffer = impl_->allocate_plan_buffer(
-                    packed.upper_l, "GetNative upper factors");
-                id<MTLBuffer> diagonal_buffer = impl_->allocate_plan_buffer(
-                    packed.inverse_diagonal, "GetNative inverse diagonal");
-                id<MTLBuffer> forward_left_buffer = impl_->allocate_plan_buffer(
-                    packed.forward_left, "GetNative forward left indices");
-                id<MTLBuffer> forward_weight_buffer = impl_->allocate_plan_buffer(
-                    packed.forward_weights, "GetNative forward weights");
-                const std::size_t tile_plan_bytes =
-                    static_cast<std::size_t>(descriptor_buffer.length)
-                    + static_cast<std::size_t>(transpose_offset_buffer.length)
-                    + static_cast<std::size_t>(transpose_index_buffer.length)
-                    + static_cast<std::size_t>(transpose_weight_buffer.length)
-                    + static_cast<std::size_t>(lower_buffer.length)
-                    + static_cast<std::size_t>(upper_buffer.length)
-                    + static_cast<std::size_t>(diagonal_buffer.length)
-                    + static_cast<std::size_t>(forward_left_buffer.length)
-                    + static_cast<std::size_t>(forward_weight_buffer.length);
+                const auto region_of = [](const auto &values) {
+                    return std::pair<const void *, std::size_t>{
+                        static_cast<const void *>(values.data()),
+                        values.size()
+                            * sizeof(typename std::decay_t<decltype(values)>::value_type)};
+                };
+                const Impl::PlanArena arena = impl_->allocate_plan_arena(
+                    {{region_of(packed.descriptors),
+                      region_of(packed.transpose_offsets),
+                      region_of(packed.transpose_indices),
+                      region_of(packed.transpose_weights),
+                      region_of(packed.lower_ld),
+                      region_of(packed.upper_l),
+                      region_of(packed.inverse_diagonal),
+                      region_of(packed.forward_left),
+                      region_of(packed.forward_weights)}},
+                    {"GetNative plan descriptors", "GetNative transpose offsets",
+                     "GetNative transpose indices", "GetNative transpose weights",
+                     "GetNative lower factors", "GetNative upper factors",
+                     "GetNative inverse diagonal", "GetNative forward left indices",
+                     "GetNative forward weights"});
+                id<MTLBuffer> plan_arena = arena.buffer;
+                const std::size_t descriptor_base = arena.offsets[0];
+                const std::size_t transpose_offsets_base = arena.offsets[1];
+                const std::size_t transpose_indices_base = arena.offsets[2];
+                const std::size_t transpose_weights_base = arena.offsets[3];
+                const std::size_t lower_base = arena.offsets[4];
+                const std::size_t upper_base = arena.offsets[5];
+                const std::size_t diagonal_base = arena.offsets[6];
+                const std::size_t forward_left_base = arena.offsets[7];
+                const std::size_t forward_weights_base = arena.offsets[8];
+                const std::size_t tile_plan_bytes = arena.total_bytes;
                 if (tile_plan_bytes > std::numeric_limits<std::size_t>::max() - queued_plan_bytes) {
                     throw std::length_error("Metal queued plan working set overflow");
                 }
@@ -1163,13 +1209,14 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     impl_->record_buffer_wiring([&] {
                         [inverse setBuffer:source_buffer offset:0 atIndex:0];
                         [inverse setBytes:&stage_job length:sizeof(stage_job) atIndex:1];
-                        [inverse setBuffer:descriptor_buffer offset:descriptor_offset atIndex:2];
-                        [inverse setBuffer:transpose_offset_buffer offset:0 atIndex:3];
-                        [inverse setBuffer:transpose_index_buffer offset:0 atIndex:4];
-                        [inverse setBuffer:transpose_weight_buffer offset:0 atIndex:5];
-                        [inverse setBuffer:lower_buffer offset:0 atIndex:6];
-                        [inverse setBuffer:upper_buffer offset:0 atIndex:7];
-                        [inverse setBuffer:diagonal_buffer offset:0 atIndex:8];
+                        [inverse setBuffer:plan_arena
+                                   offset:descriptor_base + descriptor_offset atIndex:2];
+                        [inverse setBuffer:plan_arena offset:transpose_offsets_base atIndex:3];
+                        [inverse setBuffer:plan_arena offset:transpose_indices_base atIndex:4];
+                        [inverse setBuffer:plan_arena offset:transpose_weights_base atIndex:5];
+                        [inverse setBuffer:plan_arena offset:lower_base atIndex:6];
+                        [inverse setBuffer:plan_arena offset:upper_base atIndex:7];
+                        [inverse setBuffer:plan_arena offset:diagonal_base atIndex:8];
                         [inverse setBuffer:workspace_buffer offset:0 atIndex:9];
                     });
                     const NSUInteger threads = std::min<NSUInteger>(
@@ -1195,13 +1242,14 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     [inverse setComputePipelineState:pipeline];
                     impl_->record_buffer_wiring([&] {
                         [inverse setBytes:&stage_job length:sizeof(stage_job) atIndex:0];
-                        [inverse setBuffer:descriptor_buffer offset:descriptor_offset atIndex:1];
-                        [inverse setBuffer:transpose_offset_buffer offset:0 atIndex:2];
-                        [inverse setBuffer:transpose_index_buffer offset:0 atIndex:3];
-                        [inverse setBuffer:transpose_weight_buffer offset:0 atIndex:4];
-                        [inverse setBuffer:lower_buffer offset:0 atIndex:5];
-                        [inverse setBuffer:upper_buffer offset:0 atIndex:6];
-                        [inverse setBuffer:diagonal_buffer offset:0 atIndex:7];
+                        [inverse setBuffer:plan_arena
+                                   offset:descriptor_base + descriptor_offset atIndex:1];
+                        [inverse setBuffer:plan_arena offset:transpose_offsets_base atIndex:2];
+                        [inverse setBuffer:plan_arena offset:transpose_indices_base atIndex:3];
+                        [inverse setBuffer:plan_arena offset:transpose_weights_base atIndex:4];
+                        [inverse setBuffer:plan_arena offset:lower_base atIndex:5];
+                        [inverse setBuffer:plan_arena offset:upper_base atIndex:6];
+                        [inverse setBuffer:plan_arena offset:diagonal_base atIndex:7];
                         [inverse setBuffer:workspace_buffer offset:0 atIndex:8];
                     });
                     const NSUInteger threads = std::min<NSUInteger>(
@@ -1227,9 +1275,10 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     [forward setComputePipelineState:pipeline];
                     impl_->record_buffer_wiring([&] {
                         [forward setBytes:&stage_job length:sizeof(stage_job) atIndex:0];
-                        [forward setBuffer:descriptor_buffer offset:descriptor_offset atIndex:1];
-                        [forward setBuffer:forward_left_buffer offset:0 atIndex:2];
-                        [forward setBuffer:forward_weight_buffer offset:0 atIndex:3];
+                        [forward setBuffer:plan_arena
+                                  offset:descriptor_base + descriptor_offset atIndex:1];
+                        [forward setBuffer:plan_arena offset:forward_left_base atIndex:2];
+                        [forward setBuffer:plan_arena offset:forward_weights_base atIndex:3];
                         [forward setBuffer:workspace_buffer offset:0 atIndex:4];
                     });
                     const NSUInteger threads = std::min<NSUInteger>(
@@ -1254,9 +1303,10 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     impl_->record_buffer_wiring([&] {
                         [reduction setBuffer:source_buffer offset:0 atIndex:0];
                         [reduction setBytes:&job length:sizeof(job) atIndex:1];
-                        [reduction setBuffer:descriptor_buffer offset:descriptor_offset atIndex:2];
-                        [reduction setBuffer:forward_left_buffer offset:0 atIndex:3];
-                        [reduction setBuffer:forward_weight_buffer offset:0 atIndex:4];
+                        [reduction setBuffer:plan_arena
+                                    offset:descriptor_base + descriptor_offset atIndex:2];
+                        [reduction setBuffer:plan_arena offset:forward_left_base atIndex:3];
+                        [reduction setBuffer:plan_arena offset:forward_weights_base atIndex:4];
                         [reduction setBuffer:workspace_buffer offset:0 atIndex:5];
                         [reduction setBuffer:partial_buffer offset:partial_offset_bytes atIndex:6];
                     });

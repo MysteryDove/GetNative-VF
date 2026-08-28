@@ -669,8 +669,8 @@ void test_persistent_working_buffer_reuse_and_ceiling() {
                && reused_telemetry.working_buffer_reuse_count == 3,
            "stable repeated call reuses all three Metal working buffers");
     expect(reused_telemetry.buffer_allocation_count
-               == reused_telemetry.analyzed_tile_count * 9U,
-           "stable repeated call allocates only the existing nine plan buffers per tile");
+               == reused_telemetry.analyzed_tile_count,
+           "stable repeated call allocates one packed plan arena per tile");
     expect(std::isfinite(reused_telemetry.buffer_allocation_ms)
                && std::isfinite(reused_telemetry.source_upload_ms)
                && std::isfinite(reused_telemetry.buffer_wiring_ms),
