@@ -30,7 +30,7 @@ function supportsTask(
 export function selectableBackends(capabilities: EngineEnvelope | null): BackendPreference[] {
   const backends = capabilities?.payload.backends ?? [];
   const options: BackendPreference[] = ["auto"];
-  for (const id of ["cpu", "cuda", "vulkan"] as const) {
+  for (const id of ["cpu", "cuda", "vulkan", "metal"] as const) {
     const backend = backends.find((item) => item.id === id);
     if (backend?.compiled && backend.device_available && backend.analysis_command_available) {
       options.push(id);
@@ -45,10 +45,11 @@ export function verifySelectableBackends(
   // The legacy frame-asset verify is CPU-only. Engine-side media verify
   // (verify_engine_decode) supports explicit CUDA/Vulkan — the engine
   // validates p_norm constraints and runs its own auto fallback chain.
+  // Metal is analyze-only: verify_begin does not accept it engine-side.
   if (capabilities?.payload.features?.verify_engine_decode !== true) {
     return ["auto", "cpu"];
   }
-  return selectableBackends(capabilities);
+  return selectableBackends(capabilities).filter((backend) => backend !== "metal");
 }
 
 export function resolveBackendPreference(
@@ -86,13 +87,13 @@ export function validateBackendPNorm(
     return { ok: false, reason: "p_norm_invalid" };
   }
   const resolved = resolveBackendPreference(capabilities, backend, pNorm, axisMode);
-  if (resolved !== "cpu" && resolved !== "cuda" && resolved !== "vulkan") {
+  if (resolved !== "cpu" && resolved !== "cuda" && resolved !== "vulkan" && resolved !== "metal") {
     return { ok: false, reason: "backend_unsupported" };
   }
   const reported = capabilities?.payload.backends.find((item) => item.id === resolved);
   const range = reported?.p_norms ?? (resolved === "cpu"
     ? { minimum: 1, maximum: 4_294_967_295 }
-    : resolved === "vulkan"
+    : resolved === "vulkan" || resolved === "metal"
       ? { minimum: 1, maximum: 1 }
       : { minimum: 1, maximum: 4 });
   return pNorm >= range.minimum && pNorm <= range.maximum
@@ -103,7 +104,7 @@ export function validateBackendPNorm(
 /**
  * pNorm upper bound for the resolved backend: the engine-reported maximum when
  * known, else the same fallback table validateBackendPNorm uses
- * (cuda → 4, vulkan → 1, cpu/auto/unknown → 4_294_967_295).
+ * (cuda → 4, vulkan/metal → 1, cpu/auto/unknown → 4_294_967_295).
  */
 export function pNormMaximumForBackend(
   capabilities: EngineEnvelope | null,
@@ -112,7 +113,9 @@ export function pNormMaximumForBackend(
   return (
     capabilities?.payload.backends.find((backend) => backend.id === resolvedBackend)
       ?.p_norms?.maximum ??
-    (resolvedBackend === "cuda" ? 4 : resolvedBackend === "vulkan" ? 1 : 4_294_967_295)
+    (resolvedBackend === "cuda"
+      ? 4
+      : resolvedBackend === "vulkan" || resolvedBackend === "metal" ? 1 : 4_294_967_295)
   );
 }
 

@@ -272,6 +272,8 @@
   "analyze.endpoint.exclusive": "Exclude stop",
   "analyze.applyProfileDefaults": "Apply profile defaults",
   "analyze.lanczosTaps": "Lanczos taps",
+  "analyze.blur": "Blur",
+  "analyze.blurHint": "Kernel blur factor; 1 keeps the native kernel, larger values widen it",
   "analyze.candidatesTitle": "Candidate preview",
   "analyze.candidateCount": "{count} candidates",
   "analyze.workEstimate": "work estimate {count}",

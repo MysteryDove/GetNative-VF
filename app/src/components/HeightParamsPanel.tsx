@@ -281,6 +281,25 @@ export function HeightParamsPanel({
         </label>
       ) : null}
 
+      <label className="block">
+        <span>{t("analyze.blur")}</span>
+        <input
+          type="number"
+          step="any"
+          min="0"
+          title={t("analyze.blurHint")}
+          value={String(draft.kernelParameters.blur ?? 1)}
+          onChange={(event) =>
+            onPatch({
+              kernelParameters: {
+                ...draft.kernelParameters,
+                blur: event.target.value,
+              },
+            })
+          }
+        />
+      </label>
+
       {kernelOptions.length > 1 ? (
         <fieldset className="metric-fieldset kernel-compare-fieldset">
           <legend>{t("analyze.compareKernels")}</legend>

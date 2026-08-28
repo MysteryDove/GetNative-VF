@@ -89,13 +89,28 @@ describe("kernelParamsForWire", () => {
     });
     expect(kernelParamsForWire({ id: "spline36", parameters: {} })).toEqual({ id: "spline36" });
   });
+
+  it("passes non-default blur through and keeps the default implicit", () => {
+    expect(
+      kernelParamsForWire({ id: "bicubic", parameters: { b: 0, c: 0.5, blur: "1.25" } }),
+    ).toEqual({ id: "bicubic", b: 0, c: 0.5, blur: 1.25 });
+    expect(
+      kernelParamsForWire({ id: "spline64", parameters: { blur: 1.5 } }),
+    ).toEqual({ id: "spline64", blur: 1.5 });
+    expect(
+      kernelParamsForWire({ id: "spline64", parameters: { blur: "1" } }),
+    ).toEqual({ id: "spline64" });
+    expect(
+      kernelParamsForWire({ id: "spline64", parameters: { blur: "0" } }),
+    ).toEqual({ id: "spline64" });
+  });
 });
 
 describe("backendForWire", () => {
-  it("preserves explicit Vulkan analyze requests without changing auto", () => {
+  it("passes explicit GPU backend analyze requests through, keeps auto as auto", () => {
     expect(backendForWire("vulkan")).toBe("vulkan");
+    expect(backendForWire("metal")).toBe("metal");
     expect(backendForWire("auto")).toBe("auto");
-    expect(backendForWire("metal")).toBe("auto");
   });
 });
 

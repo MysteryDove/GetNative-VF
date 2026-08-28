@@ -10,6 +10,7 @@
 #include "getnative/crop_geometry.hpp"
 #include "getnative/candidate_grid.hpp"
 #include "getnative/cuda_analysis.hpp"
+#include "getnative/metal_analysis.hpp"
 #include "getnative/profile.hpp"
 #include "getnative/plan_store.hpp"
 #include "getnative/utf8_path.hpp"
@@ -198,7 +199,7 @@ std::optional<Geometry> optional_geometry(const JsonValue &object,
 // ---------------------------------------------------------------------------
 
 enum class AxisMode : std::uint8_t { height_only, width_only, height_plus_width };
-enum class BackendChoice : std::uint8_t { cpu, cuda, vulkan, automatic };
+enum class BackendChoice : std::uint8_t { cpu, cuda, vulkan, metal, automatic };
 
 [[nodiscard]] constexpr const char *backend_choice_name(
     BackendChoice backend) noexcept {
@@ -206,6 +207,7 @@ enum class BackendChoice : std::uint8_t { cpu, cuda, vulkan, automatic };
     case BackendChoice::cpu: return "cpu";
     case BackendChoice::cuda: return "cuda";
     case BackendChoice::vulkan: return "vulkan";
+    case BackendChoice::metal: return "metal";
     case BackendChoice::automatic: return "auto";
     }
     return "cpu";
@@ -482,10 +484,18 @@ AxisMode parse_axis_mode(const std::string &value) {
 
 Filter parse_filter(const JsonValue &kernel) {
     const std::string id = require_string(kernel, "id");
-    if (id == "bilinear") return Filter::bilinear();
-    if (id == "spline16") return Filter::spline16();
-    if (id == "spline36") return Filter::spline36();
-    if (id == "spline64") return Filter::spline64();
+    double blur = 1.0;
+    if (const JsonValue *blur_value = kernel.find("blur");
+        blur_value != nullptr && !blur_value->is_null()) {
+        blur = require_number(kernel, "blur");
+        if (!std::isfinite(blur) || blur <= 0.0) {
+            throw WorkerError("bad_request", "blur must be finite and greater than zero");
+        }
+    }
+    if (id == "bilinear") return Filter::bilinear(blur);
+    if (id == "spline16") return Filter::spline16(blur);
+    if (id == "spline36") return Filter::spline36(blur);
+    if (id == "spline64") return Filter::spline64(blur);
     if (id == "bicubic") {
         const JsonValue *b = kernel.find("b");
         const JsonValue *c = kernel.find("c");
@@ -497,7 +507,7 @@ Filter parse_filter(const JsonValue &kernel) {
         if (!std::isfinite(b_value) || !std::isfinite(c_value)) {
             throw WorkerError("bad_request", "bicubic parameters must be finite");
         }
-        return Filter::bicubic(b_value, c_value);
+        return Filter::bicubic(b_value, c_value, blur);
     }
     if (id == "lanczos") {
         const JsonValue *taps = kernel.find("taps");
@@ -508,7 +518,7 @@ Filter parse_filter(const JsonValue &kernel) {
         if (value < 1 || value > 15) {
             throw WorkerError("bad_request", "lanczos taps must be within 1..15");
         }
-        return Filter::lanczos(value);
+        return Filter::lanczos(value, blur);
     }
     throw WorkerError("bad_request", "unknown kernel id: " + id);
 }
@@ -642,6 +652,8 @@ AnalyzeJobSpec parse_analyze(const JsonValue &command, std::string job_id) {
         spec.backend = BackendChoice::cuda;
     } else if (backend == "vulkan") {
         spec.backend = BackendChoice::vulkan;
+    } else if (backend == "metal") {
+        spec.backend = BackendChoice::metal;
     } else if (backend == "auto") {
         spec.backend = BackendChoice::automatic;
     } else {
@@ -668,6 +680,9 @@ AnalyzeJobSpec parse_analyze(const JsonValue &command, std::string job_id) {
     }
     if (backend == "vulkan" && spec.metric.norm != 1U) {
         throw WorkerError("unsupported", "Vulkan backend currently supports only p_norm=1");
+    }
+    if (backend == "metal" && spec.metric.norm != 1U) {
+        throw WorkerError("unsupported", "Metal backend currently supports only p_norm=1");
     }
 
     if (spec.kernel_mode) {
@@ -1757,6 +1772,18 @@ public:
 #else
             throw WorkerError("unsupported", "Vulkan backend was not compiled");
 #endif
+        } else if (spec.backend == BackendChoice::metal) {
+#if defined(GETNATIVE_HAS_METAL)
+            try {
+                selected_device = resident_metal_engine().device_info().name;
+            } catch (const std::exception &error) {
+                throw WorkerError(
+                    "unsupported",
+                    std::string{"Metal backend is not available: "} + error.what());
+            }
+#else
+            throw WorkerError("unsupported", "Metal backend was not compiled");
+#endif
         }
         auto job = std::make_shared<Job>(std::move(spec));
         // Emit accepted BEFORE the job becomes visible to the executor:
@@ -2369,6 +2396,10 @@ private:
     std::optional<VulkanAnalysisEngine> vulkan_engine_;
     std::mutex vulkan_init_mutex_;
 #endif
+#if defined(GETNATIVE_HAS_METAL)
+    std::optional<MetalAnalysisEngine> metal_engine_;
+    std::mutex metal_init_mutex_;
+#endif
     // L2 cold plan store (E4): lazily opened on the first plan-bearing job;
     // failures disable it for the session (cache degradation, never a job
     // failure). Publishing is write-behind on store_writer_.
@@ -2559,6 +2590,18 @@ private:
                  << vulkan_engine_->device_info().name << '\n';
         }
         return *vulkan_engine_;
+    }
+#endif
+#if defined(GETNATIVE_HAS_METAL)
+    MetalAnalysisEngine &resident_metal_engine() {
+        const std::scoped_lock lock(metal_init_mutex_);
+        if (!metal_engine_) {
+            log_ << "worker: initializing Metal analysis engine...\n";
+            metal_engine_.emplace();
+            log_ << "worker: Metal analysis engine initialized on "
+                 << metal_engine_->device_info().name << '\n';
+        }
+        return *metal_engine_;
     }
 #endif
 
@@ -3603,6 +3646,22 @@ private:
             throw WorkerError("unsupported", "Vulkan backend was not compiled");
         }
 #endif
+#if defined(GETNATIVE_HAS_METAL)
+        if (spec.backend == BackendChoice::metal) {
+            try {
+                (void)resident_metal_engine();
+            } catch (const std::exception &error) {
+                throw WorkerError(
+                    "unsupported",
+                    std::string{"Metal backend is not available: "} + error.what());
+            }
+            metal_engine_->reset_analysis_telemetry();
+        }
+#else
+        if (spec.backend == BackendChoice::metal) {
+            throw WorkerError("unsupported", "Metal backend was not compiled");
+        }
+#endif
 
         const auto build_chunk = [&](std::size_t chunk_index,
                                      std::vector<CandidateAnalysis> &chunk) {
@@ -3640,7 +3699,8 @@ private:
         std::size_t cpu_worker_count = 0U;
         const bool accelerator_backend =
             spec.backend == BackendChoice::cuda
-            || spec.backend == BackendChoice::vulkan;
+            || spec.backend == BackendChoice::vulkan
+            || spec.backend == BackendChoice::metal;
         const auto analyze_accelerator_chunk = [&] (
             const std::vector<CandidateAnalysis> &chunk)
             -> std::vector<CandidateResult> {
@@ -3654,6 +3714,12 @@ private:
 #if defined(GETNATIVE_HAS_VULKAN)
             if (spec.backend == BackendChoice::vulkan) {
                 return vulkan_engine_->analyze_axis_batch_f32(
+                    source, chunk, spec.metric, job.stop_source.get_token());
+            }
+#endif
+#if defined(GETNATIVE_HAS_METAL)
+            if (spec.backend == BackendChoice::metal) {
+                return metal_engine_->analyze_axis_batch_f32(
                     source, chunk, spec.metric, job.stop_source.get_token());
             }
 #endif

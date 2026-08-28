@@ -39,7 +39,7 @@ export type FrameAssetRef = {
 export type HeightJobParams = {
   frameAsset: FrameAssetRef;
   axisMode: AxisMode;
-  kernel: { id: string; b?: number; c?: number; taps?: number };
+  kernel: { id: string; b?: number; c?: number; taps?: number; blur?: number };
   candidates: string[];
   metric: {
     cropLeft?: number;
@@ -49,7 +49,7 @@ export type HeightJobParams = {
     threshold?: number;
     pNorm?: number;
   };
-  backend?: "cpu" | "cuda" | "vulkan" | "auto";
+  backend?: "cpu" | "cuda" | "vulkan" | "metal" | "auto";
   workerCount?: number;
   profileId?: string;
   endpointRule?: EndpointRule;
@@ -65,9 +65,9 @@ export type KernelJobParams = {
   /** Fixed primary-axis value (decimal string); wire candidates = [candidate]. */
   candidate: string;
   /** Ordered kernel list; result rows key on the decimal index into this list. */
-  kernels: Array<{ id: string; b?: number; c?: number; taps?: number }>;
+  kernels: Array<{ id: string; b?: number; c?: number; taps?: number; blur?: number }>;
   metric: HeightJobParams["metric"];
-  backend?: "cpu" | "cuda" | "vulkan" | "auto";
+  backend?: "cpu" | "cuda" | "vulkan" | "metal" | "auto";
   workerCount?: number;
   profileId?: string;
   endpointRule?: EndpointRule;
@@ -87,7 +87,7 @@ export type VerifyMediaJobParams = {
   startFrame?: number | null;
   endFrame?: number | null;
   axisMode: AxisMode;
-  kernel: { id: string; b?: number; c?: number; taps?: number };
+  kernel: { id: string; b?: number; c?: number; taps?: number; blur?: number };
   candidate: string;
   metric: HeightJobParams["metric"];
   backend?: "cpu" | "cuda" | "vulkan" | "auto";
@@ -679,7 +679,7 @@ function wireMode(mode: string | undefined): ComputationMode {
 }
 
 function wireBackend(backend: string | undefined): ActualBackend | undefined {
-  return backend === "cpu" || backend === "cuda" || backend === "vulkan"
+  return backend === "cpu" || backend === "cuda" || backend === "vulkan" || backend === "metal"
     ? backend
     : undefined;
 }

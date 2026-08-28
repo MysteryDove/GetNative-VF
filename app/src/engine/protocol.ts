@@ -21,7 +21,7 @@ export type EndpointRule = "inclusive" | "exclusive_stop";
 export type MathMode = "raw" | "log_display";
 
 export type BackendPreference = "cpu" | "cuda" | "vulkan" | "metal" | "auto";
-export type ActualBackend = "cpu" | "cuda" | "vulkan";
+export type ActualBackend = "cpu" | "cuda" | "vulkan" | "metal";
 
 /** Decimal grid; candidates are resolved as exact decimal strings, not binary floats. */
 export type CandidateGridSpec = {

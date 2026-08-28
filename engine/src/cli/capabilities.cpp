@@ -129,7 +129,7 @@ void write_capabilities_impl(
               "{\"id\":\"spline16\",\"parameters\":{\"kind\":\"none\"}},"
               "{\"id\":\"spline36\",\"parameters\":{\"kind\":\"none\"}},"
               "{\"id\":\"spline64\",\"parameters\":{\"kind\":\"none\"}}],"
-              "\"unsupported_features\":[\"blur\",\"spline32\"],"
+              "\"unsupported_features\":[\"spline32\"],"
               "\"features\":{\"verify_frame_ring\":true,\"media_frame_batch\":false,"
               "\"verify_engine_decode\":";
 #if defined(GETNATIVE_HAS_MEDIA)
@@ -194,6 +194,15 @@ void write_capabilities_impl(
               "\"p_norms\":{\"minimum\":1,\"maximum\":4294967295},"
               "\"max_half_bandwidth\":29,\"max_forward_width\":30,"
               "\"compiled_isa\":";
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    // The x86 ISA evaluator has no tiers to report on AArch64, where NEON is
+    // architectural baseline and the column/metric kernels always use it.
+    // Report the truth instead of a misleading scalar-only set.
+    output << "[\"scalar\",\"neon\"],\"available_isa\":[\"scalar\",\"neon\"],"
+              "\"selected_isa\":\"neon\",\"math_modes\":[\"production\"],"
+              "\"selected_math_mode\":\"production\",\"selection_reason\":"
+              "\"AArch64 baseline NEON\"}";
+#else
     write_isa_set(output, cpu.compiled);
     output << ",\"available_isa\":";
     write_isa_set(output, cpu.available);
@@ -201,13 +210,15 @@ void write_capabilities_impl(
            << ",\"math_modes\":[\"production\"],\"selected_math_mode\":\"production\","
               "\"selection_reason\":"
            << json_string(cpu.selection_reason) << '}';
+#endif
 #if defined(GETNATIVE_HAS_METAL)
     try {
         const getnative::MetalAnalysisEngine metal;
         const auto &device = metal.device_info();
         output << ",{\"id\":\"metal\",\"compiled\":true,\"device_available\":true,"
-                  "\"analysis_command_available\":false,"
-                  "\"auto_priority\":null,"
+                  "\"analysis_command_available\":"
+               << available
+               << ",\"auto_priority\":null,"
                   "\"axes\":[\"horizontal\",\"vertical\",\"both\"],"
                   "\"p_norms\":{\"minimum\":1,\"maximum\":1},"
                   "\"max_half_bandwidth\":15,\"max_forward_width\":16,\"device\":"

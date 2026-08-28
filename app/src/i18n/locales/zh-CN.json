@@ -272,6 +272,8 @@
   "analyze.endpoint.exclusive": "不包含终点",
   "analyze.applyProfileDefaults": "应用 profile 默认值",
   "analyze.lanczosTaps": "Lanczos taps",
+  "analyze.blur": "Blur",
+  "analyze.blurHint": "内核模糊系数；1 为原始内核，数值越大内核越宽",
   "analyze.candidatesTitle": "候选预览",
   "analyze.candidateCount": "{count} 个候选",
   "analyze.workEstimate": "工作量估计 {count}",

@@ -367,17 +367,17 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
             values.first().map(String::as_str) != Some("scalar")
                 || values
                     .iter()
-                    .any(|value| !matches!(value.as_str(), "scalar" | "sse2" | "avx2" | "avx512"))
+                    .any(|value| !matches!(value.as_str(), "scalar" | "sse2" | "avx2" | "avx512" | "neon"))
         })
         || cpu.available_isa.as_deref().is_none_or(|values| {
             values.first().map(String::as_str) != Some("scalar")
                 || values
                     .iter()
-                    .any(|value| !matches!(value.as_str(), "scalar" | "sse2" | "avx2" | "avx512"))
+                    .any(|value| !matches!(value.as_str(), "scalar" | "sse2" | "avx2" | "avx512" | "neon"))
         })
         || !matches!(
             cpu.selected_isa.as_deref(),
-            Some("scalar" | "sse2" | "avx2" | "avx512")
+            Some("scalar" | "sse2" | "avx2" | "avx512" | "neon")
         )
         || cpu
             .math_modes
@@ -455,7 +455,6 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
             || !valid_device
             || !valid_device_type
             || !valid_auto_priority
-            || id == "metal" && backend.analysis_command_available
         {
             return Err(format!(
                 "getnative-engine returned invalid {id} capabilities"
@@ -735,10 +734,16 @@ mod tests {
         backend_only["backends"][0]["analysis_command_available"] = json!(true);
         assert!(validate_capabilities(&backend_only).is_err());
 
+        // Metal analyze is wired engine-side: analysis_command_available=true
+        // is valid when consistent with commands.analyze, invalid without it.
         let mut metal_transport = valid_capabilities();
         metal_transport["commands"]["analyze"] = json!(true);
         metal_transport["backends"][1]["analysis_command_available"] = json!(true);
-        assert!(validate_capabilities(&metal_transport).is_err());
+        assert!(validate_capabilities(&metal_transport).is_ok());
+
+        let mut metal_inconsistent = valid_capabilities();
+        metal_inconsistent["backends"][1]["analysis_command_available"] = json!(true);
+        assert!(validate_capabilities(&metal_inconsistent).is_err());
 
         let mut cuda = valid_capabilities();
         cuda["backends"][2]["compiled"] = json!(true);
@@ -747,6 +752,25 @@ mod tests {
         let mut profiles = valid_capabilities();
         profiles["profiles"] = json!([]);
         assert!(validate_capabilities(&profiles).is_err());
+    }
+
+    #[test]
+    fn capability_schema_accepts_aarch64_neon_cpu_reporting() {
+        // The engine reports its real ISA set on ARM instead of the x86
+        // evaluator's misleading scalar-only fallback.
+        let mut arm = valid_capabilities();
+        arm["backends"][0] = json!({
+            "id": "cpu", "compiled": true, "device_available": true,
+            "analysis_command_available": false, "auto_priority": 100,
+            "axes": ["horizontal", "vertical", "both"],
+            "p_norms": {"minimum": 1, "maximum": 4294967295_u64},
+            "max_half_bandwidth": 29, "max_forward_width": 30,
+            "compiled_isa": ["scalar", "neon"], "available_isa": ["scalar", "neon"],
+            "selected_isa": "neon", "math_modes": ["production"],
+            "selected_math_mode": "production",
+            "selection_reason": "AArch64 baseline NEON"
+        });
+        assert!(validate_capabilities(&arm).is_ok());
     }
 
     #[test]

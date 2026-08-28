@@ -141,7 +141,7 @@ async function dispatchFrameAssets(input: {
 
 /** Map a semantic KernelRef onto the wire kernel shape (numbers, relevant params only). */
 export function kernelParamsForWire(kernel: KernelRef): HeightJobParams["kernel"] {
-  const wire: { id: string; b?: number; c?: number; taps?: number } = { id: kernel.id };
+  const wire: { id: string; b?: number; c?: number; taps?: number; blur?: number } = { id: kernel.id };
   if (kernel.id === "bicubic") {
     const b = Number(kernel.parameters.b);
     const c = Number(kernel.parameters.c);
@@ -151,14 +151,18 @@ export function kernelParamsForWire(kernel: KernelRef): HeightJobParams["kernel"
     const taps = Number(kernel.parameters.taps);
     if (Number.isFinite(taps)) wire.taps = taps;
   }
+  const blur = Number(kernel.parameters.blur ?? 1);
+  // blur=1 is the engine default; keep the wire payload to relevant params.
+  if (Number.isFinite(blur) && blur > 0 && blur !== 1) wire.blur = blur;
   return wire;
 }
 
-/** Analyze accepts CPU, CUDA, Vulkan, and auto; Metal degrades to auto. */
+/** Analyze accepts CPU, CUDA, Vulkan, Metal, and auto. */
 export function backendForWire(
   preference: BackendPreference,
-): "cpu" | "cuda" | "vulkan" | "auto" {
+): "cpu" | "cuda" | "vulkan" | "metal" | "auto" {
   return preference === "cpu" || preference === "cuda" || preference === "vulkan"
+    || preference === "metal"
     ? preference
     : "auto";
 }

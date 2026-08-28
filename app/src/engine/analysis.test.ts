@@ -253,6 +253,49 @@ describe("GUI-3 analysis foundation", () => {
     assert(resolveBackendPreference(cudaCapabilities, "auto") === "cpu", "integrated Vulkan is explicit-only");
     assert(selectableBackends(cudaCapabilities).includes("vulkan"), "integrated Vulkan stays explicit");
 
+    // Metal (macOS): selectable when analysis-ready, explicit-only for auto,
+    // p=1 only, and never offered for media verify.
+    const metalCapabilities: EngineEnvelope = {
+      path: "/engine",
+      payload: {
+        schema_version: 1,
+        engine: "getnative-engine",
+        version: "0",
+        commands: { capabilities: true, geometry: true, analyze: true },
+        kernels: [],
+        profiles: [],
+        backends: [{
+          id: "metal",
+          compiled: true,
+          device_available: true,
+          analysis_command_available: true,
+          axes: ["horizontal", "vertical", "both"],
+          p_norms: { minimum: 1, maximum: 1 },
+          max_half_bandwidth: 15,
+          max_forward_width: 16,
+          device: "Apple M4 Max",
+        }],
+      },
+    };
+    assert(selectableBackends(metalCapabilities).includes("metal"), "available Metal is selectable");
+    assert(resolveBackendPreference(metalCapabilities, "auto") === "cpu", "auto stays conservative on Metal");
+    assert(validateBackendPNorm(metalCapabilities, "metal", 1).ok, "Metal accepts p=1");
+    assert(!validateBackendPNorm(metalCapabilities, "metal", 2).ok, "Metal rejects p=2");
+    metalCapabilities.payload.backends[0].analysis_command_available = false;
+    assert(!selectableBackends(metalCapabilities).includes("metal"), "analysis-gated Metal is hidden");
+    metalCapabilities.payload.backends[0].analysis_command_available = true;
+    const metalDecodeCapabilities: EngineEnvelope = {
+      ...metalCapabilities,
+      payload: {
+        ...metalCapabilities.payload,
+        features: { verify_engine_decode: true },
+      },
+    };
+    assert(
+      !verifySelectableBackends(metalDecodeCapabilities).includes("metal"),
+      "media verify never offers Metal",
+    );
+
     const t = createTranslator("en");
     assert(backendOptionLabel(t, "auto", null) === "Auto (Detecting…)", "loading label");
     cudaCapabilities.payload.backends[0].auto_priority = 10;
