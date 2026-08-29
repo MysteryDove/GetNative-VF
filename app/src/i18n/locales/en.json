@@ -274,6 +274,7 @@
   "analyze.lanczosTaps": "Lanczos taps",
   "analyze.blur": "Blur",
   "analyze.blurHint": "Kernel blur factor; 1 keeps the native kernel, larger values widen it",
+  "analyze.blurInvalid": "Blur must be greater than 0.",
   "analyze.candidatesTitle": "Candidate preview",
   "analyze.candidateCount": "{count} candidates",
   "analyze.workEstimate": "work estimate {count}",

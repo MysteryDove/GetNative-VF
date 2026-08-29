@@ -12,6 +12,27 @@ void inverse_columns_neon_f32(
 void inverse_rows_neon_f32(
     const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
     float *output, std::ptrdiff_t output_row_stride, std::int32_t row_count) noexcept;
+void forward_columns_neon_f32(
+    const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
+    float *output, std::ptrdiff_t output_row_stride, std::int32_t column_count) noexcept;
+void forward_rows_neon_f32(
+    const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
+    float *output, std::ptrdiff_t output_row_stride, std::int32_t row_count) noexcept;
+void absolute_difference_neon_f32(
+    const float *source, const float *reconstruction, float *differences) noexcept;
+double absolute_difference_norm1_neon_f32(
+    const float *source, const float *reconstruction,
+    std::int32_t x_begin, std::int32_t x_end, float threshold,
+    double sum) noexcept;
+void vertical_reconstruction_neon_f32(
+    const AxisPlan &plan, std::uint32_t begin, std::int32_t left,
+    const float *source, const float *native, std::ptrdiff_t native_stride,
+    std::int32_t x, float *differences) noexcept;
+double vertical_reconstruction_norm1_neon_f32(
+    const AxisPlan &plan, std::uint32_t begin, std::int32_t left,
+    const float *source, const float *native, std::ptrdiff_t native_stride,
+    std::int32_t x_begin, std::int32_t x_end, float threshold,
+    double sum) noexcept;
 #endif
 #if GETNATIVE_X86_SSE2_COMPILED
 void inverse_columns_sse2_f32(
@@ -161,7 +182,8 @@ AnalysisRowDispatch analysis_row_dispatch(ColumnDispatchPolicy policy) {
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
     if (policy == ColumnDispatchPolicy::automatic
         || policy == ColumnDispatchPolicy::required_simd) {
-        return {};
+        return {4, absolute_difference_neon_f32, absolute_difference_norm1_neon_f32,
+                vertical_reconstruction_neon_f32, vertical_reconstruction_norm1_neon_f32};
     }
 #endif
     switch (resolve_x86_policy(policy)) {
@@ -287,6 +309,54 @@ void inverse_rows_f32(
     // per-row scalar loop is the reference path the NEON kernel mirrors.
     for (std::int32_t row = 0; row < row_count; ++row) {
         inverse_axis_f32(plan,
+                         input + static_cast<std::ptrdiff_t>(row) * input_row_stride,
+                         1,
+                         output + static_cast<std::ptrdiff_t>(row) * output_row_stride,
+                         1);
+    }
+}
+
+void forward_columns_f32(
+    const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
+    float *output, std::ptrdiff_t output_row_stride, std::int32_t column_count,
+    ColumnDispatchPolicy policy) {
+    if (!plan.valid() || input == nullptr || output == nullptr || column_count < 0
+        || input_row_stride == 0 || output_row_stride == 0) {
+        throw std::invalid_argument("invalid forward columns arguments");
+    }
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    if (policy == ColumnDispatchPolicy::automatic
+        || policy == ColumnDispatchPolicy::required_simd) {
+        forward_columns_neon_f32(
+            plan, input, input_row_stride, output, output_row_stride, column_count);
+        return;
+    }
+#endif
+    (void)policy;
+    for (std::int32_t column = 0; column < column_count; ++column) {
+        forward_axis_f32(plan, input + column, input_row_stride,
+                         output + column, output_row_stride);
+    }
+}
+
+void forward_rows_f32(
+    const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
+    float *output, std::ptrdiff_t output_row_stride, std::int32_t row_count,
+    ColumnDispatchPolicy policy) {
+    if (!plan.valid() || input == nullptr || output == nullptr || row_count < 0) {
+        throw std::invalid_argument("invalid forward rows arguments");
+    }
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    if (policy == ColumnDispatchPolicy::automatic
+        || policy == ColumnDispatchPolicy::required_simd) {
+        forward_rows_neon_f32(
+            plan, input, input_row_stride, output, output_row_stride, row_count);
+        return;
+    }
+#endif
+    (void)policy;
+    for (std::int32_t row = 0; row < row_count; ++row) {
+        forward_axis_f32(plan,
                          input + static_cast<std::ptrdiff_t>(row) * input_row_stride,
                          1,
                          output + static_cast<std::ptrdiff_t>(row) * output_row_stride,

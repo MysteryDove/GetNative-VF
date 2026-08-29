@@ -55,11 +55,19 @@ export function verifySelectableBackends(
   return selectableBackends(capabilities).filter((backend) => backend !== "metal" || metalReady);
 }
 
+function metalVerifyReady(capabilities: EngineEnvelope | null): boolean {
+  const metal = capabilities?.payload.decode_backends?.find((item) => item.id === "videotoolbox");
+  return metal?.compiled === true
+    && metal.runtime_device === true
+    && metal.zero_copy === true;
+}
+
 export function resolveBackendPreference(
   capabilities: EngineEnvelope | null,
   backend: BackendPreference,
   pNorm = 1,
   axisMode?: AxisMode,
+  options?: { verify?: boolean },
 ): Exclude<BackendPreference, "auto"> {
   if (backend !== "auto") return backend;
   const backends = capabilities?.payload.backends ?? [];
@@ -83,10 +91,18 @@ export function resolveBackendPreference(
     metal?.auto_priority === 30 &&
     pNorm >= 1 && pNorm <= 4 &&
     supportsTask(metal, pNorm, axisMode)
+    && (!options?.verify || metalVerifyReady(capabilities))
   ) {
     return "metal";
   }
   return "cpu";
+}
+
+export function reconcileBackendPreference(
+  preference: BackendPreference,
+  allowed: BackendPreference[],
+): BackendPreference {
+  return allowed.includes(preference) ? preference : "auto";
 }
 
 export function validateBackendPNorm(
@@ -136,11 +152,18 @@ export function backendOptionLabel(
   pNorm = 1,
   axisMode?: AxisMode,
   legacyVerify = false,
+  forVerify = false,
 ): string {
   if (backend !== "auto") return t(`backend.${backend}` as "backend.cpu");
   if (legacyVerify) return t("analyze.backend.autoResolved", { backend: t("backend.cpu") });
   if (!capabilities) return t("analyze.backend.autoDetecting");
-  const resolved = resolveBackendPreference(capabilities, backend, pNorm, axisMode);
+  const resolved = resolveBackendPreference(
+    capabilities,
+    backend,
+    pNorm,
+    axisMode,
+    { verify: forVerify },
+  );
   const resolvedName = t(`backend.${resolved}` as "backend.cpu");
   const device = capabilities.payload.backends.find((item) => item.id === resolved)?.device;
   return device && resolved !== "cpu"

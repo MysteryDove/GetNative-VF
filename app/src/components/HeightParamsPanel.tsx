@@ -3,6 +3,7 @@ import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
 import { kernelDisplayName, profileDisplayName } from "../engine/displayNames";
 import {
+  invalidKernelBlur,
   kernelSignature,
   missingFractionalBaseAxis,
   type HeightDraft,
@@ -221,14 +222,19 @@ export function HeightParamsPanel({
           value={draft.kernelId}
           disabled={kernelOptions.length === 0}
           onChange={(event) => {
+            const blur = draft.kernelParameters.blur;
+            const withBlur = (
+              parameters: HeightDraft["kernelParameters"],
+            ): HeightDraft["kernelParameters"] =>
+              blur === undefined ? parameters : { ...parameters, blur };
             onPatch({
               kernelId: event.target.value,
               kernelParameters:
                 event.target.value === "bicubic"
-                  ? { b: 0, c: 0.5 }
+                  ? withBlur({ b: 0, c: 0.5 })
                   : event.target.value === "lanczos"
-                    ? { taps: 3 }
-                    : {},
+                    ? withBlur({ taps: 3 })
+                    : withBlur({}),
               compareKernels: draft.compareKernels.filter(
                 (item) => item.id !== event.target.value,
               ),
@@ -286,8 +292,9 @@ export function HeightParamsPanel({
         <input
           type="number"
           step="any"
-          min="0"
+          min="0.000001"
           title={t("analyze.blurHint")}
+          aria-invalid={invalidKernelBlur(draft.kernelParameters) || undefined}
           value={String(draft.kernelParameters.blur ?? 1)}
           onChange={(event) =>
             onPatch({
@@ -299,6 +306,11 @@ export function HeightParamsPanel({
           }
         />
       </label>
+      {invalidKernelBlur(draft.kernelParameters) ? (
+        <p className="help-copy warning-copy" role="alert">
+          {t("analyze.blurInvalid")}
+        </p>
+      ) : null}
 
       {kernelOptions.length > 1 ? (
         <fieldset className="metric-fieldset kernel-compare-fieldset">

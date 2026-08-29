@@ -17,6 +17,7 @@
 #include "getnative/vulkan_analysis.hpp"
 #if defined(GETNATIVE_HAS_MEDIA)
 #include "getnative/media_decode.hpp"
+#include "verify_resume.hpp"
 #endif
 
 #include <atomic>
@@ -363,12 +364,6 @@ public:
     }
 
 private:
-    struct Result {
-        std::uint64_t seq = 0U;
-        media::FrameIdentity identity;
-        double error = 0.0;
-    };
-
     std::size_t concurrency_;
     std::stop_token stop_;
     Analyzer analyzer_;
@@ -378,11 +373,9 @@ private:
     std::condition_variable condition_;
     std::mutex collector_mutex_;
     std::deque<Frame> queue_;
-    std::map<std::uint64_t, Result> pending_;
     std::vector<std::thread> workers_;
     std::exception_ptr failure_;
     std::size_t inflight_ = 0U;
-    std::uint64_t next_emit_seq_ = 0U;
     bool decoding_done_ = false;
     bool abort_ = false;
     std::atomic<std::uint64_t> completed_{0U};
@@ -445,28 +438,21 @@ private:
 
             try {
                 const double error = analyzer_(*frame);
+                const std::uint64_t seq = frame->seq;
+                const media::FrameIdentity identity = frame->identity;
                 const std::uint64_t done =
                     completed_.fetch_add(1U, std::memory_order_relaxed) + 1U;
-                std::vector<Result> ready_results;
-                std::unique_lock lock(mutex_);
-                pending_.emplace(
-                    frame->seq, Result{frame->seq, frame->identity, error});
                 frame.reset();
-                while (true) {
-                    auto ready = pending_.find(next_emit_seq_);
-                    if (ready == pending_.end()) break;
-                    ready_results.push_back(std::move(ready->second));
-                    pending_.erase(ready);
-                    ++next_emit_seq_;
+                {
+                    const std::scoped_lock lock(mutex_);
+                    --inflight_;
                 }
-                --inflight_;
-                std::unique_lock collector_lock(collector_mutex_);
-                lock.unlock();
                 condition_.notify_all();
-                for (const Result &ready : ready_results) {
-                    collector_(
-                        ready.seq, ready.identity, ready.error, done);
-                }
+                // Report completion order, not presentation order. Concurrent
+                // decode/analysis otherwise holds seq>0 in pending until seq 0
+                // finishes, so the UI sees no verify progress or speed.
+                const std::scoped_lock collector_lock(collector_mutex_);
+                collector_(seq, identity, error, done);
             } catch (...) {
                 fail(std::current_exception());
                 return;
@@ -1968,7 +1954,7 @@ public:
                     } catch (const std::exception &error) {
                         fallback("metal", "cpu", error.what());
                     }
-                } else {
+                } else if (!metal_attempted) {
                     fallback("metal", "cpu", "requested p_norm is unsupported by Metal");
                 }
 #endif
@@ -3884,6 +3870,42 @@ private:
             }
             completed = execution.completed;
         }
+#if defined(GETNATIVE_HAS_METAL)
+        else if (spec.backend == BackendChoice::metal) {
+            std::vector<CandidateAnalysis> all_candidates;
+            all_candidates.reserve(result_count);
+            for (std::size_t chunk_index = 0; chunk_index < chunk_total; ++chunk_index) {
+                std::vector<CandidateAnalysis> chunk;
+                build_chunk(chunk_index, chunk);
+                all_candidates.insert(
+                    all_candidates.end(),
+                    std::make_move_iterator(chunk.begin()),
+                    std::make_move_iterator(chunk.end()));
+            }
+            try {
+                results = resident_metal_engine().analyze_axis_batch_f32(
+                    source, all_candidates, spec.metric, job.stop_source.get_token(),
+                    [&](std::size_t done, std::size_t total) {
+                        emit_progress(spec, "candidates", done, total);
+                    });
+            } catch (const WorkerError &) {
+                throw;
+            } catch (const std::exception &error) {
+                check_cancelled(job);
+                const std::string_view what{error.what()};
+                if (what.find("cancelled") != std::string_view::npos) {
+                    throw WorkerError("cancelled", error.what());
+                }
+                throw;
+            }
+            if (job.cancel_requested.load(std::memory_order_relaxed)) {
+                emit_partial_cancelled(spec, results);
+                return;
+            }
+            completed = results.size();
+            emit_progress(spec, "candidates", completed, result_count);
+        }
+#endif
 
         else if (accelerator_backend && chunk_total > 1U) {
             // Pipeline depth: worker_count when given (1..8), else 3.
@@ -4319,7 +4341,7 @@ private:
         vulkan_decoder_options.frame_concurrency = spec.concurrency;
         metal_decoder_options.frame_concurrency = spec.concurrency;
         metal_decoder_options.hardware_decode_sessions = spec.decode_concurrency == 0U
-            ? std::min<std::size_t>(4U, std::max<std::size_t>(2U, spec.concurrency))
+            ? 1U
             : spec.decode_concurrency;
         bool use_cuda_decode = false;
         bool use_vulkan_decode = false;
@@ -4417,10 +4439,29 @@ private:
                                             metal_decoder_options, job.stop_source.get_token(), index_progress).index;
                 use_metal_decode = true;
             } catch (const std::exception &error) {
-                throw WorkerError("metal_zero_copy_unsupported", error.what());
+                if (job.cancel_requested.load(std::memory_order_relaxed)) {
+                    throw;
+                }
+                if (spec.requested_backend != BackendChoice::automatic) {
+                    throw WorkerError("metal_zero_copy_unsupported", error.what());
+                }
+                const VerifyJobSpec::Fallback fallback{
+                    "hardware_decode_fallback", "videotoolbox", "software",
+                    error.what(), 0U};
+                spec.fallback_chain.push_back(fallback);
+                emit_verify_fallback(spec, fallback);
             }
 #else
-            throw WorkerError("metal_zero_copy_unsupported", "VideoToolbox Metal Verify is unavailable");
+            if (spec.requested_backend != BackendChoice::automatic) {
+                throw WorkerError(
+                    "metal_zero_copy_unsupported",
+                    "VideoToolbox Metal Verify is unavailable");
+            }
+            const VerifyJobSpec::Fallback fallback{
+                "hardware_decode_fallback", "videotoolbox", "software",
+                "VideoToolbox Metal Verify is unavailable", 0U};
+            spec.fallback_chain.push_back(fallback);
+            emit_verify_fallback(spec, fallback);
 #endif
         }
         try {
@@ -4468,7 +4509,7 @@ private:
                         media::DecoderOptions{}, job.stop_source.get_token(),
                         index_progress).index;
                 }
-            } else if (spec.backend != BackendChoice::metal) {
+            } else if (!use_metal_decode) {
                 index = media::ensure_index(
                     input.path, input.stream_index, input.cache_directory,
                     media::DecoderOptions{}, job.stop_source.get_token(),
@@ -4623,6 +4664,11 @@ private:
             resident_vulkan_engine().reset_analysis_telemetry();
         }
 #endif
+#if defined(GETNATIVE_HAS_METAL)
+        if (spec.backend == BackendChoice::metal) {
+            resident_metal_engine().reset_analysis_telemetry();
+        }
+#endif
 
         constexpr std::size_t result_batch_size = 32U;
         std::vector<JsonValue> result_batch;
@@ -4631,6 +4677,12 @@ private:
         final_frames.reserve(selected.size());
         std::uint64_t completed = 0U;
         std::uint64_t progress_completed = 0U;
+        std::vector<char> finished_seqs(selected.size(), 0);
+        const auto json_seq = [](const JsonValue &value) -> std::int64_t {
+            const JsonValue *seq = value.find("seq");
+            if (seq == nullptr) return 0;
+            return static_cast<std::int64_t>(std::llround(seq->number_value));
+        };
         const auto flush_results = [&] {
             if (result_batch.empty()) return;
             emit_progress(spec.request_id, spec.job_id, "verify", "verify",
@@ -4665,6 +4717,9 @@ private:
             });
             final_frames.push_back(result);
             result_batch.push_back(std::move(result));
+            if (seq < finished_seqs.size()) {
+                finished_seqs[static_cast<std::size_t>(seq)] = 1;
+            }
             ++completed;
             progress_completed = std::max(progress_completed, analyzed);
             if (result_batch.size() >= result_batch_size) flush_results();
@@ -4705,6 +4760,14 @@ private:
                     job.stop_source.get_token()).front().error;
 #else
                 throw WorkerError("unsupported", "Vulkan backend was not compiled");
+#endif
+            } else if (spec.backend == BackendChoice::metal) {
+#if defined(GETNATIVE_HAS_METAL)
+                error = resident_metal_engine().analyze_axis_batch_f32(
+                    view, candidates, spec.metric,
+                    job.stop_source.get_token()).front().error;
+#else
+                throw WorkerError("unsupported", "Metal backend was not compiled");
 #endif
             }
             compute_ms.fetch_add(
@@ -4907,61 +4970,107 @@ private:
 #endif
 #if defined(__APPLE__) && defined(GETNATIVE_HAS_METAL)
             if (spec.backend == BackendChoice::metal && use_metal_decode) {
-                MetalAnalysisEngine &metal = resident_metal_engine();
-                MediaVerifyPipeline<media::MetalFrame> pipeline{
-                    spec.concurrency, job.stop_source.get_token(),
-                    [&](const media::MetalFrame &frame) {
-                        if (frame.width != spec.width || frame.height != spec.height) {
-                            throw WorkerError("media_resolution_changed", "decoded media resolution changed during verification");
-                        }
-                        MetalLumaFrameView view{frame.pixel_buffer, frame.width, frame.height,
-                                                frame.bit_depth, frame.surface_format, frame.range};
-                        const auto start = std::chrono::steady_clock::now();
-                        const double error = metal.analyze_axis_batch_metal_luma(
-                            view, candidates, spec.metric, job.stop_source.get_token()).front().error;
-                        compute_ms.fetch_add(elapsed_ms(start), std::memory_order_relaxed);
-                        return error;
-                    },
-                    [&](std::uint64_t seq, const media::FrameIdentity &identity, double error, std::uint64_t analyzed) {
-                        append_result(seq, identity, error, analyzed);
-                    },
-                    [&] { job.stop_source.request_stop(); }};
-                pipeline.run([&](auto consume) {
-                    media::decode_selected_metal(input.path, index, selected, metal_decoder_options,
-                                                 job.stop_source.get_token(), std::move(consume), &decode_telemetry);
-                });
-                max_inflight = std::max(max_inflight, pipeline.max_inflight());
-                surface_lease_peak = std::max(surface_lease_peak, pipeline.max_inflight());
-                queue_wait_ms += pipeline.queue_wait_ms();
-                actual_decoder = "videotoolbox";
-                zero_copy = true;
-                if (decode_telemetry.host_frame_bytes != 0U
-                    || decode_telemetry.conversion_bytes != 0U) {
-                    throw WorkerError(
-                        "metal_zero_copy_unsupported",
-                        "Metal Verify produced host frame or conversion bytes");
+                try {
+                    MetalAnalysisEngine &metal = resident_metal_engine();
+                    MediaVerifyPipeline<media::MetalFrame> pipeline{
+                        spec.concurrency, job.stop_source.get_token(),
+                        [&](const media::MetalFrame &frame) {
+                            if (frame.width != spec.width || frame.height != spec.height) {
+                                throw WorkerError(
+                                    "media_resolution_changed",
+                                    "decoded media resolution changed during verification");
+                            }
+                            MetalLumaFrameView view{
+                                frame.pixel_buffer, frame.width, frame.height,
+                                frame.bit_depth, frame.surface_format, frame.range};
+                            const auto start = std::chrono::steady_clock::now();
+                            try {
+                                const double error = metal.analyze_axis_batch_metal_luma(
+                                    view, candidates, spec.metric,
+                                    job.stop_source.get_token()).front().error;
+                                compute_ms.fetch_add(
+                                    elapsed_ms(start), std::memory_order_relaxed);
+                                return error;
+                            } catch (const WorkerError &) {
+                                throw;
+                            } catch (const std::exception &error) {
+                                if (job.stop_source.stop_requested()) {
+                                    throw WorkerError(
+                                        "cancelled", "Metal analysis cancelled");
+                                }
+                                throw WorkerError(
+                                    "compute_error",
+                                    std::string{"Metal analysis failed: "}
+                                        + error.what());
+                            }
+                        },
+                        [&](std::uint64_t seq,
+                            const media::FrameIdentity &identity, double error,
+                            std::uint64_t analyzed) {
+                            append_result(seq, identity, error, analyzed);
+                        },
+                        [&] { job.stop_source.request_stop(); }};
+                    pipeline.run([&](auto consume) {
+                        media::decode_selected_metal(
+                            input.path, index, selected, metal_decoder_options,
+                            job.stop_source.get_token(), std::move(consume),
+                            &decode_telemetry);
+                    });
+                    max_inflight = std::max(max_inflight, pipeline.max_inflight());
+                    surface_lease_peak = std::max(
+                        surface_lease_peak, pipeline.max_inflight());
+                    queue_wait_ms += pipeline.queue_wait_ms();
+                    actual_decoder = "videotoolbox";
+                    zero_copy = true;
+                    if (decode_telemetry.host_frame_bytes != 0U
+                        || decode_telemetry.conversion_bytes != 0U) {
+                        throw WorkerError(
+                            "metal_zero_copy_unsupported",
+                            "Metal Verify produced host frame or conversion bytes");
+                    }
+                    decoded = true;
+                } catch (const WorkerError &) {
+                    throw;
+                } catch (const std::exception &error) {
+                    if (job.cancel_requested.load(std::memory_order_relaxed)) {
+                        throw WorkerError("cancelled", "media decode cancelled");
+                    }
+                    if (spec.requested_backend != BackendChoice::automatic) {
+                        throw WorkerError("metal_zero_copy_unsupported", error.what());
+                    }
+                    const VerifyJobSpec::Fallback fallback{
+                        "hardware_decode_fallback", "videotoolbox", "software",
+                        error.what(), completed};
+                    spec.fallback_chain.push_back(fallback);
+                    emit_verify_fallback(spec, fallback);
                 }
-                decoded = true;
             }
 #endif
             if (!decoded) {
                 media::DecodeTelemetry software_telemetry;
-                const std::size_t resume = static_cast<std::size_t>(completed);
+                const RemainingVerifyFrames remaining =
+                    remaining_verify_frames(selected, finished_seqs);
+                if (remaining.identities.empty()) {
+                    decoded = true;
+                } else {
                 MediaVerifyPipeline<media::HostFrame> pipeline{
                     spec.concurrency, job.stop_source.get_token(), analyze_host,
                     [&](std::uint64_t seq,
                         const media::FrameIdentity &identity, double error,
-                        std::uint64_t analyzed) {
+                        std::uint64_t) {
+                        if (seq >= remaining.original_seqs.size()) {
+                            throw WorkerError(
+                                "media_decode_error",
+                                "software fallback seq is outside remaining frames");
+                        }
                         append_result(
-                            static_cast<std::uint64_t>(resume) + seq,
-                            identity, error,
-                            static_cast<std::uint64_t>(resume) + analyzed);
+                            remaining.original_seqs[static_cast<std::size_t>(seq)],
+                            identity, error, completed + 1U);
                     },
                     [&] { job.stop_source.request_stop(); }};
                 pipeline.run([&](auto consume) {
                     media::decode_selected_indexed(
-                        input.path, index,
-                        std::span<const media::FrameIdentity>{selected}.subspan(resume),
+                        input.path, index, remaining.identities,
                         media::DecoderOptions{}, job.stop_source.get_token(),
                         std::move(consume), &software_telemetry);
                 });
@@ -4975,6 +5084,7 @@ private:
                 decode_telemetry.conversion_bytes += software_telemetry.conversion_bytes;
                 decode_telemetry.decode_ms += software_telemetry.decode_ms;
                 decode_telemetry.convert_ms += software_telemetry.convert_ms;
+                }
             }
         } catch (const WorkerError &error) {
             if (error.code() == "cancelled") {
@@ -4994,6 +5104,11 @@ private:
             throw WorkerError("media_decode_error", error.what());
         }
         flush_results();
+        std::sort(
+            final_frames.begin(), final_frames.end(),
+            [&](const JsonValue &left, const JsonValue &right) {
+                return json_seq(left) < json_seq(right);
+            });
         if (job.cancel_requested.load(std::memory_order_relaxed)) {
             emit_verify_cancelled(
                 spec, completed, 0U, "media verification cancelled",

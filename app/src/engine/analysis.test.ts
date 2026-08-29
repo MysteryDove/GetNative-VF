@@ -23,6 +23,7 @@ import { createTranslator } from "../i18n";
 import {
   backendOptionLabel,
   pNormMaximumForBackend,
+  reconcileBackendPreference,
   verifySelectableBackends,
 } from "./backendSelection";
 import {
@@ -317,8 +318,30 @@ describe("GUI-3 analysis foundation", () => {
       !verifySelectableBackends(metalDecodeCapabilities).includes("metal"),
       "media verify hides Metal when VideoToolbox zero-copy is unavailable",
     );
+    assert(
+      resolveBackendPreference(metalDecodeCapabilities, "auto", 1, undefined, { verify: true })
+        === "cpu",
+      "verify Auto does not resolve to hidden Metal",
+    );
 
     const t = createTranslator("en");
+    assert(
+      !backendOptionLabel(
+        t,
+        "auto",
+        metalDecodeCapabilities,
+        1,
+        undefined,
+        false,
+        true,
+      ).includes("Metal"),
+      "verify Auto label omits Metal without zero-copy",
+    );
+    assert(
+      reconcileBackendPreference("metal", verifySelectableBackends(metalDecodeCapabilities))
+        === "auto",
+      "stale Metal preference reconciles to Auto",
+    );
     assert(backendOptionLabel(t, "auto", null) === "Auto (Detecting…)", "loading label");
     cudaCapabilities.payload.backends[0].auto_priority = 10;
     assert(
@@ -870,6 +893,12 @@ describe("GUI-3 analysis foundation", () => {
 
     draft.compareKernels = [];
     assert(fixedKernelsForDraft(draft, null).length === 1, "no compare picks → fixed only");
+
+    draft.kernelParameters = { b: 0, c: 0.5, blur: 1.25 };
+    draft.compareKernels = [{ id: "lanczos", parameters: { taps: 3 } }];
+    const withBlur = fixedKernelsForDraft(draft, null);
+    assert(withBlur[0]?.parameters.blur === 1.25, "primary keeps panel blur");
+    assert(withBlur[1]?.parameters.blur === 1.25, "compare kernel inherits panel blur");
   });
 });
 

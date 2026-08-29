@@ -38,6 +38,7 @@ struct AnalysisJob {
     uint candidate_count;
     uint maximum_vector_count;
     uint norm;
+    uint transposed_source;
 };
 
 struct LumaNormalizeJob {
@@ -64,18 +65,32 @@ kernel void normalize_luma_r16(
     constant LumaNormalizeJob &job [[buffer(1)]],
     uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= job.width || gid.y >= job.height) return;
-    // VideoToolbox 10-bit bi-planar samples are stored left-aligned in a
-    // 16-bit plane. R16Unorm has already divided by 65535, so multiplying by
-    // 1023 reconstructs the logical 10-bit code without a host conversion.
-    float code = source.read(gid).r * 1023.0f;
-    float value = code / 1023.0f;
-    if (job.full_range == 0u) value = max(0.0f, (value * 1023.0f - 64.0f) / 876.0f);
+    // VideoToolbox 10-bit bi-planar samples are left-aligned in a 16-bit
+    // plane (`code10 << 6`). R16Unorm has already divided by 65535, so recover
+    // the 10-bit code before full/limited expansion.
+    float stored = source.read(gid).r * 65535.0f;
+    float code10 = stored / 64.0f;
+    float value = code10 / 1023.0f;
+    if (job.full_range == 0u) value = max(0.0f, (code10 - 64.0f) / 876.0f);
     destination[gid.y * job.width + gid.x] = clamp(value, 0.0f, 1.0f);
 }
 
-static inline uint image_index(uint direction, uint vector, uint axis_index, uint width) {
-    return direction == horizontal_axis ? vector * width + axis_index
-                                        : axis_index * width + vector;
+kernel void transpose_source(
+    device const float *source [[buffer(0)]],
+    device float *destination [[buffer(1)]],
+    constant uint2 &size [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= size.x || gid.y >= size.y) return;
+    destination[gid.x * size.y + gid.y] = source[gid.y * size.x + gid.x];
+}
+
+static inline uint image_index(uint direction, uint vector, uint axis_index,
+                               constant AnalysisJob &job) {
+    if (direction == horizontal_axis && job.transposed_source != 0u) {
+        return axis_index * job.height + vector;
+    }
+    return direction == horizontal_axis ? vector * job.width + axis_index
+                                        : axis_index * job.width + vector;
 }
 
 // fixed_half_bandwidth and bandwidth7_order are template constants so each
@@ -126,7 +141,7 @@ static inline void inverse_axis_impl(
             for (uint p = begin; p < end; ++p) {
                 sum += transpose_weights[p]
                     * source[image_index(plan.direction, vector,
-                                         transpose_indices[p], job.width)];
+                                         transpose_indices[p], job)];
             }
             const uint available = min(fixed_half_bandwidth, i);
             #pragma unroll
@@ -199,7 +214,7 @@ static inline void inverse_axis_impl(
         for (uint p = begin; p < end; ++p) {
             sum += transpose_weights[p]
                 * source[image_index(plan.direction, vector,
-                                     transpose_indices[p], job.width)];
+                                     transpose_indices[p], job)];
         }
         const uint available = min(half_bandwidth, i);
         for (uint distance = available; distance >= 1; --distance) {

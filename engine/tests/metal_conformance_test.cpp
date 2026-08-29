@@ -10,9 +10,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <atomic>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <stop_token>
@@ -104,9 +108,14 @@ void compare_cpu_metal(getnative::ConstImageView source,
     }
 }
 
-void test_iosurface_zero_copy_luma() {
+void test_iosurface_zero_copy_luma_format(
+    OSType pixel_format, std::int32_t bit_depth,
+    std::string_view surface_format, std::string_view range) {
     constexpr std::int32_t width = 64;
     constexpr std::int32_t height = 48;
+    const bool ten_bit = bit_depth > 8;
+    const bool full_range = range == "full";
+    const std::string label = std::string{"IOSurface "} + std::string{surface_format};
     CFMutableDictionaryRef attributes = CFDictionaryCreateMutable(
         kCFAllocatorDefault, 1, &kCFTypeDictionaryKeyCallBacks,
         &kCFTypeDictionaryValueCallBacks);
@@ -114,47 +123,86 @@ void test_iosurface_zero_copy_luma() {
         kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
         &kCFTypeDictionaryValueCallBacks);
     expect(attributes != nullptr && io_surface_properties != nullptr,
-           "CoreVideo test dictionaries allocate");
+           label + " dictionaries allocate");
     CFDictionarySetValue(
         attributes, kCVPixelBufferIOSurfacePropertiesKey, io_surface_properties);
     CVPixelBufferRef pixel_buffer = nullptr;
     const CVReturn created = CVPixelBufferCreate(
         kCFAllocatorDefault, static_cast<std::size_t>(width),
-        static_cast<std::size_t>(height),
-        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, attributes, &pixel_buffer);
+        static_cast<std::size_t>(height), pixel_format, attributes, &pixel_buffer);
     CFRelease(io_surface_properties);
     CFRelease(attributes);
     expect(created == kCVReturnSuccess && pixel_buffer != nullptr
                && CVPixelBufferGetIOSurface(pixel_buffer) != nullptr,
-           "zero-copy fixture has IOSurface backing");
+           label + " fixture has IOSurface backing");
     struct PixelBufferRelease {
         CVPixelBufferRef value;
         ~PixelBufferRelease() { if (value != nullptr) CVPixelBufferRelease(value); }
     } release{pixel_buffer};
 
     expect(CVPixelBufferLockBaseAddress(pixel_buffer, 0) == kCVReturnSuccess,
-           "zero-copy fixture locks for initialization");
+           label + " locks for initialization");
     std::vector<float> source(
         static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
-    auto *luma = static_cast<std::uint8_t *>(
-        CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 0));
-    const std::size_t luma_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 0);
-    for (std::int32_t y = 0; y < height; ++y) {
-        for (std::int32_t x = 0; x < width; ++x) {
-            const std::uint8_t code = static_cast<std::uint8_t>(
-                24 + ((x * 7 + y * 11 + (x * y) % 31) % 208));
-            luma[static_cast<std::size_t>(y) * luma_stride
-                 + static_cast<std::size_t>(x)] = code;
-            source[static_cast<std::size_t>(y * width + x)] =
-                static_cast<float>(code) / 255.0F;
+    void *luma_base = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 0);
+    const std::size_t luma_stride_bytes =
+        CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 0);
+    expect(luma_base != nullptr && luma_stride_bytes > 0,
+           label + " luma plane is addressable");
+    if (ten_bit) {
+        expect(luma_stride_bytes % sizeof(std::uint16_t) == 0,
+               label + " luma stride is 16-bit aligned");
+        auto *luma = static_cast<std::uint16_t *>(luma_base);
+        const std::size_t luma_stride = luma_stride_bytes / sizeof(std::uint16_t);
+        for (std::int32_t y = 0; y < height; ++y) {
+            for (std::int32_t x = 0; x < width; ++x) {
+                const std::uint16_t code10 = static_cast<std::uint16_t>(
+                    96 + ((x * 7 + y * 11 + (x * y) % 31) % 720));
+                luma[static_cast<std::size_t>(y) * luma_stride
+                     + static_cast<std::size_t>(x)] =
+                    static_cast<std::uint16_t>(code10 << 6);
+                const float value = full_range
+                    ? static_cast<float>(code10) / 1023.0F
+                    : std::max(0.0F, (static_cast<float>(code10) - 64.0F) / 876.0F);
+                source[static_cast<std::size_t>(y * width + x)] = value;
+            }
+        }
+    } else {
+        auto *luma = static_cast<std::uint8_t *>(luma_base);
+        for (std::int32_t y = 0; y < height; ++y) {
+            for (std::int32_t x = 0; x < width; ++x) {
+                const std::uint8_t code = static_cast<std::uint8_t>(
+                    24 + ((x * 7 + y * 11 + (x * y) % 31) % 208));
+                luma[static_cast<std::size_t>(y) * luma_stride_bytes
+                     + static_cast<std::size_t>(x)] = code;
+                const float value = full_range
+                    ? static_cast<float>(code) / 255.0F
+                    : std::max(0.0F, (static_cast<float>(code) - 16.0F) / 219.0F);
+                source[static_cast<std::size_t>(y * width + x)] = value;
+            }
         }
     }
-    auto *chroma = static_cast<std::uint8_t *>(
-        CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 1));
-    const std::size_t chroma_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 1);
+    void *chroma_base = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 1);
+    const std::size_t chroma_stride_bytes =
+        CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 1);
     const std::size_t chroma_height = CVPixelBufferGetHeightOfPlane(pixel_buffer, 1);
-    for (std::size_t y = 0; y < chroma_height; ++y) {
-        std::fill_n(chroma + y * chroma_stride, chroma_stride, std::uint8_t{128});
+    expect(chroma_base != nullptr && chroma_stride_bytes > 0,
+           label + " chroma plane is addressable");
+    if (ten_bit) {
+        expect(chroma_stride_bytes % sizeof(std::uint16_t) == 0,
+               label + " chroma stride is 16-bit aligned");
+        auto *chroma = static_cast<std::uint16_t *>(chroma_base);
+        const std::size_t chroma_stride = chroma_stride_bytes / sizeof(std::uint16_t);
+        for (std::size_t y = 0; y < chroma_height; ++y) {
+            std::fill_n(chroma + y * chroma_stride, chroma_stride,
+                        static_cast<std::uint16_t>(512U << 6));
+        }
+    } else {
+        auto *chroma = static_cast<std::uint8_t *>(chroma_base);
+        for (std::size_t y = 0; y < chroma_height; ++y) {
+            std::fill_n(chroma + y * chroma_stride_bytes, chroma_stride_bytes,
+                        std::uint8_t{128});
+        }
     }
     CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
 
@@ -174,19 +222,31 @@ void test_iosurface_zero_copy_luma() {
     getnative::MetalAnalysisEngine metal;
     metal.reset_analysis_telemetry();
     const getnative::MetalLumaFrameView frame{
-        reinterpret_cast<std::uintptr_t>(pixel_buffer), width, height, 8, "420f", "full",
+        reinterpret_cast<std::uintptr_t>(pixel_buffer), width, height, bit_depth,
+        std::string{surface_format}, std::string{range},
     };
     const auto gpu = metal.analyze_axis_batch_metal_luma(frame, candidates, metric);
     expect(gpu.size() == 1U && std::isfinite(gpu.front().error),
-           "IOSurface zero-copy analysis returns a finite metric");
+           label + " analysis returns a finite metric");
     expect(std::abs(gpu.front().error - cpu) <= std::max(1e-7, 5e-4 * std::abs(cpu)),
-           "IOSurface zero-copy metric matches the CPU oracle");
+           label + " metric matches the CPU oracle");
     const auto telemetry = metal.runtime_telemetry();
     expect(telemetry.external_source_zero_copy
                && telemetry.source_direct_write_bytes == 0U
                && telemetry.source_legacy_copy_bytes == 0U
                && telemetry.plan_direct_write_bytes > 0U,
-           "IOSurface analysis performs no host source write or legacy copy");
+           label + " performs no host source write or legacy copy");
+}
+
+void test_iosurface_zero_copy_luma() {
+    test_iosurface_zero_copy_luma_format(
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, 8, "420f", "full");
+    test_iosurface_zero_copy_luma_format(
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, 8, "420v", "limited");
+    test_iosurface_zero_copy_luma_format(
+        kCVPixelFormatType_420YpCbCr10BiPlanarFullRange, 10, "xf20", "full");
+    test_iosurface_zero_copy_luma_format(
+        kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, 10, "x420", "limited");
 }
 
 [[nodiscard]] getnative::CandidateAnalysis make_dual_candidate(
@@ -903,6 +963,101 @@ void test_submitted_cancellation_drains_before_reuse() {
            "immediate reuse uses retained buffers only after submitted work is complete");
 }
 
+void test_horizontal_transpose_layout_matches_cpu() {
+    constexpr std::int32_t width = 40;
+    constexpr std::int32_t height = 24;
+    std::vector<float> pixels(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
+    for (std::int32_t y = 0; y < height; ++y) {
+        for (std::int32_t x = 0; x < width; ++x) {
+            pixels[static_cast<std::size_t>(y * width + x)] =
+                static_cast<float>((x + 1) * 17 + (y + 3) * 13);
+        }
+    }
+    std::vector<float> transposed(pixels.size());
+    for (std::int32_t y = 0; y < height; ++y) {
+        for (std::int32_t x = 0; x < width; ++x) {
+            transposed[static_cast<std::size_t>(x * height + y)] =
+                pixels[static_cast<std::size_t>(y * width + x)];
+        }
+    }
+    expect(transposed[static_cast<std::size_t>(1 * height + 0)]
+               == pixels[static_cast<std::size_t>(0 * width + 1)],
+           "transpose_source layout is dest[x * height + y] = src[y * width + x]");
+    auto plan = std::make_shared<const getnative::AxisPlan>(getnative::build_axis_plan({
+        width, 28, 28.25, -0.125, getnative::Filter::bicubic(),
+        getnative::BorderMode::mirror,
+    }));
+    const std::vector<getnative::CandidateAnalysis> candidates{
+        {"h-transpose", plan, nullptr, getnative::AnalysisAxes::horizontal},
+    };
+    getnative::MetalAnalysisEngine metal;
+    compare_cpu_metal(const_view(pixels, width, height), candidates,
+                      {2, 2, 2, 2, 0.015F, 1U}, metal,
+                      "horizontal transpose layout");
+}
+
+void test_concurrent_execution_slots() {
+    constexpr std::int32_t width = 48;
+    constexpr std::int32_t height = 32;
+    const auto source = make_source(width, height);
+    const auto view = const_view(source, width, height);
+    const getnative::MetricSpec metric{2, 2, 2, 2, 0.015F, 1U};
+    auto vertical = std::make_shared<const getnative::AxisPlan>(getnative::build_axis_plan({
+        height, 24, 24.0, 0.0, getnative::Filter::bicubic(),
+        getnative::BorderMode::mirror,
+    }));
+    auto horizontal = std::make_shared<const getnative::AxisPlan>(getnative::build_axis_plan({
+        width, 36, 36.0, 0.0, getnative::Filter::bicubic(),
+        getnative::BorderMode::mirror,
+    }));
+    const std::vector<getnative::CandidateAnalysis> candidates{
+        {"v-concurrent", nullptr, vertical, getnative::AnalysisAxes::vertical},
+        {"h-concurrent", horizontal, nullptr, getnative::AnalysisAxes::horizontal},
+    };
+
+    getnative::MetalAnalysisOptions options;
+    options.execution_slots = 2;
+    getnative::MetalAnalysisEngine metal(options);
+    std::stop_source stop;
+    std::atomic<bool> finished{false};
+    std::thread watchdog([&] {
+        for (int tick = 0; tick < 80 && !finished.load(std::memory_order_relaxed); ++tick) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!finished.load(std::memory_order_relaxed)) {
+            stop.request_stop();
+        }
+    });
+
+    std::exception_ptr failure;
+    std::mutex failure_mutex;
+    const auto run = [&] {
+        try {
+            const auto results = metal.analyze_axis_batch_f32(
+                view, candidates, metric, stop.get_token());
+            expect(results.size() == candidates.size(),
+                   "concurrent Metal analysis returns one result per candidate");
+            for (const auto &result : results) {
+                expect(std::isfinite(result.error),
+                       "concurrent Metal analysis returns a finite metric");
+            }
+        } catch (...) {
+            const std::scoped_lock lock(failure_mutex);
+            if (!failure) failure = std::current_exception();
+        }
+    };
+
+    std::thread first(run);
+    std::thread second(run);
+    first.join();
+    second.join();
+    finished.store(true, std::memory_order_relaxed);
+    watchdog.join();
+    if (failure) std::rethrow_exception(failure);
+    expect(!stop.get_token().stop_requested(),
+           "two concurrent Metal slot analyses completed without hanging");
+}
+
 } // namespace
 
 int main() {
@@ -912,6 +1067,7 @@ int main() {
             return 0;
         }
         test_vertical_and_horizontal_batches();
+        test_horizontal_transpose_layout_matches_cpu();
         test_iosurface_zero_copy_luma();
         test_kernel_dispatch_policy_and_telemetry();
         test_all_supported_plan_shapes_horizontal_and_vertical();
@@ -922,6 +1078,7 @@ int main() {
         test_queued_tile_window();
         test_persistent_working_buffer_reuse_and_ceiling();
         test_submitted_cancellation_drains_before_reuse();
+        test_concurrent_execution_slots();
         std::cout << "metal conformance tests passed\n";
         return 0;
     } catch (const std::exception &error) {

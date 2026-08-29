@@ -891,11 +891,11 @@ if(GETNATIVE_ENABLE_MEDIA AND UNIX AND NOT APPLE)
         BUILD_WITH_INSTALL_RPATH TRUE)
 endif()
 if(GETNATIVE_ENABLE_MEDIA AND APPLE AND GETNATIVE_FFMPEG_ROOT)
-    # Keep local tests runnable against the selected self-contained SDK. The
-    # packaging step later stages these dylibs beside the engine and rewrites
-    # the install names to @loader_path.
+    # Build-tree tests resolve the SDK via BUILD_RPATH / absolute dylib IDs.
+    # The install image uses @loader_path; staging rewrites the copied dylibs.
     set_property(TARGET getnative-engine APPEND PROPERTY
         BUILD_RPATH "${GETNATIVE_FFMPEG_ROOT}/lib")
+    set_property(TARGET getnative-engine PROPERTY INSTALL_RPATH "@loader_path")
 endif()
 target_compile_features(getnative-engine PRIVATE cxx_std_23)
 getnative_enable_warnings(getnative-engine)
@@ -967,6 +967,12 @@ if(BUILD_TESTING)
     target_compile_features(getnative_json_tests PRIVATE cxx_std_23)
     getnative_enable_warnings(getnative_json_tests)
     add_test(NAME getnative_json_tests COMMAND getnative_json_tests)
+
+    add_executable(getnative_verify_resume_tests tests/verify_resume_test.cpp)
+    target_include_directories(getnative_verify_resume_tests PRIVATE src/cli include)
+    target_compile_features(getnative_verify_resume_tests PRIVATE cxx_std_23)
+    getnative_enable_warnings(getnative_verify_resume_tests)
+    add_test(NAME getnative_verify_resume_tests COMMAND getnative_verify_resume_tests)
 
     add_executable(getnative_utf8_path_tests tests/utf8_path_test.cpp)
     target_link_libraries(getnative_utf8_path_tests PRIVATE getnative_core)

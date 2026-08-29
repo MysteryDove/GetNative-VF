@@ -152,10 +152,81 @@ function stagedVulkanRuntime() {
   }];
 }
 
+function macosOtoolDependencies(file) {
+  const result = spawnSync("otool", ["-L", file], { encoding: "utf8" });
+  if (result.status !== 0) fail(`otool -L failed for ${file}`);
+  return (result.stdout || "")
+    .split("\n")
+    .slice(1)
+    .map((line) => {
+      const match = /^\s+(\S+)/u.exec(line);
+      return match ? match[1] : null;
+    })
+    .filter(Boolean);
+}
+
+function macosRpaths(file) {
+  const result = spawnSync("otool", ["-l", file], { encoding: "utf8" });
+  if (result.status !== 0) fail(`otool -l failed for ${file}`);
+  const rpaths = [];
+  const lines = (result.stdout || "").split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!/\bLC_RPATH\b/u.test(lines[index])) continue;
+    const pathLine = lines[index + 2] || "";
+    const match = /^\s*path\s+(\S+)/u.exec(pathLine);
+    if (match) rpaths.push(match[1]);
+  }
+  return rpaths;
+}
+
+function rewriteStagedMacosFfmpeg(enginePath, binaryDirectory, libraryNames) {
+  if (process.platform !== "darwin") return;
+  const stagedLibraries = libraryNames
+    .map((name) => join(binaryDirectory, name))
+    .filter((path) => existsSync(path));
+  const targets = [...stagedLibraries, enginePath].filter((path) => existsSync(path));
+  for (const file of targets) {
+    const isLibrary = stagedLibraries.includes(file);
+    if (isLibrary) {
+      const id = spawnSync(
+        "install_name_tool",
+        ["-id", `@loader_path/${basename(file)}`, file],
+        { encoding: "utf8" },
+      );
+      if (id.status !== 0) fail(`install_name_tool -id failed for ${file}`);
+    }
+    for (const dependency of macosOtoolDependencies(file)) {
+      const dependencyName = basename(dependency);
+      if (!libraryNames.includes(dependencyName)) continue;
+      const rewritten = `@loader_path/${dependencyName}`;
+      if (dependency === rewritten) continue;
+      const change = spawnSync(
+        "install_name_tool",
+        ["-change", dependency, rewritten, file],
+        { encoding: "utf8" },
+      );
+      if (change.status !== 0) {
+        fail(`install_name_tool -change failed for ${file} (${dependency})`);
+      }
+    }
+    for (const rpath of macosRpaths(file)) {
+      if (rpath === "@loader_path" || rpath.startsWith("@loader_path/")) continue;
+      const removed = spawnSync(
+        "install_name_tool",
+        ["-delete_rpath", rpath, file],
+        { encoding: "utf8" },
+      );
+      if (removed.status !== 0) {
+        fail(`install_name_tool -delete_rpath failed for ${file} (${rpath})`);
+      }
+    }
+  }
+}
+
 function stageFfmpegRuntime() {
   const runtimeDirectory = process.env.GETNATIVE_FFMPEG_RUNTIME_DIR
-    || (existsSync(defaultFfmpegRuntimeDirectory) ? defaultFfmpegRuntimeDirectory : null)
-    || (autoMacosFfmpegSdkAvailable ? join(autoMacosFfmpegSdkDirectory, "lib") : null);
+    || (autoMacosFfmpegSdkAvailable ? join(autoMacosFfmpegSdkDirectory, "lib") : null)
+    || (existsSync(defaultFfmpegRuntimeDirectory) ? defaultFfmpegRuntimeDirectory : null);
   if (!runtimeDirectory) {
     if (!debug) {
       fail("Release packaging requires GETNATIVE_FFMPEG_RUNTIME_DIR or src-tauri/ffmpeg-runtime");
@@ -373,6 +444,11 @@ const vulkanRuntime = stagedVulkanRuntime();
 const executableName = process.platform === "win32" ? "getnative-engine.exe" : "getnative-engine";
 const stagedEngine = join(stageDirectory, "bin", executableName);
 if (!existsSync(stagedEngine)) fail(`staged engine was not found: ${stagedEngine}`);
+rewriteStagedMacosFfmpeg(
+  stagedEngine,
+  join(stageDirectory, "bin"),
+  ffmpegRuntime.map((entry) => entry.name),
+);
 for (const forbidden of ["ffmpeg", "ffprobe", "ffmpeg.exe", "ffprobe.exe"]) {
   if (existsSync(join(stageDirectory, "bin", forbidden))) {
     fail(`external media executable must not be packaged: ${forbidden}`);

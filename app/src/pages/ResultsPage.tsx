@@ -31,12 +31,19 @@ export function runActualBackend(
   if (!telemetry || typeof telemetry !== "object" || Array.isArray(telemetry)) return null;
   const values = telemetry as Record<string, unknown>;
   const backend = values.backend;
-  if (backend !== "cpu" && backend !== "cuda" && backend !== "vulkan") return null;
+  if (
+    backend !== "cpu"
+    && backend !== "cuda"
+    && backend !== "vulkan"
+    && backend !== "metal"
+  ) return null;
   const deviceKey = backend === "cuda"
     ? "cuda_device"
     : backend === "vulkan"
       ? "vulkan_device"
-      : null;
+      : backend === "metal"
+        ? "metal_device"
+        : null;
   const device = deviceKey && typeof values[deviceKey] === "string"
     ? values[deviceKey] as string
     : undefined;
@@ -84,6 +91,34 @@ export function removeRunGroupFromState(state: ProjectState, groupId: string): P
   const runGroupsById = { ...state.runGroupsById };
   delete runGroupsById[group.id];
   return { ...state, runsById, runGroupsById, verificationReviewsByRunId };
+}
+
+export function nextHistoryFilters(
+  filters: { runGroupFilter: string; sourceFilter: string },
+  nextState: ProjectState,
+  deleted: { kind: "group"; id: string } | { kind: "run"; run: Run },
+): { runGroupFilter: string; sourceFilter: string } {
+  let runGroupFilter = filters.runGroupFilter;
+  let sourceFilter = filters.sourceFilter;
+  if (deleted.kind === "group") {
+    if (runGroupFilter === deleted.id) runGroupFilter = "all";
+  } else {
+    if (runGroupFilter === `run:${deleted.run.id}`) runGroupFilter = "all";
+    if (
+      deleted.run.runGroupId
+      && runGroupFilter === deleted.run.runGroupId
+      && nextState.runGroupsById[deleted.run.runGroupId] === undefined
+    ) {
+      runGroupFilter = "all";
+    }
+  }
+  if (sourceFilter !== "all") {
+    const sourceStillPresent = Object.values(nextState.runsById).some(
+      (run) => run.sourceId === sourceFilter,
+    );
+    if (!sourceStillPresent) sourceFilter = "all";
+  }
+  return { runGroupFilter, sourceFilter };
 }
 
 export function removeRunFromState(state: ProjectState, runId: string): ProjectState {
@@ -261,7 +296,13 @@ export function ResultsPage({
         for (const id of group.memberRunIds) next.delete(id);
         return next;
       });
-      if (runGroupFilter === pendingDelete.id) setRunGroupFilter("all");
+      const nextFilters = nextHistoryFilters(
+        { runGroupFilter, sourceFilter },
+        removeRunGroupFromState(state, pendingDelete.id),
+        { kind: "group", id: pendingDelete.id },
+      );
+      setRunGroupFilter(nextFilters.runGroupFilter);
+      setSourceFilter(nextFilters.sourceFilter);
     } else {
       const run = state.runsById[pendingDelete.id];
       if (!run || ACTIVE_STATUSES.has(run.status)) {
@@ -274,7 +315,13 @@ export function ResultsPage({
         next.delete(pendingDelete.id);
         return next;
       });
-      if (runGroupFilter === `run:${pendingDelete.id}`) setRunGroupFilter("all");
+      const nextFilters = nextHistoryFilters(
+        { runGroupFilter, sourceFilter },
+        removeRunFromState(state, pendingDelete.id),
+        { kind: "run", run },
+      );
+      setRunGroupFilter(nextFilters.runGroupFilter);
+      setSourceFilter(nextFilters.sourceFilter);
     }
     setPendingDelete(null);
   }

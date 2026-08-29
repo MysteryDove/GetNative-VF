@@ -755,7 +755,21 @@ jobs:
           set -euo pipefail
           test "$(uname -s)" = Darwin
           test "$(uname -m)" = arm64
-          rustc -vV
+      - name: Ensure Metal toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! xcrun --find metal >/dev/null 2>&1 || ! xcrun --find metallib >/dev/null 2>&1; then
+            if xcodebuild -help 2>&1 | grep -q -- '-downloadComponent'; then
+              xcode_build="$(xcodebuild -version | awk '/Build version/ {print $3}')"
+              xcodebuild -downloadComponent MetalToolchain -buildVersion "$xcode_build"
+            else
+              echo "Metal compiler tools are unavailable and this Xcode cannot download MetalToolchain" >&2
+              exit 1
+            fi
+          fi
+          xcrun --find metal
+          xcrun --find metallib
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.20.0
@@ -767,6 +781,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable # tracks current stable Rust by design
         with:
           targets: aarch64-apple-darwin
+      - name: Verify packaged Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -vV
+          rustc -vV | grep -q 'host: aarch64-apple-darwin'
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
@@ -793,7 +813,7 @@ jobs:
             libavutil.60.dylib libavfilter.11.dylib libswscale.9.dylib; do
             test -f "$sdk/lib/$library"
             if otool -L "$sdk/lib/$library" | tail -n +2 | \
-                grep -Eq "${sdk}|/opt/homebrew|/usr/local|@rpath"; then
+                grep -Eq "/opt/homebrew|/usr/local|@rpath"; then
               echo "FFmpeg SDK has a non-self-contained dependency: $library" >&2
               exit 1
             fi
@@ -840,6 +860,16 @@ jobs:
                 ;;
             esac
           done < <(otool -L "$engine" | tail -n +2)
+          while IFS= read -r rpath; do
+            case "$rpath" in
+              ""|"@loader_path"|"@loader_path/"*)
+                ;;
+              *)
+                echo "non-self-contained LC_RPATH: $rpath" >&2
+                exit 1
+                ;;
+            esac
+          done < <(otool -l "$engine" | awk '/cmd LC_RPATH/{getline; getline; if ($1=="path") print $2}')
           capabilities=$(mktemp)
           "$engine" capabilities > "$capabilities"
           node - "$capabilities" <<'NODE'

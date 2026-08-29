@@ -62,9 +62,6 @@ class Worker:
         # production defaults remain benchmark-gated off until the warm guard
         # is met on every formal kernel.
         env["GETNATIVE_CUDA_INPUT_CACHE_BYTES"] = str(512 * 1024 * 1024)
-        # Keep the baseline deterministic even when the parent Tauri dev
-        # process enables the experimental multi-session Metal path.
-        env["GETNATIVE_METAL_DECODE_SESSIONS"] = "1"
         if env_overrides:
             env.update(env_overrides)
         self.process = subprocess.Popen(
@@ -1099,7 +1096,7 @@ def main():
                 check("verify-media-software",
                       cpu_terminal["type"] == "result"
                       and len(cpu_results) == 30 and not cpu_warnings
-                      and list(cpu_results) == sorted(cpu_results)
+                      and set(cpu_results) == set(range(30))
                       and cpu_provenance.get("decoder") == "software"
                       and cpu_accepted.get("concurrency") == 2
                       and cpu_telemetry.get("requested_concurrency") == 2
@@ -1127,7 +1124,6 @@ def main():
                     check(f"verify-media-concurrency-{concurrency}",
                           accepted.get("concurrency") == concurrency
                           and terminal["type"] == "result" and close and not warnings
-                          and list(results) == sorted(results)
                           and telemetry.get("requested_concurrency") == concurrency
                           and telemetry.get("effective_concurrency") == concurrency
                           and 1 <= telemetry.get("max_inflight", 0) <= concurrency,
@@ -1152,7 +1148,6 @@ def main():
                           "failed_frames": 0,
                       }
                       and not i_warnings
-                      and list(i_results) == sorted(i_results)
                       and i_telemetry.get("decoded_frames", 1000) <= 30,
                       json.dumps({"accepted": i_accepted,
                                   "terminal": i_terminal,
@@ -1342,9 +1337,7 @@ def main():
                     baseline_payload = baseline_terminal.get("payload", {})
                     baseline_provenance = baseline_payload.get("provenance", {})
                     baseline_telemetry = baseline_payload.get("telemetry", {})
-                    parallel = Worker(env_overrides={
-                        "GETNATIVE_METAL_DECODE_SESSIONS": "2",
-                    })
+                    parallel = Worker()
                     parallel.send(
                         protocol_version=1, type="hello",
                         request_id="vm-metal-parallel-hello")
@@ -1371,7 +1364,6 @@ def main():
                           and parallel_accepted.get("backend") == "metal"
                           and parallel_terminal["type"] == "result"
                           and parallel_close and not parallel_warnings
-                          and list(parallel_results) == sorted(parallel_results)
                           and parallel_provenance.get("decoder") == "videotoolbox"
                           and parallel_provenance.get("zero_copy") is True
                           and parallel_telemetry.get("decode_sessions") == 2

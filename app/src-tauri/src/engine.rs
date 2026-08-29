@@ -207,6 +207,29 @@ pub(crate) fn find_engine(app: &AppHandle) -> Result<PathBuf, String> {
         })
 }
 
+#[cfg(target_os = "macos")]
+fn find_macos_ffmpeg_runtime(engine: &Path) -> Option<PathBuf> {
+    let mut cursor = engine.parent().map(Path::to_path_buf);
+    while let Some(dir) = cursor {
+        let candidate = dir.join(".deps/ffmpeg-macos-vt/lib");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        cursor = dir.parent().map(Path::to_path_buf);
+    }
+    env::current_dir().ok().and_then(|cwd| {
+        let mut cursor = Some(cwd);
+        while let Some(dir) = cursor {
+            let candidate = dir.join(".deps/ffmpeg-macos-vt/lib");
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+            cursor = dir.parent().map(Path::to_path_buf);
+        }
+        None
+    })
+}
+
 /// Launch the console engine without allocating a visible Windows console.
 pub(crate) fn engine_command(path: &Path) -> Command {
     #[cfg(windows)]
@@ -224,16 +247,8 @@ pub(crate) fn engine_command(path: &Path) -> Command {
         {
             let runtime = env::var_os("GETNATIVE_FFMPEG_RUNTIME_DIR")
                 .map(PathBuf::from)
-                .or_else(|| {
-                    path.parent()
-                        .map(|dir| dir.join("../../../../.deps/ffmpeg-macos-vt/lib"))
-                })
-                .or_else(|| {
-                    env::current_dir()
-                        .ok()
-                        .map(|dir| dir.join("../.deps/ffmpeg-macos-vt/lib"))
-                })
-                .filter(|dir| dir.is_dir());
+                .filter(|dir| dir.is_dir())
+                .or_else(|| find_macos_ffmpeg_runtime(path));
             if let Some(runtime) = runtime {
                 let existing = env::var_os("DYLD_LIBRARY_PATH").unwrap_or_default();
                 let value = if existing.is_empty() {

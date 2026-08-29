@@ -71,23 +71,8 @@ cd "${work_dir}/ffmpeg-${ffmpeg_version}"
 make -j "$(sysctl -n hw.logicalcpu 2>/dev/null || echo 4)"
 make install
 
-# The engine executable resolves these via @loader_path (its own directory);
-# bundle-stage/bin receives copies next to getnative-engine at build time.
-# libavfilter is not linked by the engine but is built by configure; rewrite
-# it too so every SDK dylib stays self-consistent.
-libraries="libavformat.62.dylib libavcodec.62.dylib libavutil.60.dylib libswscale.9.dylib"
-all_libraries="$libraries libavfilter.11.dylib"
-for library in $all_libraries; do
-  install_name_tool -id "@loader_path/${library}" "${sdk_dir}/lib/${library}"
-done
-for library in $all_libraries; do
-  for dependency in $all_libraries; do
-    install_name_tool -change \
-      "${sdk_dir}/lib/${dependency}" \
-      "@loader_path/${dependency}" \
-      "${sdk_dir}/lib/${library}" 2>/dev/null || true
-  done
-done
+# Keep prefix install names for link/ctest (BUILD_RPATH). Packaging rewrites
+# staged copies and getnative-engine to @loader_path after install.
 
 legal_dir="${sdk_dir}/share/ffmpeg"
 mkdir -p "${legal_dir}/source"

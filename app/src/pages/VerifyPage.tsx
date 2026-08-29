@@ -16,7 +16,11 @@ import { EmptyInlineAction } from "../components/EmptyInlineAction";
 import { RecipePicker } from "../components/RecipePicker";
 import { RunGroupPlanCard } from "../components/RunGroupPlanCard";
 import { RunLaunchButton } from "../components/RunLaunchButton";
-import { backendOptionLabel, verifySelectableBackends } from "../engine/backendSelection";
+import {
+  backendOptionLabel,
+  reconcileBackendPreference,
+  verifySelectableBackends,
+} from "../engine/backendSelection";
 import {
   defaultVerifyDraft,
   planVerifyRunGroup,
@@ -132,6 +136,18 @@ export function VerifyPage({
       return sourceIds === current.sourceIds ? current : { ...current, sourceIds };
     });
   }, [readyVideoIdsKey]);
+
+  const verifyBackends = useMemo(
+    () => verifySelectableBackends(capabilities),
+    [capabilities],
+  );
+  const verifyBackendsKey = verifyBackends.join(",");
+  useEffect(() => {
+    setDraft((current) => {
+      const next = reconcileBackendPreference(current.backendPreference, verifyBackends);
+      return next === current.backendPreference ? current : { ...current, backendPreference: next };
+    });
+  }, [verifyBackends, verifyBackendsKey]);
 
   const plan = useMemo(() => {
     if (!recipe) return null;
@@ -819,12 +835,13 @@ export function VerifyPage({
                 recipe?.metric?.pNorm ?? 1,
                 undefined,
                 capabilities?.payload.features?.verify_engine_decode !== true,
+                capabilities?.payload.features?.verify_engine_decode === true,
               )}
               onChange={(event) =>
                 patch({ backendPreference: event.target.value as BackendPreference })
               }
             >
-              {verifySelectableBackends(capabilities).map((backend) => (
+              {verifyBackends.map((backend) => (
                 <option key={backend} value={backend}>
                   {backendOptionLabel(
                     t,
@@ -833,6 +850,7 @@ export function VerifyPage({
                     recipe?.metric?.pNorm ?? 1,
                     undefined,
                     capabilities?.payload.features?.verify_engine_decode !== true,
+                    capabilities?.payload.features?.verify_engine_decode === true,
                   )}
                 </option>
               ))}

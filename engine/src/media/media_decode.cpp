@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <chrono>
 #include <cstring>
 #include <exception>
@@ -83,7 +84,8 @@ extern "C" {
     const auto codec_type = videotoolbox_codec_type(decoder);
     return codec_type.has_value() && VTIsHardwareDecodeSupported(*codec_type);
 }
-void configure_videotoolbox_decoder(AVCodecContext &codec, const AVCodec &decoder) {
+void configure_videotoolbox_decoder(
+    AVCodecContext &codec, const AVCodec &decoder, std::size_t frame_concurrency) {
     if (!decoder_supports_videotoolbox(decoder))
         throw std::runtime_error("FFmpeg decoder exposes no VideoToolbox hardware-device configuration");
     AVBufferRef *device_ref = nullptr;
@@ -95,7 +97,7 @@ void configure_videotoolbox_decoder(AVCodecContext &codec, const AVCodec &decode
     }
     codec.hw_device_ctx = device_ref;
     codec.get_format = select_videotoolbox_format;
-    codec.extra_hw_frames = 8;
+    codec.extra_hw_frames = static_cast<int>(8U + frame_concurrency);
 }
 #endif
 
@@ -634,7 +636,7 @@ struct BuiltDecoder {
 #endif
         } else {
 #if defined(__APPLE__)
-            configure_videotoolbox_decoder(*codec, *decoder);
+            configure_videotoolbox_decoder(*codec, *decoder, options->frame_concurrency);
 #else
             throw std::runtime_error("VideoToolbox hardware decode is only available on macOS");
 #endif
@@ -952,6 +954,20 @@ void validate_selected_frames(const MediaIndex &index,
         begin = end;
     }
     return runs;
+}
+
+// Consecutive RAP-sized runs on one hardware session must be decoded as one
+// bitstream, not as a seek-per-GOP loop. VideoToolbox (and other hardware
+// decoders) can stall after the first GOP if the next run seeks without
+// tearing down the hardware context.
+[[nodiscard]] IndexedDecodeRun merge_indexed_decode_runs(
+    std::span<const IndexedDecodeRun> group) {
+    IndexedDecodeRun merged = group.front();
+    merged.selected_end = group.back().selected_end;
+    merged.end_position = group.back().end_position;
+    merged.end_decode_index = group.back().end_decode_index;
+    merged.streaming = true;
+    return merged;
 }
 
 class IndexedIdentityLookup {
@@ -2915,10 +2931,25 @@ void decode_selected_hardware_indexed(
                 current_extradata_index = required_extradata;
             };
 
-            for (std::size_t run_index = run_begin; run_index < run_end; ++run_index) {
+            const auto run_extradata = [&](const IndexedDecodeRun &run)
+                -> std::optional<std::uint32_t> {
+                if (run.decode_anchor >= index.frames.size()) return std::nullopt;
+                return index.frames[run.decode_anchor].extradata_index;
+            };
+
+            for (std::size_t run_index = run_begin; run_index < run_end; ) {
                 if (stop.stop_requested()) throw std::runtime_error("cancelled");
                 if (failed.load(std::memory_order_relaxed)) return;
-                const IndexedDecodeRun &run = runs[run_index];
+                std::size_t group_end = run_index + 1U;
+                const auto group_extradata = run_extradata(runs[run_index]);
+                while (group_end < run_end
+                       && run_extradata(runs[group_end]) == group_extradata) {
+                    ++group_end;
+                }
+                const IndexedDecodeRun run = merge_indexed_decode_runs(
+                    std::span<const IndexedDecodeRun>{
+                        runs.data() + run_index, group_end - run_index});
+                run_index = group_end;
                 std::uint64_t decode_anchor = run.decode_anchor;
                 for (std::size_t attempt = 0U;; ++attempt) {
                     // Every normal run starts at an indexed RAP. Feeding the next
@@ -3246,6 +3277,10 @@ void decode_selected_metal(const std::string &path, const MediaIndex &index,
                 reinterpret_cast<CVPixelBufferRef>(source.data[3]);
             if (pixel_buffer == nullptr || !CVPixelBufferIsPlanar(pixel_buffer)) {
                 throw std::runtime_error("metal_zero_copy_unsupported: VideoToolbox frame has no CVPixelBuffer");
+            }
+            if (CVPixelBufferGetIOSurface(pixel_buffer) == nullptr) {
+                throw std::runtime_error(
+                    "metal_zero_copy_unsupported: VideoToolbox frame has no IOSurface");
             }
             const OSType format = CVPixelBufferGetPixelFormatType(pixel_buffer);
             const char *surface = nullptr;

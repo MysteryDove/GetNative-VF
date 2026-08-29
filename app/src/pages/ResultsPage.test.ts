@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { ProjectState, Run, RunGroup } from "../project/types";
 import { emptyProjectState } from "../project/normalize";
 import {
+  nextHistoryFilters,
   removeRunFromState,
   removeRunGroupFromState,
   runActualBackend,
@@ -27,6 +28,10 @@ describe("runActualBackend", () => {
       backend: "cpu",
       vulkan_device: "stale value",
     }))).toEqual({ backend: "cpu", device: undefined });
+    expect(runActualBackend(runWithTelemetry({
+      backend: "metal",
+      metal_device: "Apple M4 Max",
+    }))).toEqual({ backend: "metal", device: "Apple M4 Max" });
   });
 
   it("keeps older or malformed result payloads compatible", () => {
@@ -145,6 +150,17 @@ describe("Results deletion state", () => {
     const withoutSecond = removeRunFromState(withoutFirst, "second");
     expect(withoutSecond.runGroupsById.group).toBeUndefined();
     expect(withoutSecond.runsById.unrelated).toBeDefined();
+  });
+
+  it("resets a group filter when the last member run is deleted", () => {
+    const state = deletionState();
+    const withoutFirst = removeRunFromState(state, "first");
+    const afterLast = removeRunFromState(withoutFirst, "second");
+    expect(nextHistoryFilters(
+      { runGroupFilter: "group", sourceFilter: "all" },
+      afterLast,
+      { kind: "run", run: withoutFirst.runsById.second },
+    )).toEqual({ runGroupFilter: "all", sourceFilter: "all" });
   });
 
   it("does not delete queued or running data", () => {

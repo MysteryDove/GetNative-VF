@@ -79,6 +79,16 @@ void inverse_rows_f32(
     float *output, std::ptrdiff_t output_row_stride, std::int32_t row_count,
     ColumnDispatchPolicy policy = ColumnDispatchPolicy::automatic);
 
+void forward_columns_f32(
+    const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
+    float *output, std::ptrdiff_t output_row_stride, std::int32_t column_count,
+    ColumnDispatchPolicy policy = ColumnDispatchPolicy::automatic);
+
+void forward_rows_f32(
+    const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
+    float *output, std::ptrdiff_t output_row_stride, std::int32_t row_count,
+    ColumnDispatchPolicy policy = ColumnDispatchPolicy::automatic);
+
 [[nodiscard]] double analyze_axis_candidate_with_column_policy_f32(
     ConstImageView source, const AxisPlan &axis, AnalysisAxes axis_direction,
     const MetricSpec &metric, CpuWorkspace &workspace, ColumnDispatchPolicy policy);

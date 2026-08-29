@@ -98,6 +98,7 @@ struct AnalysisJob {
     std::uint32_t candidate_count;
     std::uint32_t maximum_vector_count;
     std::uint32_t norm;
+    std::uint32_t transposed_source = 0;
 };
 
 struct MetricCropBounds {
@@ -109,7 +110,7 @@ struct MetricCropBounds {
 };
 
 static_assert(sizeof(AxisPlanDescriptor) == 64);
-static_assert(sizeof(AnalysisJob) == 44);
+static_assert(sizeof(AnalysisJob) == 48);
 
 [[nodiscard]] std::string ns_error(NSError *error, std::string_view fallback) {
     if (error == nil) {
@@ -553,6 +554,7 @@ struct ShapePipelines {
 
 struct WorkingBufferSet {
     id<MTLBuffer> source = nil;
+    id<MTLBuffer> transposed = nil;
     id<MTLBuffer> workspace = nil;
     id<MTLBuffer> partials = nil;
     std::size_t resident_bytes = 0;
@@ -561,6 +563,7 @@ struct WorkingBufferSet {
 struct MetalExecutionSlot {
     id<MTLCommandQueue> queue = nil;
     id<MTLBuffer> retained_source_buffer = nil;
+    id<MTLBuffer> retained_transposed_buffer = nil;
     id<MTLBuffer> retained_workspace_buffer = nil;
     id<MTLBuffer> retained_partial_buffer = nil;
     id<MTLBuffer> external_source_buffer = nil;
@@ -620,6 +623,7 @@ struct MetalAnalysisEngine::Impl {
             }
             luma_normalize_r8 = make_pipeline(device, library, @"normalize_luma_r8");
             luma_normalize_r16 = make_pipeline(device, library, @"normalize_luma_r16");
+            transpose_source = make_pipeline(device, library, @"transpose_source");
             for (const PipelineStage stage : all_pipeline_stages) {
                 (void)pipeline(KernelShape::generic, stage);
             }
@@ -656,6 +660,7 @@ struct MetalAnalysisEngine::Impl {
     ShapePipelines generic;
     id<MTLComputePipelineState> luma_normalize_r8;
     id<MTLComputePipelineState> luma_normalize_r16;
+    id<MTLComputePipelineState> transpose_source;
     std::size_t peak_workspace_elements = 0;
     std::size_t peak_working_set_bytes = 0;
     std::size_t buffer_allocation_count = 0;
@@ -726,14 +731,17 @@ struct MetalAnalysisEngine::Impl {
     [[nodiscard]] std::size_t retained_working_buffer_bytes_for(
         const MetalExecutionSlot &slot) const {
         const std::size_t source_bytes = buffer_bytes(slot.retained_source_buffer);
+        const std::size_t transposed_bytes = buffer_bytes(slot.retained_transposed_buffer);
         const std::size_t workspace_bytes = buffer_bytes(slot.retained_workspace_buffer);
         const std::size_t partial_bytes = buffer_bytes(slot.retained_partial_buffer);
-        if (source_bytes > std::numeric_limits<std::size_t>::max() - workspace_bytes
-            || source_bytes + workspace_bytes
+        if (source_bytes > std::numeric_limits<std::size_t>::max() - transposed_bytes
+            || source_bytes + transposed_bytes
+                > std::numeric_limits<std::size_t>::max() - workspace_bytes
+            || source_bytes + transposed_bytes + workspace_bytes
                 > std::numeric_limits<std::size_t>::max() - partial_bytes) {
             throw std::length_error("Metal retained-buffer telemetry overflow");
         }
-        return source_bytes + workspace_bytes + partial_bytes;
+        return source_bytes + transposed_bytes + workspace_bytes + partial_bytes;
     }
 
     [[nodiscard]] std::size_t retained_working_buffer_bytes() const {
@@ -895,6 +903,7 @@ struct MetalAnalysisEngine::Impl {
 
     void clear_retained_working_buffers(MetalExecutionSlot &slot) noexcept {
         slot.retained_source_buffer = nil;
+        slot.retained_transposed_buffer = nil;
         slot.retained_workspace_buffer = nil;
         slot.retained_partial_buffer = nil;
     }
@@ -903,20 +912,43 @@ struct MetalAnalysisEngine::Impl {
         for (const auto &slot : slots) clear_retained_working_buffers(*slot);
     }
 
+    [[nodiscard]] static std::size_t add_working_bytes(
+        std::size_t left, std::size_t right, const char *what) {
+        if (right != 0U && left > std::numeric_limits<std::size_t>::max() - right) {
+            throw std::length_error(std::string{what} + " overflow");
+        }
+        return left + right;
+    }
+
     [[nodiscard]] WorkingBufferSet prepare_working_buffers(
         MetalExecutionSlot &slot,
         std::size_t source_bytes, std::size_t workspace_bytes,
-        std::size_t partial_bytes, ConstImageView source) {
+        std::size_t partial_bytes, std::size_t transpose_bytes,
+        ConstImageView source) {
         const std::scoped_lock lock(mutex);
-        if (source_bytes > std::numeric_limits<std::size_t>::max() - workspace_bytes
-            || source_bytes + workspace_bytes
-                > std::numeric_limits<std::size_t>::max() - partial_bytes) {
-            throw std::length_error("Metal working-buffer size overflow");
-        }
-        const std::size_t active_bytes = source_bytes + workspace_bytes + partial_bytes;
+        const std::size_t active_bytes = add_working_bytes(
+            add_working_bytes(
+                add_working_bytes(source_bytes, transpose_bytes, "Metal working-buffer size"),
+                workspace_bytes, "Metal working-buffer size"),
+            partial_bytes, "Metal working-buffer size");
         working_buffer_active_bytes = active_bytes;
         working_buffer_peak_active_bytes = std::max(
             working_buffer_peak_active_bytes, active_bytes);
+
+        const auto assign_transposed = [&](WorkingBufferSet &result, bool retain_slot) {
+            if (transpose_bytes == 0U) {
+                result.transposed = nil;
+                return;
+            }
+            if (retain_slot) {
+                result.transposed = acquire_retained_buffer(
+                    slot.retained_transposed_buffer, transpose_bytes,
+                    @"GetNative transposed source");
+            } else {
+                result.transposed = allocate_empty_buffer(
+                    transpose_bytes, @"GetNative transposed source", true);
+            }
+        };
 
         WorkingBufferSet result;
         if (slot.external_source_buffer != nil) {
@@ -924,11 +956,15 @@ struct MetalAnalysisEngine::Impl {
                 throw std::logic_error("Metal external source-buffer size mismatch");
             }
             result.source = slot.external_source_buffer;
+            assign_transposed(result, options.reuse_working_buffers);
             result.workspace = allocate_empty_buffer(
                 workspace_bytes, @"GetNative Metal workspace", true);
             result.partials = allocate_empty_buffer(
                 partial_bytes, @"GetNative metric partials", true);
-            result.resident_bytes = source_bytes + workspace_bytes + partial_bytes;
+            result.resident_bytes = add_working_bytes(
+                add_working_bytes(source_bytes, transpose_bytes, "Metal resident working set"),
+                add_working_bytes(workspace_bytes, partial_bytes, "Metal resident working set"),
+                "Metal resident working set");
             external_source_zero_copy = true;
             return result;
         }
@@ -936,22 +972,24 @@ struct MetalAnalysisEngine::Impl {
         if (retain) {
             const std::size_t desired_source = std::max(
                 source_bytes, buffer_bytes(slot.retained_source_buffer));
+            const std::size_t desired_transposed = transpose_bytes == 0U
+                ? buffer_bytes(slot.retained_transposed_buffer)
+                : std::max(transpose_bytes, buffer_bytes(slot.retained_transposed_buffer));
             const std::size_t desired_workspace = std::max(
                 workspace_bytes, buffer_bytes(slot.retained_workspace_buffer));
             const std::size_t desired_partials = std::max(
                 partial_bytes, buffer_bytes(slot.retained_partial_buffer));
-            if (desired_source > std::numeric_limits<std::size_t>::max() - desired_workspace
-                || desired_source + desired_workspace
-                    > std::numeric_limits<std::size_t>::max() - desired_partials) {
-                throw std::length_error("Metal retained-buffer capacity overflow");
-            }
-            retain = desired_source + desired_workspace + desired_partials
-                <= options.retained_working_buffer_limit_bytes;
+            const std::size_t desired_total = add_working_bytes(
+                add_working_bytes(desired_source, desired_transposed, "Metal retained-buffer capacity"),
+                add_working_bytes(desired_workspace, desired_partials, "Metal retained-buffer capacity"),
+                "Metal retained-buffer capacity");
+            retain = desired_total <= options.retained_working_buffer_limit_bytes;
         }
 
         if (retain) {
             result.source = acquire_retained_buffer(
                 slot.retained_source_buffer, source_bytes, @"GetNative source");
+            assign_transposed(result, true);
             result.workspace = acquire_retained_buffer(
                 slot.retained_workspace_buffer, workspace_bytes,
                 @"GetNative Metal workspace");
@@ -965,6 +1003,7 @@ struct MetalAnalysisEngine::Impl {
             clear_retained_working_buffers(slot);
             result.source = allocate_empty_buffer(
                 source_bytes, @"GetNative source", true);
+            assign_transposed(result, false);
             result.workspace = allocate_empty_buffer(
                 workspace_bytes, @"GetNative Metal workspace", true);
             result.partials = allocate_empty_buffer(
@@ -1233,8 +1272,17 @@ void MetalAnalysisEngine::preflight_axis_batch(
             dimensions, candidate, impl_->options.kernel_dispatch));
     }
     const std::size_t workspace_bytes = checked_product(workspace, sizeof(float), "Metal preflight workspace");
-    const std::size_t per_slot = source_bytes + partial_bytes + workspace_bytes;
+    bool needs_horizontal = false;
+    for (const CandidateAnalysis &candidate : candidates) {
+        if (candidate.axes != AnalysisAxes::vertical) {
+            needs_horizontal = true;
+            break;
+        }
+    }
+    const std::size_t transpose_bytes = needs_horizontal ? source_bytes : 0U;
+    const std::size_t per_slot = source_bytes + transpose_bytes + partial_bytes + workspace_bytes;
     if (source_bytes > impl_->info.maximum_buffer_bytes
+        || transpose_bytes > impl_->info.maximum_buffer_bytes
         || partial_bytes > impl_->info.maximum_buffer_bytes
         || workspace_bytes > impl_->info.maximum_buffer_bytes
         || checked_product(per_slot, concurrency, "Metal concurrent working set")
@@ -1245,7 +1293,8 @@ void MetalAnalysisEngine::preflight_axis_batch(
 
 std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
     ConstImageView source, std::span<const CandidateAnalysis> candidates,
-    const MetricSpec &metric, std::stop_token stop) {
+    const MetricSpec &metric, std::stop_token stop,
+    const std::function<void(std::size_t, std::size_t)> &progress) {
     std::unique_ptr<MetalExecutionSlot, std::function<void(MetalExecutionSlot *)>> slot_guard(
         nullptr, [](MetalExecutionSlot *) {});
     if (active_slot == nullptr) {
@@ -1358,11 +1407,22 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
             candidates.size(), groups, "Metal partial results");
         const std::size_t partial_buffer_bytes = checked_product(
             partial_count, sizeof(float), "GetNative metric partials");
+        bool needs_horizontal_transpose = false;
+        for (const TileRange &tile : tiles) {
+            if (tile.signature.axes != AnalysisAxes::vertical) {
+                needs_horizontal_transpose = true;
+                break;
+            }
+        }
+        const std::size_t transpose_bytes =
+            needs_horizontal_transpose ? source_bytes : 0U;
         const WorkingBufferSet working_buffers = impl_->prepare_working_buffers(
-            *active_slot, source_bytes, workspace_buffer_bytes, partial_buffer_bytes, source);
+            *active_slot, source_bytes, workspace_buffer_bytes, partial_buffer_bytes,
+            transpose_bytes, source);
         id<MTLBuffer> source_buffer = working_buffers.source;
         id<MTLBuffer> workspace_buffer = working_buffers.workspace;
         id<MTLBuffer> partial_buffer = working_buffers.partials;
+        id<MTLBuffer> transposed_source = working_buffers.transposed;
         const std::size_t commands_per_tile = impl_->options.profile_split_kernels ? 4 : 1;
         NSMutableArray<id<MTLCommandBuffer>> *commands =
             [NSMutableArray arrayWithCapacity:std::min(tiles.size(), maximum_queued_tiles)
@@ -1395,6 +1455,36 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                 throw std::runtime_error(command_error);
             }
         };
+        if (needs_horizontal_transpose) {
+            id<MTLCommandBuffer> command = [impl_->active_queue() commandBuffer];
+            if (command == nil) {
+                throw std::runtime_error("Metal command buffer creation failed");
+            }
+            command.label = @"GetNative transpose source";
+            id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+            if (encoder == nil) {
+                throw std::runtime_error("Metal transpose encoder creation failed");
+            }
+            const std::uint32_t size[2]{
+                static_cast<std::uint32_t>(source.width),
+                static_cast<std::uint32_t>(source.height),
+            };
+            [encoder setComputePipelineState:impl_->transpose_source];
+            [encoder setBuffer:source_buffer offset:0 atIndex:0];
+            [encoder setBuffer:transposed_source offset:0 atIndex:1];
+            [encoder setBytes:size length:sizeof(size) atIndex:2];
+            [encoder dispatchThreads:MTLSizeMake(
+                static_cast<NSUInteger>(source.width),
+                static_cast<NSUInteger>(source.height), 1)
+                threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+            [encoder endEncoding];
+            [command commit];
+            [commands addObject:command];
+            {
+                const std::scoped_lock lock(impl_->mutex);
+                ++impl_->command_buffer_submission_count;
+            }
+        }
         std::size_t queued_tiles = 0;
         std::size_t queued_plan_bytes = 0;
         const std::size_t persistent_metal_bytes =
@@ -1622,7 +1712,9 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                                                       id<MTLComputePipelineState> pipeline,
                                                       NSUInteger descriptor_offset,
                                                       AnalysisJob stage_job,
-                                                      std::size_t dispatch_count) {
+                                                      std::size_t dispatch_count,
+                                                      id<MTLBuffer> inverse_source,
+                                                      bool transposed) {
                     if (stop.stop_requested()) throw std::runtime_error("Metal analysis cancelled");
                     id<MTLComputeCommandEncoder> inverse = [command computeCommandEncoder];
                     if (inverse == nil) {
@@ -1630,8 +1722,9 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     }
                     inverse.label = @"GetNative inverse axis";
                     [inverse setComputePipelineState:pipeline];
+                    if (transposed) stage_job.transposed_source = 1U;
                     impl_->record_buffer_wiring([&] {
-                        [inverse setBuffer:source_buffer offset:0 atIndex:0];
+                        [inverse setBuffer:inverse_source offset:0 atIndex:0];
                         [inverse setBytes:&stage_job length:sizeof(stage_job) atIndex:1];
                         [inverse setBuffer:plan_arena
                                    offset:descriptor_base + descriptor_offset atIndex:2];
@@ -1764,10 +1857,15 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     inverse_job.maximum_vector_count = packed.maximum_vector_count;
                     const std::size_t inverse_count = checked_product(
                         tile_candidate_count, packed.maximum_vector_count, "Metal inverse dispatch");
+                    const bool horizontal =
+                        tile.signature.axes == AnalysisAxes::horizontal;
+                    id<MTLBuffer> inverse_source =
+                        horizontal ? transposed_source : source_buffer;
                     if (impl_->options.profile_split_kernels) {
                         id<MTLCommandBuffer> inverse_command = make_command(@"GetNative inverse tile");
                         encode_image_inverse(
-                            inverse_command, inverse_pipeline, 0, inverse_job, inverse_count);
+                            inverse_command, inverse_pipeline, 0, inverse_job, inverse_count,
+                            inverse_source, horizontal);
                         submit(inverse_command);
                         id<MTLCommandBuffer> metric_command = make_command(@"GetNative metric tile");
                         encode_reduction(metric_command, metric_pipeline, 0);
@@ -1775,7 +1873,8 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     } else {
                         id<MTLCommandBuffer> command = make_command(@"GetNative axis analysis tile");
                         encode_image_inverse(
-                            command, inverse_pipeline, 0, inverse_job, inverse_count);
+                            command, inverse_pipeline, 0, inverse_job, inverse_count,
+                            inverse_source, horizontal);
                         encode_reduction(command, metric_pipeline, 0);
                         submit(command);
                     }
@@ -1824,7 +1923,8 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     if (impl_->options.profile_split_kernels) {
                         id<MTLCommandBuffer> h_inverse = make_command(@"GetNative two-axis inverse H");
                         encode_image_inverse(h_inverse, horizontal_inverse_pipeline, 0,
-                                             horizontal_inverse_job, horizontal_inverse_count);
+                                             horizontal_inverse_job, horizontal_inverse_count,
+                                             transposed_source, true);
                         submit(h_inverse);
                         id<MTLCommandBuffer> v_inverse = make_command(@"GetNative two-axis inverse V");
                         encode_matrix_inverse(v_inverse, vertical_inverse_pipeline,
@@ -1843,7 +1943,8 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     } else {
                         id<MTLCommandBuffer> command = make_command(@"GetNative two-axis analysis tile");
                         encode_image_inverse(command, horizontal_inverse_pipeline, 0,
-                                             horizontal_inverse_job, horizontal_inverse_count);
+                                             horizontal_inverse_job, horizontal_inverse_count,
+                                             transposed_source, true);
                         encode_matrix_inverse(command, vertical_inverse_pipeline,
                                               vertical_descriptor_offset, vertical_inverse_job,
                                               vertical_inverse_count);
@@ -1860,6 +1961,9 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                 drain_commands();
                 queued_tiles = 0;
                 queued_plan_bytes = 0;
+                if (progress) {
+                    progress(tile.end, candidates.size());
+                }
                 if (stop.stop_requested()) {
                     throw std::runtime_error("Metal analysis cancelled");
                 }
