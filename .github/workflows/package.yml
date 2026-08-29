@@ -786,7 +786,9 @@ jobs:
         run: |
           set -euo pipefail
           rustc -vV
-          rustc -vV | grep -q 'host: aarch64-apple-darwin'
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "rustc host=${host}"
+          test "${host}" = aarch64-apple-darwin
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
