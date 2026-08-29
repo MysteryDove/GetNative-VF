@@ -2,124 +2,121 @@ name: Engine macOS
 
 on:
   push:
+    branches: [main]
   pull_request:
+    paths:
+      - 'engine/**'
+      - 'app/scripts/build-engine.mjs'
+      - '.github/workflows/engine-macos.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: engine-macos-${{ github.workflow }}-${{ github.ref }}
+  group: engine-macos-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  macos-arm64-metal:
+  metal:
     name: macos-15 arm64 Metal
     runs-on: macos-15
+    env:
+      SCCACHE_GHA_ENABLED: "true"
     steps:
-      - name: Check out GetNative-VF
-        uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-
-      - name: Verify runner architecture
-        run: test "$(uname -m)" = arm64
-
-      - name: Ensure Xcode MetalToolchain is installed
+      - name: Ensure Metal toolchain
         shell: bash
         run: |
           set -euo pipefail
-          component_json="$(mktemp)"
-          trap 'rm -f "$component_json"' EXIT
-          xcodebuild -showComponent MetalToolchain -json > "$component_json"
-          metal_status="$(plutil -extract status raw -o - "$component_json")"
-          if [[ "$metal_status" != "installed" ]]; then
-            xcodebuild -downloadComponent MetalToolchain
+          if ! xcrun --find metal >/dev/null 2>&1 || ! xcrun --find metallib >/dev/null 2>&1; then
+            if xcodebuild -help 2>&1 | grep -q -- '-downloadComponent'; then
+              xcode_build="$(xcodebuild -version | awk '/Build version/ {print $3}')"
+              xcodebuild -downloadComponent MetalToolchain -buildVersion "$xcode_build"
+            else
+              echo "Metal compiler tools are unavailable and this Xcode cannot download MetalToolchain" >&2
+              exit 1
+            fi
           fi
-          xcodebuild -showComponent MetalToolchain -json > "$component_json"
-          test "$(plutil -extract status raw -o - "$component_json")" = installed
+          test "$(uname -m)" = arm64
           xcrun --find metal
           xcrun --find metallib
-
-      - name: Configure CPU-only (no SDK lookup regression)
-        run: >-
-          cmake -S engine -B build/engine-macos-cpu
-          -DCMAKE_BUILD_TYPE=Release
-          -DCMAKE_OSX_ARCHITECTURES=arm64
-          -DGETNATIVE_ENABLE_METAL=OFF
-          -DGETNATIVE_ENABLE_VULKAN=OFF
-          -DBUILD_TESTING=ON
-
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
       - name: Configure
         run: >-
-          cmake -S engine -B build/engine-macos
+          cmake -S engine -B build/engine-macos -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_OSX_ARCHITECTURES=arm64
+          -DGETNATIVE_ENABLE_MEDIA=OFF
           -DGETNATIVE_ENABLE_METAL=ON
           -DGETNATIVE_ENABLE_VULKAN=OFF
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           -DBUILD_TESTING=ON
-
       - name: Build
         run: cmake --build build/engine-macos --parallel
-
-      - name: Test core, geometry, SIMD, planner, benchmark support, CLI, and Metal
+      - name: Test
         run: ctest --test-dir build/engine-macos --output-on-failure
 
-  macos-arm64-upstream-conformance:
+  upstream-conformance:
     name: macos-15 arm64 upstream conformance
+    if: github.event_name != 'pull_request'
     runs-on: macos-15
+    env:
+      SCCACHE_GHA_ENABLED: "true"
     steps:
-      - name: Check out GetNative-VF
-        uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-
-      - name: Check out pinned descale reference
-        uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: Irrational-Encoding-Wizardry/descale
           ref: 8c53f5d1297dee286e5a854ae5731103614a0583
           path: upstream/descale
           persist-credentials: false
-
-      - name: Check out pinned zimg reference
-        uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: sekrit-twc/zimg
           ref: 1ad1895d5ff0bbe69c61243f9996aede713d1b5f
           path: upstream/zimg
           persist-credentials: false
-
-      - name: Ensure Xcode MetalToolchain is installed
+      - name: Ensure Metal toolchain
         shell: bash
         run: |
           set -euo pipefail
-          component_json="$(mktemp)"
-          trap 'rm -f "$component_json"' EXIT
-          xcodebuild -showComponent MetalToolchain -json > "$component_json"
-          metal_status="$(plutil -extract status raw -o - "$component_json")"
-          if [[ "$metal_status" != "installed" ]]; then
-            xcodebuild -downloadComponent MetalToolchain
+          if ! xcrun --find metal >/dev/null 2>&1 || ! xcrun --find metallib >/dev/null 2>&1; then
+            if xcodebuild -help 2>&1 | grep -q -- '-downloadComponent'; then
+              xcode_build="$(xcodebuild -version | awk '/Build version/ {print $3}')"
+              xcodebuild -downloadComponent MetalToolchain -buildVersion "$xcode_build"
+            else
+              echo "Metal compiler tools are unavailable and this Xcode cannot download MetalToolchain" >&2
+              exit 1
+            fi
           fi
-          xcodebuild -showComponent MetalToolchain -json > "$component_json"
-          test "$(plutil -extract status raw -o - "$component_json")" = installed
           xcrun --find metal
           xcrun --find metallib
-
-      - name: Configure
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure and build
         run: >-
-          cmake -S engine -B build/engine-macos-upstream
+          cmake -S engine -B build/engine-macos-upstream -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_OSX_ARCHITECTURES=arm64
+          -DGETNATIVE_ENABLE_MEDIA=OFF
           -DGETNATIVE_ENABLE_METAL=ON
           -DGETNATIVE_ENABLE_VULKAN=OFF
           -DGETNATIVE_BUILD_UPSTREAM_CONFORMANCE=ON
+          -DGETNATIVE_PLANNER_FP_MODE=strict
           -DBUILD_TESTING=ON
-
-      - name: Build
-        run: cmake --build build/engine-macos-upstream --parallel
-
-      - name: Test upstream descale/zimg conformance
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          && cmake --build build/engine-macos-upstream --parallel
+      - name: Test upstream conformance
         run: >-
           ctest --test-dir build/engine-macos-upstream --output-on-failure
           -R '^getnative_upstream_conformance_tests$'

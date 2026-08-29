@@ -2,17 +2,12 @@
 
 #include "getnative_vulkan_forward_spv.hpp"
 #include "getnative_vulkan_inverse_spv.hpp"
-#include "getnative_vulkan_inverse_b1_spv.hpp"
-#include "getnative_vulkan_inverse_b3_spv.hpp"
-#include "getnative_vulkan_inverse_b5_spv.hpp"
-#include "getnative_vulkan_inverse_b7_spv.hpp"
-#include "getnative_vulkan_inverse_b9_spv.hpp"
-#include "getnative_vulkan_inverse_b11_spv.hpp"
 #include "getnative_vulkan_luma_spv.hpp"
 #include "getnative_vulkan_metric_spv.hpp"
 #include "getnative_vulkan_transpose_spv.hpp"
 #include "vulkan_abi.hpp"
-#include "vulkan_loader.hpp"
+
+#include <vulkan/vulkan.h>
 
 #include <algorithm>
 #include <array>
@@ -26,7 +21,6 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
-#include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -41,14 +35,6 @@ namespace getnative {
 namespace {
 
 constexpr std::size_t default_workspace_bytes = 512U * 1024U * 1024U;
-constexpr std::array<std::uint32_t, 6U> fixed_bandwidths{1U, 3U, 5U, 7U, 9U, 11U};
-
-[[nodiscard]] std::optional<std::size_t> fixed_bandwidth_index(
-    std::uint32_t bandwidth) noexcept {
-    const auto found = std::find(fixed_bandwidths.begin(), fixed_bandwidths.end(), bandwidth);
-    if (found == fixed_bandwidths.end()) return std::nullopt;
-    return static_cast<std::size_t>(std::distance(fixed_bandwidths.begin(), found));
-}
 
 [[nodiscard]] VulkanDeviceType device_type_from_vk(
     VkPhysicalDeviceType type) noexcept {
@@ -209,9 +195,7 @@ struct InstanceHandle {
         if (messenger != VK_NULL_HANDLE && destroy_messenger != nullptr) {
             destroy_messenger(value, messenger, nullptr);
         }
-        if (value != VK_NULL_HANDLE && vkDestroyInstance != nullptr) {
-            vkDestroyInstance(value, nullptr);
-        }
+        if (value != VK_NULL_HANDLE) vkDestroyInstance(value, nullptr);
     }
     InstanceHandle() = default;
     InstanceHandle(const InstanceHandle &) = delete;
@@ -237,7 +221,6 @@ VKAPI_ATTR VkBool32 VKAPI_CALL validation_callback(
 
 void create_instance(InstanceHandle &instance, bool validation,
                      std::atomic<std::size_t> *validation_errors) {
-    vulkan_detail::ensure_vulkan_loader();
     const char *validation_layer = "VK_LAYER_KHRONOS_validation";
     if (validation && !has_instance_layer(validation_layer)) {
         throw std::runtime_error(
@@ -268,7 +251,6 @@ void create_instance(InstanceHandle &instance, bool validation,
     };
     check_vk(vkCreateInstance(&create_info, nullptr, &instance.value),
              "vkCreateInstance");
-    vulkan_detail::load_vulkan_instance_functions(instance.value);
 
     if (!debug_utils) return;
     const auto create_messenger = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
@@ -343,13 +325,9 @@ struct DeviceRecord {
         record.physical = physical_devices[index];
         VkPhysicalDeviceIDProperties id_properties{};
         id_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
-        VkPhysicalDeviceFloatControlsProperties float_controls{};
-        float_controls.sType =
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES;
-        float_controls.pNext = &id_properties;
         VkPhysicalDeviceProperties2 properties2{};
         properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-        properties2.pNext = &float_controls;
+        properties2.pNext = &id_properties;
         vkGetPhysicalDeviceProperties2(record.physical, &properties2);
         record.properties = properties2.properties;
         vkGetPhysicalDeviceMemoryProperties(record.physical, &record.memory);
@@ -428,8 +406,11 @@ struct DeviceRecord {
                       VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME);
             add_codec(VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR,
                       VK_KHR_VIDEO_DECODE_H265_EXTENSION_NAME);
+#if defined(VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR) \
+    && defined(VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME)
             add_codec(VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR,
                       VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME);
+#endif
 #if defined(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME)
             add_codec(VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR,
                       VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME);
@@ -451,14 +432,6 @@ struct DeviceRecord {
             record.properties.limits.maxStorageBufferRange);
         info.maximum_compute_workgroup_invocations =
             record.properties.limits.maxComputeWorkGroupInvocations;
-        info.shader_signed_zero_inf_nan_preserve_float32 =
-            float_controls.shaderSignedZeroInfNanPreserveFloat32 == VK_TRUE;
-        info.shader_denorm_preserve_float32 =
-            float_controls.shaderDenormPreserveFloat32 == VK_TRUE;
-        info.shader_rounding_mode_rte_float32 =
-            float_controls.shaderRoundingModeRTEFloat32 == VK_TRUE;
-        info.shader_rounding_mode_rtz_float32 =
-            float_controls.shaderRoundingModeRTZFloat32 == VK_TRUE;
         const auto add_video_codec = [&](VkVideoCodecOperationFlagBitsKHR operation,
                                          const char *name) {
             if ((record.video_codec_operations
@@ -468,7 +441,10 @@ struct DeviceRecord {
         };
         add_video_codec(VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR, "h264");
         add_video_codec(VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR, "hevc");
+#if defined(VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR) \
+    && defined(VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME)
         add_video_codec(VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR, "av1");
+#endif
 #if defined(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME)
         add_video_codec(VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR, "vp9");
 #endif
@@ -606,16 +582,6 @@ public:
             extension_names.data(), nullptr};
         check_vk(vkCreateDevice(physical, &device_info, nullptr, &device),
                  "vkCreateDevice");
-        try {
-            vulkan_detail::load_vulkan_device_functions(
-                instance.value, device);
-        } catch (...) {
-            if (vkDestroyDevice != nullptr) {
-                vkDestroyDevice(device, nullptr);
-            }
-            device = VK_NULL_HANDLE;
-            throw;
-        }
         vkGetDeviceQueue(device, queue_family, 0U, &queue);
 
         try {
@@ -654,26 +620,6 @@ public:
             inverse_pipeline = create_pipeline(
                 vulkan_detail::embedded::getnative_vulkan_inverse_spv,
                 sizeof(vulkan_detail::embedded::getnative_vulkan_inverse_spv));
-            const std::array<const std::uint32_t *, 6U> fixed_code{
-                vulkan_detail::embedded::getnative_vulkan_inverse_b1_spv,
-                vulkan_detail::embedded::getnative_vulkan_inverse_b3_spv,
-                vulkan_detail::embedded::getnative_vulkan_inverse_b5_spv,
-                vulkan_detail::embedded::getnative_vulkan_inverse_b7_spv,
-                vulkan_detail::embedded::getnative_vulkan_inverse_b9_spv,
-                vulkan_detail::embedded::getnative_vulkan_inverse_b11_spv,
-            };
-            const std::array<std::size_t, 6U> fixed_bytes{
-                sizeof(vulkan_detail::embedded::getnative_vulkan_inverse_b1_spv),
-                sizeof(vulkan_detail::embedded::getnative_vulkan_inverse_b3_spv),
-                sizeof(vulkan_detail::embedded::getnative_vulkan_inverse_b5_spv),
-                sizeof(vulkan_detail::embedded::getnative_vulkan_inverse_b7_spv),
-                sizeof(vulkan_detail::embedded::getnative_vulkan_inverse_b9_spv),
-                sizeof(vulkan_detail::embedded::getnative_vulkan_inverse_b11_spv),
-            };
-            for (std::size_t index = 0U; index < fixed_inverse_pipelines.size(); ++index) {
-                fixed_inverse_pipelines[index] = create_pipeline(
-                    fixed_code[index], fixed_bytes[index]);
-            }
             forward_pipeline = create_pipeline(
                 vulkan_detail::embedded::getnative_vulkan_forward_spv,
                 sizeof(vulkan_detail::embedded::getnative_vulkan_forward_spv));
@@ -788,7 +734,6 @@ public:
     VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
     VkPipeline transpose_pipeline = VK_NULL_HANDLE;
     VkPipeline inverse_pipeline = VK_NULL_HANDLE;
-    std::array<VkPipeline, 6U> fixed_inverse_pipelines{};
     VkPipeline forward_pipeline = VK_NULL_HANDLE;
     VkPipeline metric_pipeline = VK_NULL_HANDLE;
     VkPipeline luma_pipeline = VK_NULL_HANDLE;
@@ -845,11 +790,6 @@ private:
         }
         if (inverse_pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(device, inverse_pipeline, nullptr);
-        }
-        for (const VkPipeline pipeline : fixed_inverse_pipelines) {
-            if (pipeline != VK_NULL_HANDLE) {
-                vkDestroyPipeline(device, pipeline, nullptr);
-            }
         }
         if (transpose_pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(device, transpose_pipeline, nullptr);
@@ -1003,87 +943,6 @@ private:
     bool coherent_ = false;
 };
 
-class PlanUploadPool {
-    static constexpr std::size_t maximum_retained_slots = 16U;
-
-    struct Slot {
-        Buffer staging;
-    };
-
-public:
-    class Allocation {
-    public:
-        Allocation() = default;
-        ~Allocation() { reset(); }
-        Allocation(const Allocation &) = delete;
-        Allocation &operator=(const Allocation &) = delete;
-        Allocation(Allocation &&other) noexcept
-            : pool_(std::exchange(other.pool_, nullptr)),
-              slot_(std::move(other.slot_)) {}
-        Allocation &operator=(Allocation &&other) noexcept {
-            if (this != &other) {
-                reset();
-                pool_ = std::exchange(other.pool_, nullptr);
-                slot_ = std::move(other.slot_);
-            }
-            return *this;
-        }
-
-        void reset() noexcept {
-            if (pool_ == nullptr) return;
-            pool_->release(std::move(slot_));
-            pool_ = nullptr;
-        }
-        [[nodiscard]] Buffer &staging() noexcept { return slot_->staging; }
-
-    private:
-        Allocation(PlanUploadPool &pool, std::unique_ptr<Slot> slot) noexcept
-            : pool_(&pool), slot_(std::move(slot)) {}
-
-        PlanUploadPool *pool_ = nullptr;
-        std::unique_ptr<Slot> slot_;
-        friend class PlanUploadPool;
-    };
-
-    explicit PlanUploadPool(Context &context) : context_(&context) {}
-
-    [[nodiscard]] Allocation acquire(
-        VkDeviceSize bytes, bool force_non_coherent,
-        std::size_t &allocation_count) {
-        std::unique_ptr<Slot> slot;
-        {
-            const std::scoped_lock lock(mutex_);
-            if (!available_.empty()) {
-                slot = std::move(available_.back());
-                available_.pop_back();
-            }
-        }
-        if (!slot) slot = std::make_unique<Slot>();
-        constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        slot->staging.reserve(
-            *context_, bytes, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-                | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-            force_non_coherent, allocation_count);
-        return Allocation{*this, std::move(slot)};
-    }
-
-private:
-    void release(std::unique_ptr<Slot> slot) noexcept {
-        try {
-            const std::scoped_lock lock(mutex_);
-            if (available_.size() < maximum_retained_slots) {
-                available_.push_back(std::move(slot));
-            }
-        } catch (...) {
-        }
-    }
-
-    Context *context_ = nullptr;
-    std::mutex mutex_;
-    std::vector<std::unique_ptr<Slot>> available_;
-};
-
 class ImageViewHandle {
 public:
     ImageViewHandle() = default;
@@ -1190,8 +1049,10 @@ struct ExecutionSlot {
     VkFence fence = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     VkQueryPool conversion_query_pool = VK_NULL_HANDLE;
+    Buffer host_plan;
     Buffer host_source;
     Buffer host_partials;
+    Buffer device_plan;
     Buffer device_source;
     Buffer device_workspace;
     Buffer device_partials;
@@ -1298,8 +1159,6 @@ struct PackedBatch {
         bool has_horizontal = false;
         bool has_vertical = false;
         bool has_both = false;
-        std::uint32_t horizontal_bandwidth = std::numeric_limits<std::uint32_t>::max();
-        std::uint32_t vertical_bandwidth = std::numeric_limits<std::uint32_t>::max();
     };
     std::vector<std::uint32_t> plan_words;
     std::vector<Tile> tiles;
@@ -1413,23 +1272,9 @@ struct PackedBatch {
             throw std::length_error(
                 "Vulkan candidate exceeds the effective workspace limit");
         }
-        const std::optional<std::uint32_t> horizontal_bandwidth =
-            candidate.axes != AnalysisAxes::vertical
-            ? std::optional{static_cast<std::uint32_t>(candidate.horizontal->half_bandwidth)}
-            : std::nullopt;
-        const std::optional<std::uint32_t> vertical_bandwidth =
-            candidate.axes != AnalysisAxes::horizontal
-            ? std::optional{static_cast<std::uint32_t>(candidate.vertical->half_bandwidth)}
-            : std::nullopt;
-        const bool shape_changed =
-            (horizontal_bandwidth && tile.has_horizontal
-             && tile.horizontal_bandwidth != *horizontal_bandwidth)
-            || (vertical_bandwidth && tile.has_vertical
-                && tile.vertical_bandwidth != *vertical_bandwidth);
         const bool tile_full = tile.candidate_count != 0U
             && (tile.candidate_count >= vulkan_detail::maximum_tile_candidates
-                || total > workspace_limit_elements - tile.workspace_elements
-                || shape_changed);
+                || total > workspace_limit_elements - tile.workspace_elements);
         if (tile_full) {
             packed.workspace_elements = std::max(
                 packed.workspace_elements, tile.workspace_elements);
@@ -1459,8 +1304,6 @@ struct PackedBatch {
         tile.has_vertical = tile.has_vertical
             || candidate.axes != AnalysisAxes::horizontal;
         tile.has_both = tile.has_both || candidate.axes == AnalysisAxes::both;
-        if (horizontal_bandwidth) tile.horizontal_bandwidth = *horizontal_bandwidth;
-        if (vertical_bandwidth) tile.vertical_bandwidth = *vertical_bandwidth;
         packed.has_horizontal = packed.has_horizontal || tile.has_horizontal;
 
         std::memcpy(
@@ -1475,202 +1318,6 @@ struct PackedBatch {
     }
     return packed;
 }
-
-class PreparedBatch {
-    enum class UploadState : std::uint8_t {
-        complete,
-        pending,
-        recording,
-    };
-
-    struct CandidateIdentity {
-        std::shared_ptr<const AxisPlan> horizontal;
-        std::shared_ptr<const AxisPlan> vertical;
-        AnalysisAxes axes = AnalysisAxes::both;
-    };
-
-public:
-    PreparedBatch(
-        Context &context, PlanUploadPool &upload_pool,
-        ConstImageView source, std::span<const CandidateAnalysis> candidates,
-        std::size_t workspace_limit_elements, bool pooled_upload,
-        bool force_non_coherent, std::size_t &allocation_count)
-        : packed(pack_batch(source, candidates, workspace_limit_elements)),
-          context_(&context), source_width_(source.width),
-          source_height_(source.height),
-          workspace_limit_elements_(workspace_limit_elements) {
-        identities_.reserve(candidates.size());
-        for (const CandidateAnalysis &candidate : candidates) {
-            identities_.push_back({
-                candidate.horizontal, candidate.vertical, candidate.axes});
-        }
-        plan_bytes = checked_product(
-            packed.plan_words.size(), sizeof(std::uint32_t),
-            "Vulkan plan buffer");
-        if (plan_bytes > context.info.maximum_storage_buffer_bytes) {
-            throw std::length_error(
-                "Vulkan plan buffer exceeds maxStorageBufferRange");
-        }
-        constexpr VkBufferUsageFlags device_usage =
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-            | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        device_plan.reserve(
-            context, plan_bytes, device_usage,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0U, false,
-            allocation_count,
-            static_cast<VkDeviceSize>(context.info.maximum_storage_buffer_bytes));
-
-        Buffer *upload = nullptr;
-        if (pooled_upload) {
-            pooled_staging_ = upload_pool.acquire(
-                plan_bytes, force_non_coherent, allocation_count);
-            upload = &pooled_staging_.staging();
-            upload_state_ = UploadState::pending;
-        } else {
-            constexpr VkBufferUsageFlags host_usage =
-                VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-            fence_staging_.reserve(
-                context, plan_bytes, host_usage,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-                    | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-                force_non_coherent, allocation_count);
-            upload = &fence_staging_;
-        }
-        std::memcpy(upload->mapped(), packed.plan_words.data(), plan_bytes);
-        upload->flush();
-        if (!pooled_upload) upload_with_fence(*upload);
-    }
-
-    ~PreparedBatch() = default;
-    PreparedBatch(const PreparedBatch &) = delete;
-    PreparedBatch &operator=(const PreparedBatch &) = delete;
-
-    [[nodiscard]] bool matches(
-        ConstImageView source,
-        std::span<const CandidateAnalysis> candidates,
-        std::size_t workspace_limit_elements) const noexcept {
-        if (source.width != source_width_ || source.height != source_height_
-            || workspace_limit_elements != workspace_limit_elements_
-            || candidates.size() != identities_.size()) {
-            return false;
-        }
-        for (std::size_t index = 0U; index < candidates.size(); ++index) {
-            const CandidateIdentity &identity = identities_[index];
-            if (identity.axes != candidates[index].axes
-                || identity.horizontal != candidates[index].horizontal
-                || identity.vertical != candidates[index].vertical) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    [[nodiscard]] bool record_pending_upload(VkCommandBuffer command) {
-        std::unique_lock lock(upload_mutex_);
-        upload_ready_.wait(lock, [&] {
-            return upload_state_ != UploadState::recording;
-        });
-        if (upload_state_ == UploadState::complete) return false;
-        upload_state_ = UploadState::recording;
-        record_upload(command, pooled_staging_.staging());
-        return true;
-    }
-
-    void finish_pending_upload(bool complete) noexcept {
-        {
-            const std::scoped_lock lock(upload_mutex_);
-            if (upload_state_ != UploadState::recording) return;
-            upload_state_ = complete
-                ? UploadState::complete : UploadState::pending;
-            if (complete) pooled_staging_.reset();
-        }
-        upload_ready_.notify_all();
-    }
-
-    PackedBatch packed;
-    Buffer device_plan;
-    std::size_t plan_bytes = 0U;
-
-private:
-    void record_upload(VkCommandBuffer command, const Buffer &staging) const noexcept {
-        const VkBufferCopy copy{
-            0U, 0U, static_cast<VkDeviceSize>(plan_bytes)};
-        vkCmdCopyBuffer(
-            command, staging.get(), device_plan.get(), 1U, &copy);
-        const VkBufferMemoryBarrier barrier{
-            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
-            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-            device_plan.get(), 0U, static_cast<VkDeviceSize>(plan_bytes)};
-        vkCmdPipelineBarrier(
-            command, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0U,
-            0U, nullptr, 1U, &barrier, 0U, nullptr);
-    }
-
-    void upload_with_fence(const Buffer &staging) {
-        VkCommandPool pool = VK_NULL_HANDLE;
-        VkFence fence = VK_NULL_HANDLE;
-        const auto cleanup = [&] {
-            if (fence != VK_NULL_HANDLE) {
-                vkDestroyFence(context_->device, fence, nullptr);
-            }
-            if (pool != VK_NULL_HANDLE) {
-                vkDestroyCommandPool(context_->device, pool, nullptr);
-            }
-        };
-        try {
-            const VkCommandPoolCreateInfo pool_info{
-                VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr,
-                VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, context_->queue_family};
-            check_vk(vkCreateCommandPool(
-                         context_->device, &pool_info, nullptr, &pool),
-                     "vkCreateCommandPool(plan upload)");
-            VkCommandBuffer command = VK_NULL_HANDLE;
-            const VkCommandBufferAllocateInfo command_info{
-                VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr,
-                pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1U};
-            check_vk(vkAllocateCommandBuffers(
-                         context_->device, &command_info, &command),
-                     "vkAllocateCommandBuffers(plan upload)");
-            const VkCommandBufferBeginInfo begin_info{
-                VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr,
-                VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
-            check_vk(vkBeginCommandBuffer(command, &begin_info),
-                     "vkBeginCommandBuffer(plan upload)");
-            record_upload(command, staging);
-            check_vk(vkEndCommandBuffer(command),
-                     "vkEndCommandBuffer(plan upload)");
-            const VkFenceCreateInfo fence_info{
-                VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, 0U};
-            check_vk(vkCreateFence(
-                         context_->device, &fence_info, nullptr, &fence),
-                     "vkCreateFence(plan upload)");
-            context_->submit(command, fence);
-            check_vk(vkWaitForFences(
-                         context_->device, 1U, &fence, VK_TRUE,
-                         std::numeric_limits<std::uint64_t>::max()),
-                     "vkWaitForFences(plan upload)");
-            cleanup();
-            fence_staging_ = {};
-        } catch (...) {
-            cleanup();
-            throw;
-        }
-    }
-
-    Context *context_ = nullptr;
-    std::int32_t source_width_ = 0;
-    std::int32_t source_height_ = 0;
-    std::size_t workspace_limit_elements_ = 0U;
-    std::vector<CandidateIdentity> identities_;
-    PlanUploadPool::Allocation pooled_staging_;
-    Buffer fence_staging_;
-    UploadState upload_state_ = UploadState::complete;
-    std::mutex upload_mutex_;
-    std::condition_variable upload_ready_;
-};
 
 void validate_source_and_metric(ConstImageView source, const MetricSpec &metric,
                                 bool require_host_data = true) {
@@ -1689,8 +1336,8 @@ void validate_source_and_metric(ConstImageView source, const MetricSpec &metric,
         || !std::isfinite(metric.threshold) || metric.threshold < 0.0F) {
         throw std::invalid_argument("invalid Vulkan metric configuration");
     }
-    if (metric.norm != 1U) {
-        throw std::invalid_argument("Vulkan currently supports only p=1");
+    if (metric.norm < vulkan_minimum_p_norm || metric.norm > vulkan_maximum_p_norm) {
+        throw std::invalid_argument("Vulkan supports p-norm in 1..4");
     }
 }
 
@@ -1721,13 +1368,6 @@ private:
 } // namespace
 
 struct VulkanAnalysisEngine::Impl {
-    struct PreparedBatchAcquire {
-        std::shared_ptr<PreparedBatch> prepared;
-        std::size_t allocation_count = 0U;
-        bool cache_hit = false;
-        bool fence_uploaded = false;
-    };
-
     explicit Impl(VulkanAnalysisOptions requested) : options(std::move(requested)) {
         if (options.execution_slots == 0U || options.execution_slots > 8U) {
             throw std::invalid_argument("Vulkan execution_slots must be in [1, 8]");
@@ -1737,16 +1377,7 @@ struct VulkanAnalysisEngine::Impl {
             throw std::invalid_argument(
                 "Vulkan metric_groups_per_candidate must be in [1, 128]");
         }
-        switch (options.kernel_dispatch) {
-        case VulkanKernelDispatchPolicy::automatic:
-        case VulkanKernelDispatchPolicy::generic_only:
-        case VulkanKernelDispatchPolicy::required_specialized:
-            break;
-        default:
-            throw std::invalid_argument("invalid Vulkan kernel dispatch policy");
-        }
         context = std::make_unique<Context>(options, options.execution_slots);
-        plan_upload_pool = std::make_unique<PlanUploadPool>(*context);
         native_context_info.instance = native_value(context->instance.value);
         native_context_info.physical_device = native_value(context->physical);
         native_context_info.device = native_value(context->device);
@@ -1813,19 +1444,9 @@ struct VulkanAnalysisEngine::Impl {
         std::scoped_lock lock(telemetry_mutex);
         telemetry.command_buffer_submission_count +=
             delta.command_buffer_submission_count;
-        telemetry.command_buffer_completion_count +=
-            delta.command_buffer_completion_count;
         telemetry.kernel_dispatch_count += delta.kernel_dispatch_count;
         telemetry.analyzed_candidate_count += delta.analyzed_candidate_count;
         telemetry.tile_count += delta.tile_count;
-        telemetry.generic_inverse_dispatch_count +=
-            delta.generic_inverse_dispatch_count;
-        telemetry.specialized_inverse_dispatch_count +=
-            delta.specialized_inverse_dispatch_count;
-        telemetry.plan_cache_hit_count += delta.plan_cache_hit_count;
-        telemetry.plan_cache_miss_count += delta.plan_cache_miss_count;
-        telemetry.pooled_plan_upload_count += delta.pooled_plan_upload_count;
-        telemetry.fence_plan_upload_count += delta.fence_plan_upload_count;
         telemetry.buffer_allocation_count += delta.buffer_allocation_count;
         telemetry.plan_upload_bytes += delta.plan_upload_bytes;
         telemetry.source_upload_bytes += delta.source_upload_bytes;
@@ -1843,72 +1464,14 @@ struct VulkanAnalysisEngine::Impl {
         telemetry.peak_working_set_bytes = peak_working_set;
     }
 
-    [[nodiscard]] PreparedBatchAcquire acquire_prepared_batch(
-        ConstImageView source,
-        std::span<const CandidateAnalysis> candidates) {
-        {
-            const std::scoped_lock lock(plan_cache_mutex);
-            const auto found = std::find_if(
-                plan_cache.begin(), plan_cache.end(), [&](const auto &entry) {
-                    return entry->matches(
-                        source, candidates, effective_workspace_limit_elements);
-                });
-            if (found != plan_cache.end()) {
-                auto prepared = *found;
-                plan_cache.splice(plan_cache.end(), plan_cache, found);
-                return {std::move(prepared), 0U, true, false};
-            }
-        }
-
-        std::size_t allocations = 0U;
-        const bool pooled_upload = context->timeline_semaphore
-            && !options.force_fence_plan_upload;
-        auto created = std::make_shared<PreparedBatch>(
-            *context, *plan_upload_pool, source, candidates,
-            effective_workspace_limit_elements, pooled_upload,
-            options.force_non_coherent, allocations);
-        std::vector<std::shared_ptr<PreparedBatch>> evicted;
-        {
-            const std::scoped_lock lock(plan_cache_mutex);
-            const auto found = std::find_if(
-                plan_cache.begin(), plan_cache.end(), [&](const auto &entry) {
-                    return entry->matches(
-                        source, candidates, effective_workspace_limit_elements);
-                });
-            if (found != plan_cache.end()) {
-                auto prepared = *found;
-                plan_cache.splice(plan_cache.end(), plan_cache, found);
-                return {std::move(prepared), allocations, true, false};
-            }
-            plan_cache_bytes = checked_add(
-                plan_cache_bytes, created->plan_bytes,
-                "Vulkan prepared-plan cache");
-            plan_cache.push_back(created);
-            while (plan_cache_bytes > plan_cache_capacity_bytes
-                   && plan_cache.size() > 1U) {
-                plan_cache_bytes -= plan_cache.front()->plan_bytes;
-                evicted.push_back(std::move(plan_cache.front()));
-                plan_cache.pop_front();
-            }
-        }
-        return {
-            std::move(created), allocations, false, !pooled_upload};
-    }
-
     VulkanAnalysisOptions options;
     VulkanNativeContextInfo native_context_info;
     std::unique_ptr<Context> context;
-    std::unique_ptr<PlanUploadPool> plan_upload_pool;
     std::vector<std::unique_ptr<ExecutionSlot>> slots;
     std::vector<bool> slot_busy;
     std::mutex slot_mutex;
     std::condition_variable slot_available;
     std::size_t effective_workspace_limit_elements = 0U;
-    static constexpr std::size_t plan_cache_capacity_bytes =
-        64U * 1024U * 1024U;
-    std::mutex plan_cache_mutex;
-    std::list<std::shared_ptr<PreparedBatch>> plan_cache;
-    std::size_t plan_cache_bytes = 0U;
     mutable std::mutex telemetry_mutex;
     VulkanRuntimeTelemetry telemetry;
     std::size_t peak_workspace = 0U;
@@ -1924,59 +1487,6 @@ VulkanRuntimeProbe vulkan_runtime_probe() noexcept {
         std::vector<DeviceRecord> records = device_records(instance.value);
         probe.devices.reserve(records.size());
         for (DeviceRecord &record : records) {
-            if (record.info.backend_compatible) {
-                try {
-                    VulkanAnalysisOptions options;
-                    options.device_index = record.info.index;
-                    options.execution_slots = 1U;
-                    VulkanAnalysisEngine engine(options);
-                    constexpr std::int32_t width = 16;
-                    constexpr std::int32_t height = 12;
-                    std::vector<float> source_storage(
-                        static_cast<std::size_t>(width * height));
-                    for (std::int32_t y = 0; y < height; ++y) {
-                        for (std::int32_t x = 0; x < width; ++x) {
-                            source_storage[static_cast<std::size_t>(y * width + x)] =
-                                static_cast<float>(
-                                    0.31 + 0.17 * std::sin(0.23 * x)
-                                    + 0.11 * std::cos(0.19 * y));
-                        }
-                    }
-                    const ConstImageView source{
-                        source_storage.data(), width, height, width};
-                    const auto horizontal = std::make_shared<const AxisPlan>(
-                        build_axis_plan({
-                            width, 12, 12.0, 0.0, Filter::bilinear(),
-                            BorderMode::mirror}));
-                    const auto vertical = std::make_shared<const AxisPlan>(
-                        build_axis_plan({
-                            height, 8, 8.0, 0.0, Filter::spline36(),
-                            BorderMode::mirror}));
-                    const CandidateAnalysis candidate{
-                        "vulkan-runtime-self-test", horizontal, vertical,
-                        AnalysisAxes::both};
-                    const MetricSpec metric{1, 1, 1, 1, 0.015F, 1U};
-                    CpuWorkspace workspace;
-                    const double expected = analyze_candidate_f32(
-                        source, *horizontal, *vertical, metric, workspace);
-                    const std::array candidates{candidate};
-                    const auto actual = engine.analyze_axis_batch_f32(
-                        source, candidates, metric);
-                    const double tolerance = std::max(
-                        1e-7, 5e-4 * std::abs(expected));
-                    if (actual.size() != 1U
-                        || !std::isfinite(actual.front().error)
-                        || std::abs(actual.front().error - expected) > tolerance) {
-                        throw std::runtime_error(
-                            "strict Float32 self-test exceeded the numerical tolerance");
-                    }
-                } catch (const std::exception &error) {
-                    record.info.backend_compatible = false;
-                    record.info.incompatibility_reason =
-                        std::string{"pipeline/conformance initialization failed: "}
-                        + error.what();
-                }
-            }
             probe.device_available = probe.device_available
                 || record.info.backend_compatible;
             probe.devices.push_back(std::move(record.info));
@@ -2187,15 +1697,10 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
     ScopeExit release_slot{[&] { impl_->release_slot(slot_index); }};
 
     const auto pack_start = std::chrono::steady_clock::now();
-    auto prepared_acquire = impl_->acquire_prepared_batch(source, candidates);
-    std::shared_ptr<PreparedBatch> prepared =
-        std::move(prepared_acquire.prepared);
-    const PackedBatch &packed = prepared->packed;
+    PackedBatch packed = pack_batch(
+        source, candidates, impl_->effective_workspace_limit_elements);
     delta.host_pack_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - pack_start).count();
-    delta.plan_cache_hit_count = prepared_acquire.cache_hit ? 1U : 0U;
-    delta.plan_cache_miss_count = prepared_acquire.cache_hit ? 0U : 1U;
-    delta.fence_plan_upload_count = prepared_acquire.fence_uploaded ? 1U : 0U;
     if (stop.stop_requested()) throw std::runtime_error("Vulkan analysis cancelled");
 
     const std::size_t source_elements = checked_product(
@@ -2205,7 +1710,8 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
         source_elements, sizeof(float), "Vulkan source buffer");
     const std::size_t device_source_bytes = checked_product(
         source_bytes, 2U, "Vulkan source and transpose buffer");
-    const std::size_t plan_bytes = prepared->plan_bytes;
+    const std::size_t plan_bytes = checked_product(
+        packed.plan_words.size(), sizeof(std::uint32_t), "Vulkan plan buffer");
     const std::size_t workspace_bytes = checked_product(
         packed.workspace_elements, sizeof(float), "Vulkan workspace buffer");
     const std::size_t metric_groups = std::min<std::size_t>(
@@ -2225,13 +1731,18 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
             "Vulkan storage buffer exceeds maxStorageBufferRange");
     }
 
-    std::size_t allocations = prepared_acquire.allocation_count;
+    std::size_t allocations = 0U;
     constexpr VkBufferUsageFlags host_usage =
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     constexpr VkBufferUsageFlags device_usage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
         | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
         | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    slot.host_plan.reserve(
+        *impl_->context, plan_bytes, host_usage,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        impl_->options.force_non_coherent, allocations);
     if (device_source == nullptr) {
         slot.host_source.reserve(
             *impl_->context, source_bytes, host_usage,
@@ -2244,6 +1755,10 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
         impl_->options.force_non_coherent, allocations);
+    slot.device_plan.reserve(
+        *impl_->context, plan_bytes, device_usage,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0U, false, allocations,
+        static_cast<VkDeviceSize>(storage_limit));
     slot.device_source.reserve(
         *impl_->context, device_source_bytes, device_usage,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0U, false, allocations,
@@ -2259,6 +1774,7 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
         static_cast<VkDeviceSize>(storage_limit));
     delta.buffer_allocation_count = allocations;
 
+    std::memcpy(slot.host_plan.mapped(), packed.plan_words.data(), plan_bytes);
     if (device_source == nullptr) {
         float *staged_source = static_cast<float *>(slot.host_source.mapped());
         for (std::int32_t row = 0; row < source.height; ++row) {
@@ -2270,6 +1786,7 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
         }
         slot.host_source.flush();
     }
+    slot.host_plan.flush();
 
     ImageViewHandle luma_view;
     if (device_source != nullptr) {
@@ -2277,7 +1794,7 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
     }
 
     const std::array<VkDescriptorBufferInfo, 4U> buffer_infos{{
-        {prepared->device_plan.get(), 0U, static_cast<VkDeviceSize>(plan_bytes)},
+        {slot.device_plan.get(), 0U, static_cast<VkDeviceSize>(plan_bytes)},
         {slot.device_source.get(), 0U, static_cast<VkDeviceSize>(device_source_bytes)},
         {slot.device_workspace.get(), 0U, static_cast<VkDeviceSize>(workspace_bytes)},
         {slot.device_partials.get(), 0U, static_cast<VkDeviceSize>(partial_bytes)},
@@ -2318,14 +1835,9 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
         && slot.conversion_query_pool != VK_NULL_HANDLE) {
         vkCmdResetQueryPool(slot.command, slot.conversion_query_pool, 0U, 2U);
     }
-    const bool plan_upload_recorded =
-        prepared->record_pending_upload(slot.command);
-    bool plan_upload_finished = false;
-    ScopeExit finish_plan_upload{[&] {
-        if (plan_upload_recorded && !plan_upload_finished) {
-            prepared->finish_pending_upload(false);
-        }
-    }};
+    const VkBufferCopy plan_copy{0U, 0U, static_cast<VkDeviceSize>(plan_bytes)};
+    vkCmdCopyBuffer(slot.command, slot.host_plan.get(), slot.device_plan.get(),
+                    1U, &plan_copy);
     if (device_source == nullptr) {
         const VkBufferCopy source_copy{
             0U, 0U, static_cast<VkDeviceSize>(source_bytes)};
@@ -2369,6 +1881,8 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
     push[0] = static_cast<std::uint32_t>(source.width);
     push[1] = static_cast<std::uint32_t>(source.height);
     push[2] = checked_u32(source_elements, "Vulkan source elements");
+    // Keep metric norm separate from the inverse dispatch's vertical flag.
+    push[5] = metric.norm;
     push[6] = checked_u32(metric_groups, "Vulkan metric group count");
     push[7] = static_cast<std::uint32_t>(metric.crop_left);
     push[8] = static_cast<std::uint32_t>(metric.crop_right);
@@ -2387,22 +1901,6 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
             static_cast<std::uint32_t>(sizeof(push)), push.data());
     };
     std::size_t dispatches = 0U;
-    const auto inverse_pipeline = [&](std::uint32_t bandwidth) {
-        const auto fixed = fixed_bandwidth_index(bandwidth);
-        if (impl_->options.kernel_dispatch
-                == VulkanKernelDispatchPolicy::generic_only
-            || !fixed.has_value()) {
-            if (impl_->options.kernel_dispatch
-                    == VulkanKernelDispatchPolicy::required_specialized) {
-                throw std::invalid_argument(
-                    "Vulkan required specialized inverse has no fixed-bandwidth pipeline");
-            }
-            ++delta.generic_inverse_dispatch_count;
-            return impl_->context->inverse_pipeline;
-        }
-        ++delta.specialized_inverse_dispatch_count;
-        return impl_->context->fixed_inverse_pipelines[*fixed];
-    };
     if (device_source != nullptr) {
         if (slot.conversion_query_pool != VK_NULL_HANDLE) {
             vkCmdWriteTimestamp(
@@ -2448,7 +1946,7 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
         if (tile.has_horizontal) {
             push[12] = 0U;
             vkCmdBindPipeline(slot.command, VK_PIPELINE_BIND_POINT_COMPUTE,
-                              inverse_pipeline(tile.horizontal_bandwidth));
+                              impl_->context->inverse_pipeline);
             write_push();
             vkCmdDispatch(
                 slot.command,
@@ -2463,7 +1961,7 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
         if (tile.has_vertical) {
             push[12] = 1U;
             vkCmdBindPipeline(slot.command, VK_PIPELINE_BIND_POINT_COMPUTE,
-                              inverse_pipeline(tile.vertical_bandwidth));
+                              impl_->context->inverse_pipeline);
             write_push();
             vkCmdDispatch(
                 slot.command,
@@ -2533,11 +2031,6 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
                  impl_->context->device, 1U, &slot.fence, VK_TRUE,
                  std::numeric_limits<std::uint64_t>::max()),
              "vkWaitForFences");
-    if (plan_upload_recorded) {
-        prepared->finish_pending_upload(true);
-        plan_upload_finished = true;
-        delta.pooled_plan_upload_count = 1U;
-    }
     delta.gpu_execution_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - gpu_start).count();
     slot.host_partials.invalidate();
@@ -2573,19 +2066,18 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
         for (std::size_t group = 0U; group < metric_groups; ++group) {
             sum += static_cast<double>(partials[candidate * metric_groups + group]);
         }
-        results.push_back({candidates[candidate].id, sum / pixel_count});
+        const double mean = sum / pixel_count;
+        results.push_back({candidates[candidate].id,
+                           metric.norm == 1U
+                               ? mean
+                               : std::pow(mean, 1.0 / static_cast<double>(metric.norm))});
     }
 
-    delta.command_buffer_submission_count =
-        1U + (prepared_acquire.fence_uploaded ? 1U : 0U);
-    delta.command_buffer_completion_count =
-        delta.command_buffer_submission_count;
+    delta.command_buffer_submission_count = 1U;
     delta.kernel_dispatch_count = dispatches;
     delta.analyzed_candidate_count = candidates.size();
     delta.tile_count = packed.tiles.size();
-    delta.plan_upload_bytes =
-        (plan_upload_recorded || prepared_acquire.fence_uploaded)
-        ? plan_bytes : 0U;
+    delta.plan_upload_bytes = plan_bytes;
     delta.source_upload_bytes = device_source == nullptr ? source_bytes : 0U;
     delta.source_conversion_bytes = device_source != nullptr ? source_bytes : 0U;
     delta.source_conversion_count = device_source != nullptr ? 1U : 0U;

@@ -1,0 +1,525 @@
+import { createHash } from "node:crypto";
+import {
+  cpSync,
+  copyFileSync,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+
+const scriptDirectory = dirname(fileURLToPath(import.meta.url));
+const appDirectory = resolve(scriptDirectory, "..");
+const repositoryDirectory = resolve(appDirectory, "..");
+const sourceDirectory = join(repositoryDirectory, "engine");
+const stageDirectory = join(appDirectory, "src-tauri", "bundle-stage");
+const defaultFfmpegRuntimeDirectory = join(appDirectory, "src-tauri", "ffmpeg-runtime");
+// Local macOS SDK produced by scripts/build-ffmpeg-macos.sh; used when the
+// GETNATIVE_FFMPEG_* environment overrides are not set.
+const autoMacosFfmpegSdkDirectory = join(repositoryDirectory, ".deps", "ffmpeg-macos-vt");
+const autoMacosFfmpegSdkAvailable = process.platform === "darwin"
+  && existsSync(join(autoMacosFfmpegSdkDirectory, "include"))
+  && existsSync(join(autoMacosFfmpegSdkDirectory, "lib"));
+const debug = process.argv.includes("--debug");
+// Debug and release use separate build trees so switching dev modes never
+// forces a full rebuild of the other configuration.
+const buildDirectory = join(repositoryDirectory, "build", debug ? "engine-debug" : "engine");
+const skipTests = process.argv.includes("--skip-tests");
+const buildType = debug ? "Debug" : "Release";
+const ffmpegRuntimePatterns = process.platform === "win32"
+  ? [/^avformat-62\.dll$/iu, /^avcodec-62\.dll$/iu,
+    /^avutil-60\.dll$/iu, /^swscale-9\.dll$/iu]
+  : process.platform === "darwin"
+    ? [/^libavformat\.62\.dylib$/u, /^libavcodec\.62\.dylib$/u,
+      /^libavutil\.60\.dylib$/u, /^libswscale\.9\.dylib$/u]
+    : [/^libavformat\.so\.62$/u, /^libavcodec\.so\.62$/u,
+      /^libavutil\.so\.60$/u, /^libswscale\.so\.9$/u];
+const managedFfmpegPatterns = [
+  /^avformat-62\.dll$/iu,
+  /^avcodec-62\.dll$/iu,
+  /^avutil-60\.dll$/iu,
+  /^swscale-9\.dll$/iu,
+  /^libavformat\.so\.62(?:\.|$)/u,
+  /^libavcodec\.so\.62(?:\.|$)/u,
+  /^libavutil\.so\.60(?:\.|$)/u,
+  /^libswscale\.so\.9(?:\.|$)/u,
+  /^libavformat\.62\.dylib$/u,
+  /^libavcodec\.62\.dylib$/u,
+  /^libavutil\.60\.dylib$/u,
+  /^libswscale\.9\.dylib$/u,
+];
+const managedVulkanPatterns = [/^vulkan-1\.dll$/iu, /^libvulkan\.so\.1$/u];
+
+function fail(message) {
+  console.error(message);
+  process.exit(1);
+}
+
+function run(command, args, environment) {
+  const result = spawnSync(command, args, {
+    cwd: appDirectory,
+    env: environment,
+    stdio: "inherit",
+    windowsHide: true,
+  });
+  if (result.error) fail(`${command} failed to start: ${result.error.message}`);
+  if (result.status !== 0) process.exit(result.status ?? 1);
+}
+
+function replaceEnvironmentEntry(environment, name, value) {
+  for (const key of Object.keys(environment)) {
+    if (key.toLowerCase() === name.toLowerCase()) delete environment[key];
+  }
+  environment[name] = value;
+}
+
+function environmentEntry(environment, name) {
+  const key = Object.keys(environment)
+    .find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+  return key ? environment[key] : undefined;
+}
+
+function enabled(value) {
+  return ["1", "on", "true", "yes"].includes((value || "").toLowerCase());
+}
+
+function cudaToolkitRoots() {
+  return [
+    process.env.GETNATIVE_CUDA_ROOT,
+    process.env.CUDAToolkit_ROOT,
+    process.env.CUDA_PATH,
+    process.env.CUDA_HOME,
+    "/usr/local/cuda",
+  ].filter(Boolean);
+}
+
+function cudaToolkitAvailable() {
+  const executable = process.platform === "win32" ? "nvcc.exe" : "nvcc";
+  return cudaToolkitRoots().some((root) => existsSync(join(root, "bin", executable)));
+}
+
+function cudaToolkitVersion() {
+  if (process.env.CUDA_TOOLKIT_VERSION) return process.env.CUDA_TOOLKIT_VERSION;
+  for (const root of cudaToolkitRoots()) {
+    const manifest = join(root, "version.json");
+    if (!existsSync(manifest)) continue;
+    try {
+      const version = JSON.parse(readFileSync(manifest, "utf8"))?.cuda?.version;
+      if (typeof version === "string" && version.length > 0) return version;
+    } catch {
+      // Continue to another toolkit root when a manifest is incomplete.
+    }
+  }
+  return "unknown";
+}
+
+function vulkanSdkVersion() {
+  if (process.env.VULKAN_SDK_VERSION) return process.env.VULKAN_SDK_VERSION;
+  if (process.env.VULKAN_SDK) {
+    const version = basename(resolve(process.env.VULKAN_SDK));
+    if (/^\d+\.\d+\.\d+(?:\.\d+)?$/u.test(version)) return version;
+  }
+  return "unknown";
+}
+
+function cleanManagedStageFiles() {
+  const binaryDirectory = join(stageDirectory, "bin");
+  if (!existsSync(binaryDirectory)) return;
+  for (const name of readdirSync(binaryDirectory)) {
+    const managedEngine = name === "getnative-engine" || name === "getnative-engine.exe";
+    const managedFfmpeg = managedFfmpegPatterns.some((pattern) => pattern.test(name));
+    const managedVulkan = managedVulkanPatterns.some((pattern) => pattern.test(name));
+    const forbiddenSidecar = /^(?:ffmpeg|ffprobe)(?:\.exe)?$/iu.test(name);
+    if (managedEngine || managedFfmpeg || managedVulkan || forbiddenSidecar) {
+      rmSync(join(binaryDirectory, name));
+    }
+  }
+}
+
+function stagedVulkanRuntime() {
+  if (!vulkanEnabled) return [];
+  const name = process.platform === "win32" ? "vulkan-1.dll" : "libvulkan.so.1";
+  const runtime = join(stageDirectory, "bin", name);
+  if (!existsSync(runtime)) fail(`staged Vulkan loader was not found: ${runtime}`);
+  return [{
+    name,
+    source_sha256: createHash("sha256").update(readFileSync(runtime)).digest("hex"),
+  }];
+}
+
+function macosOtoolDependencies(file) {
+  const result = spawnSync("otool", ["-L", file], { encoding: "utf8" });
+  if (result.status !== 0) fail(`otool -L failed for ${file}`);
+  return (result.stdout || "")
+    .split("\n")
+    .slice(1)
+    .map((line) => {
+      const match = /^\s+(\S+)/u.exec(line);
+      return match ? match[1] : null;
+    })
+    .filter(Boolean);
+}
+
+function macosRpaths(file) {
+  const result = spawnSync("otool", ["-l", file], { encoding: "utf8" });
+  if (result.status !== 0) fail(`otool -l failed for ${file}`);
+  const rpaths = [];
+  const lines = (result.stdout || "").split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!/\bLC_RPATH\b/u.test(lines[index])) continue;
+    const pathLine = lines[index + 2] || "";
+    const match = /^\s*path\s+(\S+)/u.exec(pathLine);
+    if (match) rpaths.push(match[1]);
+  }
+  return rpaths;
+}
+
+function rewriteStagedMacosFfmpeg(enginePath, binaryDirectory, libraryNames) {
+  if (process.platform !== "darwin") return;
+  const stagedLibraries = libraryNames
+    .map((name) => join(binaryDirectory, name))
+    .filter((path) => existsSync(path));
+  const targets = [...stagedLibraries, enginePath].filter((path) => existsSync(path));
+  for (const file of targets) {
+    const isLibrary = stagedLibraries.includes(file);
+    if (isLibrary) {
+      const id = spawnSync(
+        "install_name_tool",
+        ["-id", `@loader_path/${basename(file)}`, file],
+        { encoding: "utf8" },
+      );
+      if (id.status !== 0) fail(`install_name_tool -id failed for ${file}`);
+    }
+    for (const dependency of macosOtoolDependencies(file)) {
+      const dependencyName = basename(dependency);
+      if (!libraryNames.includes(dependencyName)) continue;
+      const rewritten = `@loader_path/${dependencyName}`;
+      if (dependency === rewritten) continue;
+      const change = spawnSync(
+        "install_name_tool",
+        ["-change", dependency, rewritten, file],
+        { encoding: "utf8" },
+      );
+      if (change.status !== 0) {
+        fail(`install_name_tool -change failed for ${file} (${dependency})`);
+      }
+    }
+    for (const rpath of macosRpaths(file)) {
+      if (rpath === "@loader_path" || rpath.startsWith("@loader_path/")) continue;
+      const removed = spawnSync(
+        "install_name_tool",
+        ["-delete_rpath", rpath, file],
+        { encoding: "utf8" },
+      );
+      if (removed.status !== 0) {
+        fail(`install_name_tool -delete_rpath failed for ${file} (${rpath})`);
+      }
+    }
+  }
+}
+
+function stageFfmpegRuntime() {
+  const runtimeDirectory = process.env.GETNATIVE_FFMPEG_RUNTIME_DIR
+    || (autoMacosFfmpegSdkAvailable ? join(autoMacosFfmpegSdkDirectory, "lib") : null)
+    || (existsSync(defaultFfmpegRuntimeDirectory) ? defaultFfmpegRuntimeDirectory : null);
+  if (!runtimeDirectory) {
+    if (!debug) {
+      fail("Release packaging requires GETNATIVE_FFMPEG_RUNTIME_DIR or src-tauri/ffmpeg-runtime");
+    }
+    return [];
+  }
+  const resolved = resolve(runtimeDirectory);
+  if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
+    fail(`GETNATIVE_FFMPEG_RUNTIME_DIR is not a directory: ${resolved}`);
+  }
+  const directoryEntries = readdirSync(resolved);
+  for (const pattern of ffmpegRuntimePatterns) {
+    if (!directoryEntries.some((entry) => pattern.test(entry))) {
+      fail(`FFmpeg runtime bundle is missing ${pattern}`);
+    }
+  }
+  const entries = directoryEntries
+    .filter((name) => ffmpegRuntimePatterns.some((pattern) => pattern.test(name)))
+    .sort();
+  const legalDirectory = resolve(process.env.GETNATIVE_FFMPEG_LEGAL_DIR
+    || (resolved === resolve(defaultFfmpegRuntimeDirectory)
+      ? join(stageDirectory, "share", "ffmpeg")
+      : join(resolved, "..", "share", "ffmpeg")));
+  if (!existsSync(legalDirectory) || !statSync(legalDirectory).isDirectory()) {
+    fail(`FFmpeg legal materials were not found: ${legalDirectory}`);
+  }
+  const buildInfo = join(legalDirectory, "BUILD_INFO.txt");
+  if (!existsSync(buildInfo)) fail(`FFmpeg build information was not found: ${buildInfo}`);
+  const configuration = readFileSync(buildInfo, "utf8");
+  for (const required of ["--disable-gpl", "--disable-nonfree", "--disable-programs"]) {
+    if (!configuration.includes(required)) {
+      fail(`FFmpeg build information is missing ${required}`);
+    }
+  }
+  for (const forbidden of ["--enable-gpl", "--enable-nonfree"]) {
+    if (configuration.includes(forbidden)) {
+      fail(`FFmpeg runtime was built with forbidden option ${forbidden}`);
+    }
+  }
+  const stagedLegalDirectory = resolve(stageDirectory, "share", "ffmpeg");
+  if (legalDirectory !== stagedLegalDirectory) {
+    rmSync(stagedLegalDirectory, { recursive: true, force: true });
+    cpSync(legalDirectory, stagedLegalDirectory, { recursive: true });
+  }
+  return entries.map((name) => {
+    const source = join(resolved, name);
+    const destination = join(stageDirectory, "bin", name);
+    copyFileSync(source, destination);
+    return {
+      name,
+      sha256: createHash("sha256").update(readFileSync(destination)).digest("hex"),
+    };
+  });
+}
+
+function visualStudioEnvironment(baseEnvironment) {
+  const defaultDevCommand =
+    "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\Common7\\Tools\\VsDevCmd.bat";
+  const devCommand = process.env.GETNATIVE_VSDEVCMD || defaultDevCommand;
+  if (!existsSync(devCommand)) {
+    fail(`Visual Studio developer command file was not found: ${devCommand}`);
+  }
+  const result = spawnSync(
+    "cmd.exe",
+    ["/d", "/s", "/c", `call "${devCommand}" -arch=x64 -host_arch=x64 >nul && set`],
+    {
+      cwd: appDirectory,
+      env: baseEnvironment,
+      encoding: "utf8",
+      windowsHide: true,
+      windowsVerbatimArguments: true,
+    },
+  );
+  if (result.error || result.status !== 0) {
+    fail(`Visual Studio developer environment failed: ${result.error?.message || result.stderr}`);
+  }
+  const environment = { ...baseEnvironment };
+  for (const line of result.stdout.split(/\r?\n/u)) {
+    const separator = line.indexOf("=");
+    if (separator <= 0) continue;
+    replaceEnvironmentEntry(
+      environment,
+      line.slice(0, separator),
+      line.slice(separator + 1),
+    );
+  }
+  return environment;
+}
+
+let environment = { ...process.env };
+const ffmpegLoaderDirectory = process.env.GETNATIVE_FFMPEG_RUNTIME_DIR
+  ? resolve(process.env.GETNATIVE_FFMPEG_RUNTIME_DIR)
+  : autoMacosFfmpegSdkAvailable
+    ? join(autoMacosFfmpegSdkDirectory, "lib")
+    : null;
+if (ffmpegLoaderDirectory) {
+  if (process.platform === "win32") {
+    replaceEnvironmentEntry(
+      environment,
+      "PATH",
+      `${ffmpegLoaderDirectory}${delimiter}${environmentEntry(environment, "PATH") || ""}`,
+    );
+  } else {
+    const loaderVariable = process.platform === "darwin"
+      ? "DYLD_LIBRARY_PATH"
+      : "LD_LIBRARY_PATH";
+    replaceEnvironmentEntry(
+      environment,
+      loaderVariable,
+      `${ffmpegLoaderDirectory}${delimiter}${environmentEntry(environment, loaderVariable) || ""}`,
+    );
+  }
+}
+let cmake = process.env.CMAKE || "cmake";
+let ctest = process.env.CTEST || "ctest";
+const configureArguments = [
+  "-S",
+  sourceDirectory,
+  "-B",
+  buildDirectory,
+  `-DCMAKE_BUILD_TYPE=${buildType}`,
+];
+const ffmpegRoot = process.env.GETNATIVE_FFMPEG_ROOT
+  || (autoMacosFfmpegSdkAvailable ? autoMacosFfmpegSdkDirectory : null);
+if (ffmpegRoot) {
+  configureArguments.push(
+    `-DGETNATIVE_FFMPEG_ROOT=${resolve(ffmpegRoot)}`,
+  );
+}
+
+let windowsBackends = "not-applicable";
+let linuxBackends = "not-applicable";
+let cudaEnabled = false;
+let vulkanEnabled = enabled(process.env.GETNATIVE_ENABLE_VULKAN);
+let cudaArchitectures = "not-applicable";
+let cudaMinimumArchitecture = "not-applicable";
+let cudaPtxArchitectures = "not-applicable";
+if (process.platform === "win32") {
+  if (!process.env.VSCMD_VER) environment = visualStudioEnvironment(environment);
+  const visualStudioDirectory = environmentEntry(environment, "VSINSTALLDIR")
+    || "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools";
+  const visualStudioCMakeRoot = join(
+    visualStudioDirectory,
+    "Common7", "IDE", "CommonExtensions", "Microsoft", "CMake",
+  );
+  const bundledCmake = join(visualStudioCMakeRoot, "CMake", "bin", "cmake.exe");
+  const bundledCtest = join(visualStudioCMakeRoot, "CMake", "bin", "ctest.exe");
+  const bundledNinja = join(visualStudioCMakeRoot, "Ninja", "ninja.exe");
+  if (!process.env.CMAKE && existsSync(bundledCmake)) cmake = bundledCmake;
+  if (!process.env.CTEST && existsSync(bundledCtest)) ctest = bundledCtest;
+  if (existsSync(bundledNinja)) {
+    configureArguments.push("-G", "Ninja", `-DCMAKE_MAKE_PROGRAM=${bundledNinja}`);
+  }
+
+  windowsBackends = (process.env.GETNATIVE_WINDOWS_BACKENDS || "cpu").toLowerCase();
+  if (!["cpu", "cuda", "vulkan", "cuda-vulkan"].includes(windowsBackends)) {
+    fail("GETNATIVE_WINDOWS_BACKENDS must be cpu, cuda, vulkan, or cuda-vulkan");
+  }
+  cudaEnabled = windowsBackends === "cuda" || windowsBackends === "cuda-vulkan";
+  vulkanEnabled = vulkanEnabled
+    || windowsBackends === "vulkan"
+    || windowsBackends === "cuda-vulkan";
+  cudaMinimumArchitecture = process.env.GETNATIVE_CUDA_MIN_ARCHITECTURE || "75";
+  cudaArchitectures =
+    process.env.GETNATIVE_CUDA_ARCHITECTURES ||
+    "75;86;89;120";
+  cudaPtxArchitectures = process.env.GETNATIVE_CUDA_PTX_ARCHITECTURES || "75;120";
+  configureArguments.push(
+    "-DGETNATIVE_ENABLE_METAL=OFF",
+    "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>",
+    "-DGETNATIVE_ENABLE_X86_SIMD=ON",
+    "-DGETNATIVE_ENABLE_X86_AVX512=ON",
+    `-DGETNATIVE_ENABLE_CUDA=${cudaEnabled ? "ON" : "OFF"}`,
+    `-DGETNATIVE_ENABLE_VULKAN=${vulkanEnabled ? "ON" : "OFF"}`,
+    `-DGETNATIVE_CUDA_MIN_ARCHITECTURE=${cudaMinimumArchitecture}`,
+    `-DGETNATIVE_CUDA_ARCHITECTURES=${cudaArchitectures}`,
+    `-DGETNATIVE_CUDA_PTX_ARCHITECTURES=${cudaPtxArchitectures}`,
+  );
+} else if (process.platform === "linux") {
+  linuxBackends = (process.env.GETNATIVE_LINUX_BACKENDS || "auto").toLowerCase();
+  if (!["auto", "cpu", "cuda", "vulkan", "cuda-vulkan"].includes(linuxBackends)) {
+    fail("GETNATIVE_LINUX_BACKENDS must be auto, cpu, cuda, vulkan, or cuda-vulkan");
+  }
+  cudaEnabled = linuxBackends === "cuda"
+    || linuxBackends === "cuda-vulkan"
+    || (linuxBackends === "auto" && cudaToolkitAvailable());
+  vulkanEnabled = vulkanEnabled
+    || linuxBackends === "vulkan"
+    || linuxBackends === "cuda-vulkan";
+  cudaMinimumArchitecture = process.env.GETNATIVE_CUDA_MIN_ARCHITECTURE || "75";
+  cudaArchitectures = process.env.GETNATIVE_CUDA_ARCHITECTURES
+    || "75;86;89;120";
+  cudaPtxArchitectures = process.env.GETNATIVE_CUDA_PTX_ARCHITECTURES || "75;120";
+  configureArguments.push(
+    `-DGETNATIVE_ENABLE_CUDA=${cudaEnabled ? "ON" : "OFF"}`,
+    `-DGETNATIVE_ENABLE_VULKAN=${vulkanEnabled ? "ON" : "OFF"}`,
+    `-DGETNATIVE_CUDA_MIN_ARCHITECTURE=${cudaMinimumArchitecture}`,
+    `-DGETNATIVE_CUDA_ARCHITECTURES=${cudaArchitectures}`,
+    `-DGETNATIVE_CUDA_PTX_ARCHITECTURES=${cudaPtxArchitectures}`,
+  );
+} else {
+  vulkanEnabled = false;
+}
+
+run(cmake, configureArguments, environment);
+run(cmake, ["--build", buildDirectory, "--parallel"], environment);
+if (!skipTests) {
+  run(ctest, ["--test-dir", buildDirectory, "--output-on-failure"], environment);
+}
+cleanManagedStageFiles();
+run(cmake, ["--install", buildDirectory, "--prefix", stageDirectory], environment);
+const ffmpegRuntime = stageFfmpegRuntime();
+const vulkanRuntime = stagedVulkanRuntime();
+
+const executableName = process.platform === "win32" ? "getnative-engine.exe" : "getnative-engine";
+const stagedEngine = join(stageDirectory, "bin", executableName);
+if (!existsSync(stagedEngine)) fail(`staged engine was not found: ${stagedEngine}`);
+rewriteStagedMacosFfmpeg(
+  stagedEngine,
+  join(stageDirectory, "bin"),
+  ffmpegRuntime.map((entry) => entry.name),
+);
+for (const forbidden of ["ffmpeg", "ffprobe", "ffmpeg.exe", "ffprobe.exe"]) {
+  if (existsSync(join(stageDirectory, "bin", forbidden))) {
+    fail(`external media executable must not be packaged: ${forbidden}`);
+  }
+}
+if (!debug) {
+  const result = spawnSync(stagedEngine, ["capabilities"], {
+    cwd: appDirectory,
+    env: environment,
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  if (result.error || result.status !== 0) {
+    fail(`staged engine media capability check failed: ${result.error?.message || result.stderr}`);
+  }
+  let capabilities;
+  try {
+    capabilities = JSON.parse(result.stdout);
+  } catch (error) {
+    fail(`staged engine returned invalid capabilities JSON: ${error.message}`);
+  }
+  const commands = capabilities?.commands || {};
+  const mediaCommands = [
+    "media_index_begin",
+    "media_frame_window",
+    "media_preview_begin",
+    "media_asset_batch_begin",
+  ];
+  if (!capabilities?.media?.available
+      || capabilities.media.ffmpeg_abi !== "62.62.60.9"
+      || capabilities.media.index_version !== 3
+      || mediaCommands.some((command) => commands[command] !== true)) {
+    fail("release engine is missing required in-process media capabilities");
+  }
+}
+const sha256 = createHash("sha256").update(readFileSync(stagedEngine)).digest("hex");
+writeFileSync(
+  join(stageDirectory, "build-provenance.json"),
+  `${JSON.stringify(
+    {
+      schema_version: 1,
+      build_type: buildType,
+      platform: process.platform,
+      windows_backends: windowsBackends,
+      linux_backends: linuxBackends,
+      cuda_enabled: cudaEnabled,
+      vulkan_enabled: vulkanEnabled,
+      cuda_minimum_architecture: cudaMinimumArchitecture,
+      cuda_architectures: cudaArchitectures,
+      cuda_ptx_architectures: cudaPtxArchitectures,
+      cuda_toolkit_version: cudaEnabled
+        ? cudaToolkitVersion()
+        : "not-applicable",
+      vulkan_sdk_version: vulkanEnabled
+        ? vulkanSdkVersion()
+        : "not-applicable",
+      engine_sha256: sha256,
+      ffmpeg_runtime: ffmpegRuntime,
+      vulkan_runtime: vulkanRuntime,
+      ctest_passed: !skipTests,
+    },
+    null,
+    2,
+  )}\n`,
+  "utf8",
+);
+console.log(`staged_engine=${stagedEngine}`);
+console.log(`engine_sha256=${sha256}`);
+if (ffmpegRuntime.length > 0) {
+  console.log(`ffmpeg_runtime=${ffmpegRuntime.map(({ name }) => name).join(",")}`);
+}
+if (vulkanRuntime.length > 0) {
+  console.log(`vulkan_runtime=${vulkanRuntime.map(({ name }) => name).join(",")}`);
+}

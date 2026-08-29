@@ -80,8 +80,11 @@ struct AxisPlanCacheBatchResult {
 
 // Caller-owned cache for a bounded scan/video session. Batch misses use the
 // bounded planner workers and publish only after the complete batch succeeds.
-// Concurrent cold calls may duplicate construction; this is not single-flight.
-// Limits use fixed admission: overflow plans are returned but not retained.
+// Admission is a byte+entry dual-cap LRU (front = most recent); miss paths
+// serialize on an internal build mutex and re-check before building, so
+// concurrent callers never duplicate construction (single-flight at call
+// granularity, the dsmvc SingleFlightLru semantics; see
+// docs/cold-plan-cache-evaluation.md §3).
 class AxisPlanCache {
 public:
     explicit AxisPlanCache(AxisPlanCacheLimits limits = {});
@@ -93,6 +96,14 @@ public:
     [[nodiscard]] AxisPlanCacheBatchResult get_or_build_batch(
         std::span<const AxisPlanRequest> requests,
         std::size_t worker_count = 0U);
+    // Admits an externally produced plan under the LRU policy (store
+    // preheat path); an already-resident key is simply touched.
+    void publish(const AxisPlanRequest &request,
+                 std::shared_ptr<const AxisPlan> plan);
+    // Read-only lookup: results are parallel to `requests`, null on misses.
+    // Never builds; hits are touched under the LRU policy.
+    [[nodiscard]] std::vector<std::shared_ptr<const AxisPlan>> lookup_batch(
+        std::span<const AxisPlanRequest> requests);
     [[nodiscard]] AxisPlanCacheLimits limits() const noexcept;
     [[nodiscard]] std::size_t size() const;
     [[nodiscard]] std::size_t resident_bytes() const;

@@ -145,4 +145,34 @@ Geometry descale_geometry_pro(
     };
 }
 
+Geometry resolve_candidate_geometry(
+    std::int64_t source_width,
+    std::int64_t source_height,
+    GeometryAxisMode axis_mode,
+    double candidate,
+    std::optional<std::int64_t> base_height,
+    std::optional<std::int64_t> base_width) {
+    if (source_width <= 0 || source_height <= 0) {
+        throw std::invalid_argument("source dimensions must be positive");
+    }
+    require_finite(candidate, "candidate");
+    if (candidate <= 0.0) {
+        throw std::invalid_argument("candidate must be positive");
+    }
+
+    const double active_height = axis_mode == GeometryAxisMode::width_only
+        ? static_cast<double>(source_height) : candidate;
+    const double active_width = axis_mode == GeometryAxisMode::width_only
+        ? candidate
+        : axis_mode == GeometryAxisMode::height_plus_width
+            ? static_cast<double>(source_width) * candidate / static_cast<double>(source_height)
+            : static_cast<double>(source_width);
+
+    if (axis_mode == GeometryAxisMode::height_plus_width && !base_width) {
+        return descale_geometry(source_width, source_height, active_width,
+                                active_height, base_height);
+    }
+    return descale_geometry_pro(active_width, active_height, base_height, base_width);
+}
+
 } // namespace getnative

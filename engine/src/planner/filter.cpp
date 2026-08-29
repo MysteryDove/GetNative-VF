@@ -46,13 +46,12 @@ std::int32_t Filter::effective_support() const {
         (std::numeric_limits<std::int32_t>::max() - 1) / 2;
     const std::int32_t base_support = support();
     const double scaled_support = static_cast<double>(base_support) * blur;
-    if (!std::isfinite(scaled_support)
-        || scaled_support > static_cast<double>(maximum_support)) {
+    if (!(scaled_support <= static_cast<double>(maximum_support))) {
         throw std::length_error("effective filter support is too large");
     }
     const double effective = std::ceil(scaled_support);
     if (!(effective >= 1.0)
-        || effective > static_cast<double>(maximum_support)) {
+        || !(effective <= static_cast<double>(maximum_support))) {
         throw std::length_error("effective filter support is too large");
     }
     return static_cast<std::int32_t>(effective);

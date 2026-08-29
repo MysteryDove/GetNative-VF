@@ -1,15 +1,22 @@
 #include "getnative/metal_analysis.hpp"
+#include "getnative/joining_thread.hpp"
 
 #include "getnative/filter.hpp"
+
+#include <CoreVideo/CoreVideo.h>
 
 #include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <atomic>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <stop_token>
@@ -99,6 +106,147 @@ void compare_cpu_metal(getnative::ConstImageView source,
         throw std::runtime_error(std::string{label}
                                  + " Metal minimum differs by more than one candidate step");
     }
+}
+
+void test_iosurface_zero_copy_luma_format(
+    OSType pixel_format, std::int32_t bit_depth,
+    std::string_view surface_format, std::string_view range) {
+    constexpr std::int32_t width = 64;
+    constexpr std::int32_t height = 48;
+    const bool ten_bit = bit_depth > 8;
+    const bool full_range = range == "full";
+    const std::string label = std::string{"IOSurface "} + std::string{surface_format};
+    CFMutableDictionaryRef attributes = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 1, &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+    CFMutableDictionaryRef io_surface_properties = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+    expect(attributes != nullptr && io_surface_properties != nullptr,
+           label + " dictionaries allocate");
+    CFDictionarySetValue(
+        attributes, kCVPixelBufferIOSurfacePropertiesKey, io_surface_properties);
+    CVPixelBufferRef pixel_buffer = nullptr;
+    const CVReturn created = CVPixelBufferCreate(
+        kCFAllocatorDefault, static_cast<std::size_t>(width),
+        static_cast<std::size_t>(height), pixel_format, attributes, &pixel_buffer);
+    CFRelease(io_surface_properties);
+    CFRelease(attributes);
+    expect(created == kCVReturnSuccess && pixel_buffer != nullptr
+               && CVPixelBufferGetIOSurface(pixel_buffer) != nullptr,
+           label + " fixture has IOSurface backing");
+    struct PixelBufferRelease {
+        CVPixelBufferRef value;
+        ~PixelBufferRelease() { if (value != nullptr) CVPixelBufferRelease(value); }
+    } release{pixel_buffer};
+
+    expect(CVPixelBufferLockBaseAddress(pixel_buffer, 0) == kCVReturnSuccess,
+           label + " locks for initialization");
+    std::vector<float> source(
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
+    void *luma_base = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 0);
+    const std::size_t luma_stride_bytes =
+        CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 0);
+    expect(luma_base != nullptr && luma_stride_bytes > 0,
+           label + " luma plane is addressable");
+    if (ten_bit) {
+        expect(luma_stride_bytes % sizeof(std::uint16_t) == 0,
+               label + " luma stride is 16-bit aligned");
+        auto *luma = static_cast<std::uint16_t *>(luma_base);
+        const std::size_t luma_stride = luma_stride_bytes / sizeof(std::uint16_t);
+        for (std::int32_t y = 0; y < height; ++y) {
+            for (std::int32_t x = 0; x < width; ++x) {
+                const std::uint16_t code10 = static_cast<std::uint16_t>(
+                    96 + ((x * 7 + y * 11 + (x * y) % 31) % 720));
+                luma[static_cast<std::size_t>(y) * luma_stride
+                     + static_cast<std::size_t>(x)] =
+                    static_cast<std::uint16_t>(code10 << 6);
+                const float value = full_range
+                    ? static_cast<float>(code10) / 1023.0F
+                    : std::max(0.0F, (static_cast<float>(code10) - 64.0F) / 876.0F);
+                source[static_cast<std::size_t>(y * width + x)] = value;
+            }
+        }
+    } else {
+        auto *luma = static_cast<std::uint8_t *>(luma_base);
+        for (std::int32_t y = 0; y < height; ++y) {
+            for (std::int32_t x = 0; x < width; ++x) {
+                const std::uint8_t code = static_cast<std::uint8_t>(
+                    24 + ((x * 7 + y * 11 + (x * y) % 31) % 208));
+                luma[static_cast<std::size_t>(y) * luma_stride_bytes
+                     + static_cast<std::size_t>(x)] = code;
+                const float value = full_range
+                    ? static_cast<float>(code) / 255.0F
+                    : std::max(0.0F, (static_cast<float>(code) - 16.0F) / 219.0F);
+                source[static_cast<std::size_t>(y * width + x)] = value;
+            }
+        }
+    }
+    void *chroma_base = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 1);
+    const std::size_t chroma_stride_bytes =
+        CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 1);
+    const std::size_t chroma_height = CVPixelBufferGetHeightOfPlane(pixel_buffer, 1);
+    expect(chroma_base != nullptr && chroma_stride_bytes > 0,
+           label + " chroma plane is addressable");
+    if (ten_bit) {
+        expect(chroma_stride_bytes % sizeof(std::uint16_t) == 0,
+               label + " chroma stride is 16-bit aligned");
+        auto *chroma = static_cast<std::uint16_t *>(chroma_base);
+        const std::size_t chroma_stride = chroma_stride_bytes / sizeof(std::uint16_t);
+        for (std::size_t y = 0; y < chroma_height; ++y) {
+            std::fill_n(chroma + y * chroma_stride, chroma_stride,
+                        static_cast<std::uint16_t>(512U << 6));
+        }
+    } else {
+        auto *chroma = static_cast<std::uint8_t *>(chroma_base);
+        for (std::size_t y = 0; y < chroma_height; ++y) {
+            std::fill_n(chroma + y * chroma_stride_bytes, chroma_stride_bytes,
+                        std::uint8_t{128});
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
+
+    auto plan = std::make_shared<const getnative::AxisPlan>(getnative::build_axis_plan({
+        height, 32, 32.0, 0.0, getnative::Filter::bicubic(),
+        getnative::BorderMode::mirror,
+    }));
+    const std::vector<getnative::CandidateAnalysis> candidates{
+        {"iosurface", nullptr, plan, getnative::AnalysisAxes::vertical},
+    };
+    const getnative::MetricSpec metric{2, 2, 2, 2, 0.015F, 1U};
+    getnative::CpuWorkspace workspace;
+    const double cpu = getnative::analyze_axis_candidate_f32(
+        const_view(source, width, height), *plan, getnative::AnalysisAxes::vertical,
+        metric, workspace);
+
+    getnative::MetalAnalysisEngine metal;
+    metal.reset_analysis_telemetry();
+    const getnative::MetalLumaFrameView frame{
+        reinterpret_cast<std::uintptr_t>(pixel_buffer), width, height, bit_depth,
+        std::string{surface_format}, std::string{range},
+    };
+    const auto gpu = metal.analyze_axis_batch_metal_luma(frame, candidates, metric);
+    expect(gpu.size() == 1U && std::isfinite(gpu.front().error),
+           label + " analysis returns a finite metric");
+    expect(std::abs(gpu.front().error - cpu) <= std::max(1e-7, 5e-4 * std::abs(cpu)),
+           label + " metric matches the CPU oracle");
+    const auto telemetry = metal.runtime_telemetry();
+    expect(telemetry.external_source_zero_copy
+               && telemetry.source_direct_write_bytes == 0U
+               && telemetry.source_legacy_copy_bytes == 0U
+               && telemetry.plan_direct_write_bytes > 0U,
+           label + " performs no host source write or legacy copy");
+}
+
+void test_iosurface_zero_copy_luma() {
+    test_iosurface_zero_copy_luma_format(
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, 8, "420f", "full");
+    test_iosurface_zero_copy_luma_format(
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, 8, "420v", "limited");
+    test_iosurface_zero_copy_luma_format(
+        kCVPixelFormatType_420YpCbCr10BiPlanarFullRange, 10, "xf20", "full");
+    test_iosurface_zero_copy_luma_format(
+        kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, 10, "x420", "limited");
 }
 
 [[nodiscard]] getnative::CandidateAnalysis make_dual_candidate(
@@ -370,8 +518,8 @@ void test_kernel_dispatch_policy_and_telemetry() {
     expect(wider_telemetry.created_pipeline_names.size() == 19,
            "single-axis B11/B15 use creates only inverse and metric pipelines");
     for (const std::string_view name : {
-             "inverse_axis_b11", "metric_axis_p1_b11",
-             "inverse_axis_b15", "metric_axis_p1_b15"}) {
+             "inverse_axis_b11", "metric_axis_b11",
+             "inverse_axis_b15", "metric_axis_b15"}) {
         expect(std::find(wider_telemetry.created_pipeline_names.begin(),
                          wider_telemetry.created_pipeline_names.end(), name)
                    != wider_telemetry.created_pipeline_names.end(),
@@ -379,8 +527,8 @@ void test_kernel_dispatch_policy_and_telemetry() {
     }
     for (const std::string_view name : {
              "inverse_axis_matrix_b11", "forward_axis_matrix_b11",
-             "metric_axis_p1_horizontal_first_b11", "inverse_axis_matrix_b15",
-             "forward_axis_matrix_b15", "metric_axis_p1_horizontal_first_b15"}) {
+             "metric_axis_horizontal_first_b11", "inverse_axis_matrix_b15",
+             "forward_axis_matrix_b15", "metric_axis_horizontal_first_b15"}) {
         expect(std::find(wider_telemetry.created_pipeline_names.begin(),
                          wider_telemetry.created_pipeline_names.end(), name)
                    == wider_telemetry.created_pipeline_names.end(),
@@ -484,6 +632,16 @@ void test_validation_and_cancellation() {
         {"first", nullptr, plan, getnative::AnalysisAxes::vertical},
         {"second", nullptr, plan, getnative::AnalysisAxes::vertical},
     };
+    auto horizontal_plan = std::make_shared<const getnative::AxisPlan>(
+        getnative::build_axis_plan({
+            width, 20, 20.25, 0.125, getnative::Filter::bicubic(),
+            getnative::BorderMode::mirror,
+        }));
+    const std::vector<getnative::CandidateAnalysis> p_norm_candidates{
+        {"horizontal", horizontal_plan, nullptr, getnative::AnalysisAxes::horizontal},
+        {"vertical", nullptr, plan, getnative::AnalysisAxes::vertical},
+        {"both", horizontal_plan, plan, getnative::AnalysisAxes::both},
+    };
     getnative::MetalAnalysisEngine metal;
     float oversized_pixel = 0.0F;
     const getnative::ConstImageView oversized_source{
@@ -523,12 +681,18 @@ void test_validation_and_cancellation() {
             getnative::MetalAnalysisEngine invalid({1, overflowing_groups, 0});
         },
         "Metal rejects reduction schedules that can overflow shader indices");
+    for (const std::uint32_t norm : {1U, 2U, 3U, 4U}) {
+        compare_cpu_metal(
+            view, p_norm_candidates,
+            getnative::MetricSpec{2, 2, 2, 2, 0.015F, norm}, metal,
+            std::string{"Metal p-norm "} + std::to_string(norm));
+    }
     expect_throws(
         [&] {
             (void)metal.analyze_axis_batch_f32(
-                view, candidates, getnative::MetricSpec{2, 2, 2, 2, 0.015F, 2U});
+                view, candidates, getnative::MetricSpec{2, 2, 2, 2, 0.015F, 5U});
         },
-        "Metal rejects non-p1 metrics in the MVP");
+        "Metal rejects p-norms above four");
 
     for (const float threshold : {std::numeric_limits<float>::quiet_NaN(),
                                   std::numeric_limits<float>::infinity(),
@@ -605,6 +769,14 @@ void test_queued_tile_window() {
     compare_cpu_metal(
         view, candidates, getnative::MetricSpec{2, 2, 2, 2, 0.015F, 1U}, metal,
         "queued bicubic vertical");
+    const auto telemetry = metal.runtime_telemetry();
+    expect(telemetry.plan_direct_write_bytes > 0U
+               && telemetry.plan_legacy_copy_bytes == 0U
+               && telemetry.source_direct_write_bytes
+                   == static_cast<std::size_t>(width) * static_cast<std::size_t>(height)
+                          * sizeof(float)
+               && telemetry.source_legacy_copy_bytes == 0U,
+           "default Metal path writes plan and source directly into shared buffers");
     expect(metal.peak_workspace_elements() == 256,
            "queued tiles reuse one bounded workspace across submission windows");
 }
@@ -668,8 +840,8 @@ void test_persistent_working_buffer_reuse_and_ceiling() {
                && reused_telemetry.working_buffer_reuse_count == 3,
            "stable repeated call reuses all three Metal working buffers");
     expect(reused_telemetry.buffer_allocation_count
-               == reused_telemetry.analyzed_tile_count * 9U,
-           "stable repeated call allocates only the existing nine plan buffers per tile");
+               == reused_telemetry.analyzed_tile_count,
+           "stable repeated call allocates one packed plan arena per tile");
     expect(std::isfinite(reused_telemetry.buffer_allocation_ms)
                && std::isfinite(reused_telemetry.source_upload_ms)
                && std::isfinite(reused_telemetry.buffer_wiring_ms),
@@ -696,6 +868,20 @@ void test_persistent_working_buffer_reuse_and_ceiling() {
                && transient_telemetry.working_buffer_retained_bytes == 0,
            "diagnostic transient path allocates and retains no working buffers");
 
+    getnative::MetalAnalysisOptions legacy_options = persistent_options;
+    legacy_options.direct_plan_pack = false;
+    legacy_options.direct_source_write = false;
+    getnative::MetalAnalysisEngine legacy(legacy_options);
+    const auto legacy_results = legacy.analyze_axis_batch_f32(view, large, metric);
+    const auto legacy_telemetry = legacy.runtime_telemetry();
+    expect(legacy_telemetry.plan_direct_write_bytes == 0U
+               && legacy_telemetry.plan_legacy_copy_bytes > 0U
+               && legacy_telemetry.source_direct_write_bytes == 0U
+               && legacy_telemetry.source_legacy_copy_bytes
+                   == static_cast<std::size_t>(width) * static_cast<std::size_t>(height)
+                          * sizeof(float),
+           "legacy Metal adapter reports its compatibility copies explicitly");
+
     getnative::MetalAnalysisOptions constrained_options = persistent_options;
     constrained_options.retained_working_buffer_limit_bytes = 1;
     getnative::MetalAnalysisEngine constrained(constrained_options);
@@ -710,6 +896,7 @@ void test_persistent_working_buffer_reuse_and_ceiling() {
     expect(first.size() == small.size() && grown.size() == large.size()
                && reused.size() == large.size() && after_trim.size() == large.size()
                && transient_results.size() == large.size()
+               && legacy_results.size() == large.size()
                && constrained_results.size() == large.size(),
            "working-buffer paths return every candidate");
     for (std::size_t index = 0; index < large.size(); ++index) {
@@ -717,6 +904,7 @@ void test_persistent_working_buffer_reuse_and_ceiling() {
         expect(std::bit_cast<std::uint64_t>(reused[index].error) == expected
                    && std::bit_cast<std::uint64_t>(after_trim[index].error) == expected
                    && std::bit_cast<std::uint64_t>(transient_results[index].error) == expected
+                   && std::bit_cast<std::uint64_t>(legacy_results[index].error) == expected
                    && std::bit_cast<std::uint64_t>(constrained_results[index].error) == expected,
                "persistent, trimmed, transient, and ceiling-fallback metrics are bit-identical");
     }
@@ -742,7 +930,7 @@ void test_submitted_cancellation_drains_before_reuse() {
 
     getnative::MetalAnalysisEngine metal({1, 2, 0, true, 32});
     std::stop_source stop;
-    std::jthread canceller([&] {
+    getnative::JoiningThread canceller([&] {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         stop.request_stop();
     });
@@ -775,6 +963,101 @@ void test_submitted_cancellation_drains_before_reuse() {
            "immediate reuse uses retained buffers only after submitted work is complete");
 }
 
+void test_horizontal_transpose_layout_matches_cpu() {
+    constexpr std::int32_t width = 40;
+    constexpr std::int32_t height = 24;
+    std::vector<float> pixels(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
+    for (std::int32_t y = 0; y < height; ++y) {
+        for (std::int32_t x = 0; x < width; ++x) {
+            pixels[static_cast<std::size_t>(y * width + x)] =
+                static_cast<float>((x + 1) * 17 + (y + 3) * 13);
+        }
+    }
+    std::vector<float> transposed(pixels.size());
+    for (std::int32_t y = 0; y < height; ++y) {
+        for (std::int32_t x = 0; x < width; ++x) {
+            transposed[static_cast<std::size_t>(x * height + y)] =
+                pixels[static_cast<std::size_t>(y * width + x)];
+        }
+    }
+    expect(transposed[static_cast<std::size_t>(1 * height + 0)]
+               == pixels[static_cast<std::size_t>(0 * width + 1)],
+           "transpose_source layout is dest[x * height + y] = src[y * width + x]");
+    auto plan = std::make_shared<const getnative::AxisPlan>(getnative::build_axis_plan({
+        width, 28, 28.25, -0.125, getnative::Filter::bicubic(),
+        getnative::BorderMode::mirror,
+    }));
+    const std::vector<getnative::CandidateAnalysis> candidates{
+        {"h-transpose", plan, nullptr, getnative::AnalysisAxes::horizontal},
+    };
+    getnative::MetalAnalysisEngine metal;
+    compare_cpu_metal(const_view(pixels, width, height), candidates,
+                      {2, 2, 2, 2, 0.015F, 1U}, metal,
+                      "horizontal transpose layout");
+}
+
+void test_concurrent_execution_slots() {
+    constexpr std::int32_t width = 48;
+    constexpr std::int32_t height = 32;
+    const auto source = make_source(width, height);
+    const auto view = const_view(source, width, height);
+    const getnative::MetricSpec metric{2, 2, 2, 2, 0.015F, 1U};
+    auto vertical = std::make_shared<const getnative::AxisPlan>(getnative::build_axis_plan({
+        height, 24, 24.0, 0.0, getnative::Filter::bicubic(),
+        getnative::BorderMode::mirror,
+    }));
+    auto horizontal = std::make_shared<const getnative::AxisPlan>(getnative::build_axis_plan({
+        width, 36, 36.0, 0.0, getnative::Filter::bicubic(),
+        getnative::BorderMode::mirror,
+    }));
+    const std::vector<getnative::CandidateAnalysis> candidates{
+        {"v-concurrent", nullptr, vertical, getnative::AnalysisAxes::vertical},
+        {"h-concurrent", horizontal, nullptr, getnative::AnalysisAxes::horizontal},
+    };
+
+    getnative::MetalAnalysisOptions options;
+    options.execution_slots = 2;
+    getnative::MetalAnalysisEngine metal(options);
+    std::stop_source stop;
+    std::atomic<bool> finished{false};
+    std::thread watchdog([&] {
+        for (int tick = 0; tick < 80 && !finished.load(std::memory_order_relaxed); ++tick) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!finished.load(std::memory_order_relaxed)) {
+            stop.request_stop();
+        }
+    });
+
+    std::exception_ptr failure;
+    std::mutex failure_mutex;
+    const auto run = [&] {
+        try {
+            const auto results = metal.analyze_axis_batch_f32(
+                view, candidates, metric, stop.get_token());
+            expect(results.size() == candidates.size(),
+                   "concurrent Metal analysis returns one result per candidate");
+            for (const auto &result : results) {
+                expect(std::isfinite(result.error),
+                       "concurrent Metal analysis returns a finite metric");
+            }
+        } catch (...) {
+            const std::scoped_lock lock(failure_mutex);
+            if (!failure) failure = std::current_exception();
+        }
+    };
+
+    std::thread first(run);
+    std::thread second(run);
+    first.join();
+    second.join();
+    finished.store(true, std::memory_order_relaxed);
+    watchdog.join();
+    if (failure) std::rethrow_exception(failure);
+    expect(!stop.get_token().stop_requested(),
+           "two concurrent Metal slot analyses completed without hanging");
+}
+
 } // namespace
 
 int main() {
@@ -784,6 +1067,8 @@ int main() {
             return 0;
         }
         test_vertical_and_horizontal_batches();
+        test_horizontal_transpose_layout_matches_cpu();
+        test_iosurface_zero_copy_luma();
         test_kernel_dispatch_policy_and_telemetry();
         test_all_supported_plan_shapes_horizontal_and_vertical();
         test_dual_axis_filter_families_and_forward_orders();
@@ -793,6 +1078,7 @@ int main() {
         test_queued_tile_window();
         test_persistent_working_buffer_reuse_and_ceiling();
         test_submitted_cancellation_drains_before_reuse();
+        test_concurrent_execution_slots();
         std::cout << "metal conformance tests passed\n";
         return 0;
     } catch (const std::exception &error) {

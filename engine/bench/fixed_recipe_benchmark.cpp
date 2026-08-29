@@ -2,6 +2,7 @@
 
 #include "getnative/filter.hpp"
 #include "getnative/metal_analysis.hpp"
+#include "getnative/joining_thread.hpp"
 
 #include <algorithm>
 #include <array>
@@ -427,7 +428,7 @@ void fnv1a_vector(std::uint64_t &hash, const std::vector<T> &values) {
     std::atomic_size_t cursor{0U};
     std::exception_ptr failure;
     std::mutex failure_mutex;
-    std::vector<std::jthread> workers;
+    std::vector<getnative::JoiningThread> workers;
     workers.reserve(worker_count);
     for (std::size_t worker = 0; worker < worker_count; ++worker) {
         workers.emplace_back([&] {

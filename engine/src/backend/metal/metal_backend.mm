@@ -4,14 +4,18 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <CoreVideo/CoreVideo.h>
+#import <IOSurface/IOSurface.h>
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -46,6 +50,13 @@ enum class PipelineStage : std::uint8_t {
     matrix_inverse,
     matrix_forward,
     horizontal_first_metric,
+};
+
+struct LumaNormalizeJob {
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t bit_depth;
+    std::uint32_t full_range;
 };
 
 constexpr std::array all_pipeline_stages{
@@ -86,6 +97,8 @@ struct AnalysisJob {
     std::uint32_t groups_per_candidate;
     std::uint32_t candidate_count;
     std::uint32_t maximum_vector_count;
+    std::uint32_t norm;
+    std::uint32_t transposed_source = 0;
 };
 
 struct MetricCropBounds {
@@ -97,7 +110,7 @@ struct MetricCropBounds {
 };
 
 static_assert(sizeof(AxisPlanDescriptor) == 64);
-static_assert(sizeof(AnalysisJob) == 40);
+static_assert(sizeof(AnalysisJob) == 48);
 
 [[nodiscard]] std::string ns_error(NSError *error, std::string_view fallback) {
     if (error == nil) {
@@ -149,21 +162,96 @@ static_assert(sizeof(AnalysisJob) == 40);
     };
 }
 
+template <class T>
+class PlanRegion {
+public:
+    using value_type = T;
+    PlanRegion() = default;
+    explicit PlanRegion(std::span<T> storage) : mode_(Mode::direct), storage_(storage) {}
+
+    [[nodiscard]] static PlanRegion owning() {
+        PlanRegion result;
+        result.mode_ = Mode::owning;
+        return result;
+    }
+
+    [[nodiscard]] std::size_t size() const noexcept {
+        return mode_ == Mode::owning ? values_.size() : size_;
+    }
+    [[nodiscard]] const T *data() const noexcept {
+        return mode_ == Mode::owning ? values_.data() : storage_.data();
+    }
+    void reserve(std::size_t size) {
+        if (mode_ == Mode::owning) {
+            values_.reserve(size);
+        } else if (mode_ == Mode::direct && size > storage_.size()) {
+            throw std::length_error("Metal direct plan region is too small");
+        }
+    }
+    void push_back(const T &value) {
+        if (mode_ == Mode::owning) {
+            values_.push_back(value);
+            return;
+        }
+        if (size_ == std::numeric_limits<std::size_t>::max()) {
+            throw std::length_error("Metal plan region size overflow");
+        }
+        if (mode_ == Mode::direct) {
+            if (size_ == storage_.size()) {
+                throw std::length_error("Metal direct plan region overflow");
+            }
+            storage_[size_] = value;
+        }
+        ++size_;
+    }
+    template <class Iterator>
+    void append(Iterator first, Iterator last) {
+        if (mode_ == Mode::owning) {
+            values_.insert(values_.end(), first, last);
+            return;
+        }
+        for (; first != last; ++first) {
+            push_back(*first);
+        }
+    }
+
+private:
+    enum class Mode : std::uint8_t { counting, owning, direct };
+    Mode mode_ = Mode::counting;
+    std::vector<T> values_;
+    std::span<T> storage_;
+    std::size_t size_ = 0U;
+};
+
 struct PackedTile {
-    std::vector<AxisPlanDescriptor> descriptors;
-    std::vector<std::uint32_t> transpose_offsets;
-    std::vector<std::uint32_t> transpose_indices;
-    std::vector<float> transpose_weights;
-    std::vector<float> lower_ld;
-    std::vector<float> upper_l;
-    std::vector<float> inverse_diagonal;
-    std::vector<std::int32_t> forward_left;
-    std::vector<float> forward_weights;
+    PlanRegion<AxisPlanDescriptor> descriptors;
+    PlanRegion<std::uint32_t> transpose_offsets;
+    PlanRegion<std::uint32_t> transpose_indices;
+    PlanRegion<float> transpose_weights;
+    PlanRegion<float> lower_ld;
+    PlanRegion<float> upper_l;
+    PlanRegion<float> inverse_diagonal;
+    PlanRegion<std::int32_t> forward_left;
+    PlanRegion<float> forward_weights;
     std::size_t workspace_elements = 0;
     std::uint32_t maximum_vector_count = 0;
     std::uint32_t maximum_native_width = 0;
     std::uint32_t maximum_native_height = 0;
 };
+
+[[nodiscard]] PackedTile make_owning_packed_tile() {
+    return {
+        PlanRegion<AxisPlanDescriptor>::owning(),
+        PlanRegion<std::uint32_t>::owning(),
+        PlanRegion<std::uint32_t>::owning(),
+        PlanRegion<float>::owning(),
+        PlanRegion<float>::owning(),
+        PlanRegion<float>::owning(),
+        PlanRegion<float>::owning(),
+        PlanRegion<std::int32_t>::owning(),
+        PlanRegion<float>::owning(),
+    };
+}
 
 struct TileSignature {
     AnalysisAxes axes = AnalysisAxes::vertical;
@@ -307,6 +395,19 @@ struct AxisKernelShapes {
 void append_axis(PackedTile &packed, const AxisPlan &plan, bool horizontal,
                  std::uint32_t vector_count, std::uint32_t workspace_base,
                  std::uint32_t reserved_0 = 0, std::uint32_t reserved_1 = 0) {
+    const auto require_finite = [](const auto &values, std::string_view name) {
+        for (const auto value : values) {
+            if (!std::isfinite(value)) {
+                throw std::invalid_argument(
+                    "Metal plan contains a non-finite " + std::string{name});
+            }
+        }
+    };
+    require_finite(plan.transpose_weights, "transpose weight");
+    require_finite(plan.lower_ld, "lower factor");
+    require_finite(plan.upper_l, "upper factor");
+    require_finite(plan.inverse_diagonal, "inverse diagonal");
+    require_finite(plan.forward_weights, "forward weight");
     AxisPlanDescriptor descriptor{};
     descriptor.source_size = static_cast<std::uint32_t>(plan.source_size);
     descriptor.destination_size = static_cast<std::uint32_t>(plan.destination_size);
@@ -329,20 +430,17 @@ void append_axis(PackedTile &packed, const AxisPlan &plan, bool horizontal,
     descriptor.reserved_0 = reserved_0;
     descriptor.reserved_1 = reserved_1;
 
-    packed.transpose_offsets.insert(packed.transpose_offsets.end(),
-                                    plan.transpose_offsets.begin(), plan.transpose_offsets.end());
+    packed.transpose_offsets.append(plan.transpose_offsets.begin(), plan.transpose_offsets.end());
     for (const std::int32_t index : plan.transpose_indices) {
         if (index < 0 || index >= plan.source_size) {
             throw std::invalid_argument("Metal transpose index is outside the source axis");
         }
         packed.transpose_indices.push_back(static_cast<std::uint32_t>(index));
     }
-    packed.transpose_weights.insert(packed.transpose_weights.end(),
-                                    plan.transpose_weights.begin(), plan.transpose_weights.end());
-    packed.lower_ld.insert(packed.lower_ld.end(), plan.lower_ld.begin(), plan.lower_ld.end());
-    packed.upper_l.insert(packed.upper_l.end(), plan.upper_l.begin(), plan.upper_l.end());
-    packed.inverse_diagonal.insert(packed.inverse_diagonal.end(),
-                                   plan.inverse_diagonal.begin(), plan.inverse_diagonal.end());
+    packed.transpose_weights.append(plan.transpose_weights.begin(), plan.transpose_weights.end());
+    packed.lower_ld.append(plan.lower_ld.begin(), plan.lower_ld.end());
+    packed.upper_l.append(plan.upper_l.begin(), plan.upper_l.end());
+    packed.inverse_diagonal.append(plan.inverse_diagonal.begin(), plan.inverse_diagonal.end());
     for (std::int32_t row = 0; row < plan.source_size; ++row) {
         const std::uint32_t begin = plan.forward_offsets[static_cast<std::size_t>(row)];
         const std::uint32_t end = plan.forward_offsets[static_cast<std::size_t>(row) + 1U];
@@ -359,8 +457,7 @@ void append_axis(PackedTile &packed, const AxisPlan &plan, bool horizontal,
             }
         }
         packed.forward_left.push_back(left);
-        packed.forward_weights.insert(
-            packed.forward_weights.end(),
+        packed.forward_weights.append(
             plan.forward_weights.begin() + static_cast<std::ptrdiff_t>(begin),
             plan.forward_weights.begin() + static_cast<std::ptrdiff_t>(end));
     }
@@ -457,10 +554,23 @@ struct ShapePipelines {
 
 struct WorkingBufferSet {
     id<MTLBuffer> source = nil;
+    id<MTLBuffer> transposed = nil;
     id<MTLBuffer> workspace = nil;
     id<MTLBuffer> partials = nil;
     std::size_t resident_bytes = 0;
 };
+
+struct MetalExecutionSlot {
+    id<MTLCommandQueue> queue = nil;
+    id<MTLBuffer> retained_source_buffer = nil;
+    id<MTLBuffer> retained_transposed_buffer = nil;
+    id<MTLBuffer> retained_workspace_buffer = nil;
+    id<MTLBuffer> retained_partial_buffer = nil;
+    id<MTLBuffer> external_source_buffer = nil;
+    std::size_t external_source_bytes = 0U;
+};
+
+thread_local MetalExecutionSlot *active_slot = nullptr;
 
 } // namespace
 
@@ -472,6 +582,9 @@ struct MetalAnalysisEngine::Impl {
         }
         if (options.tile_size > std::numeric_limits<std::uint32_t>::max()) {
             throw std::invalid_argument("Metal tile size exceeds the supported range");
+        }
+        if (options.execution_slots == 0U || options.execution_slots > 8U) {
+            throw std::invalid_argument("Metal execution_slots must be in [1, 8]");
         }
         if (options.reduction_groups_per_candidate > maximum_reduction_groups) {
             throw std::invalid_argument("Metal reduction group count exceeds the 32-bit schedule range");
@@ -487,9 +600,17 @@ struct MetalAnalysisEngine::Impl {
                 throw std::runtime_error("no Metal device is available");
             }
             queue = [device newCommandQueue];
-            if (queue == nil) {
-                throw std::runtime_error("Metal command queue creation failed");
+            if (queue == nil) throw std::runtime_error("Metal command queue creation failed");
+            slots.reserve(options.execution_slots);
+            for (std::size_t index = 0U; index < options.execution_slots; ++index) {
+                auto slot = std::make_unique<MetalExecutionSlot>();
+                slot->queue = [device newCommandQueue];
+                if (slot->queue == nil) {
+                    throw std::runtime_error("Metal slot command queue creation failed");
+                }
+                slots.push_back(std::move(slot));
             }
+            slot_busy.assign(options.execution_slots, false);
 
             dispatch_data_t library_data = dispatch_data_create(
                 getnative_metallib, getnative_metallib_size,
@@ -500,6 +621,9 @@ struct MetalAnalysisEngine::Impl {
             if (library == nil) {
                 throw std::runtime_error(ns_error(error, "embedded Metal library could not be loaded"));
             }
+            luma_normalize_r8 = make_pipeline(device, library, @"normalize_luma_r8");
+            luma_normalize_r16 = make_pipeline(device, library, @"normalize_luma_r16");
+            transpose_source = make_pipeline(device, library, @"transpose_source");
             for (const PipelineStage stage : all_pipeline_stages) {
                 (void)pipeline(KernelShape::generic, stage);
             }
@@ -523,15 +647,20 @@ struct MetalAnalysisEngine::Impl {
     MetalDeviceInfo info;
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
+    std::vector<std::unique_ptr<MetalExecutionSlot>> slots;
+    std::vector<bool> slot_busy;
+    std::mutex slot_mutex;
+    std::condition_variable slot_available;
+    std::mutex pipeline_mutex;
     id<MTLLibrary> library;
     ShapePipelines bandwidth3;
     ShapePipelines bandwidth7;
     ShapePipelines bandwidth11;
     ShapePipelines bandwidth15;
     ShapePipelines generic;
-    id<MTLBuffer> retained_source_buffer = nil;
-    id<MTLBuffer> retained_workspace_buffer = nil;
-    id<MTLBuffer> retained_partial_buffer = nil;
+    id<MTLComputePipelineState> luma_normalize_r8;
+    id<MTLComputePipelineState> luma_normalize_r16;
+    id<MTLComputePipelineState> transpose_source;
     std::size_t peak_workspace_elements = 0;
     std::size_t peak_working_set_bytes = 0;
     std::size_t buffer_allocation_count = 0;
@@ -544,6 +673,10 @@ struct MetalAnalysisEngine::Impl {
     std::size_t working_buffer_peak_retained_bytes = 0;
     std::size_t command_buffer_submission_count = 0;
     std::size_t command_buffer_completion_count = 0;
+    std::size_t source_direct_write_bytes = 0;
+    std::size_t source_legacy_copy_bytes = 0;
+    std::size_t plan_direct_write_bytes = 0;
+    std::size_t plan_legacy_copy_bytes = 0;
     std::size_t plan_upload_bytes = 0;
     std::size_t analyzed_tile_count = 0;
     std::size_t generic_tile_count = 0;
@@ -552,29 +685,79 @@ struct MetalAnalysisEngine::Impl {
     double working_buffer_allocation_ms = 0.0;
     double source_upload_ms = 0.0;
     double plan_upload_ms = 0.0;
+    double source_pack_ms = 0.0;
+    double plan_pack_ms = 0.0;
     double buffer_wiring_ms = 0.0;
     double pipeline_creation_ms = 0.0;
     double gpu_execution_ms = 0.0;
+    double execution_slot_wait_ms = 0.0;
+    bool external_source_zero_copy = false;
+    std::string fallback_reason;
     std::vector<std::string> created_pipeline_names;
-    mutable std::mutex mutex;
+    mutable std::recursive_mutex mutex;
+
+    [[nodiscard]] std::size_t acquire_slot(std::stop_token stop) {
+        std::unique_lock lock(slot_mutex);
+        for (;;) {
+            for (std::size_t index = 0U; index < slots.size(); ++index) {
+                if (!slot_busy[index]) {
+                    slot_busy[index] = true;
+                    return index;
+                }
+            }
+            if (stop.stop_requested()) {
+                throw std::runtime_error("Metal analysis cancelled while waiting for a slot");
+            }
+            slot_available.wait_for(lock, std::chrono::milliseconds(2));
+        }
+    }
+
+    void release_slot(std::size_t index) noexcept {
+        {
+            const std::scoped_lock lock(slot_mutex);
+            slot_busy[index] = false;
+        }
+        slot_available.notify_one();
+    }
+
+    [[nodiscard]] id<MTLCommandQueue> active_queue() const noexcept {
+        return active_slot != nullptr ? active_slot->queue : queue;
+    }
 
     [[nodiscard]] static std::size_t buffer_bytes(id<MTLBuffer> buffer) noexcept {
         return buffer == nil ? 0 : static_cast<std::size_t>(buffer.length);
     }
 
-    [[nodiscard]] std::size_t retained_working_buffer_bytes() const {
-        const std::size_t source_bytes = buffer_bytes(retained_source_buffer);
-        const std::size_t workspace_bytes = buffer_bytes(retained_workspace_buffer);
-        const std::size_t partial_bytes = buffer_bytes(retained_partial_buffer);
-        if (source_bytes > std::numeric_limits<std::size_t>::max() - workspace_bytes
-            || source_bytes + workspace_bytes
+    [[nodiscard]] std::size_t retained_working_buffer_bytes_for(
+        const MetalExecutionSlot &slot) const {
+        const std::size_t source_bytes = buffer_bytes(slot.retained_source_buffer);
+        const std::size_t transposed_bytes = buffer_bytes(slot.retained_transposed_buffer);
+        const std::size_t workspace_bytes = buffer_bytes(slot.retained_workspace_buffer);
+        const std::size_t partial_bytes = buffer_bytes(slot.retained_partial_buffer);
+        if (source_bytes > std::numeric_limits<std::size_t>::max() - transposed_bytes
+            || source_bytes + transposed_bytes
+                > std::numeric_limits<std::size_t>::max() - workspace_bytes
+            || source_bytes + transposed_bytes + workspace_bytes
                 > std::numeric_limits<std::size_t>::max() - partial_bytes) {
             throw std::length_error("Metal retained-buffer telemetry overflow");
         }
-        return source_bytes + workspace_bytes + partial_bytes;
+        return source_bytes + transposed_bytes + workspace_bytes + partial_bytes;
+    }
+
+    [[nodiscard]] std::size_t retained_working_buffer_bytes() const {
+        std::size_t total = 0U;
+        for (const auto &slot : slots) {
+            const std::size_t bytes = retained_working_buffer_bytes_for(*slot);
+            if (bytes > std::numeric_limits<std::size_t>::max() - total) {
+                throw std::length_error("Metal retained-buffer telemetry overflow");
+            }
+            total += bytes;
+        }
+        return total;
     }
 
     void record_buffer(id<MTLBuffer> buffer, double elapsed_ms, bool working_buffer) {
+        const std::scoped_lock lock(mutex);
         const std::size_t bytes = static_cast<std::size_t>(buffer.length);
         if (bytes > std::numeric_limits<std::size_t>::max() - buffer_allocation_bytes) {
             throw std::length_error("Metal allocation telemetry overflow");
@@ -637,9 +820,77 @@ struct MetalAnalysisEngine::Impl {
         return buffer;
     }
 
+    // One plan arena per tile instead of nine separate MTLBuffers: all plan
+    // arrays are packed into a single shared allocation with 16-byte-aligned
+    // regions, turning 9 allocations into 1 while the descriptor/base-offset
+    // addressing the kernels already use stays unchanged.
+    struct PlanArena {
+        id<MTLBuffer> buffer;
+        std::array<std::size_t, 9> offsets{};
+        std::size_t total_bytes = 0;
+    };
+
+    [[nodiscard]] PlanArena allocate_plan_arena(
+        const std::array<std::size_t, 9> &region_bytes,
+        const std::array<std::string_view, 9> &names) {
+        const std::scoped_lock lock(mutex);
+        constexpr std::size_t alignment = 16;
+        PlanArena arena;
+        std::size_t cursor = 0;
+        for (std::size_t index = 0; index < region_bytes.size(); ++index) {
+            if (cursor > std::numeric_limits<std::size_t>::max() - (alignment - 1U)) {
+                throw std::length_error(std::string{names[index]} + " alignment overflow");
+            }
+            arena.offsets[index] = (cursor + alignment - 1) / alignment * alignment;
+            if (region_bytes[index] > std::numeric_limits<std::size_t>::max()
+                                          - arena.offsets[index]) {
+                throw std::length_error(std::string{names[index]} + " size overflow");
+            }
+            cursor = arena.offsets[index] + region_bytes[index];
+        }
+        if (cursor == 0U) throw std::invalid_argument("Metal plan arena must not be empty");
+        arena.total_bytes = cursor;
+        const std::string label_text{"GetNative plan arena"};
+        arena.buffer = allocate_empty_buffer(
+            cursor, [NSString stringWithUTF8String:label_text.c_str()], false);
+        if (arena.total_bytes > std::numeric_limits<std::size_t>::max() - plan_upload_bytes) {
+            throw std::length_error("Metal plan-upload telemetry overflow");
+        }
+        plan_upload_bytes += arena.total_bytes;
+        return arena;
+    }
+
+    void copy_legacy_plan_regions(
+        const PlanArena &arena,
+        const std::array<std::pair<const void *, std::size_t>, 9> &regions) {
+        const auto start = std::chrono::steady_clock::now();
+        auto *base = static_cast<std::byte *>(arena.buffer.contents);
+        for (std::size_t index = 0; index < regions.size(); ++index) {
+            if (regions[index].second != 0U) {
+                std::memcpy(base + arena.offsets[index], regions[index].first,
+                            regions[index].second);
+            }
+        }
+        const double elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+        const std::scoped_lock lock(mutex);
+        plan_pack_ms += elapsed;
+        plan_upload_ms += elapsed;
+        plan_legacy_copy_bytes += arena.total_bytes;
+        fallback_reason = "legacy_plan_pack_requested";
+    }
+
+    void record_direct_plan_write(const PlanArena &arena, double elapsed) {
+        const std::scoped_lock lock(mutex);
+        plan_pack_ms += elapsed;
+        plan_upload_ms += elapsed;
+        plan_direct_write_bytes += arena.total_bytes;
+    }
+
     [[nodiscard]] id<MTLBuffer> acquire_retained_buffer(id<MTLBuffer> __strong &buffer,
                                                          std::size_t required_bytes,
                                                          NSString *label) {
+        const std::scoped_lock lock(mutex);
         if (buffer != nil && buffer_bytes(buffer) >= required_bytes) {
             ++working_buffer_reuse_count;
             return buffer;
@@ -650,59 +901,109 @@ struct MetalAnalysisEngine::Impl {
         return buffer;
     }
 
+    void clear_retained_working_buffers(MetalExecutionSlot &slot) noexcept {
+        slot.retained_source_buffer = nil;
+        slot.retained_transposed_buffer = nil;
+        slot.retained_workspace_buffer = nil;
+        slot.retained_partial_buffer = nil;
+    }
+
     void clear_retained_working_buffers() noexcept {
-        retained_source_buffer = nil;
-        retained_workspace_buffer = nil;
-        retained_partial_buffer = nil;
+        for (const auto &slot : slots) clear_retained_working_buffers(*slot);
+    }
+
+    [[nodiscard]] static std::size_t add_working_bytes(
+        std::size_t left, std::size_t right, const char *what) {
+        if (right != 0U && left > std::numeric_limits<std::size_t>::max() - right) {
+            throw std::length_error(std::string{what} + " overflow");
+        }
+        return left + right;
     }
 
     [[nodiscard]] WorkingBufferSet prepare_working_buffers(
+        MetalExecutionSlot &slot,
         std::size_t source_bytes, std::size_t workspace_bytes,
-        std::size_t partial_bytes, const float *source_data) {
-        if (source_bytes > std::numeric_limits<std::size_t>::max() - workspace_bytes
-            || source_bytes + workspace_bytes
-                > std::numeric_limits<std::size_t>::max() - partial_bytes) {
-            throw std::length_error("Metal working-buffer size overflow");
-        }
-        const std::size_t active_bytes = source_bytes + workspace_bytes + partial_bytes;
+        std::size_t partial_bytes, std::size_t transpose_bytes,
+        ConstImageView source) {
+        const std::scoped_lock lock(mutex);
+        const std::size_t active_bytes = add_working_bytes(
+            add_working_bytes(
+                add_working_bytes(source_bytes, transpose_bytes, "Metal working-buffer size"),
+                workspace_bytes, "Metal working-buffer size"),
+            partial_bytes, "Metal working-buffer size");
         working_buffer_active_bytes = active_bytes;
         working_buffer_peak_active_bytes = std::max(
             working_buffer_peak_active_bytes, active_bytes);
 
+        const auto assign_transposed = [&](WorkingBufferSet &result, bool retain_slot) {
+            if (transpose_bytes == 0U) {
+                result.transposed = nil;
+                return;
+            }
+            if (retain_slot) {
+                result.transposed = acquire_retained_buffer(
+                    slot.retained_transposed_buffer, transpose_bytes,
+                    @"GetNative transposed source");
+            } else {
+                result.transposed = allocate_empty_buffer(
+                    transpose_bytes, @"GetNative transposed source", true);
+            }
+        };
+
         WorkingBufferSet result;
+        if (slot.external_source_buffer != nil) {
+            if (slot.external_source_bytes != source_bytes) {
+                throw std::logic_error("Metal external source-buffer size mismatch");
+            }
+            result.source = slot.external_source_buffer;
+            assign_transposed(result, options.reuse_working_buffers);
+            result.workspace = allocate_empty_buffer(
+                workspace_bytes, @"GetNative Metal workspace", true);
+            result.partials = allocate_empty_buffer(
+                partial_bytes, @"GetNative metric partials", true);
+            result.resident_bytes = add_working_bytes(
+                add_working_bytes(source_bytes, transpose_bytes, "Metal resident working set"),
+                add_working_bytes(workspace_bytes, partial_bytes, "Metal resident working set"),
+                "Metal resident working set");
+            external_source_zero_copy = true;
+            return result;
+        }
         bool retain = options.reuse_working_buffers;
         if (retain) {
             const std::size_t desired_source = std::max(
-                source_bytes, buffer_bytes(retained_source_buffer));
+                source_bytes, buffer_bytes(slot.retained_source_buffer));
+            const std::size_t desired_transposed = transpose_bytes == 0U
+                ? buffer_bytes(slot.retained_transposed_buffer)
+                : std::max(transpose_bytes, buffer_bytes(slot.retained_transposed_buffer));
             const std::size_t desired_workspace = std::max(
-                workspace_bytes, buffer_bytes(retained_workspace_buffer));
+                workspace_bytes, buffer_bytes(slot.retained_workspace_buffer));
             const std::size_t desired_partials = std::max(
-                partial_bytes, buffer_bytes(retained_partial_buffer));
-            if (desired_source > std::numeric_limits<std::size_t>::max() - desired_workspace
-                || desired_source + desired_workspace
-                    > std::numeric_limits<std::size_t>::max() - desired_partials) {
-                throw std::length_error("Metal retained-buffer capacity overflow");
-            }
-            retain = desired_source + desired_workspace + desired_partials
-                <= options.retained_working_buffer_limit_bytes;
+                partial_bytes, buffer_bytes(slot.retained_partial_buffer));
+            const std::size_t desired_total = add_working_bytes(
+                add_working_bytes(desired_source, desired_transposed, "Metal retained-buffer capacity"),
+                add_working_bytes(desired_workspace, desired_partials, "Metal retained-buffer capacity"),
+                "Metal retained-buffer capacity");
+            retain = desired_total <= options.retained_working_buffer_limit_bytes;
         }
 
         if (retain) {
             result.source = acquire_retained_buffer(
-                retained_source_buffer, source_bytes, @"GetNative source");
+                slot.retained_source_buffer, source_bytes, @"GetNative source");
+            assign_transposed(result, true);
             result.workspace = acquire_retained_buffer(
-                retained_workspace_buffer, workspace_bytes,
+                slot.retained_workspace_buffer, workspace_bytes,
                 @"GetNative Metal workspace");
             result.partials = acquire_retained_buffer(
-                retained_partial_buffer, partial_bytes,
+                slot.retained_partial_buffer, partial_bytes,
                 @"GetNative metric partials");
-            result.resident_bytes = retained_working_buffer_bytes();
+            result.resident_bytes = retained_working_buffer_bytes_for(slot);
             working_buffer_peak_retained_bytes = std::max(
                 working_buffer_peak_retained_bytes, result.resident_bytes);
         } else {
-            clear_retained_working_buffers();
+            clear_retained_working_buffers(slot);
             result.source = allocate_empty_buffer(
                 source_bytes, @"GetNative source", true);
+            assign_transposed(result, false);
             result.workspace = allocate_empty_buffer(
                 workspace_bytes, @"GetNative Metal workspace", true);
             result.partials = allocate_empty_buffer(
@@ -711,9 +1012,37 @@ struct MetalAnalysisEngine::Impl {
         }
 
         const auto upload_start = std::chrono::steady_clock::now();
-        std::memcpy(result.source.contents, source_data, source_bytes);
-        source_upload_ms += std::chrono::duration<double, std::milli>(
+        auto *destination = static_cast<float *>(result.source.contents);
+        if (options.direct_source_write) {
+            if (source.stride == source.width) {
+                std::memcpy(destination, source.data, source_bytes);
+            } else {
+                for (std::int32_t y = 0; y < source.height; ++y) {
+                    std::memcpy(
+                        destination + static_cast<std::ptrdiff_t>(y) * source.width,
+                        source.data + static_cast<std::ptrdiff_t>(y) * source.stride,
+                        static_cast<std::size_t>(source.width) * sizeof(float));
+                }
+            }
+            source_direct_write_bytes += source_bytes;
+        } else {
+            std::vector<float> contiguous(
+                static_cast<std::size_t>(source.width)
+                * static_cast<std::size_t>(source.height));
+            for (std::int32_t y = 0; y < source.height; ++y) {
+                std::copy_n(
+                    source.data + static_cast<std::ptrdiff_t>(y) * source.stride,
+                    source.width,
+                    contiguous.data() + static_cast<std::ptrdiff_t>(y) * source.width);
+            }
+            std::memcpy(destination, contiguous.data(), source_bytes);
+            source_legacy_copy_bytes += source_bytes;
+            fallback_reason = "legacy_source_pack_requested";
+        }
+        const double elapsed = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - upload_start).count();
+        source_pack_ms += elapsed;
+        source_upload_ms += elapsed;
         return result;
     }
 
@@ -721,6 +1050,7 @@ struct MetalAnalysisEngine::Impl {
     void record_buffer_wiring(Function &&function) {
         const auto start = std::chrono::steady_clock::now();
         std::forward<Function>(function)();
+        const std::scoped_lock lock(mutex);
         buffer_wiring_ms += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - start).count();
     }
@@ -750,11 +1080,11 @@ struct MetalAnalysisEngine::Impl {
     [[nodiscard]] static std::string_view stage_prefix(PipelineStage stage) noexcept {
         switch (stage) {
         case PipelineStage::image_inverse: return "inverse_axis";
-        case PipelineStage::metric: return "metric_axis_p1";
+        case PipelineStage::metric: return "metric_axis";
         case PipelineStage::matrix_inverse: return "inverse_axis_matrix";
         case PipelineStage::matrix_forward: return "forward_axis_matrix";
         case PipelineStage::horizontal_first_metric:
-            return "metric_axis_p1_horizontal_first";
+            return "metric_axis_horizontal_first";
         }
         return "Metal pipeline";
     }
@@ -786,6 +1116,7 @@ struct MetalAnalysisEngine::Impl {
 
     [[nodiscard]] id<MTLComputePipelineState> pipeline(KernelShape shape,
                                                        PipelineStage stage) {
+        const std::scoped_lock lock(pipeline_mutex);
         ShapePipelines &shape_pipelines = pipelines(shape);
         id<MTLComputePipelineState> result = existing_pipeline(shape_pipelines, stage);
         if (result != nil) return result;
@@ -798,14 +1129,20 @@ struct MetalAnalysisEngine::Impl {
         const auto start = std::chrono::steady_clock::now();
         result = make_pipeline(device, library, function_name);
         const auto elapsed = std::chrono::steady_clock::now() - start;
-        pipeline_creation_ms += std::chrono::duration<double, std::milli>(elapsed).count();
+        {
+            const std::scoped_lock telemetry_lock(mutex);
+            pipeline_creation_ms += std::chrono::duration<double, std::milli>(elapsed).count();
+        }
         if ((stage == PipelineStage::metric
              || stage == PipelineStage::horizontal_first_metric)
             && result.maxTotalThreadsPerThreadgroup < reduction_width) {
             throw std::runtime_error("Metal device cannot run the 256-thread reduction kernels");
         }
         store_pipeline(shape_pipelines, stage, result);
-        created_pipeline_names.push_back(std::move(name));
+        {
+            const std::scoped_lock telemetry_lock(mutex);
+            created_pipeline_names.push_back(std::move(name));
+        }
         return result;
     }
 };
@@ -845,6 +1182,10 @@ MetalRuntimeTelemetry MetalAnalysisEngine::runtime_telemetry() const {
     result.working_buffer_peak_retained_bytes = impl_->working_buffer_peak_retained_bytes;
     result.command_buffer_submission_count = impl_->command_buffer_submission_count;
     result.command_buffer_completion_count = impl_->command_buffer_completion_count;
+    result.source_direct_write_bytes = impl_->source_direct_write_bytes;
+    result.source_legacy_copy_bytes = impl_->source_legacy_copy_bytes;
+    result.plan_direct_write_bytes = impl_->plan_direct_write_bytes;
+    result.plan_legacy_copy_bytes = impl_->plan_legacy_copy_bytes;
     result.plan_upload_bytes = impl_->plan_upload_bytes;
     result.analyzed_tile_count = impl_->analyzed_tile_count;
     result.generic_tile_count = impl_->generic_tile_count;
@@ -853,9 +1194,15 @@ MetalRuntimeTelemetry MetalAnalysisEngine::runtime_telemetry() const {
     result.working_buffer_allocation_ms = impl_->working_buffer_allocation_ms;
     result.source_upload_ms = impl_->source_upload_ms;
     result.plan_upload_ms = impl_->plan_upload_ms;
+    result.source_pack_ms = impl_->source_pack_ms;
+    result.plan_pack_ms = impl_->plan_pack_ms;
     result.buffer_wiring_ms = impl_->buffer_wiring_ms;
     result.pipeline_creation_ms = impl_->pipeline_creation_ms;
     result.gpu_execution_ms = impl_->gpu_execution_ms;
+    result.execution_slot_wait_ms = impl_->execution_slot_wait_ms;
+    result.external_source_zero_copy = impl_->external_source_zero_copy;
+    result.shared_uma_path = impl_->info.unified_memory;
+    result.fallback_reason = impl_->fallback_reason;
     result.created_pipeline_names = impl_->created_pipeline_names;
     return result;
 }
@@ -871,6 +1218,10 @@ void MetalAnalysisEngine::reset_analysis_telemetry() {
     impl_->working_buffer_peak_retained_bytes = impl_->retained_working_buffer_bytes();
     impl_->command_buffer_submission_count = 0;
     impl_->command_buffer_completion_count = 0;
+    impl_->source_direct_write_bytes = 0;
+    impl_->source_legacy_copy_bytes = 0;
+    impl_->plan_direct_write_bytes = 0;
+    impl_->plan_legacy_copy_bytes = 0;
     impl_->plan_upload_bytes = 0;
     impl_->analyzed_tile_count = 0;
     impl_->generic_tile_count = 0;
@@ -879,8 +1230,13 @@ void MetalAnalysisEngine::reset_analysis_telemetry() {
     impl_->working_buffer_allocation_ms = 0.0;
     impl_->source_upload_ms = 0.0;
     impl_->plan_upload_ms = 0.0;
+    impl_->source_pack_ms = 0.0;
+    impl_->plan_pack_ms = 0.0;
     impl_->buffer_wiring_ms = 0.0;
     impl_->gpu_execution_ms = 0.0;
+    impl_->execution_slot_wait_ms = 0.0;
+    impl_->external_source_zero_copy = false;
+    impl_->fallback_reason.clear();
 }
 
 void MetalAnalysisEngine::trim_working_buffers() {
@@ -888,17 +1244,81 @@ void MetalAnalysisEngine::trim_working_buffers() {
     impl_->clear_retained_working_buffers();
 }
 
+void MetalAnalysisEngine::preflight_axis_batch(
+    ConstImageView dimensions, std::span<const CandidateAnalysis> candidates,
+    const MetricSpec &metric, std::size_t concurrency) const {
+    if (dimensions.width <= 0 || dimensions.height <= 0
+        || dimensions.stride < dimensions.width) {
+        throw std::invalid_argument("invalid Metal preflight dimensions");
+    }
+    if (concurrency == 0U || concurrency > impl_->options.execution_slots) {
+        throw std::length_error("Metal execution slots cannot satisfy requested concurrency");
+    }
+    if (metric.norm < metal_minimum_p_norm || metric.norm > metal_maximum_p_norm) {
+        throw std::invalid_argument("Metal supports p-norm in 1..4");
+    }
+    if (candidates.empty()) return;
+    const std::size_t elements = checked_product(
+        static_cast<std::size_t>(dimensions.width),
+        static_cast<std::size_t>(dimensions.height), "Metal preflight source");
+    const std::size_t source_bytes = checked_product(elements, sizeof(float), "Metal preflight source");
+    const std::size_t groups = impl_->options.reduction_groups_per_candidate;
+    const std::size_t partial_bytes = checked_product(
+        checked_product(candidates.size(), groups, "Metal preflight partials"),
+        sizeof(float), "Metal preflight partials");
+    std::size_t workspace = 0U;
+    for (const CandidateAnalysis &candidate : candidates) {
+        workspace = std::max(workspace, candidate_workspace_elements(
+            dimensions, candidate, impl_->options.kernel_dispatch));
+    }
+    const std::size_t workspace_bytes = checked_product(workspace, sizeof(float), "Metal preflight workspace");
+    bool needs_horizontal = false;
+    for (const CandidateAnalysis &candidate : candidates) {
+        if (candidate.axes != AnalysisAxes::vertical) {
+            needs_horizontal = true;
+            break;
+        }
+    }
+    const std::size_t transpose_bytes = needs_horizontal ? source_bytes : 0U;
+    const std::size_t per_slot = source_bytes + transpose_bytes + partial_bytes + workspace_bytes;
+    if (source_bytes > impl_->info.maximum_buffer_bytes
+        || transpose_bytes > impl_->info.maximum_buffer_bytes
+        || partial_bytes > impl_->info.maximum_buffer_bytes
+        || workspace_bytes > impl_->info.maximum_buffer_bytes
+        || checked_product(per_slot, concurrency, "Metal concurrent working set")
+               > impl_->options.retained_working_buffer_limit_bytes) {
+        throw std::length_error("Metal device memory cannot satisfy requested concurrency");
+    }
+}
+
 std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
     ConstImageView source, std::span<const CandidateAnalysis> candidates,
-    const MetricSpec &metric, std::stop_token stop) {
-    const std::scoped_lock call_lock(impl_->mutex);
+    const MetricSpec &metric, std::stop_token stop,
+    const std::function<void(std::size_t, std::size_t)> &progress) {
+    std::unique_ptr<MetalExecutionSlot, std::function<void(MetalExecutionSlot *)>> slot_guard(
+        nullptr, [](MetalExecutionSlot *) {});
+    if (active_slot == nullptr) {
+        const auto slot_wait_start = std::chrono::steady_clock::now();
+        const std::size_t slot_index = impl_->acquire_slot(stop);
+        {
+            const std::scoped_lock lock(impl_->mutex);
+            impl_->execution_slot_wait_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - slot_wait_start).count();
+        }
+        active_slot = impl_->slots[slot_index].get();
+        slot_guard = decltype(slot_guard)(active_slot,
+            [impl = impl_.get(), slot_index](MetalExecutionSlot *) {
+                active_slot = nullptr;
+                impl->release_slot(slot_index);
+            });
+    }
     if (source.data == nullptr || source.width <= 0 || source.height <= 0
         || source.stride < source.width) {
         throw std::invalid_argument("invalid Metal source image");
     }
     const auto crop_bounds = metric_crop_bounds(source, metric);
-    if (metric.norm != 1U) {
-        throw std::invalid_argument("Metal currently supports only p=1 metrics");
+    if (metric.norm < metal_minimum_p_norm || metric.norm > metal_maximum_p_norm) {
+        throw std::invalid_argument("Metal supports p-norm in 1..4");
     }
     if (candidates.empty()) {
         return {};
@@ -911,18 +1331,6 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
         static_cast<std::size_t>(source.width), static_cast<std::size_t>(source.height),
         "source image");
     (void)checked_u32(image_elements, "source image element count");
-    std::vector<float> contiguous_source;
-    const float *source_data = source.data;
-    if (source.stride != source.width) {
-        contiguous_source.resize(image_elements);
-        for (std::int32_t y = 0; y < source.height; ++y) {
-            std::copy_n(source.data + static_cast<std::ptrdiff_t>(y) * source.stride,
-                        source.width,
-                        contiguous_source.data() + static_cast<std::ptrdiff_t>(y) * source.width);
-        }
-        source_data = contiguous_source.data();
-    }
-
     @autoreleasepool {
         const std::size_t source_bytes = checked_product(
             image_elements, sizeof(float), "Metal source buffer");
@@ -988,19 +1396,33 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
             tile_begin = tile_end;
         }
 
-        impl_->peak_workspace_elements = std::max(
-            impl_->peak_workspace_elements, maximum_workspace_elements);
+        {
+            const std::scoped_lock lock(impl_->mutex);
+            impl_->peak_workspace_elements = std::max(
+                impl_->peak_workspace_elements, maximum_workspace_elements);
+        }
         const std::size_t workspace_buffer_bytes = checked_product(
             maximum_workspace_elements, sizeof(float), "GetNative Metal workspace");
         const std::size_t partial_count = checked_product(
             candidates.size(), groups, "Metal partial results");
         const std::size_t partial_buffer_bytes = checked_product(
             partial_count, sizeof(float), "GetNative metric partials");
+        bool needs_horizontal_transpose = false;
+        for (const TileRange &tile : tiles) {
+            if (tile.signature.axes != AnalysisAxes::vertical) {
+                needs_horizontal_transpose = true;
+                break;
+            }
+        }
+        const std::size_t transpose_bytes =
+            needs_horizontal_transpose ? source_bytes : 0U;
         const WorkingBufferSet working_buffers = impl_->prepare_working_buffers(
-            source_bytes, workspace_buffer_bytes, partial_buffer_bytes, source_data);
+            *active_slot, source_bytes, workspace_buffer_bytes, partial_buffer_bytes,
+            transpose_bytes, source);
         id<MTLBuffer> source_buffer = working_buffers.source;
         id<MTLBuffer> workspace_buffer = working_buffers.workspace;
         id<MTLBuffer> partial_buffer = working_buffers.partials;
+        id<MTLBuffer> transposed_source = working_buffers.transposed;
         const std::size_t commands_per_tile = impl_->options.profile_split_kernels ? 4 : 1;
         NSMutableArray<id<MTLCommandBuffer>> *commands =
             [NSMutableArray arrayWithCapacity:std::min(tiles.size(), maximum_queued_tiles)
@@ -1009,7 +1431,10 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
             std::string command_error;
             for (id<MTLCommandBuffer> command in commands) {
                 [command waitUntilCompleted];
-                ++impl_->command_buffer_completion_count;
+                {
+                    const std::scoped_lock lock(impl_->mutex);
+                    ++impl_->command_buffer_completion_count;
+                }
                 if (command.status == MTLCommandBufferStatusError &&
                     command_error.empty()) {
                     command_error = ns_error(command.error,
@@ -1020,8 +1445,8 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     const double gpu_end = command.GPUEndTime;
                     if (std::isfinite(gpu_start) && std::isfinite(gpu_end) &&
                         gpu_end >= gpu_start) {
-                        impl_->gpu_execution_ms +=
-                            (gpu_end - gpu_start) * 1000.0;
+                        const std::scoped_lock lock(impl_->mutex);
+                        impl_->gpu_execution_ms += (gpu_end - gpu_start) * 1000.0;
                     }
                 }
             }
@@ -1030,38 +1455,80 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                 throw std::runtime_error(command_error);
             }
         };
+        if (needs_horizontal_transpose) {
+            id<MTLCommandBuffer> command = [impl_->active_queue() commandBuffer];
+            if (command == nil) {
+                throw std::runtime_error("Metal command buffer creation failed");
+            }
+            command.label = @"GetNative transpose source";
+            id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+            if (encoder == nil) {
+                throw std::runtime_error("Metal transpose encoder creation failed");
+            }
+            const std::uint32_t size[2]{
+                static_cast<std::uint32_t>(source.width),
+                static_cast<std::uint32_t>(source.height),
+            };
+            [encoder setComputePipelineState:impl_->transpose_source];
+            [encoder setBuffer:source_buffer offset:0 atIndex:0];
+            [encoder setBuffer:transposed_source offset:0 atIndex:1];
+            [encoder setBytes:size length:sizeof(size) atIndex:2];
+            [encoder dispatchThreads:MTLSizeMake(
+                static_cast<NSUInteger>(source.width),
+                static_cast<NSUInteger>(source.height), 1)
+                threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+            [encoder endEncoding];
+            [command commit];
+            [commands addObject:command];
+            {
+                const std::scoped_lock lock(impl_->mutex);
+                ++impl_->command_buffer_submission_count;
+            }
+        }
         std::size_t queued_tiles = 0;
         std::size_t queued_plan_bytes = 0;
         const std::size_t persistent_metal_bytes =
             working_buffers.resident_bytes;
-        impl_->peak_working_set_bytes = std::max(
-            impl_->peak_working_set_bytes, persistent_metal_bytes);
+        {
+            const std::scoped_lock lock(impl_->mutex);
+            impl_->peak_working_set_bytes = std::max(
+                impl_->peak_working_set_bytes, persistent_metal_bytes);
+        }
 
         const auto process_tile = [&](const TileRange &tile) {
             if (stop.stop_requested()) {
                 throw std::runtime_error("Metal analysis cancelled");
             }
             @autoreleasepool {
-                ++impl_->analyzed_tile_count;
-                if (uses_specialized_pipeline(tile.signature)) {
-                    ++impl_->specialized_tile_count;
-                } else {
-                    ++impl_->generic_tile_count;
-                }
-                PackedTile packed;
-                const std::size_t tile_candidate_count = tile.end - tile.begin;
-                packed.descriptors.reserve(
-                    tile_candidate_count * (tile.signature.axes == AnalysisAxes::both ? 2U : 1U));
-                if (tile.signature.axes == AnalysisAxes::both) {
-                    append_two_axis_plans(
-                        packed, source, candidates.subspan(tile.begin, tile_candidate_count),
-                        impl_->options.kernel_dispatch);
-                } else {
-                    for (std::size_t index = tile.begin; index < tile.end; ++index) {
-                        append_single_plan(
-                            packed, source, candidates[index], impl_->options.kernel_dispatch);
+                {
+                    const std::scoped_lock lock(impl_->mutex);
+                    ++impl_->analyzed_tile_count;
+                    if (uses_specialized_pipeline(tile.signature)) {
+                        ++impl_->specialized_tile_count;
+                    } else {
+                        ++impl_->generic_tile_count;
                     }
                 }
+                const std::size_t tile_candidate_count = tile.end - tile.begin;
+                const auto pack_into = [&]<class Packed>(Packed &packed) {
+                    packed.descriptors.reserve(
+                        tile_candidate_count
+                        * (tile.signature.axes == AnalysisAxes::both ? 2U : 1U));
+                    if (tile.signature.axes == AnalysisAxes::both) {
+                        append_two_axis_plans(
+                            packed, source,
+                            candidates.subspan(tile.begin, tile_candidate_count),
+                            impl_->options.kernel_dispatch);
+                    } else {
+                        for (std::size_t index = tile.begin; index < tile.end; ++index) {
+                            append_single_plan(
+                                packed, source, candidates[index],
+                                impl_->options.kernel_dispatch);
+                        }
+                    }
+                };
+                PackedTile packed;
+                pack_into(packed);
                 const std::size_t workspace_bytes = checked_product(
                     packed.workspace_elements, sizeof(float), "Metal workspace");
                 if (workspace_bytes > impl_->info.maximum_buffer_bytes) {
@@ -1092,36 +1559,126 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     checked_u32(groups, "reduction group count"),
                     checked_u32(tile_candidate_count, "candidate count"),
                     packed.maximum_vector_count,
+                    metric.norm,
                 };
 
-                id<MTLBuffer> descriptor_buffer = impl_->allocate_plan_buffer(
-                    packed.descriptors, "GetNative plan descriptors");
-                id<MTLBuffer> transpose_offset_buffer = impl_->allocate_plan_buffer(
-                    packed.transpose_offsets, "GetNative transpose offsets");
-                id<MTLBuffer> transpose_index_buffer = impl_->allocate_plan_buffer(
-                    packed.transpose_indices, "GetNative transpose indices");
-                id<MTLBuffer> transpose_weight_buffer = impl_->allocate_plan_buffer(
-                    packed.transpose_weights, "GetNative transpose weights");
-                id<MTLBuffer> lower_buffer = impl_->allocate_plan_buffer(
-                    packed.lower_ld, "GetNative lower factors");
-                id<MTLBuffer> upper_buffer = impl_->allocate_plan_buffer(
-                    packed.upper_l, "GetNative upper factors");
-                id<MTLBuffer> diagonal_buffer = impl_->allocate_plan_buffer(
-                    packed.inverse_diagonal, "GetNative inverse diagonal");
-                id<MTLBuffer> forward_left_buffer = impl_->allocate_plan_buffer(
-                    packed.forward_left, "GetNative forward left indices");
-                id<MTLBuffer> forward_weight_buffer = impl_->allocate_plan_buffer(
-                    packed.forward_weights, "GetNative forward weights");
-                const std::size_t tile_plan_bytes =
-                    static_cast<std::size_t>(descriptor_buffer.length)
-                    + static_cast<std::size_t>(transpose_offset_buffer.length)
-                    + static_cast<std::size_t>(transpose_index_buffer.length)
-                    + static_cast<std::size_t>(transpose_weight_buffer.length)
-                    + static_cast<std::size_t>(lower_buffer.length)
-                    + static_cast<std::size_t>(upper_buffer.length)
-                    + static_cast<std::size_t>(diagonal_buffer.length)
-                    + static_cast<std::size_t>(forward_left_buffer.length)
-                    + static_cast<std::size_t>(forward_weight_buffer.length);
+                const auto region_bytes = [](const auto &values, std::string_view name) {
+                    return checked_product(
+                        values.size(), sizeof(typename std::decay_t<decltype(values)>::value_type),
+                        name);
+                };
+                const std::array<std::size_t, 9> region_sizes{
+                    region_bytes(packed.descriptors, "Metal plan descriptors"),
+                    region_bytes(packed.transpose_offsets, "Metal transpose offsets"),
+                    region_bytes(packed.transpose_indices, "Metal transpose indices"),
+                    region_bytes(packed.transpose_weights, "Metal transpose weights"),
+                    region_bytes(packed.lower_ld, "Metal lower factors"),
+                    region_bytes(packed.upper_l, "Metal upper factors"),
+                    region_bytes(packed.inverse_diagonal, "Metal inverse diagonal"),
+                    region_bytes(packed.forward_left, "Metal forward left indices"),
+                    region_bytes(packed.forward_weights, "Metal forward weights"),
+                };
+                constexpr std::array<std::string_view, 9> region_names{
+                    "GetNative plan descriptors", "GetNative transpose offsets",
+                    "GetNative transpose indices", "GetNative transpose weights",
+                    "GetNative lower factors", "GetNative upper factors",
+                    "GetNative inverse diagonal", "GetNative forward left indices",
+                    "GetNative forward weights",
+                };
+                const auto same_shape = [](const auto &left, const auto &right) {
+                    return left.descriptors.size() == right.descriptors.size()
+                        && left.transpose_offsets.size() == right.transpose_offsets.size()
+                        && left.transpose_indices.size() == right.transpose_indices.size()
+                        && left.transpose_weights.size() == right.transpose_weights.size()
+                        && left.lower_ld.size() == right.lower_ld.size()
+                        && left.upper_l.size() == right.upper_l.size()
+                        && left.inverse_diagonal.size() == right.inverse_diagonal.size()
+                        && left.forward_left.size() == right.forward_left.size()
+                        && left.forward_weights.size() == right.forward_weights.size()
+                        && left.workspace_elements == right.workspace_elements
+                        && left.maximum_vector_count == right.maximum_vector_count
+                        && left.maximum_native_width == right.maximum_native_width
+                        && left.maximum_native_height == right.maximum_native_height;
+                };
+                Impl::PlanArena arena;
+                if (impl_->options.direct_plan_pack) {
+                    arena = impl_->allocate_plan_arena(region_sizes, region_names);
+                    auto *base = static_cast<std::byte *>(arena.buffer.contents);
+                    PackedTile direct{
+                        PlanRegion<AxisPlanDescriptor>{std::span<AxisPlanDescriptor>{
+                            reinterpret_cast<AxisPlanDescriptor *>(base + arena.offsets[0]),
+                            packed.descriptors.size()}},
+                        PlanRegion<std::uint32_t>{std::span<std::uint32_t>{
+                            reinterpret_cast<std::uint32_t *>(base + arena.offsets[1]),
+                            packed.transpose_offsets.size()}},
+                        PlanRegion<std::uint32_t>{std::span<std::uint32_t>{
+                            reinterpret_cast<std::uint32_t *>(base + arena.offsets[2]),
+                            packed.transpose_indices.size()}},
+                        PlanRegion<float>{std::span<float>{
+                            reinterpret_cast<float *>(base + arena.offsets[3]),
+                            packed.transpose_weights.size()}},
+                        PlanRegion<float>{std::span<float>{
+                            reinterpret_cast<float *>(base + arena.offsets[4]),
+                            packed.lower_ld.size()}},
+                        PlanRegion<float>{std::span<float>{
+                            reinterpret_cast<float *>(base + arena.offsets[5]),
+                            packed.upper_l.size()}},
+                        PlanRegion<float>{std::span<float>{
+                            reinterpret_cast<float *>(base + arena.offsets[6]),
+                            packed.inverse_diagonal.size()}},
+                        PlanRegion<std::int32_t>{std::span<std::int32_t>{
+                            reinterpret_cast<std::int32_t *>(base + arena.offsets[7]),
+                            packed.forward_left.size()}},
+                        PlanRegion<float>{std::span<float>{
+                            reinterpret_cast<float *>(base + arena.offsets[8]),
+                            packed.forward_weights.size()}},
+                    };
+                    const auto pack_start = std::chrono::steady_clock::now();
+                    pack_into(direct);
+                    const double pack_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - pack_start).count();
+                    if (!same_shape(packed, direct)) {
+                        throw std::logic_error("Metal direct plan pack preflight mismatch");
+                    }
+                    impl_->record_direct_plan_write(arena, pack_ms);
+                } else {
+                    PackedTile legacy = make_owning_packed_tile();
+                    pack_into(legacy);
+                    if (!same_shape(packed, legacy)) {
+                        throw std::logic_error("Metal legacy plan pack preflight mismatch");
+                    }
+                    arena = impl_->allocate_plan_arena(region_sizes, region_names);
+                    const auto region_of = [](const auto &values, std::string_view name) {
+                        return std::pair<const void *, std::size_t>{
+                            static_cast<const void *>(values.data()),
+                            checked_product(
+                                values.size(),
+                                sizeof(typename std::decay_t<decltype(values)>::value_type),
+                                name)};
+                    };
+                    impl_->copy_legacy_plan_regions(
+                        arena,
+                        {{region_of(legacy.descriptors, "Metal plan descriptors"),
+                          region_of(legacy.transpose_offsets, "Metal transpose offsets"),
+                          region_of(legacy.transpose_indices, "Metal transpose indices"),
+                          region_of(legacy.transpose_weights, "Metal transpose weights"),
+                          region_of(legacy.lower_ld, "Metal lower factors"),
+                          region_of(legacy.upper_l, "Metal upper factors"),
+                          region_of(legacy.inverse_diagonal, "Metal inverse diagonal"),
+                          region_of(legacy.forward_left, "Metal forward left indices"),
+                          region_of(legacy.forward_weights, "Metal forward weights")}});
+                }
+                id<MTLBuffer> plan_arena = arena.buffer;
+                const std::size_t descriptor_base = arena.offsets[0];
+                const std::size_t transpose_offsets_base = arena.offsets[1];
+                const std::size_t transpose_indices_base = arena.offsets[2];
+                const std::size_t transpose_weights_base = arena.offsets[3];
+                const std::size_t lower_base = arena.offsets[4];
+                const std::size_t upper_base = arena.offsets[5];
+                const std::size_t diagonal_base = arena.offsets[6];
+                const std::size_t forward_left_base = arena.offsets[7];
+                const std::size_t forward_weights_base = arena.offsets[8];
+                const std::size_t tile_plan_bytes = arena.total_bytes;
                 if (tile_plan_bytes > std::numeric_limits<std::size_t>::max() - queued_plan_bytes) {
                     throw std::length_error("Metal queued plan working set overflow");
                 }
@@ -1130,9 +1687,12 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                                             - persistent_metal_bytes) {
                     throw std::length_error("Metal total working set overflow");
                 }
-                impl_->peak_working_set_bytes = std::max(
-                    impl_->peak_working_set_bytes,
-                    persistent_metal_bytes + queued_plan_bytes);
+                {
+                    const std::scoped_lock lock(impl_->mutex);
+                    impl_->peak_working_set_bytes = std::max(
+                        impl_->peak_working_set_bytes,
+                        persistent_metal_bytes + queued_plan_bytes);
+                }
                 const std::size_t tile_partial_count = checked_product(
                     tile_candidate_count, groups, "Metal tile partial results");
                 const std::size_t partial_offset_elements = checked_product(
@@ -1141,7 +1701,7 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     partial_offset_elements, sizeof(float), "Metal partial result byte offset");
 
                 const auto make_command = [&](NSString *label) {
-                    id<MTLCommandBuffer> command = [impl_->queue commandBuffer];
+                    id<MTLCommandBuffer> command = [impl_->active_queue() commandBuffer];
                     if (command == nil) {
                         throw std::runtime_error("Metal command buffer creation failed");
                     }
@@ -1152,7 +1712,9 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                                                       id<MTLComputePipelineState> pipeline,
                                                       NSUInteger descriptor_offset,
                                                       AnalysisJob stage_job,
-                                                      std::size_t dispatch_count) {
+                                                      std::size_t dispatch_count,
+                                                      id<MTLBuffer> inverse_source,
+                                                      bool transposed) {
                     if (stop.stop_requested()) throw std::runtime_error("Metal analysis cancelled");
                     id<MTLComputeCommandEncoder> inverse = [command computeCommandEncoder];
                     if (inverse == nil) {
@@ -1160,16 +1722,18 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     }
                     inverse.label = @"GetNative inverse axis";
                     [inverse setComputePipelineState:pipeline];
+                    if (transposed) stage_job.transposed_source = 1U;
                     impl_->record_buffer_wiring([&] {
-                        [inverse setBuffer:source_buffer offset:0 atIndex:0];
+                        [inverse setBuffer:inverse_source offset:0 atIndex:0];
                         [inverse setBytes:&stage_job length:sizeof(stage_job) atIndex:1];
-                        [inverse setBuffer:descriptor_buffer offset:descriptor_offset atIndex:2];
-                        [inverse setBuffer:transpose_offset_buffer offset:0 atIndex:3];
-                        [inverse setBuffer:transpose_index_buffer offset:0 atIndex:4];
-                        [inverse setBuffer:transpose_weight_buffer offset:0 atIndex:5];
-                        [inverse setBuffer:lower_buffer offset:0 atIndex:6];
-                        [inverse setBuffer:upper_buffer offset:0 atIndex:7];
-                        [inverse setBuffer:diagonal_buffer offset:0 atIndex:8];
+                        [inverse setBuffer:plan_arena
+                                   offset:descriptor_base + descriptor_offset atIndex:2];
+                        [inverse setBuffer:plan_arena offset:transpose_offsets_base atIndex:3];
+                        [inverse setBuffer:plan_arena offset:transpose_indices_base atIndex:4];
+                        [inverse setBuffer:plan_arena offset:transpose_weights_base atIndex:5];
+                        [inverse setBuffer:plan_arena offset:lower_base atIndex:6];
+                        [inverse setBuffer:plan_arena offset:upper_base atIndex:7];
+                        [inverse setBuffer:plan_arena offset:diagonal_base atIndex:8];
                         [inverse setBuffer:workspace_buffer offset:0 atIndex:9];
                     });
                     const NSUInteger threads = std::min<NSUInteger>(
@@ -1195,13 +1759,14 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     [inverse setComputePipelineState:pipeline];
                     impl_->record_buffer_wiring([&] {
                         [inverse setBytes:&stage_job length:sizeof(stage_job) atIndex:0];
-                        [inverse setBuffer:descriptor_buffer offset:descriptor_offset atIndex:1];
-                        [inverse setBuffer:transpose_offset_buffer offset:0 atIndex:2];
-                        [inverse setBuffer:transpose_index_buffer offset:0 atIndex:3];
-                        [inverse setBuffer:transpose_weight_buffer offset:0 atIndex:4];
-                        [inverse setBuffer:lower_buffer offset:0 atIndex:5];
-                        [inverse setBuffer:upper_buffer offset:0 atIndex:6];
-                        [inverse setBuffer:diagonal_buffer offset:0 atIndex:7];
+                        [inverse setBuffer:plan_arena
+                                   offset:descriptor_base + descriptor_offset atIndex:1];
+                        [inverse setBuffer:plan_arena offset:transpose_offsets_base atIndex:2];
+                        [inverse setBuffer:plan_arena offset:transpose_indices_base atIndex:3];
+                        [inverse setBuffer:plan_arena offset:transpose_weights_base atIndex:4];
+                        [inverse setBuffer:plan_arena offset:lower_base atIndex:5];
+                        [inverse setBuffer:plan_arena offset:upper_base atIndex:6];
+                        [inverse setBuffer:plan_arena offset:diagonal_base atIndex:7];
                         [inverse setBuffer:workspace_buffer offset:0 atIndex:8];
                     });
                     const NSUInteger threads = std::min<NSUInteger>(
@@ -1227,9 +1792,10 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     [forward setComputePipelineState:pipeline];
                     impl_->record_buffer_wiring([&] {
                         [forward setBytes:&stage_job length:sizeof(stage_job) atIndex:0];
-                        [forward setBuffer:descriptor_buffer offset:descriptor_offset atIndex:1];
-                        [forward setBuffer:forward_left_buffer offset:0 atIndex:2];
-                        [forward setBuffer:forward_weight_buffer offset:0 atIndex:3];
+                        [forward setBuffer:plan_arena
+                                  offset:descriptor_base + descriptor_offset atIndex:1];
+                        [forward setBuffer:plan_arena offset:forward_left_base atIndex:2];
+                        [forward setBuffer:plan_arena offset:forward_weights_base atIndex:3];
                         [forward setBuffer:workspace_buffer offset:0 atIndex:4];
                     });
                     const NSUInteger threads = std::min<NSUInteger>(
@@ -1254,9 +1820,10 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     impl_->record_buffer_wiring([&] {
                         [reduction setBuffer:source_buffer offset:0 atIndex:0];
                         [reduction setBytes:&job length:sizeof(job) atIndex:1];
-                        [reduction setBuffer:descriptor_buffer offset:descriptor_offset atIndex:2];
-                        [reduction setBuffer:forward_left_buffer offset:0 atIndex:3];
-                        [reduction setBuffer:forward_weight_buffer offset:0 atIndex:4];
+                        [reduction setBuffer:plan_arena
+                                    offset:descriptor_base + descriptor_offset atIndex:2];
+                        [reduction setBuffer:plan_arena offset:forward_left_base atIndex:3];
+                        [reduction setBuffer:plan_arena offset:forward_weights_base atIndex:4];
                         [reduction setBuffer:workspace_buffer offset:0 atIndex:5];
                         [reduction setBuffer:partial_buffer offset:partial_offset_bytes atIndex:6];
                     });
@@ -1269,7 +1836,10 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                 const auto submit = [&](id<MTLCommandBuffer> command) {
                     [command commit];
                     [commands addObject:command];
-                    ++impl_->command_buffer_submission_count;
+                    {
+                        const std::scoped_lock lock(impl_->mutex);
+                        ++impl_->command_buffer_submission_count;
+                    }
                 };
 
                 if (tile.signature.axes != AnalysisAxes::both) {
@@ -1287,10 +1857,15 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     inverse_job.maximum_vector_count = packed.maximum_vector_count;
                     const std::size_t inverse_count = checked_product(
                         tile_candidate_count, packed.maximum_vector_count, "Metal inverse dispatch");
+                    const bool horizontal =
+                        tile.signature.axes == AnalysisAxes::horizontal;
+                    id<MTLBuffer> inverse_source =
+                        horizontal ? transposed_source : source_buffer;
                     if (impl_->options.profile_split_kernels) {
                         id<MTLCommandBuffer> inverse_command = make_command(@"GetNative inverse tile");
                         encode_image_inverse(
-                            inverse_command, inverse_pipeline, 0, inverse_job, inverse_count);
+                            inverse_command, inverse_pipeline, 0, inverse_job, inverse_count,
+                            inverse_source, horizontal);
                         submit(inverse_command);
                         id<MTLCommandBuffer> metric_command = make_command(@"GetNative metric tile");
                         encode_reduction(metric_command, metric_pipeline, 0);
@@ -1298,7 +1873,8 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     } else {
                         id<MTLCommandBuffer> command = make_command(@"GetNative axis analysis tile");
                         encode_image_inverse(
-                            command, inverse_pipeline, 0, inverse_job, inverse_count);
+                            command, inverse_pipeline, 0, inverse_job, inverse_count,
+                            inverse_source, horizontal);
                         encode_reduction(command, metric_pipeline, 0);
                         submit(command);
                     }
@@ -1347,7 +1923,8 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     if (impl_->options.profile_split_kernels) {
                         id<MTLCommandBuffer> h_inverse = make_command(@"GetNative two-axis inverse H");
                         encode_image_inverse(h_inverse, horizontal_inverse_pipeline, 0,
-                                             horizontal_inverse_job, horizontal_inverse_count);
+                                             horizontal_inverse_job, horizontal_inverse_count,
+                                             transposed_source, true);
                         submit(h_inverse);
                         id<MTLCommandBuffer> v_inverse = make_command(@"GetNative two-axis inverse V");
                         encode_matrix_inverse(v_inverse, vertical_inverse_pipeline,
@@ -1366,7 +1943,8 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     } else {
                         id<MTLCommandBuffer> command = make_command(@"GetNative two-axis analysis tile");
                         encode_image_inverse(command, horizontal_inverse_pipeline, 0,
-                                             horizontal_inverse_job, horizontal_inverse_count);
+                                             horizontal_inverse_job, horizontal_inverse_count,
+                                             transposed_source, true);
                         encode_matrix_inverse(command, vertical_inverse_pipeline,
                                               vertical_descriptor_offset, vertical_inverse_job,
                                               vertical_inverse_count);
@@ -1383,6 +1961,9 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                 drain_commands();
                 queued_tiles = 0;
                 queued_plan_bytes = 0;
+                if (progress) {
+                    progress(tile.end, candidates.size());
+                }
                 if (stop.stop_requested()) {
                     throw std::runtime_error("Metal analysis cancelled");
                 }
@@ -1409,9 +1990,128 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
             for (std::size_t part = 0; part < groups; ++part) {
                 sum += static_cast<double>(partials[index * groups + part]);
             }
-            results[index] = {candidates[index].id, sum / pixel_count};
+            const double mean = sum / pixel_count;
+            results[index] = {candidates[index].id,
+                              metric.norm == 1U
+                                  ? mean
+                                  : std::pow(mean, 1.0 / static_cast<double>(metric.norm))};
         }
         return results;
+    }
+}
+
+std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_metal_luma(
+    const MetalLumaFrameView &source,
+    std::span<const CandidateAnalysis> candidates,
+    const MetricSpec &metric, std::stop_token stop) {
+    if (source.pixel_buffer == 0U || source.width <= 0 || source.height <= 0) {
+        throw std::invalid_argument("metal_zero_copy_unsupported: invalid CVPixelBuffer");
+    }
+    if (source.surface_format != "420v" && source.surface_format != "420f"
+        && source.surface_format != "x420" && source.surface_format != "xf20") {
+        throw std::invalid_argument("metal_zero_copy_unsupported: unsupported CVPixelBuffer surface");
+    }
+    if (stop.stop_requested()) {
+        throw std::runtime_error("Metal analysis cancelled");
+    }
+    std::unique_ptr<MetalExecutionSlot, std::function<void(MetalExecutionSlot *)>> slot_guard(
+        nullptr, [](MetalExecutionSlot *) {});
+    if (active_slot == nullptr) {
+        const auto slot_wait_start = std::chrono::steady_clock::now();
+        const std::size_t slot_index = impl_->acquire_slot(stop);
+        {
+            const std::scoped_lock lock(impl_->mutex);
+            impl_->execution_slot_wait_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - slot_wait_start).count();
+        }
+        active_slot = impl_->slots[slot_index].get();
+        slot_guard = decltype(slot_guard)(active_slot,
+            [impl = impl_.get(), slot_index](MetalExecutionSlot *) {
+                active_slot = nullptr;
+                impl->release_slot(slot_index);
+            });
+    }
+    @autoreleasepool {
+        CVPixelBufferRef pixel_buffer = reinterpret_cast<CVPixelBufferRef>(source.pixel_buffer);
+        if (CVPixelBufferGetIOSurface(pixel_buffer) == nullptr) {
+            throw std::runtime_error("metal_zero_copy_unsupported: CVPixelBuffer has no IOSurface backing");
+        }
+        const bool ten_bit = source.bit_depth > 8;
+        const OSType format = CVPixelBufferGetPixelFormatType(pixel_buffer);
+        const bool format_is_10_bit =
+            format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
+        if (format_is_10_bit != ten_bit) {
+            throw std::runtime_error("metal_zero_copy_unsupported: CVPixelBuffer bit depth mismatch");
+        }
+        const bool full_range =
+            format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
+        const std::string_view expected_surface = ten_bit
+            ? (full_range ? "xf20" : "x420")
+            : (full_range ? "420f" : "420v");
+        if (source.surface_format != expected_surface) {
+            throw std::runtime_error("metal_zero_copy_unsupported: CVPixelBuffer surface metadata mismatch");
+        }
+        CVMetalTextureCacheRef cache = nullptr;
+        if (CVMetalTextureCacheCreate(kCFAllocatorDefault, nullptr,
+                                      impl_->device, nullptr, &cache) != kCVReturnSuccess) {
+            throw std::runtime_error("metal_zero_copy_unsupported: texture cache creation failed");
+        }
+        const std::size_t width = static_cast<std::size_t>(source.width);
+        const std::size_t height = static_cast<std::size_t>(source.height);
+        const std::size_t elements = checked_product(width, height, "Metal luma frame");
+        id<MTLBuffer> normalized = impl_->allocate_empty_buffer(
+            checked_product(elements, sizeof(float), "Metal normalized luma"),
+            @"GetNative normalized luma", true);
+        CVMetalTextureRef cv_texture = nullptr;
+        const MTLPixelFormat texture_format = ten_bit ? MTLPixelFormatR16Unorm : MTLPixelFormatR8Unorm;
+        const CVReturn texture_result = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, cache, pixel_buffer, nullptr, texture_format,
+            width, height, 0, &cv_texture);
+        if (texture_result != kCVReturnSuccess || cv_texture == nullptr) {
+            CFRelease(cache);
+            throw std::runtime_error("metal_zero_copy_unsupported: luma texture import failed");
+        }
+        id<MTLCommandBuffer> command = [active_slot->queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = command == nil ? nil : [command computeCommandEncoder];
+        if (encoder == nil) {
+            CFRelease(cv_texture); CFRelease(cache);
+            throw std::runtime_error("metal_zero_copy_unsupported: normalization encoder creation failed");
+        }
+        LumaNormalizeJob normalize_job{
+            static_cast<std::uint32_t>(source.width),
+            static_cast<std::uint32_t>(source.height),
+            static_cast<std::uint32_t>(source.bit_depth),
+            static_cast<std::uint32_t>(source.surface_format == "420f"
+                                       || source.surface_format == "xf20")};
+        [encoder setComputePipelineState:ten_bit ? impl_->luma_normalize_r16
+                                                  : impl_->luma_normalize_r8];
+        [encoder setTexture:CVMetalTextureGetTexture(cv_texture) atIndex:0];
+        [encoder setBuffer:normalized offset:0 atIndex:0];
+        [encoder setBytes:&normalize_job length:sizeof(normalize_job) atIndex:1];
+        [encoder dispatchThreads:MTLSizeMake(width, height, 1)
+            threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        [encoder endEncoding];
+        [command commit];
+        [command waitUntilCompleted];
+        CFRelease(cv_texture); CFRelease(cache);
+        if (command.status == MTLCommandBufferStatusError) {
+            throw std::runtime_error("metal_zero_copy_unsupported: luma normalization failed");
+        }
+        struct ExternalSourceReset {
+            MetalExecutionSlot *slot;
+            ~ExternalSourceReset() {
+                slot->external_source_buffer = nil;
+                slot->external_source_bytes = 0;
+            }
+        } reset{active_slot};
+        active_slot->external_source_buffer = normalized;
+        active_slot->external_source_bytes = elements * sizeof(float);
+        ConstImageView view{
+            reinterpret_cast<const float *>(std::uintptr_t{1}),
+            source.width, source.height, source.width};
+        return analyze_axis_batch_f32(view, candidates, metric, stop);
     }
 }
 

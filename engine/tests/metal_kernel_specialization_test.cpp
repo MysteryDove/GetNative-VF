@@ -283,10 +283,10 @@ void test_wider_fixed_shapes() {
                && specialized_telemetry.generic_tile_count == 0,
            "wider fixed shapes create all ten lazy stages without fallback");
     for (const std::string_view name : {
-             "inverse_axis_b11", "metric_axis_p1_b11", "inverse_axis_matrix_b11",
-             "forward_axis_matrix_b11", "metric_axis_p1_horizontal_first_b11",
-             "inverse_axis_b15", "metric_axis_p1_b15", "inverse_axis_matrix_b15",
-             "forward_axis_matrix_b15", "metric_axis_p1_horizontal_first_b15"}) {
+             "inverse_axis_b11", "metric_axis_b11", "inverse_axis_matrix_b11",
+             "forward_axis_matrix_b11", "metric_axis_horizontal_first_b11",
+             "inverse_axis_b15", "metric_axis_b15", "inverse_axis_matrix_b15",
+             "forward_axis_matrix_b15", "metric_axis_horizontal_first_b15"}) {
         expect(std::find(specialized_telemetry.created_pipeline_names.begin(),
                          specialized_telemetry.created_pipeline_names.end(), name)
                    != specialized_telemetry.created_pipeline_names.end(),
@@ -345,8 +345,8 @@ void test_b7_inverse_and_forward_dispatch_are_independent() {
                && specialized_telemetry.generic_tile_count == 0,
            "B7/F4 and B7/F6 both satisfy component-wise specialization");
     for (const std::string_view name : {
-             "metric_axis_p1_b11", "forward_axis_matrix_b11",
-             "metric_axis_p1_horizontal_first_b11"}) {
+             "metric_axis_b11", "forward_axis_matrix_b11",
+             "metric_axis_horizontal_first_b11"}) {
         expect(std::find(specialized_telemetry.created_pipeline_names.begin(),
                          specialized_telemetry.created_pipeline_names.end(), name)
                    != specialized_telemetry.created_pipeline_names.end(),

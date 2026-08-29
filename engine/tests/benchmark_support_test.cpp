@@ -1,4 +1,5 @@
 #include "benchmark_support.hpp"
+#include "formal_matrix.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -8,6 +9,10 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+
+#ifndef GETNATIVE_FORMAL_MATRIX_PATH
+#define GETNATIVE_FORMAL_MATRIX_PATH ""
+#endif
 
 namespace {
 
@@ -92,6 +97,28 @@ int main() {
                 "publication race overwrote the competing final path");
 
         std::filesystem::remove(temporary_path);
+
+        const auto matrix = getnative::benchmark::formal::load_matrix(
+            GETNATIVE_FORMAL_MATRIX_PATH);
+        const auto cases = getnative::benchmark::formal::make_cases(matrix);
+        require(getnative::benchmark::formal::is_formal_matrix(matrix, cases),
+                "tracked matrix did not satisfy the formal contract");
+        require(cases.size() == getnative::benchmark::formal::matrix_case_count,
+                "formal matrix did not expand to 112 unique cases");
+        const auto primary = std::find_if(
+            cases.begin(), cases.end(),
+            [](const auto &value) { return value.primary; });
+        require(primary != cases.end()
+                    && primary->id == getnative::benchmark::formal::primary_case_id,
+                "formal matrix primary case changed");
+        const auto source = getnative::benchmark::formal::make_source(matrix);
+        require(getnative::benchmark::formal::source_f32_fnv1a64(source)
+                    == "db88efa47eae48a6",
+                "formal source Float32 fingerprint changed");
+        require(getnative::benchmark::formal::candidate_contract_fingerprint(
+                    matrix, *primary) == "4e348b83236896e6",
+                "formal primary candidate fingerprint changed");
+
         std::cout << "benchmark support tests passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception &error) {

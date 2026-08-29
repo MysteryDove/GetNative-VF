@@ -35,9 +35,9 @@ float forward_point(uint candidate, bool vertical, uint row,
     for (uint tap = 0U; tap < width; ++tap) {
         const float weight = uintBitsToFloat(
             plan_data[weights_base + tap * source_size + row]);
-        sum += weight
-            * workspace_data[
-                input_base + uint(left + int(tap)) * input_stride];
+        sum = fma(weight,
+                  workspace_data[input_base + uint(left + int(tap)) * input_stride],
+                  sum);
     }
     return sum;
 }

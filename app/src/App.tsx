@@ -1,392 +1,591 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
-  Activity,
-  AlertTriangle,
-  Check,
-  Cpu,
-  Gauge,
-  LoaderCircle,
-  Play,
-  SlidersHorizontal,
-  X,
-  Zap,
-} from "lucide-react";
+  createTranslator,
+  DEFAULT_LOCALE,
+  isLocaleCode,
+  type LocaleCode,
+  type Translator,
+} from "./i18n";
+import { formatProjectError, ProjectHub } from "./components/ProjectHub";
+import { ProjectShell } from "./components/ProjectShell";
+import type { UiError } from "./components/ErrorNotice";
+import type { EngineEnvelope, EngineState } from "./engine/types";
+import { engineWorker } from "./engine/workerClient";
+import {
+  emptyExecutionState,
+  queueJob,
+  reduceWorkerEvent,
+  requestCancel,
+  type ExecutionState,
+  type QueueJobInput,
+} from "./engine/runReducer";
+import { applyTerminalEventToRun, type ExecutionBridge } from "./engine/executeRunGroup";
+import { applyOpenResult, createTauriProjectStorage } from "./project/storage";
+import { restoredProjectRoute } from "./project/normalize";
+import {
+  applyTheme,
+  isThemeMode,
+  resolveTheme,
+  storeThemeMode,
+  systemTheme,
+  type ResolvedTheme,
+  type ThemeMode,
+} from "./utils/theme";
+import type {
+  ProjectRoute,
+  ProjectCommandResult,
+  ProjectState,
+  RecentProjectEntry,
+  RecoveryInfo,
+} from "./project/types";
 import "./App.css";
 
-type GeometryMode = "standard" | "pro";
-type EngineState = "checking" | "ready" | "missing";
-
-type Geometry = {
-  width: number;
-  height: number;
-  src_left: number;
-  src_top: number;
-  src_width: number;
-  src_height: number;
+type AppPreferences = {
+  language: LocaleCode;
+  axisPlanCacheDir: string | null;
+  theme?: ThemeMode;
 };
 
-type KernelCapability = {
-  id: string;
-  parameters: Record<string, string | number | boolean>;
-};
-
-type BackendCapability = {
-  id: string;
-  compiled: boolean;
-  device_available: boolean;
-  analysis_command_available: boolean;
-  axes: string[];
-  p_norms: { minimum: number; maximum: number } | null;
-  max_half_bandwidth: number | null;
-  max_forward_width: number | null;
-  device?: string;
-  reason?: string;
-};
-
-type EngineEnvelope = {
-  path: string;
-  payload: {
-    schema_version: number;
-    engine: string;
-    version: string;
-    commands: {
-      capabilities: boolean;
-      geometry: boolean;
-      analyze: boolean;
-    };
-    kernels: KernelCapability[];
-    backends: BackendCapability[];
-    profiles: Array<{ id: string; default_crop: number }>;
-  };
-};
-
-type GeometryEnvelope = {
-  path: string;
-  payload: {
-    geometry: Geometry;
-    profile: string;
-    mode: GeometryMode;
-  };
-};
-
-const profileLabels: Record<string, string> = {
-  "muf-d278cd3": "MUF compatibility",
-  "getfnative-44c8d0f": "GetFnative compatibility",
-  modern: "Modern deterministic",
-};
-
-function requiredNumeric(value: string, label: string): number {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
-    throw new Error(`${label} must be finite`);
-  }
-  return parsed;
-}
-
-function optionalNumeric(value: string, label: string): number | null {
-  return value.trim() === "" ? null : requiredNumeric(value, label);
-}
+const storage = createTauriProjectStorage();
 
 function App() {
-  const [geometryMode, setGeometryMode] = useState<GeometryMode>("standard");
-  const [profile, setProfile] = useState("muf-d278cd3");
-  const [sourceWidth, setSourceWidth] = useState("1488");
-  const [sourceHeight, setSourceHeight] = useState("837");
-  const [activeWidth, setActiveWidth] = useState("1488");
-  const [activeHeight, setActiveHeight] = useState("837");
-  const [baseWidth, setBaseWidth] = useState("");
-  const [baseHeight, setBaseHeight] = useState("838");
+  const [locale, setLocale] = useState<LocaleCode>(DEFAULT_LOCALE);
+  const [themeMode, setThemeMode] = useState<ThemeMode>("system");
+  const [systemResolved, setSystemResolved] = useState<ResolvedTheme>(() => systemTheme());
+  const [axisPlanCacheDir, setAxisPlanCacheDir] = useState<string | null>(null);
+  const [prefsReady, setPrefsReady] = useState(false);
+  const [project, setProject] = useState<ProjectState | null>(null);
+  const [route, setRoute] = useState<ProjectRoute>("overview");
+  const [recent, setRecent] = useState<RecentProjectEntry[]>([]);
+  const [recovery, setRecovery] = useState<RecoveryInfo>({
+    present: false,
+    path: null,
+    name: null,
+    updated_at: null,
+  });
+  const [busy, setBusy] = useState(false);
+  const [hubError, setHubError] = useState<UiError | null>(null);
+  const [projectError, setProjectError] = useState<UiError | null>(null);
+
   const [engineState, setEngineState] = useState<EngineState>("checking");
   const [enginePath, setEnginePath] = useState("");
   const [engineError, setEngineError] = useState("");
   const [capabilities, setCapabilities] = useState<EngineEnvelope | null>(null);
-  const [geometry, setGeometry] = useState<Geometry | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [execution, setExecution] = useState<ExecutionState>(() => emptyExecutionState());
+  /** Live job runId → persistent Project Run id, bound at queue time. */
+  const projectRunBindings = useRef(new Map<string, string>());
 
-  const analysisAvailable = capabilities?.payload.commands.analyze ?? false;
-  const profiles = capabilities?.payload.profiles ?? [];
-  const backends = capabilities?.payload.backends ?? [];
-  const kernels = capabilities?.payload.kernels ?? [];
-  const canvasRatio = useMemo(() => {
-    const width = geometry?.width ?? Number(sourceWidth);
-    const height = geometry?.height ?? Number(sourceHeight);
-    return Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0
-      ? `${width} / ${height}`
-      : "16 / 9";
-  }, [geometry, sourceWidth, sourceHeight]);
+  const t = useMemo(() => createTranslator(locale), [locale]);
+
+  const refreshHub = useCallback(async () => {
+    const [recentList, recoveryInfo] = await Promise.all([
+      storage.listRecent(),
+      storage.recoveryInfo(),
+    ]);
+    setRecent(recentList);
+    setRecovery(recoveryInfo);
+  }, []);
 
   useEffect(() => {
-    invoke<EngineEnvelope>("engine_capabilities")
-      .then((result) => {
+    invoke<AppPreferences>("app_get_preferences")
+      .then((prefs) => {
+        if (isLocaleCode(prefs.language)) {
+          setLocale(prefs.language);
+        }
+        if (isThemeMode(prefs.theme)) {
+          setThemeMode(prefs.theme);
+          storeThemeMode(prefs.theme);
+        }
+        setAxisPlanCacheDir(prefs.axisPlanCacheDir ?? null);
+      })
+      .catch((error: unknown) => {
+        setLocale(DEFAULT_LOCALE);
+        setHubError({
+          summary: createTranslator(DEFAULT_LOCALE)("app.error.languageLoad"),
+          detail: String(error),
+        });
+      })
+      .finally(() => setPrefsReady(true));
+  }, []);
+
+  // Track the OS appearance while "system" mode can depend on it, then apply
+  // the resolved theme. The boot application skips the cross-fade; later
+  // changes (settings switch or OS toggle) animate.
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = () => setSystemResolved(media.matches ? "dark" : "light");
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, []);
+
+  const resolvedTheme = resolveTheme(themeMode, systemResolved);
+  const bootThemeApplied = useRef(false);
+  useEffect(() => {
+    const animate = bootThemeApplied.current;
+    bootThemeApplied.current = true;
+    applyTheme(resolvedTheme, animate);
+  }, [resolvedTheme]);
+
+  // Worker session lifecycle: stream engine events into the Job Tray state,
+  // and prefer the resident worker's capability envelope (analyze=true per the
+  // backend contract) over the one-shot CLI, which stays analyze=false.
+  // Terminal events are also bridged onto the persistent Project Run records
+  // (append-only); progress never touches ProjectState, so autosave stays calm.
+  useEffect(() => {
+    const unsubscribe = engineWorker.subscribe((event) => {
+      setExecution((state) => reduceWorkerEvent(state, event));
+      if (event.type === "result" || event.type === "cancelled" || event.type === "error") {
+        const projectRunId = projectRunBindings.current.get(event.runId);
+        if (projectRunId) {
+          const nowIso = new Date().toISOString();
+          handleProjectChange((current) =>
+            applyTerminalEventToRun(
+              current,
+              projectRunId,
+              {
+                type: event.type,
+                ...(event.type === "result" ? { payload: event.payload } : {}),
+                ...(event.type === "cancelled" ? { partial: event.partial } : {}),
+                ...(event.type === "error"
+                  ? { code: event.code, message: event.message }
+                  : {}),
+              },
+              nowIso,
+            ),
+          );
+          projectRunBindings.current.delete(event.runId);
+        }
+      }
+    });
+    const unsubscribeExit = engineWorker.onExit(() => {
+      // The resident worker died: fall back to the one-shot envelope so
+      // analyze gating reflects what the app can actually run.
+      invoke<EngineEnvelope>("engine_capabilities")
+        .then((result) => {
+          setCapabilities(result);
+          setEnginePath(result.path);
+          setEngineState("ready");
+          setEngineError("worker_exit: resident engine worker exited; analysis is unavailable until restart");
+        })
+        .catch((error: unknown) => {
+          setCapabilities(null);
+          setEngineState("missing");
+          setEngineError(String(error));
+        });
+    });
+    return () => {
+      unsubscribe();
+      unsubscribeExit();
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        await engineWorker.connect();
+        const envelope = await engineWorker.capabilities();
+        if (cancelled) return;
+        setCapabilities(envelope);
+        setEnginePath(envelope.path);
+        setEngineState("ready");
+        setEngineError("");
+        return;
+      } catch {
+        // Fall through to the one-shot CLI transport below.
+      }
+      if (cancelled) return;
+      try {
+        const result = await invoke<EngineEnvelope>("engine_capabilities");
+        if (cancelled) return;
         setCapabilities(result);
         setEnginePath(result.path);
         setEngineState("ready");
-      })
-      .catch((error: unknown) => {
+        setEngineError("");
+      } catch (error: unknown) {
+        if (cancelled) return;
         setEngineState("missing");
         setEngineError(String(error));
-      });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  async function previewGeometry() {
-    setBusy(true);
-    setEngineError("");
+  useEffect(() => {
+    if (!prefsReady || project) return;
+    refreshHub().catch((error: unknown) => {
+      setHubError({ summary: t("hub.error.generic"), detail: String(error) });
+    });
+  }, [prefsReady, project, refreshHub, t]);
+
+  useEffect(() => {
+    if (!project?.project.dirty || project.project.readOnly || busy) return;
+    const snapshot = project;
+    const timer = window.setTimeout(() => {
+      storage
+        .autosave(snapshot)
+        .then((result) => {
+          const applied = applyOpenResult(result);
+          if ("error" in applied) {
+            setProjectError({
+              summary: t("project.error.autosave"),
+              detail: applied.error.message,
+            });
+            return;
+          }
+          setProject((current) => (current === snapshot ? applied.state : current));
+        })
+        .catch((error: unknown) => {
+          setProjectError({ summary: t("project.error.autosave"), detail: String(error) });
+        });
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [busy, project, t]);
+
+  async function changeLanguage(next: LocaleCode) {
+    setLocale(next);
     try {
-      const result = await invoke<GeometryEnvelope>("engine_geometry", {
-        request: {
-          profile,
-          mode: geometryMode,
-          sourceWidth: requiredNumeric(sourceWidth, "Source width"),
-          sourceHeight: requiredNumeric(sourceHeight, "Source height"),
-          activeWidth: requiredNumeric(activeWidth, "Active width"),
-          activeHeight: requiredNumeric(activeHeight, "Active height"),
-          baseHeight: optionalNumeric(baseHeight, "Base height"),
-          baseWidth: optionalNumeric(baseWidth, "Base width"),
-        },
+      await invoke<AppPreferences>("app_set_language", {
+        request: { language: next },
       });
-      setGeometry(result.payload.geometry);
-      setEngineState("ready");
     } catch (error) {
-      setEngineError(String(error));
+      const uiError = {
+        summary: createTranslator(next)("app.error.languageSave"),
+        detail: String(error),
+      };
+      if (project) {
+        setProjectError(uiError);
+      } else {
+        setHubError(uiError);
+      }
+    }
+  }
+
+  async function changeTheme(next: ThemeMode) {
+    setThemeMode(next);
+    storeThemeMode(next);
+    try {
+      await invoke<AppPreferences>("app_set_theme", {
+        request: { theme: next },
+      });
+    } catch (error) {
+      const uiError = {
+        summary: t("app.error.themeSave"),
+        detail: String(error),
+      };
+      if (project) {
+        setProjectError(uiError);
+      } else {
+        setHubError(uiError);
+      }
+    }
+  }
+
+  async function changeAxisPlanCacheDir(next: string | null) {
+    try {
+      const prefs = await invoke<AppPreferences>("app_set_axis_plan_cache_dir", {
+        request: { path: next },
+      });
+      setAxisPlanCacheDir(prefs.axisPlanCacheDir ?? null);
+
+      // The engine reads its cache environment when the resident process is
+      // spawned. Restart it so the new setting applies immediately.
+      await engineWorker.shutdown();
+      const hello = await engineWorker.connect();
+      const envelope = await engineWorker.capabilities();
+      setEnginePath(hello.path);
+      setCapabilities(envelope);
+      setEngineState("ready");
+      setEngineError("");
+    } catch (error: unknown) {
+      const uiError = {
+        summary: t("settings.cacheSaveError"),
+        detail: String(error),
+      };
+      if (project) {
+        setProjectError(uiError);
+      } else {
+        setHubError(uiError);
+      }
+    }
+  }
+
+  async function openFromResult(result: Awaited<ReturnType<typeof storage.open>>, nextRoute: ProjectRoute) {
+    const applied = applyOpenResult(result);
+    if ("error" in applied) {
+      if (applied.error.code === "cancelled") {
+        setHubError(null);
+        return;
+      }
+      setHubError({
+        summary: formatProjectError(applied.error, t),
+        detail: applied.error.message,
+      });
+      return;
+    }
+    setProject(applied.state);
+    setProjectError(projectWarnings(result, t));
+    setRoute(restoredProjectRoute(applied.state, nextRoute));
+    setHubError(null);
+    try {
+      await refreshHub();
+    } catch (error) {
+      setProjectError(projectWarnings(result, t, error));
+    }
+  }
+
+  async function handleNew(name: string) {
+    setBusy(true);
+    setHubError(null);
+    try {
+      const result = await storage.createNamed(name);
+      await openFromResult(result, "overview");
+    } catch (error) {
+      setHubError({ summary: t("hub.error.generic"), detail: String(error) });
     } finally {
       setBusy(false);
     }
   }
 
-  return (
-    <div className={`app-shell ${engineError ? "has-error" : ""}`}>
-      <header className="topbar">
-        <div className="brand-block">
-          <div className="brand-mark" aria-hidden="true">
-            <Activity size={19} strokeWidth={2.2} />
-          </div>
-          <div>
-            <h1>GetNative VF</h1>
-            <span>Geometry workbench</span>
-          </div>
-        </div>
-
-        <div className="mode-switch" role="tablist" aria-label="Workbench mode">
-          <button className="active" role="tab" aria-selected="true">Geometry</button>
-          <button role="tab" aria-selected="false" disabled={!analysisAvailable}>Analysis</button>
-        </div>
-
-        <div className="top-actions">
-          <div className={`engine-state ${engineState}`} title={enginePath || engineError}>
-            <span className="status-dot" />
-            {engineState === "ready"
-              ? `Engine ${capabilities?.payload.version ?? ""}`
-              : engineState}
-          </div>
-          <button
-            className="run-button"
-            onClick={previewGeometry}
-            disabled={busy || engineState !== "ready"}
-          >
-            {busy ? <LoaderCircle className="spin" size={16} /> : <Play size={16} fill="currentColor" />}
-            {busy ? "Working" : "Preview"}
-          </button>
-        </div>
-      </header>
-
-      {engineError && (
-        <div className="error-strip" role="alert">
-          <AlertTriangle size={16} />
-          <span>{engineError}</span>
-        </div>
-      )}
-
-      <main className="workspace capability-workspace">
-        <aside className="parameters-panel">
-          <section className="panel-section">
-            <div className="section-heading">
-              <SlidersHorizontal size={17} />
-              <h2>Geometry</h2>
-            </div>
-            <label className="select-field first-field">
-              <span>Profile</span>
-              <div>
-                <select value={profile} onChange={(event) => setProfile(event.target.value)}>
-                  {profiles.map((item) => (
-                    <option value={item.id} key={item.id}>
-                      {profileLabels[item.id] ?? item.id}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </label>
-            <div className="axis-switch" aria-label="Geometry mode">
-              {(["standard", "pro"] as GeometryMode[]).map((item) => (
-                <button
-                  className={geometryMode === item ? "active" : ""}
-                  key={item}
-                  onClick={() => setGeometryMode(item)}
-                >
-                  {item === "standard" ? "Standard" : "Pro"}
-                </button>
-              ))}
-            </div>
-          </section>
-
-          <section className="panel-section">
-            <div className="section-heading">
-              <Gauge size={17} />
-              <h2>Dimensions</h2>
-            </div>
-            <div className="two-column-fields no-top-margin">
-              <Field label="Source W" value={sourceWidth} onChange={setSourceWidth} suffix="px" />
-              <Field label="Source H" value={sourceHeight} onChange={setSourceHeight} suffix="px" />
-            </div>
-            <div className="two-column-fields">
-              <Field label="Active W" value={activeWidth} onChange={setActiveWidth} suffix="px" />
-              <Field label="Active H" value={activeHeight} onChange={setActiveHeight} suffix="px" />
-            </div>
-            <div className="two-column-fields">
-              <Field label="Base W" value={baseWidth} onChange={setBaseWidth} suffix="px" />
-              <Field label="Base H" value={baseHeight} onChange={setBaseHeight} suffix="px" />
-            </div>
-          </section>
-        </aside>
-
-        <section className="analysis-panel geometry-panel">
-          <div className="analysis-toolbar">
-            <div>
-              <h2>Geometry preview</h2>
-              <span>{profileLabels[profile] ?? profile} / {geometryMode}</span>
-            </div>
-            <div className={`command-badge ${analysisAvailable ? "available" : "unavailable"}`}>
-              {analysisAvailable ? <Check size={14} /> : <X size={14} />}
-              Analysis command {analysisAvailable ? "available" : "unavailable"}
-            </div>
-          </div>
-
-          <div className="geometry-preview-region">
-            <div className="geometry-canvas" style={{ aspectRatio: canvasRatio }}>
-              <span>{geometry ? `${geometry.width} x ${geometry.height}` : "No geometry result"}</span>
-            </div>
-            <div className="geometry-readout">
-              <GeometryRow label="Canvas" value={geometry ? `${geometry.width} x ${geometry.height}` : "-"} />
-              <GeometryRow label="Active" value={geometry ? `${geometry.src_width} x ${geometry.src_height}` : "-"} />
-              <GeometryRow label="Offset" value={geometry ? `${geometry.src_left}, ${geometry.src_top}` : "-"} />
-              <GeometryRow
-                label="Parity"
-                value={geometry ? `${geometry.width % 2 ? "odd" : "even"} / ${geometry.height % 2 ? "odd" : "even"}` : "-"}
-              />
-            </div>
-          </div>
-
-          <div className="jobs-bar">
-            <div className="job-icon"><Cpu size={17} /></div>
-            <div className="job-copy">
-              <strong>{geometry ? "Geometry preview complete" : "Ready for geometry preview"}</strong>
-              <span>{engineState === "ready" ? enginePath : "Engine unavailable"}</span>
-            </div>
-            <div className="job-progress"><span style={{ width: geometry ? "100%" : "0%" }} /></div>
-            <span className="job-time">{geometry ? "done" : "idle"}</span>
-          </div>
-        </section>
-
-        <aside className="results-panel capabilities-panel">
-          <div className="results-heading">
-            <div>
-              <h2>Capabilities</h2>
-              <span>Engine schema {capabilities?.payload.schema_version ?? "-"}</span>
-            </div>
-            <Zap size={18} />
-          </div>
-
-          <div className="backend-list">
-            {backends.map((backend) => <BackendRow backend={backend} key={backend.id} />)}
-          </div>
-
-          <div className="kernel-section">
-            <h3>Kernel contract</h3>
-            {kernels.map((kernel) => (
-              <div className="kernel-row" key={kernel.id}>
-                <span>{kernel.id}</span>
-                <strong>{kernelSummary(kernel)}</strong>
-              </div>
-            ))}
-          </div>
-        </aside>
-      </main>
-    </div>
-  );
-}
-
-function kernelSummary(kernel: KernelCapability): string {
-  if (kernel.id === "bicubic") return "finite B / C";
-  if (kernel.id === "lanczos") {
-    return `${kernel.parameters.gui_min}-${kernel.parameters.gui_max} GUI / ${kernel.parameters.core_min}-${kernel.parameters.core_max} core`;
+  async function handleOpen(path?: string) {
+    setBusy(true);
+    setHubError(null);
+    try {
+      const result = await storage.open(path);
+      await openFromResult(result, "overview");
+    } catch (error) {
+      setHubError({ summary: t("hub.error.generic"), detail: String(error) });
+    } finally {
+      setBusy(false);
+    }
   }
-  return "fixed";
-}
 
-function BackendRow({ backend }: { backend: BackendCapability }) {
-  const ready = backend.compiled && backend.device_available;
-  const pNorm = backend.p_norms
-    ? backend.p_norms.maximum === 4_294_967_295
-      ? `p >= ${backend.p_norms.minimum}`
-      : `p${backend.p_norms.minimum}`
-    : "";
-  const status = !backend.compiled
-    ? "Not compiled"
-    : !backend.device_available
-      ? "No device"
-      : backend.analysis_command_available
-        ? "Analysis ready"
-        : "Device ready";
-  const shape = backend.max_half_bandwidth && backend.max_forward_width
-    ? ` | shape ${backend.max_half_bandwidth}/${backend.max_forward_width}`
-    : "";
+  async function handleQuick() {
+    setBusy(true);
+    setHubError(null);
+    try {
+      const result = await storage.createUntitled();
+      await openFromResult(result, "media");
+    } catch (error) {
+      setHubError({ summary: t("hub.error.generic"), detail: String(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRecover() {
+    setBusy(true);
+    setHubError(null);
+    try {
+      const result = await storage.recover();
+      await openFromResult(result, "media");
+    } catch (error) {
+      setHubError({ summary: t("hub.error.generic"), detail: String(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleDiscardRecovery() {
+    setBusy(true);
+    setHubError(null);
+    try {
+      setRecovery(await storage.discardRecovery());
+    } catch (error) {
+      setHubError({ summary: t("hub.error.generic"), detail: String(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRemoveRecent(path: string) {
+    setBusy(true);
+    try {
+      const next = await storage.removeRecent(path);
+      setRecent(next);
+    } catch (error) {
+      setHubError({ summary: t("hub.error.generic"), detail: String(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRevealRecent(path: string) {
+    setBusy(true);
+    setHubError(null);
+    try {
+      await storage.reveal(path);
+    } catch (error) {
+      setHubError({ summary: t("hub.error.generic"), detail: String(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSave() {
+    if (!project) return;
+    setBusy(true);
+    try {
+      const result = await storage.save(project, {
+        dialogName: project.project.untitled ? t("shell.untitled") : undefined,
+      });
+      const applied = applyOpenResult(result);
+      if ("error" in applied) {
+        if (applied.error.code !== "cancelled") {
+          setProjectError({
+            summary: formatProjectError(applied.error, t),
+            detail: applied.error.message,
+          });
+        }
+        return;
+      }
+      setProject(applied.state);
+      setProjectError(projectWarnings(result, t));
+      try {
+        await refreshHub();
+      } catch (error) {
+        setProjectError(projectWarnings(result, t, error));
+      }
+    } catch (error) {
+      setProjectError({ summary: t("project.error.save"), detail: String(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function handleNavigate(nextRoute: ProjectRoute) {
+    if (nextRoute === route) return;
+    setRoute(nextRoute);
+    setProject((current) =>
+      current
+        ? {
+            ...current,
+            project: {
+              ...current.project,
+              dirty: current.project.readOnly ? current.project.dirty : true,
+            },
+            uiStateByRoute: {
+              ...current.uiStateByRoute,
+              shell: { lastRoute: nextRoute },
+            },
+          }
+        : current,
+    );
+  }
+
+  // Stable identity: pages hang effects off this; a new function per render
+  // re-fires downstream effects (e.g. media preview reloads) on every App render.
+  const handleProjectChange = useCallback(
+    (updater: (state: ProjectState) => ProjectState) => {
+      setProject((current) => {
+        if (!current || current.project.readOnly) return current;
+        const next = updater(current);
+        return next === current
+          ? current
+          : { ...next, project: { ...next.project, dirty: true } };
+      });
+    },
+    [],
+  );
+
+  const queueExecutionJob = useCallback((input: QueueJobInput) => {
+    if (input.projectRunId) {
+      projectRunBindings.current.set(input.runId, input.projectRunId);
+    }
+    setExecution((state) => queueJob(state, input));
+  }, []);
+
+  const cancelExecutionJob = useCallback((jobId: string) => {
+    void engineWorker.cancel(jobId).catch(() => undefined);
+    setExecution((state) => requestCancel(state, { jobId, nowMs: Date.now() }));
+  }, []);
+
+  const executionBridge: ExecutionBridge = useMemo(
+    () => ({ queue: queueExecutionJob, cancel: cancelExecutionJob }),
+    [queueExecutionJob, cancelExecutionJob],
+  );
+
+  if (!prefsReady) {
+    return <div className="boot-screen" />;
+  }
+
+  if (!project) {
+    return (
+      <ProjectHub
+        t={t}
+        recent={recent}
+        recovery={recovery}
+        busy={busy}
+        error={hubError}
+        onNew={handleNew}
+        onOpen={() => handleOpen()}
+        onQuick={handleQuick}
+        onOpenRecent={(path) => handleOpen(path)}
+        onRevealRecent={handleRevealRecent}
+        onRemoveRecent={handleRemoveRecent}
+        onRecover={handleRecover}
+        onDiscardRecovery={handleDiscardRecovery}
+        onLanguageChange={changeLanguage}
+        locale={locale}
+      />
+    );
+  }
+
   return (
-    <div className="backend-row">
-      <div className={`backend-icon ${ready ? "ready" : "unavailable"}`}>
-        {ready ? <Check size={15} /> : <X size={15} />}
-      </div>
-      <div>
-        <strong>{backend.id.toUpperCase()}</strong>
-        <span>{status}</span>
-        <small>
-          {backend.axes.length
-            ? `${backend.analysis_command_available ? "command ready" : "no analyze command"} | ${backend.axes.join(" / ")} | ${pNorm}${shape}`
-            : backend.reason}
-        </small>
-      </div>
-    </div>
+    <ProjectShell
+      t={t}
+      state={project}
+      route={route}
+      engineState={engineState}
+      enginePath={enginePath}
+      engineError={engineError}
+      projectError={projectError}
+      capabilities={capabilities}
+      language={locale}
+      onLanguageChange={changeLanguage}
+      themeMode={themeMode}
+      onThemeChange={(mode: ThemeMode) => void changeTheme(mode)}
+      axisPlanCacheDir={axisPlanCacheDir}
+      onAxisPlanCacheDirChange={changeAxisPlanCacheDir}
+      onNavigate={handleNavigate}
+      onClose={() => {
+        setProject(null);
+        setProjectError(null);
+        setRoute("overview");
+        refreshHub().catch(() => undefined);
+      }}
+      onSave={handleSave}
+      onProjectChange={handleProjectChange}
+      onEngineError={setEngineError}
+      onGeometrySuccess={() => {
+        setEngineState("ready");
+        setEngineError("");
+      }}
+      busy={busy}
+      execution={execution}
+      executionBridge={executionBridge}
+    />
   );
 }
 
-function Field({
-  label,
-  value,
-  suffix,
-  onChange,
-}: {
-  label: string;
-  value: string;
-  suffix?: string;
-  onChange: (value: string) => void;
-}) {
-  return (
-    <label className="number-field">
-      <span>{label}</span>
-      <div>
-        <input value={value} inputMode="decimal" onChange={(event) => onChange(event.target.value)} />
-        {suffix && <small>{suffix}</small>}
-      </div>
-    </label>
-  );
-}
-
-function GeometryRow({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="geometry-row">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
+function projectWarnings(
+  result: ProjectCommandResult,
+  t: Translator,
+  refreshError?: unknown,
+): UiError | null {
+  const details = result.warnings.map((warning) => warning.message);
+  if (refreshError !== undefined) {
+    details.push(refreshError instanceof Error ? refreshError.message : String(refreshError));
+  }
+  const uniqueDetails = [...new Set(details.filter(Boolean))];
+  if (!uniqueDetails.length) return null;
+  return {
+    summary: t("project.warning.maintenance"),
+    detail: uniqueDetails.join("\n"),
+  };
 }
 
 export default App;

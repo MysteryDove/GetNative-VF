@@ -752,17 +752,33 @@ Rules:
   - No coined terminology (`禁止生造字词`). Do not invent product labels, abbreviations, portmanteaus, or translations merely to make copy shorter or sound more branded.
   - When a concept appears in `总监培训2026_20260725.html` or `总监培训2026_20260726.html`, prefer the wording already used there for the corresponding locale.
   - Preserve canonical spellings for `getnative`, `descale`, `Bicubic`, `Bilinear`, `Spline`, and `Lanczos`; do not transliterate or rename them.
-  - Source vocabulary observed in both HTML files includes `原生分辨率`, `误差`, `阈值`, and `扫描`. Use these established words in Simplified Chinese UI where their meanings match.
+  - Source vocabulary observed in the HTML files includes `原生分辨率`, `分辨率`, `算法`, `误差`, `阈值`, `帧号`, `预览`, `测试`, `检查`, and `两个方向`. Use these established words in the Simplified Chinese UI where their meanings match.
   - If neither HTML contains the required concept, use established video, encoding, or desktop-software terminology and record the bilingual mapping before the copy ships. Do not create a new word.
   - When the two sources use variants, keep one established term as the display label and record the other as a search/help alias; never blend them into a newly coined term.
+- Reviewed bilingual mapping for the core workflow:
+
+  | Internal concept | Simplified Chinese display term | English display term | Terminology basis |
+  | --- | --- | --- | --- |
+  | Native resolution | 原生分辨率 | Native resolution | Exact training term |
+  | Height Analysis | 分辨率测试 | Resolution Test | Training phrases `测试原生分辨率` and `测分辨率` |
+  | Kernel Analysis | 算法测试 | Algorithm Test | Training phrases `测算法` and `选择分辨率和算法`; preserve literal kernel names |
+  | Full Verification | 全视频检查 | Full Video Check | Training phrase `全集检查`, generalized only from episode to any video input |
+  | I-picture Preview | I 帧检查 | I-frame Check | Training phrase `只选了i帧进行检查` |
+  | Error metric | 误差 | Error | Exact training term |
+  | Frame index | 帧号 | Frame Number | Exact training term |
+  | Analysis Recipe | 分析方案 | Analysis Recipe | Established desktop term for a saved, reproducible parameter set; absent from the training sources |
+  | Reveal Project file | 在文件夹中显示 | Show in Folder | Established cross-platform desktop command; absent from the training sources |
+
+  Internal identifiers such as `HeightAnalysis`, `KernelAnalysis`, `VerificationRun`, and `Recipe` remain stable and language-neutral. They do not become visible copy automatically.
 - Terminology:
   - `Source`, `Sample`, `Recipe`, `Run`, and `RunGroup` are stable internal domain names. Their visible labels come from the approved bilingual terminology mapping rather than raw identifiers.
   - Internal `Sample` means a still image or selected video frame used in analysis.
   - Internal Analysis Recipe, displayed as `分析方案` in the Simplified Chinese UI, means a complete reproducible parameter set confirmed by the user.
+  - The one enabled Recipe is displayed as `当前分析方案`; do not translate Active Recipe literally as `活动分析方案`.
   - Height Analysis, Kernel Analysis, and Whole-video Verification are internal workflow names in this document, not automatically approved display copy.
   - Suggestion, Selected, and Locked are distinct internal states; localized labels must preserve those distinctions.
   - Pixel Exclusion Threshold and Frame Review Threshold are distinct internal concepts; localized labels must not collapse them into one generic threshold.
-  - Full Verification means every eligible frame, while Preview Scan means I-picture or stride sampling; localized labels must preserve the coverage distinction and prefer the source term `扫描` where appropriate.
+  - Full Verification means every eligible frame, while Preview Scan means I-picture or stride sampling; localized labels must preserve the coverage distinction and use `检查` in Simplified Chinese rather than introducing `扫描` or `校验` as competing workflow names.
 - Microcopy rules:
   - Every navigation label, command, tooltip, validation message, empty state, error, status, table header, and accessibility label has both `zh-CN` and `en` text.
   - Do not build sentences by concatenating translated fragments. Each locale owns a complete phrase with placeholders.

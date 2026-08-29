@@ -1,6 +1,7 @@
 #include "getnative/candidate_grid.hpp"
+#include "getnative/number_parse.hpp"
 
-#include <charconv>
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <limits>
@@ -106,8 +107,7 @@ std::string format_fixed(std::int64_t units, std::uint32_t scale) {
 
 double parse_double(std::string_view text) {
     double value = 0.0;
-    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
-    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value)) {
+    if (!getnative::parse_finite_double(text, value)) {
         throw std::invalid_argument("invalid floating-point decimal: " + std::string{text});
     }
     return value;
@@ -175,6 +175,67 @@ std::vector<Candidate> generate_candidates(const CandidateGridSpec& spec, GridSe
             current += step;
         }
     }
+    return result;
+}
+
+std::vector<Candidate> generate_candidate_range(
+    const CandidateRangeSpec& spec, GridSemantics semantics) {
+    if (spec.maximum_count == 0U) {
+        throw std::invalid_argument("candidate maximum_count must be positive");
+    }
+
+    std::vector<Candidate> result;
+    result.reserve(std::min<std::size_t>(spec.maximum_count, 4096U));
+
+    if (semantics == GridSemantics::decimal_fixed_point) {
+        auto start = parse_decimal(spec.start);
+        auto stop = parse_decimal(spec.stop);
+        auto step = parse_decimal(spec.step);
+        const auto scale = std::max({start.scale, stop.scale, step.scale});
+        start = rescale(start, scale);
+        stop = rescale(stop, scale);
+        step = rescale(step, scale);
+        if (step.units <= 0) throw std::invalid_argument("candidate step must be positive");
+        if (stop.units < start.units) throw std::invalid_argument("candidate stop precedes start");
+        for (std::int64_t units = start.units;;) {
+            const bool within = spec.endpoint == EndpointRule::inclusive
+                ? units <= stop.units : units < stop.units;
+            if (!within) break;
+            if (result.size() >= spec.maximum_count) {
+                throw std::out_of_range("candidate range exceeds maximum_count");
+            }
+            const std::string decimal = format_fixed(units, scale);
+            result.push_back({decimal, parse_double(decimal)});
+            if (units > std::numeric_limits<std::int64_t>::max() - step.units) {
+                throw std::out_of_range("candidate grid overflow");
+            }
+            units += step.units;
+        }
+    } else {
+        const double start = parse_double(spec.start);
+        const double stop = parse_double(spec.stop);
+        const double step = parse_double(spec.step);
+        if (!(step > 0.0)) throw std::invalid_argument("candidate step must be positive");
+        if (stop < start) throw std::invalid_argument("candidate stop precedes start");
+        double current = start;
+        for (std::size_t index = 0;; ++index) {
+            const double value = semantics == GridSemantics::repeated_addition
+                ? current : start + static_cast<double>(index) * step;
+            if (!std::isfinite(value)) {
+                throw std::out_of_range("candidate grid is outside the finite double range");
+            }
+            const bool within = spec.endpoint == EndpointRule::inclusive
+                ? value <= stop : value < stop;
+            if (!within) break;
+            if (result.size() >= spec.maximum_count) {
+                throw std::out_of_range("candidate range exceeds maximum_count");
+            }
+            result.push_back({format_double(value), value});
+            if (semantics == GridSemantics::repeated_addition) current += step;
+        }
+    }
+
+    if (result.empty()) throw std::invalid_argument("candidate range is empty");
     return result;
 }
 

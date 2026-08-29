@@ -2,10 +2,6 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-#ifndef GETNATIVE_FIXED_BANDWIDTH
-#define GETNATIVE_FIXED_BANDWIDTH 0
-#endif
-
 layout(set = 0, binding = 0, std430) readonly buffer PlanBuffer {
     uint plan_data[];
 };
@@ -23,11 +19,7 @@ const uint HORIZONTAL_AXES = 0U;
 const uint VERTICAL_AXES = 1U;
 const uint BOTH_AXES = 2U;
 const uint CANDIDATE_WORDS = 29U;
-#if GETNATIVE_FIXED_BANDWIDTH > 0
-const uint MAXIMUM_BAND = uint(GETNATIVE_FIXED_BANDWIDTH);
-#else
 const uint MAXIMUM_BAND = 15U;
-#endif
 
 uint candidate_word(uint candidate, uint field) {
     return plan_data[candidate * CANDIDATE_WORDS + field];
@@ -51,15 +43,14 @@ void inverse_axis(uint candidate, bool vertical, bool source_input,
                   uint input_base, uint input_stride,
                   uint output_base, uint output_stride) {
     const uint size = axis_word(candidate, vertical, 1U);
-    const uint band = GETNATIVE_FIXED_BANDWIDTH == 0
-        ? axis_word(candidate, vertical, 2U) : uint(GETNATIVE_FIXED_BANDWIDTH);
+    const uint band = axis_word(candidate, vertical, 2U);
     const uint transpose_offsets = axis_word(candidate, vertical, 6U);
     const uint transpose_indices = axis_word(candidate, vertical, 7U);
     const uint transpose_weights = axis_word(candidate, vertical, 8U);
     const uint lower_ld = axis_word(candidate, vertical, 9U);
     const uint upper_l = axis_word(candidate, vertical, 10U);
     const uint inverse_diagonal = axis_word(candidate, vertical, 11U);
-    float recent[MAXIMUM_BAND];
+    float recent[15];
     for (uint distance = 0U; distance < MAXIMUM_BAND; ++distance) {
         recent[distance] = 0.0;
     }
@@ -70,19 +61,15 @@ void inverse_axis(uint candidate, bool vertical, bool source_input,
         const uint end = plan_data[transpose_offsets + index + 1U];
         for (uint position = begin; position < end; ++position) {
             const uint input_index = plan_data[transpose_indices + position];
-            sum += plan_float(transpose_weights + position)
-                * input_value(
-                    source_input, input_base, input_index, input_stride);
+            sum = fma(plan_float(transpose_weights + position),
+                      input_value(source_input, input_base, input_index, input_stride),
+                      sum);
         }
         const uint available = min(band, index);
-#if GETNATIVE_FIXED_BANDWIDTH > 0
-        for (uint reverse = GETNATIVE_FIXED_BANDWIDTH; reverse > 0U; --reverse) {
-#else
         for (uint reverse = MAXIMUM_BAND; reverse > 0U; --reverse) {
-#endif
             if (reverse <= available) {
                 const uint factor = lower_ld + (reverse - 1U) * size + index;
-                sum -= plan_float(factor) * recent[reverse - 1U];
+                sum = fma(-plan_float(factor), recent[reverse - 1U], sum);
             }
         }
         const float current = sum * plan_float(inverse_diagonal + index);
@@ -106,14 +93,14 @@ void inverse_axis(uint candidate, bool vertical, bool source_input,
             for (uint distance = 1U; distance <= MAXIMUM_BAND; ++distance) {
                 if (distance <= available) {
                     const uint factor = upper_l + (distance - 1U) * size + index;
-                    sum += plan_float(factor) * recent[distance - 1U];
+                    sum = fma(plan_float(factor), recent[distance - 1U], sum);
                 }
             }
         } else {
             for (uint distance = MAXIMUM_BAND; distance > 0U; --distance) {
                 if (distance <= available) {
                     const uint factor = upper_l + (distance - 1U) * size + index;
-                    sum += plan_float(factor) * recent[distance - 1U];
+                    sum = fma(plan_float(factor), recent[distance - 1U], sum);
                 }
             }
         }

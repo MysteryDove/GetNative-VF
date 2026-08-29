@@ -1,0 +1,134 @@
+name: CI Media
+
+on:
+  pull_request:
+    paths:
+      - 'engine/CMakeLists.txt'
+      - 'engine/include/getnative/**'
+      - 'engine/src/backend/**'
+      - 'engine/src/cli/**'
+      - 'engine/src/geometry/**'
+      - 'engine/src/media/**'
+      - 'engine/src/planner/**'
+      - 'engine/tests/**'
+      - 'app/src/engine/**'
+      - 'app/src/media/**'
+      - 'app/src-tauri/**'
+      - 'app/scripts/build-engine.mjs'
+      - 'app/package.json'
+      - 'app/pnpm-lock.yaml'
+      - 'scripts/build-ffmpeg-*.sh'
+      - '.github/workflows/ci-media.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-media-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FFMPEG_VERSION: 8.1.2
+
+jobs:
+  linux-media:
+    name: Linux x64 media integration
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install build and test dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          build-essential ninja-build nasm patchelf pkg-config zlib1g-dev ffmpeg
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: ffmpeg-cache
+        with:
+          path: .deps/ffmpeg-linux-x64
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-linux-x64-${{ hashFiles('scripts/build-ffmpeg-linux.sh') }}
+      - name: Build pinned FFmpeg SDK
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: scripts/build-ffmpeg-linux.sh .deps/ffmpeg-linux-x64
+      - name: Build and test release engine
+        working-directory: app
+        env:
+          GETNATIVE_LINUX_BACKENDS: cpu
+          GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}/.deps/ffmpeg-linux-x64
+          GETNATIVE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/.deps/ffmpeg-linux-x64/lib
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build:engine
+      - name: Verify staged dependency closure
+        run: |
+          stage_bin=app/src-tauri/bundle-stage/bin
+          dependencies=$(ldd "$stage_bin/getnative-engine")
+          test -z "$(printf '%s\n' "$dependencies" | sed -n '/not found/p')"
+          for library in libavformat.so.62 libavcodec.so.62 libavutil.so.60 libswscale.so.9; do
+            printf '%s\n' "$dependencies" | grep -F "$stage_bin/$library"
+            test "$(patchelf --print-rpath "$stage_bin/$library")" = '$ORIGIN'
+          done
+          ! find app/src-tauri/bundle-stage/bin -maxdepth 1 -type f -name 'ffmpeg*' | grep -q .
+          app/src-tauri/bundle-stage/bin/getnative-engine capabilities | grep -q '"ffmpeg_abi":"62.62.60.9"'
+
+  windows-media:
+    name: Windows x64 media integration
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: x64
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: MSYS
+          update: true
+          path-type: inherit
+          install: diffutils make nasm pkgconf
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: ffmpeg-cache
+        with:
+          path: .deps/ffmpeg-windows-x64
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-windows-x64-msvc-${{ hashFiles('scripts/build-ffmpeg-windows.sh') }}
+      - name: Build pinned FFmpeg SDK
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: scripts/build-ffmpeg-windows.sh .deps/ffmpeg-windows-x64
+      - name: Install test-only FFmpeg CLI
+        run: choco install ffmpeg -y --no-progress
+      - name: Build and test release engine
+        working-directory: app
+        env:
+          GETNATIVE_WINDOWS_BACKENDS: cpu
+          GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}\.deps\ffmpeg-windows-x64
+          GETNATIVE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}\.deps\ffmpeg-windows-x64\bin
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build:engine
+      - name: Verify staged runtime
+        shell: pwsh
+        run: |
+          if (Test-Path app/src-tauri/bundle-stage/bin/ffmpeg.exe) { throw "ffmpeg.exe entered the product bundle" }
+          $capabilities = app/src-tauri/bundle-stage/bin/getnative-engine.exe capabilities | ConvertFrom-Json
+          if ($capabilities.media.ffmpeg_abi -ne "62.62.60.9") { throw "unexpected FFmpeg ABI" }

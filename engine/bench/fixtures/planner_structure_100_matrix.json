@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "profile_id": "planner-structure-100-v1",
+  "profile_note": "Planner structure byte-identity coverage with 100 candidates per filter.",
+  "source": {
+    "width": 1920,
+    "height": 1080
+  },
+  "candidates": 100,
+  "tile_size": 32,
+  "reduction_groups": 8,
+  "inverse_threads": 32,
+  "primary_native_height": 810,
+  "cpu_primary_filter_id": "bicubic-catrom",
+  "native_heights": [810],
+  "metric": {
+    "crop_left": 5,
+    "crop_right": 5,
+    "crop_top": 5,
+    "crop_bottom": 5,
+    "threshold": 0.015
+  },
+  "filters": [
+    {"id": "bilinear", "type": "bilinear", "control": true},
+    {"id": "bicubic-catrom", "type": "bicubic", "b": 0.0, "c": 0.5, "control": true},
+    {"id": "bicubic-mitchell", "type": "bicubic", "b": 0.3333333333333333, "c": 0.3333333333333333},
+    {"id": "spline16", "type": "spline16"},
+    {"id": "spline36", "type": "spline36"},
+    {"id": "spline64", "type": "spline64"},
+    {"id": "lanczos3", "type": "lanczos", "taps": 3},
+    {"id": "lanczos4", "type": "lanczos", "taps": 4},
+    {"id": "lanczos5", "type": "lanczos", "taps": 5},
+    {"id": "lanczos8", "type": "lanczos", "taps": 8}
+  ]
+}

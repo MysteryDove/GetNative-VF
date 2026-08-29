@@ -21,6 +21,13 @@
 #include <vector>
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <fcntl.h>
 #include <io.h>
 #include <sys/stat.h>
@@ -233,10 +240,16 @@ inline void publish_json_no_replace(
     const std::filesystem::path &temporary_path,
     const std::filesystem::path &final_path) {
 #if defined(_WIN32)
-    std::error_code error;
-    std::filesystem::rename(temporary_path, final_path, error);
-    if (error) {
-        throw std::system_error(error, "failed to atomically publish JSON output");
+    // MoveFileExW without MOVEFILE_REPLACE_EXISTING is atomic on the same
+    // volume and preserves the no-overwrite contract under publication races.
+    if (::MoveFileExW(
+            temporary_path.c_str(),
+            final_path.c_str(),
+            MOVEFILE_WRITE_THROUGH) == 0) {
+        throw std::system_error(
+            static_cast<int>(::GetLastError()),
+            std::system_category(),
+            "failed to atomically publish JSON output");
     }
 #elif defined(__APPLE__)
     if (::renamex_np(temporary_path.c_str(), final_path.c_str(), RENAME_EXCL) != 0) {

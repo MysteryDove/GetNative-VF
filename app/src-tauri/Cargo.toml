@@ -1,6 +1,6 @@
 [package]
 name = "getnative-gui"
-version = "0.1.0"
+version = "0.2.1"
 description = "Standalone native-resolution analysis workbench"
 authors = ["GetNative VF contributors"]
 license = "MIT"
@@ -8,17 +8,30 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+# Keep line-level debugging for the application while avoiding full debug
+# information for the large dependency graph during development builds.
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = 0
+incremental = false
+
 [lib]
-# The `_lib` suffix may seem redundant but it is necessary
-# to make the lib name unique and wouldn't conflict with the bin name.
-# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+# This project targets desktop only, so the binary only needs the Rust library.
+# Tauri's staticlib and cdylib outputs are required for mobile targets.
 name = "getnative_gui_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rfd = "0.15"
+atomicwrites = "0.4"
+uuid = { version = "1", features = ["v4"] }
+image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
+sha2 = "0.10"

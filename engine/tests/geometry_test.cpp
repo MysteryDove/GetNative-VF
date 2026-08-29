@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 
@@ -80,6 +81,53 @@ void test_geometry_range_validation() {
            "normal fractional parity geometry remains unchanged");
 }
 
+void test_candidate_geometry_resolver() {
+    const auto height = getnative::resolve_candidate_geometry(
+        1920, 1080, getnative::GeometryAxisMode::height_only, 837.25, 838);
+    expect(height.width == 1920 && height.height == 838, "H-only keeps source width");
+    expect_close(height.src_height, 837.25, "H-only keeps fractional active height");
+    expect_close(height.src_top, 0.375, "H-only centers fractional active height");
+
+    const auto oversized_base = getnative::resolve_candidate_geometry(
+        1920, 1080, getnative::GeometryAxisMode::height_only, 843.8, 1081);
+    expect(oversized_base.height == 845,
+           "base height above source height remains a parity reference");
+    expect_close(oversized_base.src_height, 843.8,
+                 "oversized base does not replace the active height");
+
+    const auto width = getnative::resolve_candidate_geometry(
+        1920, 1080, getnative::GeometryAxisMode::width_only, 1488.5,
+        std::nullopt, 1490);
+    expect(width.width == 1490 && width.height == 1080, "W-only keeps source height");
+    expect_close(width.src_width, 1488.5, "W-only keeps fractional active width");
+    expect_close(width.src_left, 0.75, "W-only centers fractional active width");
+
+    const auto both = getnative::resolve_candidate_geometry(
+        1920, 1080, getnative::GeometryAxisMode::height_plus_width, 810.0);
+    expect(both.width == 1440 && both.height == 810, "H+W derives integer width");
+    expect_close(both.src_width, 1440.0, "H+W uses source aspect ratio");
+
+    const auto explicit_width = getnative::resolve_candidate_geometry(
+        1920, 1080, getnative::GeometryAxisMode::height_plus_width, 810.5,
+        1001, 2001);
+    const double derived_width = 1920.0 * 810.5 / 1080.0;
+    expect_close(explicit_width.src_width, derived_width,
+                 "explicit base width does not replace derived active width");
+    expect(explicit_width.width == 1441 && explicit_width.height == 811,
+           "explicit bases resolve parity canvases independently");
+    expect_close(explicit_width.src_top, 0.25, "explicit base height resolves fractional shift");
+    expect_close(explicit_width.src_left, (1441.0 - derived_width) / 2.0,
+                 "explicit base width resolves fractional shift");
+
+    expect_throws(
+        [] {
+            (void)getnative::resolve_candidate_geometry(
+                1920, 1080, getnative::GeometryAxisMode::height_only,
+                std::numeric_limits<double>::infinity());
+        },
+        "candidate resolver rejects non-finite geometry");
+}
+
 void test_candidate_grids() {
     const getnative::CandidateGridSpec spec{"0.1", "0.1", 12};
     const auto repeated = getnative::generate_candidates(spec, getnative::GridSemantics::repeated_addition);
@@ -91,6 +139,25 @@ void test_candidate_grids() {
     expect(decimal[6].decimal == "0.7", "decimal grid preserves exact decimal candidate");
     expect(decimal[11].decimal == "1.2", "decimal grid preserves exact end candidate");
     expect(repeated[0].decimal == "0.10000000000000001", "repeated grid serializes exact double value");
+
+    const getnative::CandidateRangeSpec inclusive{
+        "0.01", "0.19", "0.01", getnative::EndpointRule::inclusive, 100};
+    const auto repeated_range = getnative::generate_candidate_range(
+        inclusive, getnative::GridSemantics::repeated_addition);
+    const auto indexed_range = getnative::generate_candidate_range(
+        inclusive, getnative::GridSemantics::index_multiplication);
+    const auto fixed_range = getnative::generate_candidate_range(
+        inclusive, getnative::GridSemantics::decimal_fixed_point);
+    expect(repeated_range.size() == 18, "MUF repeated addition preserves strict float stop");
+    expect(indexed_range.size() == 19, "getnative indexed multiplication preserves its stop");
+    expect(fixed_range.size() == 19 && fixed_range.back().decimal == "0.19",
+           "modern fixed-point includes the exact stop");
+
+    auto exclusive = inclusive;
+    exclusive.endpoint = getnative::EndpointRule::exclusive_stop;
+    expect(getnative::generate_candidate_range(
+               exclusive, getnative::GridSemantics::decimal_fixed_point).size() == 18,
+           "exclusive_stop omits the exact endpoint");
 
     const getnative::CandidateGridSpec overflowing{"1e308", "1e308", 2};
     expect_throws(
@@ -114,6 +181,14 @@ void test_profiles() {
            "muf defaults to repeated addition");
     expect(getnative::profile(getnative::CompatibilityProfile::getfnative_44c8d0f).default_crop == 10,
            "GetFnative crop default is ten");
+    const auto &muf_profile = getnative::profile(*muf);
+    expect(muf_profile.default_axis == getnative::DefaultAxisMode::height_plus_width,
+           "MUF defaults to H+W");
+    expect(muf_profile.default_start == "500" && muf_profile.default_stop == "1000"
+               && muf_profile.default_step == "1",
+           "MUF default range matches upstream");
+    expect(muf_profile.default_b == 0.0 && muf_profile.default_c == 0.5,
+           "MUF default bicubic parameters match upstream");
 }
 
 } // namespace
@@ -124,6 +199,7 @@ int main() {
         test_course_geometry();
         test_no_base_rounding();
         test_geometry_range_validation();
+        test_candidate_geometry_resolver();
         test_candidate_grids();
         test_profiles();
         std::cout << "all geometry tests passed\n";

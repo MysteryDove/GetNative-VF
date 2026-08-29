@@ -2,87 +2,95 @@ name: Engine Linux
 
 on:
   push:
+    branches: [main]
   pull_request:
+    paths:
+      - 'engine/**'
+      - 'app/scripts/build-engine.mjs'
+      - '.github/workflows/engine-linux.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: engine-linux-${{ github.workflow }}-${{ github.ref }}
+  group: engine-linux-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   cpu:
     name: ${{ matrix.os }} CPU-only
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-          - os: ubuntu-24.04-arm
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
     steps:
-      - name: Check out GetNative-VF
-        uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-
-      - name: Configure CPU-only engine
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure CPU-only
         run: >-
-          cmake -S engine -B build/engine-linux-cpu
+          cmake -S engine -B build/engine-linux-cpu -G Ninja
           -DCMAKE_BUILD_TYPE=Release
+          -DGETNATIVE_ENABLE_MEDIA=OFF
           -DGETNATIVE_ENABLE_METAL=OFF
+          -DGETNATIVE_ENABLE_CUDA=OFF
           -DGETNATIVE_ENABLE_VULKAN=OFF
           -DBUILD_TESTING=ON
-
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
       - name: Build
         run: cmake --build build/engine-linux-cpu --parallel
-
-      - name: Test CPU-only engine
+      - name: Test
         run: ctest --test-dir build/engine-linux-cpu --output-on-failure
 
   vulkan:
     name: ${{ matrix.os }} Vulkan build and SPIR-V validation
     runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-          - os: ubuntu-24.04-arm
-    # Public repositories have ubuntu-24.04-arm free runners. If an account
-    # cannot obtain one, use a QEMU cross-build as a follow-up; it is not a
-    # substitute for native runner evidence and is intentionally not wired here.
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["ubuntu-24.04", "ubuntu-24.04-arm"]') }}
+    # ubuntu-24.04-arm is the native evidence path. QEMU cross-build is a
+    # documented fallback only if an account cannot obtain native arm runners.
     steps:
-      - name: Check out GetNative-VF
-        uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
       - name: Install distro Vulkan toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y glslang-tools spirv-tools libvulkan-dev
-
-      - name: Verify distro tools and architecture
+      - name: Verify distro tools
         run: |
           command -v glslangValidator
           command -v spirv-val
-          command -v spirv-dis
           test -f /usr/include/vulkan/vulkan.h
           uname -m
-
-      - name: Configure Vulkan engine
+      - name: Configure Vulkan
         run: >-
-          cmake -S engine -B build/engine-linux-vulkan
+          cmake -S engine -B build/engine-linux-vulkan -G Ninja
           -DCMAKE_BUILD_TYPE=Release
+          -DGETNATIVE_ENABLE_MEDIA=OFF
           -DGETNATIVE_ENABLE_METAL=OFF
+          -DGETNATIVE_ENABLE_CUDA=OFF
           -DGETNATIVE_ENABLE_VULKAN=ON
           -DBUILD_TESTING=ON
-
-      - name: Build Vulkan engine and embedded shaders
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+      - name: Build Vulkan and embedded SPIR-V
         run: cmake --build build/engine-linux-vulkan --parallel
-
       - name: Validate SPIR-V and run tests
         run: ctest --test-dir build/engine-linux-vulkan --output-on-failure

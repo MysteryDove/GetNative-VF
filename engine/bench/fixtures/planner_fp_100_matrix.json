@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "profile_id": "planner-fp-100-v1",
+  "profile_note": "Diagnostic planner FP A/B: one Bicubic Catrom height grid with 100 candidates.",
+  "source": {
+    "width": 1920,
+    "height": 1080
+  },
+  "candidates": 100,
+  "tile_size": 32,
+  "reduction_groups": 8,
+  "inverse_threads": 32,
+  "primary_native_height": 810,
+  "cpu_primary_filter_id": "bicubic-catrom",
+  "native_heights": [810],
+  "metric": {
+    "crop_left": 5,
+    "crop_right": 5,
+    "crop_top": 5,
+    "crop_bottom": 5,
+    "threshold": 0.015
+  },
+  "filters": [
+    {"id": "bicubic-catrom", "type": "bicubic", "b": 0.0, "c": 0.5, "control": true}
+  ]
+}

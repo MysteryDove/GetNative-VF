@@ -4,14 +4,12 @@
 #include "getnative/filter.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <future>
 #include <iostream>
 #include <memory>
-#include <span>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -210,186 +208,6 @@ void compare_with_cpu(
     }
 }
 
-[[nodiscard]] std::vector<getnative::CandidateAnalysis>
-make_fixed_bandwidth_candidates(std::int32_t width) {
-    const std::array filters{
-        getnative::Filter::bilinear(),
-        getnative::Filter::bicubic(),
-        getnative::Filter::spline36(),
-        getnative::Filter::spline64(),
-        getnative::Filter::spline64(1.25),
-        getnative::Filter::spline64(1.5),
-    };
-    constexpr std::array<std::int32_t, 6U> expected_bandwidths{1, 3, 5, 7, 9, 11};
-    std::vector<getnative::CandidateAnalysis> candidates;
-    candidates.reserve(filters.size());
-    for (std::size_t index = 0U; index < filters.size(); ++index) {
-        auto plan = make_plan(width, 25, 25.25, -0.125, filters[index]);
-        expect(plan->half_bandwidth == expected_bandwidths[index],
-               "fixed-bandwidth fixture must cover b1/3/5/7/9/11");
-        candidates.push_back({
-            "fixed-b" + std::to_string(expected_bandwidths[index]),
-            std::move(plan), nullptr, getnative::AnalysisAxes::horizontal});
-    }
-    return candidates;
-}
-
-void expect_exact_results(
-    std::span<const getnative::CandidateResult> left,
-    std::span<const getnative::CandidateResult> right,
-    std::string_view message) {
-    expect(left.size() == right.size(), message);
-    for (std::size_t index = 0U; index < left.size(); ++index) {
-        expect(left[index].id == right[index].id
-                   && left[index].error == right[index].error,
-               message);
-    }
-}
-
-void test_specialized_dispatch(
-    const getnative::VulkanRuntimeProbe &probe,
-    const SourceFixture &source, const getnative::MetricSpec &metric) {
-    const auto candidates = make_fixed_bandwidth_candidates(source.view.width);
-    getnative::VulkanAnalysisOptions base;
-    base.device_index = compatible_device(probe).index;
-    base.execution_slots = 1U;
-
-    auto generic_options = base;
-    generic_options.kernel_dispatch =
-        getnative::VulkanKernelDispatchPolicy::generic_only;
-    getnative::VulkanAnalysisEngine generic(generic_options);
-    const auto generic_results = generic.analyze_axis_batch_f32(
-        source.view, candidates, metric);
-    const auto generic_telemetry = generic.runtime_telemetry();
-    expect(generic_telemetry.generic_inverse_dispatch_count == candidates.size()
-               && generic_telemetry.specialized_inverse_dispatch_count == 0U,
-           "forced generic dispatch must not use fixed pipelines");
-
-    auto specialized_options = base;
-    specialized_options.kernel_dispatch =
-        getnative::VulkanKernelDispatchPolicy::required_specialized;
-    getnative::VulkanAnalysisEngine specialized(specialized_options);
-    const auto specialized_results = specialized.analyze_axis_batch_f32(
-        source.view, candidates, metric);
-    expect_exact_results(generic_results, specialized_results,
-                         "fixed inverse pipelines must be bit-identical to generic");
-    const auto specialized_telemetry = specialized.runtime_telemetry();
-    expect(specialized_telemetry.specialized_inverse_dispatch_count
-                   == candidates.size()
-               && specialized_telemetry.generic_inverse_dispatch_count == 0U,
-           "required specialized dispatch must use every fixed pipeline");
-
-    getnative::VulkanAnalysisEngine automatic(base);
-    const auto automatic_results = automatic.analyze_axis_batch_f32(
-        source.view, candidates, metric);
-    expect_exact_results(generic_results, automatic_results,
-                         "automatic fixed dispatch must be bit-identical to generic");
-    const auto automatic_telemetry = automatic.runtime_telemetry();
-    expect(automatic_telemetry.specialized_inverse_dispatch_count
-                   == candidates.size()
-               && automatic_telemetry.generic_inverse_dispatch_count == 0U,
-           "automatic dispatch must select b1/3/5/7/9/11 pipelines");
-
-    const std::vector<getnative::CandidateAnalysis> generic_fallbacks{
-        {"generic-b13",
-         make_plan(source.view.width, 25, 25.25, -0.125,
-                   getnative::Filter::spline64(1.75)),
-         nullptr, getnative::AnalysisAxes::horizontal},
-        {"generic-b15",
-         make_plan(source.view.width, 25, 25.25, -0.125,
-                   getnative::Filter::spline64(2.0)),
-         nullptr, getnative::AnalysisAxes::horizontal},
-    };
-    expect(generic_fallbacks[0].horizontal->half_bandwidth == 13
-               && generic_fallbacks[1].horizontal->half_bandwidth == 15,
-           "generic fallback fixtures must produce b13/b15");
-    const auto generic_fallback_results = generic.analyze_axis_batch_f32(
-        source.view, generic_fallbacks, metric);
-    automatic.reset_analysis_telemetry();
-    const auto automatic_fallback_results = automatic.analyze_axis_batch_f32(
-        source.view, generic_fallbacks, metric);
-    expect_exact_results(
-        generic_fallback_results, automatic_fallback_results,
-        "automatic b13/b15 fallback must be bit-identical to forced generic");
-    expect(automatic.runtime_telemetry().generic_inverse_dispatch_count == 2U
-               && automatic.runtime_telemetry().specialized_inverse_dispatch_count == 0U,
-           "automatic dispatch must route b13/b15 to generic");
-    expect_throws<std::invalid_argument>(
-        [&] {
-            (void)specialized.analyze_axis_batch_f32(
-                source.view, generic_fallbacks, metric);
-        },
-        "required specialized dispatch must reject b13/b15");
-
-    auto invalid_options = base;
-    invalid_options.kernel_dispatch =
-        static_cast<getnative::VulkanKernelDispatchPolicy>(255U);
-    expect_throws<std::invalid_argument>(
-        [&] { getnative::VulkanAnalysisEngine invalid(invalid_options); },
-        "Vulkan rejects an invalid kernel dispatch policy");
-}
-
-void test_plan_upload_reuse(
-    const getnative::VulkanRuntimeProbe &probe,
-    const SourceFixture &source, const getnative::MetricSpec &metric) {
-    const auto candidates = make_fixed_bandwidth_candidates(source.view.width);
-    getnative::VulkanAnalysisOptions options;
-    options.device_index = compatible_device(probe).index;
-    options.execution_slots = 2U;
-    getnative::VulkanAnalysisEngine engine(options);
-    const auto first = engine.analyze_axis_batch_f32(
-        source.view, candidates, metric);
-    const auto first_telemetry = engine.runtime_telemetry();
-    expect(first_telemetry.plan_cache_miss_count == 1U
-               && first_telemetry.plan_cache_hit_count == 0U
-               && first_telemetry.plan_upload_bytes > 0U,
-           "first Vulkan batch must pack and upload its plan");
-    if (engine.native_context().timeline_semaphore) {
-        expect(first_telemetry.pooled_plan_upload_count == 1U
-                   && first_telemetry.fence_plan_upload_count == 0U,
-               "timeline-capable Vulkan uses the pooled plan upload path");
-    } else {
-        expect(first_telemetry.pooled_plan_upload_count == 0U
-                   && first_telemetry.fence_plan_upload_count == 1U,
-               "Vulkan without timeline support uses the fence fallback");
-    }
-
-    engine.reset_analysis_telemetry();
-    const auto second = engine.analyze_axis_batch_f32(
-        source.view, candidates, metric);
-    expect_exact_results(first, second,
-                         "cached Vulkan plan execution must be bit-identical");
-    const auto second_telemetry = engine.runtime_telemetry();
-    expect(second_telemetry.plan_cache_hit_count == 1U
-               && second_telemetry.plan_cache_miss_count == 0U
-               && second_telemetry.plan_upload_bytes == 0U
-               && second_telemetry.pooled_plan_upload_count == 0U
-               && second_telemetry.fence_plan_upload_count == 0U,
-           "cached Vulkan batch must not repack or upload its plan");
-
-    auto fence_options = options;
-    fence_options.force_fence_plan_upload = true;
-    getnative::VulkanAnalysisEngine fence_engine(fence_options);
-    const auto fence_first = fence_engine.analyze_axis_batch_f32(
-        source.view, candidates, metric);
-    const auto fence_first_telemetry = fence_engine.runtime_telemetry();
-    expect(fence_first_telemetry.plan_cache_miss_count == 1U
-               && fence_first_telemetry.fence_plan_upload_count == 1U
-               && fence_first_telemetry.pooled_plan_upload_count == 0U
-               && fence_first_telemetry.plan_upload_bytes > 0U,
-           "forced Vulkan fence fallback uploads a cold plan once");
-    fence_engine.reset_analysis_telemetry();
-    const auto fence_second = fence_engine.analyze_axis_batch_f32(
-        source.view, candidates, metric);
-    expect_exact_results(fence_first, fence_second,
-                         "fence-uploaded Vulkan plan remains reusable");
-    const auto fence_second_telemetry = fence_engine.runtime_telemetry();
-    expect(fence_second_telemetry.plan_cache_hit_count == 1U
-               && fence_second_telemetry.plan_upload_bytes == 0U
-               && fence_second_telemetry.fence_plan_upload_count == 0U,
-           "fence fallback must not re-upload a cached Vulkan plan");
-}
-
 void test_conformance(const getnative::VulkanRuntimeProbe &probe) {
     constexpr std::int32_t width = 37;
     constexpr std::int32_t height = 29;
@@ -402,8 +220,6 @@ void test_conformance(const getnative::VulkanRuntimeProbe &probe) {
     options.execution_slots = 2U;
     getnative::VulkanAnalysisEngine engine(options);
     compare_with_cpu(engine, source.view, candidates, metric, "mixed-axis batch");
-    test_specialized_dispatch(probe, source, metric);
-    test_plan_upload_reuse(probe, source, metric);
 
     std::vector<float> exact_storage(8U * 6U, 0.5F);
     const getnative::ConstImageView exact_source{
@@ -424,8 +240,6 @@ void test_conformance(const getnative::VulkanRuntimeProbe &probe) {
 
     const auto telemetry = engine.runtime_telemetry();
     expect(telemetry.command_buffer_submission_count == 3U
-               && telemetry.command_buffer_completion_count
-                    == telemetry.command_buffer_submission_count
                && telemetry.kernel_dispatch_count >= 4U
                && telemetry.analyzed_candidate_count == candidates.size() + 2U
                && telemetry.plan_upload_bytes > 0U
@@ -457,14 +271,22 @@ void test_conformance(const getnative::VulkanRuntimeProbe &probe) {
         },
         "Vulkan rejects a pre-cancelled call");
 
+    for (const std::uint32_t norm : {1U, 2U, 3U, 4U}) {
+        getnative::MetricSpec p_norm_metric = metric;
+        p_norm_metric.norm = norm;
+        compare_with_cpu(
+            engine, source.view, candidates, p_norm_metric,
+            std::string{"p-norm "} + std::to_string(norm));
+    }
+
     getnative::MetricSpec unsupported = metric;
-    unsupported.norm = 2U;
+    unsupported.norm = 5U;
     expect_throws<std::invalid_argument>(
         [&] {
             (void)engine.analyze_axis_batch_f32(
                 source.view, candidates, unsupported);
         },
-        "Vulkan rejects p>1");
+        "Vulkan rejects p-norms above four");
 
     getnative::VulkanAnalysisOptions tiled_options = options;
     tiled_options.execution_slots = 1U;
@@ -474,16 +296,6 @@ void test_conformance(const getnative::VulkanRuntimeProbe &probe) {
     expect(tiled.runtime_telemetry().tile_count > 1U
                && tiled.peak_workspace_elements() <= 1500U,
            "Vulkan workspace limit forces multiple tiles");
-
-    getnative::VulkanAnalysisOptions noncoherent_options = options;
-    noncoherent_options.execution_slots = 1U;
-    noncoherent_options.force_non_coherent = true;
-    getnative::VulkanAnalysisEngine noncoherent(noncoherent_options);
-    compare_with_cpu(noncoherent, source.view, candidates, metric,
-                     "forced noncoherent batch");
-    expect(noncoherent.runtime_telemetry().command_buffer_submission_count
-               == noncoherent.runtime_telemetry().command_buffer_completion_count,
-           "noncoherent Vulkan execution completes every submission");
 
     try {
         getnative::VulkanAnalysisOptions validation_options = options;

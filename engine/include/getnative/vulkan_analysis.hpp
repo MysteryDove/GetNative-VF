@@ -1,6 +1,7 @@
 #pragma once
 
 #include "getnative/cpu_analysis.hpp"
+#include "getnative/stop_token.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -13,7 +14,7 @@
 namespace getnative {
 
 inline constexpr std::uint32_t vulkan_minimum_p_norm = 1U;
-inline constexpr std::uint32_t vulkan_maximum_p_norm = 1U;
+inline constexpr std::uint32_t vulkan_maximum_p_norm = 4U;
 inline constexpr std::int32_t vulkan_automatic_device_index = -1;
 
 enum class VulkanDeviceType : std::uint8_t {
@@ -48,10 +49,6 @@ struct VulkanDeviceInfo {
     std::size_t device_local_memory_bytes = 0U;
     std::size_t maximum_storage_buffer_bytes = 0U;
     std::uint32_t maximum_compute_workgroup_invocations = 0U;
-    bool shader_signed_zero_inf_nan_preserve_float32 = false;
-    bool shader_denorm_preserve_float32 = false;
-    bool shader_rounding_mode_rte_float32 = false;
-    bool shader_rounding_mode_rtz_float32 = false;
     bool backend_compatible = false;
     bool video_decode_available = false;
     std::vector<std::string> video_decode_codecs;
@@ -68,16 +65,9 @@ struct VulkanRuntimeProbe {
 
 struct VulkanRuntimeTelemetry {
     std::size_t command_buffer_submission_count = 0U;
-    std::size_t command_buffer_completion_count = 0U;
     std::size_t kernel_dispatch_count = 0U;
     std::size_t analyzed_candidate_count = 0U;
     std::size_t tile_count = 0U;
-    std::size_t generic_inverse_dispatch_count = 0U;
-    std::size_t specialized_inverse_dispatch_count = 0U;
-    std::size_t plan_cache_hit_count = 0U;
-    std::size_t plan_cache_miss_count = 0U;
-    std::size_t pooled_plan_upload_count = 0U;
-    std::size_t fence_plan_upload_count = 0U;
     std::size_t buffer_allocation_count = 0U;
     std::size_t plan_upload_bytes = 0U;
     std::size_t source_upload_bytes = 0U;
@@ -92,12 +82,6 @@ struct VulkanRuntimeTelemetry {
     double host_pack_ms = 0.0;
     double source_conversion_ms = 0.0;
     double gpu_execution_ms = 0.0;
-};
-
-enum class VulkanKernelDispatchPolicy : std::uint8_t {
-    automatic,
-    generic_only,
-    required_specialized,
 };
 
 struct VulkanNativeContextInfo {
@@ -146,11 +130,6 @@ struct VulkanAnalysisOptions {
     std::uint32_t metric_groups_per_candidate = 128U;
     bool enable_validation = false;
     bool force_non_coherent = false;
-    // Test/diagnostic switch for the Vulkan 1.2 fence fallback. Production
-    // automatic mode uses pooled staging when timeline semaphores are present.
-    bool force_fence_plan_upload = false;
-    VulkanKernelDispatchPolicy kernel_dispatch =
-        VulkanKernelDispatchPolicy::automatic;
 };
 
 [[nodiscard]] VulkanRuntimeProbe vulkan_runtime_probe() noexcept;
