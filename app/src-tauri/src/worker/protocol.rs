@@ -196,14 +196,14 @@ fn validate_backend(
             "unsupported: CUDA{scope} only supports p_norm in 1..4"
         ));
     }
-    if backend == "vulkan" && p_norm != 1 {
+    if backend == "vulkan" && !(1..=4).contains(&p_norm) {
         return Err(format!(
-            "unsupported: Vulkan{scope} currently supports only p_norm=1"
+            "unsupported: Vulkan{scope} only supports p_norm in 1..4"
         ));
     }
-    if backend == "metal" && p_norm != 1 {
+    if backend == "metal" && !(1..=4).contains(&p_norm) {
         return Err(format!(
-            "unsupported: Metal{scope} currently supports only p_norm=1"
+            "unsupported: Metal{scope} only supports p_norm in 1..4"
         ));
     }
     Ok(())
@@ -497,6 +497,8 @@ pub struct VerifyMediaBeginRequest {
     pub backend: String,
     #[serde(default = "default_media_verify_concurrency")]
     pub concurrency: u32,
+    #[serde(default)]
+    pub decode_concurrency: u32,
     pub geometry: Option<GeometryCommand>,
 }
 
@@ -537,6 +539,9 @@ pub(crate) fn validate_verify_media_begin(request: &VerifyMediaBeginRequest) -> 
     )?;
     if !(1..=8).contains(&request.concurrency) {
         return Err("bad_request: concurrency must be within 1..=8".to_owned());
+    }
+    if request.decode_concurrency > 4 {
+        return Err("bad_request: decodeConcurrency must be within 0..=4".to_owned());
     }
     match request.selection.as_str() {
         "all" | "decoded_i_picture" => {}
@@ -581,6 +586,7 @@ pub(crate) fn verify_media_begin_command(
         "metric": metric_json(&request.metric),
         "backend": request.backend,
         "concurrency": request.concurrency,
+        "decode_concurrency": request.decode_concurrency,
         "resolved_geometry": request.geometry.as_ref().map(|geometry| json!({
             "width": geometry.width,
             "height": geometry.height,
@@ -758,13 +764,17 @@ mod tests {
         let mut request = analyze_request();
         request.backend = "vulkan".to_owned();
         assert!(validate_analyze(&request).is_ok());
-        request.metric.p_norm = Some(2);
+        request.metric.p_norm = Some(4);
+        assert!(validate_analyze(&request).is_ok());
+        request.metric.p_norm = Some(5);
         assert!(validate_analyze(&request).is_err());
 
         let mut request = analyze_request();
         request.backend = "metal".to_owned();
         assert!(validate_analyze(&request).is_ok());
-        request.metric.p_norm = Some(2);
+        request.metric.p_norm = Some(4);
+        assert!(validate_analyze(&request).is_ok());
+        request.metric.p_norm = Some(5);
         assert!(validate_analyze(&request).is_err());
 
         let mut request = analyze_request();

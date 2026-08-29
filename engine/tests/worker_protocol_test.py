@@ -39,7 +39,7 @@ def write_frame(path, width, height, seed=0):
 
 class Worker:
     def __init__(self, store_dir=None, engine=ENGINE, use_default_store=False,
-                 xdg_cache_home=None):
+                 xdg_cache_home=None, env_overrides=None):
         # stdout stays binary: events are framed with an internal byte buffer
         # (select + buffered readline loses events that arrive in one chunk).
         # Each worker gets an isolated plan-store dir: the persistent cache
@@ -62,6 +62,11 @@ class Worker:
         # production defaults remain benchmark-gated off until the warm guard
         # is met on every formal kernel.
         env["GETNATIVE_CUDA_INPUT_CACHE_BYTES"] = str(512 * 1024 * 1024)
+        # Keep the baseline deterministic even when the parent Tauri dev
+        # process enables the experimental multi-session Metal path.
+        env["GETNATIVE_METAL_DECODE_SESSIONS"] = "1"
+        if env_overrides:
+            env.update(env_overrides)
         self.process = subprocess.Popen(
             [engine, "worker"],
             stdin=subprocess.PIPE,
@@ -145,7 +150,7 @@ def verify_begin_command(request_id, candidate, width=320, height=240, **overrid
 
 
 def verify_media_command(request_id, media_path, backend, width=128, height=96,
-                         scan_scope=None, concurrency=None):
+                         scan_scope=None, concurrency=None, decode_concurrency=None):
     command = {
         "protocol_version": 1,
         "type": "verify_media_begin",
@@ -168,6 +173,8 @@ def verify_media_command(request_id, media_path, backend, width=128, height=96,
     }
     if concurrency is not None:
         command["concurrency"] = concurrency
+    if decode_concurrency is not None:
+        command["decode_concurrency"] = decode_concurrency
     return command
 
 
@@ -257,6 +264,11 @@ def main():
         vulkan_available = (vulkan.get("compiled") is True
                             and vulkan.get("device_available") is True
                             and vulkan.get("analysis_command_available") is True)
+        metal = next((b for b in payload.get("backends", [])
+                      if b.get("id") == "metal"), {})
+        metal_available = (metal.get("compiled") is True
+                           and metal.get("device_available") is True
+                           and metal.get("analysis_command_available") is True)
         backend_ids = {backend.get("id") for backend in payload.get("backends", [])}
         check("capabilities-analyze-gating",
               event["type"] == "capabilities"
@@ -266,6 +278,7 @@ def main():
               backend_ids == {"cpu", "metal", "cuda", "vulkan"}
               and cpu.get("auto_priority") == 100
               and (not cuda_available or cuda.get("auto_priority") == 10)
+              and (not metal_available or metal.get("auto_priority") == 30)
               and (not vulkan_available
                    or vulkan.get("device_type") in {
                        "discrete_gpu", "integrated_gpu", "virtual_gpu", "cpu", "other"
@@ -340,21 +353,22 @@ def main():
               and profiled["payload"]["candidates"][0]["id"] == "204",
               json.dumps(profiled)[:500])
 
-        # Auto follows the advertised CUDA/Vulkan p-norm ranges. Vulkan only
-        # participates for p=1 when a discrete device is explicitly admitted.
+        # Auto follows the advertised CUDA/Vulkan/Metal p-norm ranges.
         for norm in range(1, 5):
             auto_accepted, auto_norm = run_analyze_with_accepted(worker, analyze_command(
                 f"r3auto-p{norm}", frame, ["204"], backend="auto",
                 metric={"p_norm": norm}))
             expected_auto_backend = (
                 "cuda" if cuda_available
-                else "vulkan" if norm == 1 and vulkan.get("auto_priority") == 20
+                else "vulkan" if vulkan.get("auto_priority") == 20
+                else "metal" if metal.get("auto_priority") == 30
                 else "cpu"
             )
             telemetry = auto_norm.get("payload", {}).get("telemetry", {})
             expected_device = (
                 telemetry.get("cuda_device") if expected_auto_backend == "cuda"
                 else telemetry.get("vulkan_device") if expected_auto_backend == "vulkan"
+                else telemetry.get("metal_device") if expected_auto_backend == "metal"
                 else None
             )
             check(f"auto-p{norm}-backend",
@@ -639,12 +653,16 @@ def main():
             worker,
             analyze_command("c-auto", frame, ["200"], backend="auto"),
         )
+        metal_backend = next((backend for backend in capabilities.get("backends", [])
+                              if backend.get("id") == "metal"), {})
         expected_auto = ("cuda" if cuda_usable
                          else "vulkan" if vulkan_backend.get("auto_priority") == 20
+                         else "metal" if metal_backend.get("auto_priority") == 30
                          else "cpu")
         telemetry = auto_result.get("payload", {}).get("telemetry", {})
         device = (telemetry.get("cuda_device") if expected_auto == "cuda"
                   else telemetry.get("vulkan_device") if expected_auto == "vulkan"
+                  else telemetry.get("metal_device") if expected_auto == "metal"
                   else None)
         check(
             "auto-cuda-vulkan-cpu-priority",
@@ -1054,6 +1072,23 @@ def main():
                           and rejected["code"] == "bad_request",
                           json.dumps(rejected))
 
+                metal_capability = next(
+                    (backend for backend in capabilities.get("backends", [])
+                     if backend.get("id") == "metal"), {})
+                if (metal_capability.get("compiled") is True
+                        and metal_capability.get("device_available") is True):
+                    worker.send(**verify_media_command(
+                        "vm-metal-parse", media_path, "metal",
+                        scan_scope={"selection": "all", "start_frame": 0,
+                                    "end_frame": 0}, concurrency=1))
+                    metal_first = worker.read_event()
+                    check("verify-media-metal-parser",
+                          not (metal_first.get("type") == "error"
+                               and metal_first.get("message") == "unknown backend: metal"),
+                          json.dumps(metal_first))
+                    if metal_first.get("type") == "accepted":
+                        collect_verify(worker)
+
                 worker.send(**verify_media_command(
                     "vm-cpu", media_path, "cpu"))
                 cpu_accepted = worker.read_event()
@@ -1201,6 +1236,12 @@ def main():
                 if (vulkan_usable
                         and decode_backends.get("vulkan_video", {}).get("runtime_device")):
                     accelerators.append(("vulkan", "vulkan_video"))
+                metal_usable = (
+                    metal_capability.get("compiled") is True
+                    and metal_capability.get("device_available") is True
+                    and decode_backends.get("videotoolbox", {}).get("runtime_device") is True
+                    and decode_backends.get("videotoolbox", {}).get("zero_copy") is True
+                )
 
                 late_scope = {
                     "selection": "all", "start_frame": 24, "end_frame": 29,
@@ -1291,6 +1332,59 @@ def main():
                           and accelerator_i_telemetry.get("effective_concurrency") == 4,
                           json.dumps({"terminal": accelerator_i_terminal,
                                       "warnings": accelerator_i_warnings})[:1000])
+
+                if metal_usable:
+                    worker.send(**verify_media_command(
+                        "vm-metal-parallel-baseline", media_path, "metal",
+                        concurrency=4, decode_concurrency=1))
+                    baseline_terminal, baseline_results, baseline_warnings = \
+                        collect_verify(worker)
+                    baseline_payload = baseline_terminal.get("payload", {})
+                    baseline_provenance = baseline_payload.get("provenance", {})
+                    baseline_telemetry = baseline_payload.get("telemetry", {})
+                    parallel = Worker(env_overrides={
+                        "GETNATIVE_METAL_DECODE_SESSIONS": "2",
+                    })
+                    parallel.send(
+                        protocol_version=1, type="hello",
+                        request_id="vm-metal-parallel-hello")
+                    parallel.read_event()
+                    parallel.send(**verify_media_command(
+                        "vm-metal-parallel", media_path, "metal",
+                        concurrency=4, decode_concurrency=2))
+                    parallel_accepted = parallel.read_event()
+                    parallel_terminal, parallel_results, parallel_warnings = \
+                        collect_verify(parallel)
+                    parallel_payload = parallel_terminal.get("payload", {})
+                    parallel_provenance = parallel_payload.get("provenance", {})
+                    parallel_telemetry = parallel_payload.get("telemetry", {})
+                    parallel_close = (
+                        parallel_results.keys() == baseline_results.keys()
+                        and all(parallel_results[seq] == baseline_results[seq]
+                                for seq in baseline_results)
+                    )
+                    check("verify-media-videotoolbox-parallel-sessions",
+                          baseline_terminal["type"] == "result"
+                          and not baseline_warnings
+                          and baseline_provenance.get("decoder") == "videotoolbox"
+                          and baseline_telemetry.get("decode_sessions") == 1
+                          and parallel_accepted.get("backend") == "metal"
+                          and parallel_terminal["type"] == "result"
+                          and parallel_close and not parallel_warnings
+                          and list(parallel_results) == sorted(parallel_results)
+                          and parallel_provenance.get("decoder") == "videotoolbox"
+                          and parallel_provenance.get("zero_copy") is True
+                          and parallel_telemetry.get("decode_sessions") == 2
+                          and parallel_telemetry.get("host_frame_bytes") == 0
+                          and parallel_telemetry.get("conversion_bytes") == 0,
+                          json.dumps({"terminal": parallel_terminal,
+                                      "warnings": parallel_warnings})[:1200])
+                    parallel.send(
+                        protocol_version=1, type="shutdown",
+                        request_id="vm-metal-parallel-stop")
+                    while parallel.read_event()["type"] != "shutdown":
+                        pass
+                    parallel.wait_exit()
 
                 hevc_accelerators = [
                     (backend, decoder)

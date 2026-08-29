@@ -20,7 +20,11 @@ import {
 import type { HeightAnalyzeRequest, KernelAnalyzeRequest, VerifyRequest, WorkerEvent } from "./protocol";
 import type { EngineEnvelope } from "./types";
 import { createTranslator } from "../i18n";
-import { backendOptionLabel, verifySelectableBackends } from "./backendSelection";
+import {
+  backendOptionLabel,
+  pNormMaximumForBackend,
+  verifySelectableBackends,
+} from "./backendSelection";
 import {
   extractHeightSeries,
   materializeHeightRunGroup,
@@ -189,7 +193,9 @@ describe("GUI-3 analysis foundation", () => {
     assert(validateBackendPNorm(null, "cuda", 4).ok, "CUDA fallback contract accepts p=4");
     assert(!validateBackendPNorm(null, "cuda", 5).ok, "CUDA fallback contract rejects p=5");
     assert(validateBackendPNorm(null, "vulkan", 1).ok, "Vulkan accepts p=1");
-    assert(!validateBackendPNorm(null, "vulkan", 2).ok, "Vulkan rejects p=2");
+    assert(validateBackendPNorm(null, "vulkan", 4).ok, "Vulkan accepts p=4");
+    assert(pNormMaximumForBackend(null, "vulkan") === 4, "Vulkan fallback max is p=4");
+    assert(pNormMaximumForBackend(null, "metal") === 4, "Metal fallback max is p=4");
     assert(!validateBackendPNorm(null, "cpu", 0).ok, "zero is invalid");
     assert(!validateBackendPNorm(null, "cpu", 4_294_967_296).ok, "uint32 overflow invalid");
 
@@ -233,7 +239,7 @@ describe("GUI-3 analysis foundation", () => {
       device_available: true,
       analysis_command_available: true,
       axes: ["horizontal", "vertical", "both"],
-      p_norms: { minimum: 1, maximum: 1 },
+      p_norms: { minimum: 1, maximum: 4 },
       max_half_bandwidth: null,
       max_forward_width: null,
       device: "Discrete Vulkan GPU",
@@ -242,19 +248,20 @@ describe("GUI-3 analysis foundation", () => {
     });
     assert(selectableBackends(cudaCapabilities).includes("vulkan"), "available Vulkan is selectable");
     assert(validateBackendPNorm(cudaCapabilities, "vulkan", 1).ok, "reported Vulkan accepts p=1");
-    assert(!validateBackendPNorm(cudaCapabilities, "vulkan", 2).ok, "reported Vulkan rejects p=2");
+    assert(validateBackendPNorm(cudaCapabilities, "vulkan", 2).ok, "reported Vulkan accepts p=2");
+    assert(!validateBackendPNorm(cudaCapabilities, "vulkan", 5).ok, "reported Vulkan rejects p=5");
     assert(resolveBackendPreference(cudaCapabilities, "auto") === "cuda", "auto keeps CUDA first");
 
     cudaCapabilities.payload.backends[0].auto_priority = null;
     assert(resolveBackendPreference(cudaCapabilities, "auto") === "vulkan", "discrete Vulkan follows CUDA");
-    assert(resolveBackendPreference(cudaCapabilities, "auto", 2) === "cpu", "Vulkan p>1 uses CPU");
+    assert(resolveBackendPreference(cudaCapabilities, "auto", 2) === "vulkan", "Vulkan handles p=2..4");
     cudaCapabilities.payload.backends[1].device_type = "integrated_gpu";
     cudaCapabilities.payload.backends[1].auto_priority = null;
     assert(resolveBackendPreference(cudaCapabilities, "auto") === "cpu", "integrated Vulkan is explicit-only");
     assert(selectableBackends(cudaCapabilities).includes("vulkan"), "integrated Vulkan stays explicit");
 
-    // Metal (macOS): selectable when analysis-ready, explicit-only for auto,
-    // p=1 only, and never offered for media verify.
+    // Metal (macOS): selectable when analysis-ready and the default auto backend,
+    // p=1..4, and offered for media verify only with VideoToolbox zero-copy.
     const metalCapabilities: EngineEnvelope = {
       path: "/engine",
       payload: {
@@ -270,17 +277,19 @@ describe("GUI-3 analysis foundation", () => {
           device_available: true,
           analysis_command_available: true,
           axes: ["horizontal", "vertical", "both"],
-          p_norms: { minimum: 1, maximum: 1 },
+          p_norms: { minimum: 1, maximum: 4 },
           max_half_bandwidth: 15,
           max_forward_width: 16,
           device: "Apple M4 Max",
+          auto_priority: 30,
         }],
       },
     };
     assert(selectableBackends(metalCapabilities).includes("metal"), "available Metal is selectable");
-    assert(resolveBackendPreference(metalCapabilities, "auto") === "cpu", "auto stays conservative on Metal");
+    assert(resolveBackendPreference(metalCapabilities, "auto") === "metal", "auto defaults to Metal on macOS");
     assert(validateBackendPNorm(metalCapabilities, "metal", 1).ok, "Metal accepts p=1");
-    assert(!validateBackendPNorm(metalCapabilities, "metal", 2).ok, "Metal rejects p=2");
+    assert(validateBackendPNorm(metalCapabilities, "metal", 2).ok, "Metal accepts p=2");
+    assert(!validateBackendPNorm(metalCapabilities, "metal", 5).ok, "Metal rejects p=5");
     metalCapabilities.payload.backends[0].analysis_command_available = false;
     assert(!selectableBackends(metalCapabilities).includes("metal"), "analysis-gated Metal is hidden");
     metalCapabilities.payload.backends[0].analysis_command_available = true;
@@ -289,11 +298,24 @@ describe("GUI-3 analysis foundation", () => {
       payload: {
         ...metalCapabilities.payload,
         features: { verify_engine_decode: true },
+        decode_backends: [{
+          id: "videotoolbox",
+          compiled: true,
+          runtime_device: true,
+          codecs: ["h264", "hevc"],
+          surface_formats: ["420v", "420f", "x420", "xf20"],
+          zero_copy: true,
+        }],
       },
     };
     assert(
+      verifySelectableBackends(metalDecodeCapabilities).includes("metal"),
+      "media verify offers Metal when VideoToolbox zero-copy is available",
+    );
+    metalDecodeCapabilities.payload.decode_backends![0].zero_copy = false;
+    assert(
       !verifySelectableBackends(metalDecodeCapabilities).includes("metal"),
-      "media verify never offers Metal",
+      "media verify hides Metal when VideoToolbox zero-copy is unavailable",
     );
 
     const t = createTranslator("en");

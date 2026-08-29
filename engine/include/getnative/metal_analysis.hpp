@@ -13,6 +13,9 @@
 
 namespace getnative {
 
+inline constexpr std::uint32_t metal_minimum_p_norm = 1U;
+inline constexpr std::uint32_t metal_maximum_p_norm = 4U;
+
 struct MetalDeviceInfo {
     std::string name;
     std::uint64_t registry_id = 0;
@@ -40,6 +43,10 @@ struct MetalRuntimeTelemetry {
     std::size_t working_buffer_peak_retained_bytes = 0;
     std::size_t command_buffer_submission_count = 0;
     std::size_t command_buffer_completion_count = 0;
+    std::size_t source_direct_write_bytes = 0;
+    std::size_t source_legacy_copy_bytes = 0;
+    std::size_t plan_direct_write_bytes = 0;
+    std::size_t plan_legacy_copy_bytes = 0;
     std::size_t plan_upload_bytes = 0;
     std::size_t analyzed_tile_count = 0;
     std::size_t generic_tile_count = 0;
@@ -48,10 +55,15 @@ struct MetalRuntimeTelemetry {
     double working_buffer_allocation_ms = 0.0;
     double source_upload_ms = 0.0;
     double plan_upload_ms = 0.0;
+    double source_pack_ms = 0.0;
+    double plan_pack_ms = 0.0;
     double buffer_wiring_ms = 0.0;
     double pipeline_creation_ms = 0.0;
     double gpu_execution_ms = 0.0;
     double execution_slot_wait_ms = 0.0;
+    bool external_source_zero_copy = false;
+    bool shared_uma_path = false;
+    std::string fallback_reason;
     std::vector<std::string> created_pipeline_names;
 };
 
@@ -68,6 +80,9 @@ struct MetalAnalysisOptions {
     std::size_t retained_working_buffer_limit_bytes =
         2ULL * 1024ULL * 1024ULL * 1024ULL;
     std::size_t execution_slots = 2U;
+    // Diagnostic compatibility paths used for direct-vs-legacy conformance.
+    bool direct_plan_pack = true;
+    bool direct_source_write = true;
 };
 
 struct MetalLumaFrameView {
@@ -81,7 +96,7 @@ struct MetalLumaFrameView {
 
 [[nodiscard]] bool metal_backend_available() noexcept;
 
-// Accepts single- and two-axis plans through half-bandwidth 15 / forward width 16 and p=1.
+// Accepts single- and two-axis plans through half-bandwidth 15 / forward width 16 and p=1..4.
 // Calls are serialized so one engine can safely be reused.
 class MetalAnalysisEngine {
 public:

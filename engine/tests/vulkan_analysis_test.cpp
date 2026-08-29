@@ -271,14 +271,22 @@ void test_conformance(const getnative::VulkanRuntimeProbe &probe) {
         },
         "Vulkan rejects a pre-cancelled call");
 
+    for (const std::uint32_t norm : {1U, 2U, 3U, 4U}) {
+        getnative::MetricSpec p_norm_metric = metric;
+        p_norm_metric.norm = norm;
+        compare_with_cpu(
+            engine, source.view, candidates, p_norm_metric,
+            std::string{"p-norm "} + std::to_string(norm));
+    }
+
     getnative::MetricSpec unsupported = metric;
-    unsupported.norm = 2U;
+    unsupported.norm = 5U;
     expect_throws<std::invalid_argument>(
         [&] {
             (void)engine.analyze_axis_batch_f32(
                 source.view, candidates, unsupported);
         },
-        "Vulkan rejects p>1");
+        "Vulkan rejects p-norms above four");
 
     getnative::VulkanAnalysisOptions tiled_options = options;
     tiled_options.execution_slots = 1U;

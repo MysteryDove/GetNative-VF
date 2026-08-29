@@ -14,7 +14,7 @@
 namespace getnative {
 
 inline constexpr std::uint32_t vulkan_minimum_p_norm = 1U;
-inline constexpr std::uint32_t vulkan_maximum_p_norm = 1U;
+inline constexpr std::uint32_t vulkan_maximum_p_norm = 4U;
 inline constexpr std::int32_t vulkan_automatic_device_index = -1;
 
 enum class VulkanDeviceType : std::uint8_t {

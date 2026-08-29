@@ -194,6 +194,7 @@ async function runEngineMediaVerifyMember(
       },
       backend: wireBackend,
       concurrency: member.request.concurrency,
+      decodeConcurrency: member.request.decodeConcurrency ?? 0,
     }, (job) => {
       myRunId = job.runId;
       acceptedPromise = deps.worker.waitAccepted(job.requestId);

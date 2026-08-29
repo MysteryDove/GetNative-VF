@@ -137,6 +137,7 @@ struct DecodeTelemetry {
     std::uint64_t discarded_packets = 0U;
     std::uint64_t host_frame_bytes = 0U;
     std::uint64_t conversion_bytes = 0U;
+    std::size_t decode_sessions = 0U;
     double index_ms = 0.0;
     double decode_ms = 0.0;
     double convert_ms = 0.0;
@@ -259,6 +260,9 @@ struct DecoderOptions {
     bool output_luma = true;
     // Number of decoded frames the caller may retain concurrently.
     std::size_t frame_concurrency = 2U;
+    // Independent hardware decoder sessions. Values above one are an
+    // experimental RAP-partitioned path; callers must opt in explicitly.
+    std::size_t hardware_decode_sessions = 1U;
 };
 
 using IndexProgress = std::function<void(std::uint64_t indexed_records)>;

@@ -81,6 +81,7 @@ describe("reconcileReadyVideoSourceIds", () => {
 describe("resolveScanScope", () => {
   it("defaults media verification concurrency to two", () => {
     expect(defaultVerifyDraft().concurrency).toBe(2);
+    expect(defaultVerifyDraft().decodeConcurrency).toBe(0);
   });
   it("builds a full-scan scope and validates ranges", () => {
     const full = resolveScanScope({ ...defaultVerifyDraft(), scopeKind: "full" }, 0);

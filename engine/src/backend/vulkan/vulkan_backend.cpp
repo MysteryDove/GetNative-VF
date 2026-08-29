@@ -1336,8 +1336,8 @@ void validate_source_and_metric(ConstImageView source, const MetricSpec &metric,
         || !std::isfinite(metric.threshold) || metric.threshold < 0.0F) {
         throw std::invalid_argument("invalid Vulkan metric configuration");
     }
-    if (metric.norm != 1U) {
-        throw std::invalid_argument("Vulkan currently supports only p=1");
+    if (metric.norm < vulkan_minimum_p_norm || metric.norm > vulkan_maximum_p_norm) {
+        throw std::invalid_argument("Vulkan supports p-norm in 1..4");
     }
 }
 
@@ -1881,6 +1881,8 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
     push[0] = static_cast<std::uint32_t>(source.width);
     push[1] = static_cast<std::uint32_t>(source.height);
     push[2] = checked_u32(source_elements, "Vulkan source elements");
+    // Keep metric norm separate from the inverse dispatch's vertical flag.
+    push[5] = metric.norm;
     push[6] = checked_u32(metric_groups, "Vulkan metric group count");
     push[7] = static_cast<std::uint32_t>(metric.crop_left);
     push[8] = static_cast<std::uint32_t>(metric.crop_right);
@@ -2064,7 +2066,11 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
         for (std::size_t group = 0U; group < metric_groups; ++group) {
             sum += static_cast<double>(partials[candidate * metric_groups + group]);
         }
-        results.push_back({candidates[candidate].id, sum / pixel_count});
+        const double mean = sum / pixel_count;
+        results.push_back({candidates[candidate].id,
+                           metric.norm == 1U
+                               ? mean
+                               : std::pow(mean, 1.0 / static_cast<double>(metric.norm))});
     }
 
     delta.command_buffer_submission_count = 1U;

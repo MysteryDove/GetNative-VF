@@ -120,6 +120,12 @@ void write_capabilities_impl(
         getnative::media::DecoderOptions::Backend::videotoolbox);
     const auto videotoolbox_codecs = getnative::media::hardware_codecs(
         getnative::media::DecoderOptions::Backend::videotoolbox);
+#if defined(GETNATIVE_HAS_METAL)
+    const bool metal_zero_copy_available =
+        videotoolbox_runtime && getnative::metal_backend_available();
+#else
+    constexpr bool metal_zero_copy_available = false;
+#endif
 #endif
     output << "{\"schema_version\":2,\"engine\":\"getnative-engine\",\"version\":\"0.2.1\","
               "\"commands\":{\"capabilities\":true,\"geometry\":true,\"analyze\":"
@@ -143,8 +149,7 @@ void write_capabilities_impl(
               "\"features\":{\"verify_frame_ring\":true,\"media_frame_batch\":false,"
               "\"verify_engine_decode\":";
 #if defined(GETNATIVE_HAS_MEDIA)
-    output << "true,\"verify_metal_zero_copy\":false"
-           << ",\"media_verify_concurrency\":{\"min\":1,\"max\":8,\"default\":2}},\"decode_backends\":["
+    output << "true,\"media_verify_concurrency\":{\"min\":1,\"max\":8,\"default\":2}},\"decode_backends\":["
               "{\"id\":\"software\",\"compiled\":true,\"runtime_device\":true,"
               "\"codecs\":[\"*\"],\"zero_copy\":false},";
 #if defined(GETNATIVE_HAS_CUDA)
@@ -186,12 +191,23 @@ void write_capabilities_impl(
         output << json_string(videotoolbox_codecs[index]);
     }
     output << "],\"surface_formats\":[\"420v\",\"420f\",\"x420\",\"xf20\"],\"zero_copy\":"
-           << "false,\"reason\":\"Metal zero-copy path is implemented but multi-slot/oracle validation is incomplete\"}],";
+           << (metal_zero_copy_available ? "true" : "false");
+    if (!metal_zero_copy_available) {
+        output << ",\"reason\":" << json_string(
+#if defined(GETNATIVE_HAS_METAL)
+            videotoolbox_runtime ? "Metal device is unavailable"
+                                 : "VideoToolbox runtime is unavailable"
+#else
+            "Metal backend is not compiled"
+#endif
+        );
+    }
+    output << "}],";
 #else
     output << "{\"id\":\"videotoolbox\",\"compiled\":false,\"runtime_device\":false,\"codecs\":[],\"surface_formats\":[\"420v\",\"420f\",\"x420\",\"xf20\"],\"zero_copy\":false,\"reason\":\"not compiled\"}],";
 #endif
 #else
-    output << "false,\"verify_metal_zero_copy\":false,\"media_verify_concurrency\":{\"min\":1,\"max\":8,\"default\":2}},\"decode_backends\":["
+    output << "false,\"media_verify_concurrency\":{\"min\":1,\"max\":8,\"default\":2}},\"decode_backends\":["
               "{\"id\":\"software\",\"compiled\":false,\"runtime_device\":false,"
               "\"codecs\":[],\"zero_copy\":false,\"reason\":\"not compiled\"},"
               "{\"id\":\"nvdec\",\"compiled\":false,\"runtime_device\":false,"
@@ -244,21 +260,30 @@ void write_capabilities_impl(
         output << ",{\"id\":\"metal\",\"compiled\":true,\"device_available\":true,"
                   "\"analysis_command_available\":"
                << available
-               << ",\"auto_priority\":null,"
+               << ",\"auto_priority\":30,"
                   "\"axes\":[\"horizontal\",\"vertical\",\"both\"],"
-                  "\"p_norms\":{\"minimum\":1,\"maximum\":1},"
+                  "\"p_norms\":{\"minimum\":"
+               << getnative::metal_minimum_p_norm
+               << ",\"maximum\":" << getnative::metal_maximum_p_norm << "},"
                   "\"max_half_bandwidth\":15,\"max_forward_width\":16,\"device\":"
                << json_string(device.name)
                << ",\"registry_id\":" << device.registry_id
                << ",\"unified_memory\":" << (device.unified_memory ? "true" : "false")
+               << ",\"shared_buffer_direct_write\":true"
+                  ",\"external_source_zero_copy\":true"
+                  ",\"plan_direct_pack\":true"
                << '}';
     } catch (const std::exception &error) {
         output << ",{\"id\":\"metal\",\"compiled\":true,\"device_available\":false,"
                   "\"analysis_command_available\":false,"
                   "\"auto_priority\":null,"
                   "\"axes\":[\"horizontal\",\"vertical\",\"both\"],"
-                  "\"p_norms\":{\"minimum\":1,\"maximum\":1},"
-                  "\"max_half_bandwidth\":15,\"max_forward_width\":16,\"reason\":"
+                  "\"p_norms\":{\"minimum\":"
+               << getnative::metal_minimum_p_norm
+               << ",\"maximum\":" << getnative::metal_maximum_p_norm << "},"
+                  "\"max_half_bandwidth\":15,\"max_forward_width\":16,"
+                  "\"unified_memory\":false,\"shared_buffer_direct_write\":true,"
+                  "\"external_source_zero_copy\":true,\"plan_direct_pack\":true,\"reason\":"
                << json_string(error.what()) << '}';
     }
 #else
@@ -266,6 +291,8 @@ void write_capabilities_impl(
               "\"analysis_command_available\":false,\"auto_priority\":null,"
               "\"axes\":[],\"p_norms\":null,"
               "\"max_half_bandwidth\":null,\"max_forward_width\":null,"
+              "\"unified_memory\":false,\"shared_buffer_direct_write\":false,"
+              "\"external_source_zero_copy\":false,\"plan_direct_pack\":false,"
               "\"reason\":\"not compiled\"}";
 #endif
 #if defined(GETNATIVE_HAS_CUDA)

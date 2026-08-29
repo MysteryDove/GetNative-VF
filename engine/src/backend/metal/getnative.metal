@@ -37,6 +37,7 @@ struct AnalysisJob {
     uint groups_per_candidate;
     uint candidate_count;
     uint maximum_vector_count;
+    uint norm;
 };
 
 struct LumaNormalizeJob {
@@ -513,7 +514,7 @@ DEFINE_MATRIX_FORWARD(forward_axis_matrix_b11, 6u)
 DEFINE_MATRIX_FORWARD(forward_axis_matrix_b15, 8u)
 DEFINE_MATRIX_FORWARD(forward_axis_matrix_generic, 0u)
 
-static inline void metric_axis_p1_impl(
+static inline void metric_axis_impl(
     device const float *source,
     constant AnalysisJob &job,
     device const AxisPlanDescriptor *plans,
@@ -564,7 +565,14 @@ static inline void metric_axis_p1_impl(
         }
         const float difference = abs(source[y * job.width + x] - reconstructed);
         if (difference > job.threshold) {
-            sum += difference;
+            float moment = difference;
+            if (job.norm == 2u) moment = difference * difference;
+            if (job.norm == 3u) moment = difference * difference * difference;
+            if (job.norm == 4u) {
+                const float square = difference * difference;
+                moment = square * square;
+            }
+            sum += moment;
         }
 
         const uint next_x = x_offset + stride_x;
@@ -586,7 +594,7 @@ static inline void metric_axis_p1_impl(
     }
 }
 
-kernel void metric_axis_p1_b3(
+kernel void metric_axis_b3(
     device const float *source [[buffer(0)]],
     constant AnalysisJob &job [[buffer(1)]],
     device const AxisPlanDescriptor *plans [[buffer(2)]],
@@ -597,11 +605,11 @@ kernel void metric_axis_p1_b3(
     uint thread_index [[thread_index_in_threadgroup]],
     uint group_index [[threadgroup_position_in_grid]]) {
     threadgroup float reduction[reduction_width];
-    metric_axis_p1_impl(source, job, plans, forward_left, forward_weights,
+    metric_axis_impl(source, job, plans, forward_left, forward_weights,
                         workspace, partials, reduction, thread_index, group_index, 2u, false);
 }
 
-kernel void metric_axis_p1_b7(
+kernel void metric_axis_b7(
     device const float *source [[buffer(0)]],
     constant AnalysisJob &job [[buffer(1)]],
     device const AxisPlanDescriptor *plans [[buffer(2)]],
@@ -612,7 +620,7 @@ kernel void metric_axis_p1_b7(
     uint thread_index [[thread_index_in_threadgroup]],
     uint group_index [[threadgroup_position_in_grid]]) {
     threadgroup float reduction[reduction_width];
-    metric_axis_p1_impl(source, job, plans, forward_left, forward_weights,
+    metric_axis_impl(source, job, plans, forward_left, forward_weights,
                         workspace, partials, reduction, thread_index, group_index, 4u, false);
 }
 
@@ -628,14 +636,14 @@ kernel void NAME( \
     uint thread_index [[thread_index_in_threadgroup]], \
     uint group_index [[threadgroup_position_in_grid]]) { \
     threadgroup float reduction[reduction_width]; \
-    metric_axis_p1_impl(source, job, plans, forward_left, forward_weights, \
+    metric_axis_impl(source, job, plans, forward_left, forward_weights, \
         workspace, partials, reduction, thread_index, group_index, WIDTH, false); \
 }
 
-DEFINE_AXIS_METRIC_FIXED(metric_axis_p1_b11, 6u)
-DEFINE_AXIS_METRIC_FIXED(metric_axis_p1_b15, 8u)
+DEFINE_AXIS_METRIC_FIXED(metric_axis_b11, 6u)
+DEFINE_AXIS_METRIC_FIXED(metric_axis_b15, 8u)
 
-kernel void metric_axis_p1_generic(
+kernel void metric_axis_generic(
     device const float *source [[buffer(0)]],
     constant AnalysisJob &job [[buffer(1)]],
     device const AxisPlanDescriptor *plans [[buffer(2)]],
@@ -646,7 +654,7 @@ kernel void metric_axis_p1_generic(
     uint thread_index [[thread_index_in_threadgroup]],
     uint group_index [[threadgroup_position_in_grid]]) {
     threadgroup float reduction[reduction_width];
-    metric_axis_p1_impl(source, job, plans, forward_left, forward_weights,
+    metric_axis_impl(source, job, plans, forward_left, forward_weights,
                         workspace, partials, reduction, thread_index, group_index, 0u, false);
 }
 
@@ -662,12 +670,12 @@ kernel void NAME( \
     uint thread_index [[thread_index_in_threadgroup]], \
     uint group_index [[threadgroup_position_in_grid]]) { \
     threadgroup float reduction[reduction_width]; \
-    metric_axis_p1_impl(source, job, plans, forward_left, forward_weights, \
+    metric_axis_impl(source, job, plans, forward_left, forward_weights, \
         workspace, partials, reduction, thread_index, group_index, WIDTH, true); \
 }
 
-DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_p1_horizontal_first_b3, 2u)
-DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_p1_horizontal_first_b7, 4u)
-DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_p1_horizontal_first_b11, 6u)
-DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_p1_horizontal_first_b15, 8u)
-DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_p1_horizontal_first_generic, 0u)
+DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_horizontal_first_b3, 2u)
+DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_horizontal_first_b7, 4u)
+DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_horizontal_first_b11, 6u)
+DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_horizontal_first_b15, 8u)
+DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_horizontal_first_generic, 0u)

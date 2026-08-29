@@ -23,6 +23,7 @@ import {
   reconcileReadyVideoSourceIds,
   verificationRuns,
   validVerifyConcurrency,
+  validDecodeConcurrency,
   type VerifyDraft,
 } from "../engine/verifyPlan";
 import { startVerifyRunGroup, type VerifyFrameEntry } from "../engine/executeVerify";
@@ -194,6 +195,7 @@ export function VerifyPage({
   const concurrencyMin = concurrencyCapability?.min ?? 1;
   const concurrencyMax = concurrencyCapability?.max ?? 8;
   const concurrencyInvalid = !validVerifyConcurrency(draft.concurrency);
+  const decodeConcurrencyInvalid = !validDecodeConcurrency(draft.decodeConcurrency);
 
   /** Stable per-run colors (indexed over all runs, not the filtered view). */
   const runColorById = useMemo(
@@ -340,6 +342,8 @@ export function VerifyPage({
           ? t("verify.blocked.noSources")
           : concurrencyInvalid
             ? t("verify.blocked.concurrency")
+            : decodeConcurrencyInvalid
+              ? t("verify.blocked.decodeConcurrency")
           : !plan
             ? t("verify.blocked.invalidPlan")
             : null;
@@ -520,13 +524,17 @@ export function VerifyPage({
         <section className="analyze-plot pane">
           <div className="verify-review-toolbar">
             <h3>{t("verify.reviewTitle")}</h3>
-            <label className="block verify-filter">
+            <label className="verify-filter verify-history-source">
               <span>{t("verify.historySource")}</span>
-              <select value={historySourceId} onChange={(event) => {
-                setHistorySourceId(event.target.value);
-                setSelectedFusionRunIds(new Set());
-                setSelectedFusionId(null);
-              }}>
+              <select
+                className="control-select"
+                value={historySourceId}
+                onChange={(event) => {
+                  setHistorySourceId(event.target.value);
+                  setSelectedFusionRunIds(new Set());
+                  setSelectedFusionId(null);
+                }}
+              >
                 {historySources.map((source) => <option key={source.id} value={source.id}>{source.label || source.path}</option>)}
               </select>
             </label>
@@ -540,7 +548,7 @@ export function VerifyPage({
                   />
                   <span>{t("analyze.logDisplay")}</span>
                 </label>
-                <label className="block verify-filter">
+                <label className="verify-filter">
                   <span>{t("verify.reviewThreshold")}</span>
                   <input
                     value={reviewThreshold}
@@ -548,7 +556,7 @@ export function VerifyPage({
                     onChange={(event) => setReviewThreshold(event.target.value)}
                   />
                 </label>
-                <label className="block verify-filter">
+                <label className="verify-filter">
                   <span>{t("verify.topN")}</span>
                   <input
                     value={topN}
@@ -561,7 +569,7 @@ export function VerifyPage({
           {runs.length > 0 || sourceFusions.length > 0 ? (
             <div className="verify-fusion-picker">
               <div className="verify-fusion-picker-head">
-                <strong>{t("verify.fusionTitle")}</strong>
+                <h3>{t("verify.fusionTitle")}</h3>
                 <button
                   className="secondary-button"
                   type="button"
@@ -588,9 +596,9 @@ export function VerifyPage({
               </div>
               {sourceFusions.length > 0 ? (
                 <div className="verify-saved-fusions">
-                  <label className="block verify-filter">
+                  <label className="verify-filter">
                     <span>{t("verify.savedFusions")}</span>
-                    <select value={selectedFusionId ?? ""} onChange={(event) => {
+                    <select className="control-select" value={selectedFusionId ?? ""} onChange={(event) => {
                       const nextId = event.target.value || null;
                       setSelectedFusionId(nextId);
                       const nextFusion = nextId ? state.verificationFusionsById[nextId] : null;
@@ -694,7 +702,7 @@ export function VerifyPage({
             const frame = selectedFusion.frames.find((entry) => entry.frameIndex === selectedFusionFrame);
             return frame ? (
               <div className="verify-fusion-frame-detail">
-                <label className="block verify-filter"><span>{t("verify.fusionFrame")}</span><select value={String(selectedFusionFrame)} onChange={(event) => setSelectedFusionFrame(Number(event.target.value))}>{selectedFusion.frames.map((entry) => <option key={entry.frameIndex} value={entry.frameIndex}>#{entry.frameIndex}</option>)}</select></label>
+                <label className="verify-filter"><span>{t("verify.fusionFrame")}</span><select className="control-select" value={String(selectedFusionFrame)} onChange={(event) => setSelectedFusionFrame(Number(event.target.value))}>{selectedFusion.frames.map((entry) => <option key={entry.frameIndex} value={entry.frameIndex}>#{entry.frameIndex}</option>)}</select></label>
                 <span>{t("verify.fusionWinner", { recipe: selectedFusion.inputs.find((input) => input.recipeId === frame.winnerRecipeId)?.recipeName ?? frame.winnerRecipeId, error: frame.fusedError.toPrecision(6) })}</span>
                 <span>{frame.candidates.map((candidate) => `${selectedFusion.inputs.find((input) => input.recipeId === candidate.recipeId)?.recipeName ?? candidate.recipeId}: ${candidate.error.toPrecision(6)}`).join(" · ")}</span>
               </div>
@@ -827,6 +835,20 @@ export function VerifyPage({
                     capabilities?.payload.features?.verify_engine_decode !== true,
                   )}
                 </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="block">
+            <span>{t("verify.decodeConcurrency")}</span>
+            <select
+              value={draft.decodeConcurrency}
+              aria-invalid={decodeConcurrencyInvalid}
+              onChange={(event) => patch({ decodeConcurrency: Number(event.target.value) })}
+            >
+              <option value={0}>{t("verify.decodeConcurrencyAuto")}</option>
+              {[1, 2, 3, 4].map((value) => (
+                <option key={value} value={value}>{value}</option>
               ))}
             </select>
           </label>

@@ -97,7 +97,6 @@ export type EngineEnvelope = {
       verify_frame_ring?: boolean;
       media_frame_batch?: boolean;
       verify_engine_decode?: boolean;
-      verify_metal_zero_copy?: boolean;
       media_verify_concurrency?: {
         min: number;
         max: number;

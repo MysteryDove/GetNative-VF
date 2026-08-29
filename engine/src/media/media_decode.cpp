@@ -909,13 +909,14 @@ void validate_selected_frames(const MediaIndex &index,
 }
 
 [[nodiscard]] std::vector<IndexedDecodeRun> plan_indexed_decode_runs(
-    const MediaIndex &index, std::span<const FrameIdentity> selected) {
+    const MediaIndex &index, std::span<const FrameIdentity> selected,
+    bool split_dense_at_rap = false) {
     validate_selected_frames(index, selected);
     std::vector<IndexedDecodeRun> runs;
     if (selected.empty()) return runs;
     const std::uint64_t covered = selected.back().frame_index
         - selected.front().frame_index + 1U;
-    const bool dense = selected.size() * 2U >= covered;
+    const bool dense = !split_dense_at_rap && selected.size() * 2U >= covered;
     std::size_t begin = 0U;
     while (begin < selected.size()) {
         const std::uint64_t anchor = selected[begin].keyframe_anchor;
@@ -2862,14 +2863,15 @@ void decode_selected_hardware_indexed(
     DecodeTelemetry *telemetry) {
     if (selected_frames.empty()) return;
     const auto start = Clock::now();
-    const std::vector<IndexedDecodeRun> runs =
-        plan_indexed_decode_runs(index, selected_frames);
+    const std::size_t requested_sessions = std::clamp<std::size_t>(
+        options.hardware_decode_sessions, 1U, 4U);
+    const std::vector<IndexedDecodeRun> runs = plan_indexed_decode_runs(
+        index, selected_frames, requested_sessions > 1U);
     const IndexedIdentityLookup identity_lookup{index};
-    // Keep one hardware decoder alive across indexed RAP seeks. Multiple
-    // demux/decode slices each pay a separate NVDEC/Vulkan session startup and
-    // cannot reuse codec state across their boundary; analysis still uses the
-    // caller's requested frame_concurrency in the downstream pipeline.
-    constexpr std::size_t worker_count = 1U;
+    // The default remains one persistent hardware decoder. The experimental
+    // multi-session path partitions whole RAP-aligned runs so no decoder
+    // depends on reference state owned by another session.
+    const std::size_t worker_count = std::min(requested_sessions, runs.size());
     std::vector<DecodeTelemetry> worker_telemetry(worker_count);
     std::vector<double> worker_consumer_ms(worker_count, 0.0);
     std::mutex failure_mutex;
@@ -3036,6 +3038,7 @@ void decode_selected_hardware_indexed(
     if (failure) std::rethrow_exception(failure);
 
     if (telemetry) {
+        telemetry->decode_sessions = worker_count;
         for (const DecodeTelemetry &local : worker_telemetry) {
             telemetry->decoded_frames += local.decoded_frames;
             telemetry->selected_frames += local.selected_frames;

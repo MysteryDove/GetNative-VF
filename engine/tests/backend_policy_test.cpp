@@ -26,8 +26,8 @@ int main() {
                    == AutomaticBackend::cpu,
                "integrated or software Vulkan must not enter Auto");
         expect(choose_automatic_backend(2U, false, true, true)
-                   == AutomaticBackend::cpu,
-               "Vulkan must not handle p>1");
+                   == AutomaticBackend::vulkan,
+               "Vulkan must handle p=2..4");
         expect(choose_automatic_backend(4U, true, true, true)
                    == AutomaticBackend::cuda,
                "CUDA must handle p=2..4");

@@ -1106,7 +1106,8 @@ if(BUILD_TESTING)
 
     if(GETNATIVE_ENABLE_METAL)
         add_executable(getnative_metal_tests tests/metal_conformance_test.cpp)
-        target_link_libraries(getnative_metal_tests PRIVATE getnative_metal)
+        target_link_libraries(getnative_metal_tests PRIVATE getnative_metal
+            "${GETNATIVE_METAL_COREVIDEO_FRAMEWORK}")
         target_compile_features(getnative_metal_tests PRIVATE cxx_std_23)
         getnative_enable_warnings(getnative_metal_tests)
         getnative_enable_strict_fp(getnative_metal_tests)

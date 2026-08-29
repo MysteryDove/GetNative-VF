@@ -128,8 +128,6 @@ struct ProfileKernelCapability {
 struct FeatureCapabilities {
     #[serde(default)]
     verify_engine_decode: bool,
-    #[serde(default)]
-    verify_metal_zero_copy: bool,
 }
 
 #[derive(Deserialize)]
@@ -320,11 +318,6 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
                         .to_owned(),
                 );
             }
-            if capabilities.features.verify_metal_zero_copy
-                && !(videotoolbox.compiled && videotoolbox.runtime_device && videotoolbox.zero_copy)
-            {
-                return Err("getnative-engine Metal decode feature is inconsistent".to_owned());
-            }
         }
         let software = &capabilities.decode_backends[0];
         if capabilities.features.verify_engine_decode
@@ -468,7 +461,7 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
                     range.minimum == 1
                         && match id {
                             "cuda" => (1..=CUDA_MAXIMUM_P_NORM).contains(&range.maximum),
-                            "metal" | "vulkan" => range.maximum == 1,
+                            "metal" | "vulkan" => (1..=4).contains(&range.maximum),
                             _ => false,
                         }
                 })
@@ -507,7 +500,9 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
             _ => backend.device_type.is_none(),
         };
         let valid_auto_priority = match id {
-            "metal" => backend.auto_priority.is_none(),
+            "metal" => backend.auto_priority.is_none_or(|priority| {
+                priority == 30 && backend.compiled && backend.device_available
+            }),
             "cuda" => backend.auto_priority.is_none_or(|priority| {
                 priority == 10 && backend.compiled && backend.device_available
             }),
@@ -698,7 +693,7 @@ mod tests {
             ],
             "backends": [
                 {"id": "cpu", "compiled": true, "device_available": true, "analysis_command_available": false, "auto_priority": 100, "axes": ["horizontal", "vertical", "both"], "p_norms": {"minimum": 1, "maximum": 4294967295_u64}, "max_half_bandwidth": 29, "max_forward_width": 30, "compiled_isa": ["scalar", "sse2", "avx2", "avx512"], "available_isa": ["scalar", "sse2", "avx2"], "selected_isa": "avx2", "math_modes": ["production"], "selected_math_mode": "production", "selection_reason": "avx512 not benchmark-approved"},
-                {"id": "metal", "compiled": true, "device_available": true, "analysis_command_available": false, "auto_priority": null, "device": "Apple GPU", "axes": ["horizontal", "vertical", "both"], "p_norms": {"minimum": 1, "maximum": 1}, "max_half_bandwidth": 15, "max_forward_width": 16},
+                {"id": "metal", "compiled": true, "device_available": true, "analysis_command_available": false, "auto_priority": 30, "device": "Apple GPU", "axes": ["horizontal", "vertical", "both"], "p_norms": {"minimum": 1, "maximum": 4}, "max_half_bandwidth": 15, "max_forward_width": 16},
                 {"id": "cuda", "compiled": false, "device_available": false, "analysis_command_available": false, "auto_priority": null, "axes": [], "p_norms": null, "max_half_bandwidth": null, "max_forward_width": null, "reason": "not compiled"},
                 {"id": "vulkan", "compiled": false, "device_available": false, "analysis_command_available": false, "auto_priority": null, "axes": [], "p_norms": null, "max_half_bandwidth": null, "max_forward_width": null, "reason": "not compiled"}
             ],
@@ -792,7 +787,7 @@ mod tests {
             "analysis_command_available": true, "auto_priority": 20,
             "device": "Discrete GPU", "device_type": "discrete_gpu",
             "axes": ["horizontal", "vertical", "both"],
-            "p_norms": {"minimum": 1, "maximum": 1},
+            "p_norms": {"minimum": 1, "maximum": 4},
             "max_half_bandwidth": 15, "max_forward_width": 16
         });
         assert!(validate_capabilities(&vulkan).is_ok());
@@ -881,7 +876,7 @@ mod tests {
             "analysis_command_available": false, "auto_priority": 20,
             "device": "Integrated GPU", "device_type": "integrated_gpu",
             "axes": ["horizontal", "vertical", "both"],
-            "p_norms": {"minimum": 1, "maximum": 1},
+            "p_norms": {"minimum": 1, "maximum": 4},
             "max_half_bandwidth": 15, "max_forward_width": 16
         });
         assert!(validate_capabilities(&integrated_auto).is_err());

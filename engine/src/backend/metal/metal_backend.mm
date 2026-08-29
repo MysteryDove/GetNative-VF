@@ -97,6 +97,7 @@ struct AnalysisJob {
     std::uint32_t groups_per_candidate;
     std::uint32_t candidate_count;
     std::uint32_t maximum_vector_count;
+    std::uint32_t norm;
 };
 
 struct MetricCropBounds {
@@ -108,7 +109,7 @@ struct MetricCropBounds {
 };
 
 static_assert(sizeof(AxisPlanDescriptor) == 64);
-static_assert(sizeof(AnalysisJob) == 40);
+static_assert(sizeof(AnalysisJob) == 44);
 
 [[nodiscard]] std::string ns_error(NSError *error, std::string_view fallback) {
     if (error == nil) {
@@ -160,21 +161,96 @@ static_assert(sizeof(AnalysisJob) == 40);
     };
 }
 
+template <class T>
+class PlanRegion {
+public:
+    using value_type = T;
+    PlanRegion() = default;
+    explicit PlanRegion(std::span<T> storage) : mode_(Mode::direct), storage_(storage) {}
+
+    [[nodiscard]] static PlanRegion owning() {
+        PlanRegion result;
+        result.mode_ = Mode::owning;
+        return result;
+    }
+
+    [[nodiscard]] std::size_t size() const noexcept {
+        return mode_ == Mode::owning ? values_.size() : size_;
+    }
+    [[nodiscard]] const T *data() const noexcept {
+        return mode_ == Mode::owning ? values_.data() : storage_.data();
+    }
+    void reserve(std::size_t size) {
+        if (mode_ == Mode::owning) {
+            values_.reserve(size);
+        } else if (mode_ == Mode::direct && size > storage_.size()) {
+            throw std::length_error("Metal direct plan region is too small");
+        }
+    }
+    void push_back(const T &value) {
+        if (mode_ == Mode::owning) {
+            values_.push_back(value);
+            return;
+        }
+        if (size_ == std::numeric_limits<std::size_t>::max()) {
+            throw std::length_error("Metal plan region size overflow");
+        }
+        if (mode_ == Mode::direct) {
+            if (size_ == storage_.size()) {
+                throw std::length_error("Metal direct plan region overflow");
+            }
+            storage_[size_] = value;
+        }
+        ++size_;
+    }
+    template <class Iterator>
+    void append(Iterator first, Iterator last) {
+        if (mode_ == Mode::owning) {
+            values_.insert(values_.end(), first, last);
+            return;
+        }
+        for (; first != last; ++first) {
+            push_back(*first);
+        }
+    }
+
+private:
+    enum class Mode : std::uint8_t { counting, owning, direct };
+    Mode mode_ = Mode::counting;
+    std::vector<T> values_;
+    std::span<T> storage_;
+    std::size_t size_ = 0U;
+};
+
 struct PackedTile {
-    std::vector<AxisPlanDescriptor> descriptors;
-    std::vector<std::uint32_t> transpose_offsets;
-    std::vector<std::uint32_t> transpose_indices;
-    std::vector<float> transpose_weights;
-    std::vector<float> lower_ld;
-    std::vector<float> upper_l;
-    std::vector<float> inverse_diagonal;
-    std::vector<std::int32_t> forward_left;
-    std::vector<float> forward_weights;
+    PlanRegion<AxisPlanDescriptor> descriptors;
+    PlanRegion<std::uint32_t> transpose_offsets;
+    PlanRegion<std::uint32_t> transpose_indices;
+    PlanRegion<float> transpose_weights;
+    PlanRegion<float> lower_ld;
+    PlanRegion<float> upper_l;
+    PlanRegion<float> inverse_diagonal;
+    PlanRegion<std::int32_t> forward_left;
+    PlanRegion<float> forward_weights;
     std::size_t workspace_elements = 0;
     std::uint32_t maximum_vector_count = 0;
     std::uint32_t maximum_native_width = 0;
     std::uint32_t maximum_native_height = 0;
 };
+
+[[nodiscard]] PackedTile make_owning_packed_tile() {
+    return {
+        PlanRegion<AxisPlanDescriptor>::owning(),
+        PlanRegion<std::uint32_t>::owning(),
+        PlanRegion<std::uint32_t>::owning(),
+        PlanRegion<float>::owning(),
+        PlanRegion<float>::owning(),
+        PlanRegion<float>::owning(),
+        PlanRegion<float>::owning(),
+        PlanRegion<std::int32_t>::owning(),
+        PlanRegion<float>::owning(),
+    };
+}
 
 struct TileSignature {
     AnalysisAxes axes = AnalysisAxes::vertical;
@@ -318,6 +394,19 @@ struct AxisKernelShapes {
 void append_axis(PackedTile &packed, const AxisPlan &plan, bool horizontal,
                  std::uint32_t vector_count, std::uint32_t workspace_base,
                  std::uint32_t reserved_0 = 0, std::uint32_t reserved_1 = 0) {
+    const auto require_finite = [](const auto &values, std::string_view name) {
+        for (const auto value : values) {
+            if (!std::isfinite(value)) {
+                throw std::invalid_argument(
+                    "Metal plan contains a non-finite " + std::string{name});
+            }
+        }
+    };
+    require_finite(plan.transpose_weights, "transpose weight");
+    require_finite(plan.lower_ld, "lower factor");
+    require_finite(plan.upper_l, "upper factor");
+    require_finite(plan.inverse_diagonal, "inverse diagonal");
+    require_finite(plan.forward_weights, "forward weight");
     AxisPlanDescriptor descriptor{};
     descriptor.source_size = static_cast<std::uint32_t>(plan.source_size);
     descriptor.destination_size = static_cast<std::uint32_t>(plan.destination_size);
@@ -340,20 +429,17 @@ void append_axis(PackedTile &packed, const AxisPlan &plan, bool horizontal,
     descriptor.reserved_0 = reserved_0;
     descriptor.reserved_1 = reserved_1;
 
-    packed.transpose_offsets.insert(packed.transpose_offsets.end(),
-                                    plan.transpose_offsets.begin(), plan.transpose_offsets.end());
+    packed.transpose_offsets.append(plan.transpose_offsets.begin(), plan.transpose_offsets.end());
     for (const std::int32_t index : plan.transpose_indices) {
         if (index < 0 || index >= plan.source_size) {
             throw std::invalid_argument("Metal transpose index is outside the source axis");
         }
         packed.transpose_indices.push_back(static_cast<std::uint32_t>(index));
     }
-    packed.transpose_weights.insert(packed.transpose_weights.end(),
-                                    plan.transpose_weights.begin(), plan.transpose_weights.end());
-    packed.lower_ld.insert(packed.lower_ld.end(), plan.lower_ld.begin(), plan.lower_ld.end());
-    packed.upper_l.insert(packed.upper_l.end(), plan.upper_l.begin(), plan.upper_l.end());
-    packed.inverse_diagonal.insert(packed.inverse_diagonal.end(),
-                                   plan.inverse_diagonal.begin(), plan.inverse_diagonal.end());
+    packed.transpose_weights.append(plan.transpose_weights.begin(), plan.transpose_weights.end());
+    packed.lower_ld.append(plan.lower_ld.begin(), plan.lower_ld.end());
+    packed.upper_l.append(plan.upper_l.begin(), plan.upper_l.end());
+    packed.inverse_diagonal.append(plan.inverse_diagonal.begin(), plan.inverse_diagonal.end());
     for (std::int32_t row = 0; row < plan.source_size; ++row) {
         const std::uint32_t begin = plan.forward_offsets[static_cast<std::size_t>(row)];
         const std::uint32_t end = plan.forward_offsets[static_cast<std::size_t>(row) + 1U];
@@ -370,8 +456,7 @@ void append_axis(PackedTile &packed, const AxisPlan &plan, bool horizontal,
             }
         }
         packed.forward_left.push_back(left);
-        packed.forward_weights.insert(
-            packed.forward_weights.end(),
+        packed.forward_weights.append(
             plan.forward_weights.begin() + static_cast<std::ptrdiff_t>(begin),
             plan.forward_weights.begin() + static_cast<std::ptrdiff_t>(end));
     }
@@ -583,6 +668,10 @@ struct MetalAnalysisEngine::Impl {
     std::size_t working_buffer_peak_retained_bytes = 0;
     std::size_t command_buffer_submission_count = 0;
     std::size_t command_buffer_completion_count = 0;
+    std::size_t source_direct_write_bytes = 0;
+    std::size_t source_legacy_copy_bytes = 0;
+    std::size_t plan_direct_write_bytes = 0;
+    std::size_t plan_legacy_copy_bytes = 0;
     std::size_t plan_upload_bytes = 0;
     std::size_t analyzed_tile_count = 0;
     std::size_t generic_tile_count = 0;
@@ -591,10 +680,14 @@ struct MetalAnalysisEngine::Impl {
     double working_buffer_allocation_ms = 0.0;
     double source_upload_ms = 0.0;
     double plan_upload_ms = 0.0;
+    double source_pack_ms = 0.0;
+    double plan_pack_ms = 0.0;
     double buffer_wiring_ms = 0.0;
     double pipeline_creation_ms = 0.0;
     double gpu_execution_ms = 0.0;
     double execution_slot_wait_ms = 0.0;
+    bool external_source_zero_copy = false;
+    std::string fallback_reason;
     std::vector<std::string> created_pipeline_names;
     mutable std::recursive_mutex mutex;
 
@@ -730,36 +823,60 @@ struct MetalAnalysisEngine::Impl {
     };
 
     [[nodiscard]] PlanArena allocate_plan_arena(
-        const std::array<std::pair<const void *, std::size_t>, 9> &regions,
+        const std::array<std::size_t, 9> &region_bytes,
         const std::array<std::string_view, 9> &names) {
         const std::scoped_lock lock(mutex);
         constexpr std::size_t alignment = 16;
         PlanArena arena;
         std::size_t cursor = 0;
-        for (std::size_t index = 0; index < regions.size(); ++index) {
-            if (regions[index].second == 0) {
-                throw std::invalid_argument(std::string{names[index]} + " must not be empty");
+        for (std::size_t index = 0; index < region_bytes.size(); ++index) {
+            if (cursor > std::numeric_limits<std::size_t>::max() - (alignment - 1U)) {
+                throw std::length_error(std::string{names[index]} + " alignment overflow");
             }
             arena.offsets[index] = (cursor + alignment - 1) / alignment * alignment;
-            cursor = arena.offsets[index] + regions[index].second;
+            if (region_bytes[index] > std::numeric_limits<std::size_t>::max()
+                                          - arena.offsets[index]) {
+                throw std::length_error(std::string{names[index]} + " size overflow");
+            }
+            cursor = arena.offsets[index] + region_bytes[index];
         }
+        if (cursor == 0U) throw std::invalid_argument("Metal plan arena must not be empty");
         arena.total_bytes = cursor;
         const std::string label_text{"GetNative plan arena"};
         arena.buffer = allocate_empty_buffer(
             cursor, [NSString stringWithUTF8String:label_text.c_str()], false);
-        const auto upload_start = std::chrono::steady_clock::now();
-        auto *base = static_cast<char *>(arena.buffer.contents);
-        for (std::size_t index = 0; index < regions.size(); ++index) {
-            std::memcpy(base + arena.offsets[index], regions[index].first,
-                        regions[index].second);
-        }
-        plan_upload_ms += std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - upload_start).count();
         if (arena.total_bytes > std::numeric_limits<std::size_t>::max() - plan_upload_bytes) {
             throw std::length_error("Metal plan-upload telemetry overflow");
         }
         plan_upload_bytes += arena.total_bytes;
         return arena;
+    }
+
+    void copy_legacy_plan_regions(
+        const PlanArena &arena,
+        const std::array<std::pair<const void *, std::size_t>, 9> &regions) {
+        const auto start = std::chrono::steady_clock::now();
+        auto *base = static_cast<std::byte *>(arena.buffer.contents);
+        for (std::size_t index = 0; index < regions.size(); ++index) {
+            if (regions[index].second != 0U) {
+                std::memcpy(base + arena.offsets[index], regions[index].first,
+                            regions[index].second);
+            }
+        }
+        const double elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+        const std::scoped_lock lock(mutex);
+        plan_pack_ms += elapsed;
+        plan_upload_ms += elapsed;
+        plan_legacy_copy_bytes += arena.total_bytes;
+        fallback_reason = "legacy_plan_pack_requested";
+    }
+
+    void record_direct_plan_write(const PlanArena &arena, double elapsed) {
+        const std::scoped_lock lock(mutex);
+        plan_pack_ms += elapsed;
+        plan_upload_ms += elapsed;
+        plan_direct_write_bytes += arena.total_bytes;
     }
 
     [[nodiscard]] id<MTLBuffer> acquire_retained_buffer(id<MTLBuffer> __strong &buffer,
@@ -789,7 +906,7 @@ struct MetalAnalysisEngine::Impl {
     [[nodiscard]] WorkingBufferSet prepare_working_buffers(
         MetalExecutionSlot &slot,
         std::size_t source_bytes, std::size_t workspace_bytes,
-        std::size_t partial_bytes, const float *source_data) {
+        std::size_t partial_bytes, ConstImageView source) {
         const std::scoped_lock lock(mutex);
         if (source_bytes > std::numeric_limits<std::size_t>::max() - workspace_bytes
             || source_bytes + workspace_bytes
@@ -812,6 +929,7 @@ struct MetalAnalysisEngine::Impl {
             result.partials = allocate_empty_buffer(
                 partial_bytes, @"GetNative metric partials", true);
             result.resident_bytes = source_bytes + workspace_bytes + partial_bytes;
+            external_source_zero_copy = true;
             return result;
         }
         bool retain = options.reuse_working_buffers;
@@ -855,9 +973,37 @@ struct MetalAnalysisEngine::Impl {
         }
 
         const auto upload_start = std::chrono::steady_clock::now();
-        std::memcpy(result.source.contents, source_data, source_bytes);
-        source_upload_ms += std::chrono::duration<double, std::milli>(
+        auto *destination = static_cast<float *>(result.source.contents);
+        if (options.direct_source_write) {
+            if (source.stride == source.width) {
+                std::memcpy(destination, source.data, source_bytes);
+            } else {
+                for (std::int32_t y = 0; y < source.height; ++y) {
+                    std::memcpy(
+                        destination + static_cast<std::ptrdiff_t>(y) * source.width,
+                        source.data + static_cast<std::ptrdiff_t>(y) * source.stride,
+                        static_cast<std::size_t>(source.width) * sizeof(float));
+                }
+            }
+            source_direct_write_bytes += source_bytes;
+        } else {
+            std::vector<float> contiguous(
+                static_cast<std::size_t>(source.width)
+                * static_cast<std::size_t>(source.height));
+            for (std::int32_t y = 0; y < source.height; ++y) {
+                std::copy_n(
+                    source.data + static_cast<std::ptrdiff_t>(y) * source.stride,
+                    source.width,
+                    contiguous.data() + static_cast<std::ptrdiff_t>(y) * source.width);
+            }
+            std::memcpy(destination, contiguous.data(), source_bytes);
+            source_legacy_copy_bytes += source_bytes;
+            fallback_reason = "legacy_source_pack_requested";
+        }
+        const double elapsed = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - upload_start).count();
+        source_pack_ms += elapsed;
+        source_upload_ms += elapsed;
         return result;
     }
 
@@ -895,11 +1041,11 @@ struct MetalAnalysisEngine::Impl {
     [[nodiscard]] static std::string_view stage_prefix(PipelineStage stage) noexcept {
         switch (stage) {
         case PipelineStage::image_inverse: return "inverse_axis";
-        case PipelineStage::metric: return "metric_axis_p1";
+        case PipelineStage::metric: return "metric_axis";
         case PipelineStage::matrix_inverse: return "inverse_axis_matrix";
         case PipelineStage::matrix_forward: return "forward_axis_matrix";
         case PipelineStage::horizontal_first_metric:
-            return "metric_axis_p1_horizontal_first";
+            return "metric_axis_horizontal_first";
         }
         return "Metal pipeline";
     }
@@ -997,6 +1143,10 @@ MetalRuntimeTelemetry MetalAnalysisEngine::runtime_telemetry() const {
     result.working_buffer_peak_retained_bytes = impl_->working_buffer_peak_retained_bytes;
     result.command_buffer_submission_count = impl_->command_buffer_submission_count;
     result.command_buffer_completion_count = impl_->command_buffer_completion_count;
+    result.source_direct_write_bytes = impl_->source_direct_write_bytes;
+    result.source_legacy_copy_bytes = impl_->source_legacy_copy_bytes;
+    result.plan_direct_write_bytes = impl_->plan_direct_write_bytes;
+    result.plan_legacy_copy_bytes = impl_->plan_legacy_copy_bytes;
     result.plan_upload_bytes = impl_->plan_upload_bytes;
     result.analyzed_tile_count = impl_->analyzed_tile_count;
     result.generic_tile_count = impl_->generic_tile_count;
@@ -1005,10 +1155,15 @@ MetalRuntimeTelemetry MetalAnalysisEngine::runtime_telemetry() const {
     result.working_buffer_allocation_ms = impl_->working_buffer_allocation_ms;
     result.source_upload_ms = impl_->source_upload_ms;
     result.plan_upload_ms = impl_->plan_upload_ms;
+    result.source_pack_ms = impl_->source_pack_ms;
+    result.plan_pack_ms = impl_->plan_pack_ms;
     result.buffer_wiring_ms = impl_->buffer_wiring_ms;
     result.pipeline_creation_ms = impl_->pipeline_creation_ms;
     result.gpu_execution_ms = impl_->gpu_execution_ms;
     result.execution_slot_wait_ms = impl_->execution_slot_wait_ms;
+    result.external_source_zero_copy = impl_->external_source_zero_copy;
+    result.shared_uma_path = impl_->info.unified_memory;
+    result.fallback_reason = impl_->fallback_reason;
     result.created_pipeline_names = impl_->created_pipeline_names;
     return result;
 }
@@ -1024,6 +1179,10 @@ void MetalAnalysisEngine::reset_analysis_telemetry() {
     impl_->working_buffer_peak_retained_bytes = impl_->retained_working_buffer_bytes();
     impl_->command_buffer_submission_count = 0;
     impl_->command_buffer_completion_count = 0;
+    impl_->source_direct_write_bytes = 0;
+    impl_->source_legacy_copy_bytes = 0;
+    impl_->plan_direct_write_bytes = 0;
+    impl_->plan_legacy_copy_bytes = 0;
     impl_->plan_upload_bytes = 0;
     impl_->analyzed_tile_count = 0;
     impl_->generic_tile_count = 0;
@@ -1032,9 +1191,13 @@ void MetalAnalysisEngine::reset_analysis_telemetry() {
     impl_->working_buffer_allocation_ms = 0.0;
     impl_->source_upload_ms = 0.0;
     impl_->plan_upload_ms = 0.0;
+    impl_->source_pack_ms = 0.0;
+    impl_->plan_pack_ms = 0.0;
     impl_->buffer_wiring_ms = 0.0;
     impl_->gpu_execution_ms = 0.0;
     impl_->execution_slot_wait_ms = 0.0;
+    impl_->external_source_zero_copy = false;
+    impl_->fallback_reason.clear();
 }
 
 void MetalAnalysisEngine::trim_working_buffers() {
@@ -1052,8 +1215,8 @@ void MetalAnalysisEngine::preflight_axis_batch(
     if (concurrency == 0U || concurrency > impl_->options.execution_slots) {
         throw std::length_error("Metal execution slots cannot satisfy requested concurrency");
     }
-    if (metric.norm != 1U) {
-        throw std::invalid_argument("Metal currently supports only p=1 metrics");
+    if (metric.norm < metal_minimum_p_norm || metric.norm > metal_maximum_p_norm) {
+        throw std::invalid_argument("Metal supports p-norm in 1..4");
     }
     if (candidates.empty()) return;
     const std::size_t elements = checked_product(
@@ -1105,8 +1268,8 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
         throw std::invalid_argument("invalid Metal source image");
     }
     const auto crop_bounds = metric_crop_bounds(source, metric);
-    if (metric.norm != 1U) {
-        throw std::invalid_argument("Metal currently supports only p=1 metrics");
+    if (metric.norm < metal_minimum_p_norm || metric.norm > metal_maximum_p_norm) {
+        throw std::invalid_argument("Metal supports p-norm in 1..4");
     }
     if (candidates.empty()) {
         return {};
@@ -1119,18 +1282,6 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
         static_cast<std::size_t>(source.width), static_cast<std::size_t>(source.height),
         "source image");
     (void)checked_u32(image_elements, "source image element count");
-    std::vector<float> contiguous_source;
-    const float *source_data = source.data;
-    if (source.stride != source.width) {
-        contiguous_source.resize(image_elements);
-        for (std::int32_t y = 0; y < source.height; ++y) {
-            std::copy_n(source.data + static_cast<std::ptrdiff_t>(y) * source.stride,
-                        source.width,
-                        contiguous_source.data() + static_cast<std::ptrdiff_t>(y) * source.width);
-        }
-        source_data = contiguous_source.data();
-    }
-
     @autoreleasepool {
         const std::size_t source_bytes = checked_product(
             image_elements, sizeof(float), "Metal source buffer");
@@ -1208,7 +1359,7 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
         const std::size_t partial_buffer_bytes = checked_product(
             partial_count, sizeof(float), "GetNative metric partials");
         const WorkingBufferSet working_buffers = impl_->prepare_working_buffers(
-            *active_slot, source_bytes, workspace_buffer_bytes, partial_buffer_bytes, source_data);
+            *active_slot, source_bytes, workspace_buffer_bytes, partial_buffer_bytes, source);
         id<MTLBuffer> source_buffer = working_buffers.source;
         id<MTLBuffer> workspace_buffer = working_buffers.workspace;
         id<MTLBuffer> partial_buffer = working_buffers.partials;
@@ -1268,20 +1419,26 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                         ++impl_->generic_tile_count;
                     }
                 }
-                PackedTile packed;
                 const std::size_t tile_candidate_count = tile.end - tile.begin;
-                packed.descriptors.reserve(
-                    tile_candidate_count * (tile.signature.axes == AnalysisAxes::both ? 2U : 1U));
-                if (tile.signature.axes == AnalysisAxes::both) {
-                    append_two_axis_plans(
-                        packed, source, candidates.subspan(tile.begin, tile_candidate_count),
-                        impl_->options.kernel_dispatch);
-                } else {
-                    for (std::size_t index = tile.begin; index < tile.end; ++index) {
-                        append_single_plan(
-                            packed, source, candidates[index], impl_->options.kernel_dispatch);
+                const auto pack_into = [&]<class Packed>(Packed &packed) {
+                    packed.descriptors.reserve(
+                        tile_candidate_count
+                        * (tile.signature.axes == AnalysisAxes::both ? 2U : 1U));
+                    if (tile.signature.axes == AnalysisAxes::both) {
+                        append_two_axis_plans(
+                            packed, source,
+                            candidates.subspan(tile.begin, tile_candidate_count),
+                            impl_->options.kernel_dispatch);
+                    } else {
+                        for (std::size_t index = tile.begin; index < tile.end; ++index) {
+                            append_single_plan(
+                                packed, source, candidates[index],
+                                impl_->options.kernel_dispatch);
+                        }
                     }
-                }
+                };
+                PackedTile packed;
+                pack_into(packed);
                 const std::size_t workspace_bytes = checked_product(
                     packed.workspace_elements, sizeof(float), "Metal workspace");
                 if (workspace_bytes > impl_->info.maximum_buffer_bytes) {
@@ -1312,29 +1469,115 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     checked_u32(groups, "reduction group count"),
                     checked_u32(tile_candidate_count, "candidate count"),
                     packed.maximum_vector_count,
+                    metric.norm,
                 };
 
-                const auto region_of = [](const auto &values) {
-                    return std::pair<const void *, std::size_t>{
-                        static_cast<const void *>(values.data()),
-                        values.size()
-                            * sizeof(typename std::decay_t<decltype(values)>::value_type)};
+                const auto region_bytes = [](const auto &values, std::string_view name) {
+                    return checked_product(
+                        values.size(), sizeof(typename std::decay_t<decltype(values)>::value_type),
+                        name);
                 };
-                const Impl::PlanArena arena = impl_->allocate_plan_arena(
-                    {{region_of(packed.descriptors),
-                      region_of(packed.transpose_offsets),
-                      region_of(packed.transpose_indices),
-                      region_of(packed.transpose_weights),
-                      region_of(packed.lower_ld),
-                      region_of(packed.upper_l),
-                      region_of(packed.inverse_diagonal),
-                      region_of(packed.forward_left),
-                      region_of(packed.forward_weights)}},
-                    {"GetNative plan descriptors", "GetNative transpose offsets",
-                     "GetNative transpose indices", "GetNative transpose weights",
-                     "GetNative lower factors", "GetNative upper factors",
-                     "GetNative inverse diagonal", "GetNative forward left indices",
-                     "GetNative forward weights"});
+                const std::array<std::size_t, 9> region_sizes{
+                    region_bytes(packed.descriptors, "Metal plan descriptors"),
+                    region_bytes(packed.transpose_offsets, "Metal transpose offsets"),
+                    region_bytes(packed.transpose_indices, "Metal transpose indices"),
+                    region_bytes(packed.transpose_weights, "Metal transpose weights"),
+                    region_bytes(packed.lower_ld, "Metal lower factors"),
+                    region_bytes(packed.upper_l, "Metal upper factors"),
+                    region_bytes(packed.inverse_diagonal, "Metal inverse diagonal"),
+                    region_bytes(packed.forward_left, "Metal forward left indices"),
+                    region_bytes(packed.forward_weights, "Metal forward weights"),
+                };
+                constexpr std::array<std::string_view, 9> region_names{
+                    "GetNative plan descriptors", "GetNative transpose offsets",
+                    "GetNative transpose indices", "GetNative transpose weights",
+                    "GetNative lower factors", "GetNative upper factors",
+                    "GetNative inverse diagonal", "GetNative forward left indices",
+                    "GetNative forward weights",
+                };
+                const auto same_shape = [](const auto &left, const auto &right) {
+                    return left.descriptors.size() == right.descriptors.size()
+                        && left.transpose_offsets.size() == right.transpose_offsets.size()
+                        && left.transpose_indices.size() == right.transpose_indices.size()
+                        && left.transpose_weights.size() == right.transpose_weights.size()
+                        && left.lower_ld.size() == right.lower_ld.size()
+                        && left.upper_l.size() == right.upper_l.size()
+                        && left.inverse_diagonal.size() == right.inverse_diagonal.size()
+                        && left.forward_left.size() == right.forward_left.size()
+                        && left.forward_weights.size() == right.forward_weights.size()
+                        && left.workspace_elements == right.workspace_elements
+                        && left.maximum_vector_count == right.maximum_vector_count
+                        && left.maximum_native_width == right.maximum_native_width
+                        && left.maximum_native_height == right.maximum_native_height;
+                };
+                Impl::PlanArena arena;
+                if (impl_->options.direct_plan_pack) {
+                    arena = impl_->allocate_plan_arena(region_sizes, region_names);
+                    auto *base = static_cast<std::byte *>(arena.buffer.contents);
+                    PackedTile direct{
+                        PlanRegion<AxisPlanDescriptor>{std::span<AxisPlanDescriptor>{
+                            reinterpret_cast<AxisPlanDescriptor *>(base + arena.offsets[0]),
+                            packed.descriptors.size()}},
+                        PlanRegion<std::uint32_t>{std::span<std::uint32_t>{
+                            reinterpret_cast<std::uint32_t *>(base + arena.offsets[1]),
+                            packed.transpose_offsets.size()}},
+                        PlanRegion<std::uint32_t>{std::span<std::uint32_t>{
+                            reinterpret_cast<std::uint32_t *>(base + arena.offsets[2]),
+                            packed.transpose_indices.size()}},
+                        PlanRegion<float>{std::span<float>{
+                            reinterpret_cast<float *>(base + arena.offsets[3]),
+                            packed.transpose_weights.size()}},
+                        PlanRegion<float>{std::span<float>{
+                            reinterpret_cast<float *>(base + arena.offsets[4]),
+                            packed.lower_ld.size()}},
+                        PlanRegion<float>{std::span<float>{
+                            reinterpret_cast<float *>(base + arena.offsets[5]),
+                            packed.upper_l.size()}},
+                        PlanRegion<float>{std::span<float>{
+                            reinterpret_cast<float *>(base + arena.offsets[6]),
+                            packed.inverse_diagonal.size()}},
+                        PlanRegion<std::int32_t>{std::span<std::int32_t>{
+                            reinterpret_cast<std::int32_t *>(base + arena.offsets[7]),
+                            packed.forward_left.size()}},
+                        PlanRegion<float>{std::span<float>{
+                            reinterpret_cast<float *>(base + arena.offsets[8]),
+                            packed.forward_weights.size()}},
+                    };
+                    const auto pack_start = std::chrono::steady_clock::now();
+                    pack_into(direct);
+                    const double pack_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - pack_start).count();
+                    if (!same_shape(packed, direct)) {
+                        throw std::logic_error("Metal direct plan pack preflight mismatch");
+                    }
+                    impl_->record_direct_plan_write(arena, pack_ms);
+                } else {
+                    PackedTile legacy = make_owning_packed_tile();
+                    pack_into(legacy);
+                    if (!same_shape(packed, legacy)) {
+                        throw std::logic_error("Metal legacy plan pack preflight mismatch");
+                    }
+                    arena = impl_->allocate_plan_arena(region_sizes, region_names);
+                    const auto region_of = [](const auto &values, std::string_view name) {
+                        return std::pair<const void *, std::size_t>{
+                            static_cast<const void *>(values.data()),
+                            checked_product(
+                                values.size(),
+                                sizeof(typename std::decay_t<decltype(values)>::value_type),
+                                name)};
+                    };
+                    impl_->copy_legacy_plan_regions(
+                        arena,
+                        {{region_of(legacy.descriptors, "Metal plan descriptors"),
+                          region_of(legacy.transpose_offsets, "Metal transpose offsets"),
+                          region_of(legacy.transpose_indices, "Metal transpose indices"),
+                          region_of(legacy.transpose_weights, "Metal transpose weights"),
+                          region_of(legacy.lower_ld, "Metal lower factors"),
+                          region_of(legacy.upper_l, "Metal upper factors"),
+                          region_of(legacy.inverse_diagonal, "Metal inverse diagonal"),
+                          region_of(legacy.forward_left, "Metal forward left indices"),
+                          region_of(legacy.forward_weights, "Metal forward weights")}});
+                }
                 id<MTLBuffer> plan_arena = arena.buffer;
                 const std::size_t descriptor_base = arena.offsets[0];
                 const std::size_t transpose_offsets_base = arena.offsets[1];
@@ -1643,7 +1886,11 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
             for (std::size_t part = 0; part < groups; ++part) {
                 sum += static_cast<double>(partials[index * groups + part]);
             }
-            results[index] = {candidates[index].id, sum / pixel_count};
+            const double mean = sum / pixel_count;
+            results[index] = {candidates[index].id,
+                              metric.norm == 1U
+                                  ? mean
+                                  : std::pow(mean, 1.0 / static_cast<double>(metric.norm))};
         }
         return results;
     }
