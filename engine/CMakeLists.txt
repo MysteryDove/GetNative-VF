@@ -754,7 +754,7 @@ if(GETNATIVE_ENABLE_METAL)
         OUTPUT "${GETNATIVE_METAL_AIR}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${GETNATIVE_METAL_GENERATED_DIR}"
         COMMAND "${GETNATIVE_XCRUN}" -sdk macosx metal
-                -Werror -fno-fast-math -ffp-contract=off
+                -Werror -Wno-c++17-extensions -fno-fast-math -ffp-contract=off
                 -c "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal/getnative.metal"
                 -o "${GETNATIVE_METAL_AIR}"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal/getnative.metal"
