@@ -418,7 +418,7 @@ MetalToolchain. Offline AIR/metallib compilation, embedded-library loading, and
 runtime dispatch are verified on this machine.
 
 The current Metal backend covers horizontal, vertical, and combined-axis
-strict p=1 analysis. It retains specialized half-bandwidth-1/forward-width-2
+p=1..4 analysis. It retains specialized half-bandwidth-1/forward-width-2
 and half-bandwidth-3/forward-width-4 pipelines, adds a generic path through
 half-bandwidth 15 / forward width 16, and dispatches by actual plan shape.
 Combined-axis execution uses fixed H-to-V inverse order, the same forward-order
@@ -426,8 +426,8 @@ heuristic as CPU, a shared bounded arena, and a fused final-axis metric. On the
 declared 1920x1080 bicubic fixture with 1000 height candidates, the five-run
 Metal median is 125.409 ms, the maximum CPU/Metal metric difference is 5.61e-8,
 the valley distance is zero, peak arena workspace is 168.750 MiB, and all
-explicit Metal buffers total 252.230 MiB at peak. Other p-norms, media input,
-and CUDA remain outside this Metal-host proof.
+explicit Metal buffers total 252.230 MiB at peak. The recorded benchmark is a
+p=1 workload; p=2..4 and media input remain outside this Metal-host proof.
 
 CUDA has a separate real-device gate on an RTX 5080. The p1..4 correctness,
 resource, and throughput evidence is recorded in

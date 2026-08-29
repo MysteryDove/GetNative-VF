@@ -22,8 +22,10 @@ jobs:
     name: Validate release version
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - name: Check synchronized versions
@@ -36,20 +38,23 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install build and bundle dependencies
         run: >-
           sudo apt-get update && sudo apt-get install -y --no-install-recommends
           build-essential ninja-build nasm pkg-config zlib1g-dev
           libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
           libxdo-dev libssl-dev patchelf libfuse2 desktop-file-utils
-          libvulkan1
+          binutils jq libvulkan1 mesa-vulkan-drivers vulkan-tools
+          vulkan-validationlayers
       - name: Resolve Vulkan SDK config path
         id: vulkan-config
         shell: bash
-        run: echo "path=$(realpath .github/vulkan-sdk/1.4.357.0-linux.json)" >> "$GITHUB_OUTPUT"
+        run: echo "path=$(realpath ".github/vulkan-sdk/${VULKAN_SDK_VERSION}-linux.json")" >> "$GITHUB_OUTPUT"
       - name: Install Vulkan SDK components
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        uses: humbletim/setup-vulkan-sdk@c25f41106918cde0bf347e6f201277392b3a9e9d # v1.2.1
         with:
           vulkan-config-file: ${{ steps.vulkan-config.outputs.path }}
           vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang, SPIRV-Tools
@@ -64,7 +69,20 @@ jobs:
           test -f "$VULKAN_SDK/lib/libvulkan.so.1"
           printf 'VULKAN_SDK=%s\nVULKAN_SDK_VERSION=%s\n' \
             "$VULKAN_SDK" "$VULKAN_SDK_VERSION"
-      - uses: Jimver/cuda-toolkit@v0.2.36
+      - name: Configure software Vulkan runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          driver=$(find /usr/share/vulkan/icd.d -type f -name 'lvp*.json' -print -quit)
+          layer=$(find /usr/share/vulkan/explicit_layer.d -type f \
+            -name 'VkLayer_khronos_validation.json' -print -quit)
+          test -n "$driver"
+          test -n "$layer"
+          printf 'VK_DRIVER_FILES=%s\n' "$driver" >> "$GITHUB_ENV"
+          printf 'VK_LAYER_PATH=%s\n' "$(dirname "$layer")" >> "$GITHUB_ENV"
+          VK_DRIVER_FILES="$driver" VK_LAYER_PATH="$(dirname "$layer")" \
+            vulkaninfo --summary
+      - uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
         with:
           cuda: ${{ env.CUDA_TOOLKIT_VERSION }}
           method: network
@@ -78,23 +96,23 @@ jobs:
           test -f "${CUDA_PATH:-/usr/local/cuda}/include/cuda.h" ||
             test -f /usr/local/cuda/include/cuda.h
           nvcc --version
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.20.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: app/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable # tracks current stable Rust by design
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: app/src-tauri
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         id: ffmpeg-cache
         with:
           path: .deps/ffmpeg-linux-x64
@@ -112,12 +130,59 @@ jobs:
           GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}/.deps/ffmpeg-linux-x64
           GETNATIVE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/.deps/ffmpeg-linux-x64/lib
         run: pnpm tauri build --bundles deb
+      - name: Stage verified AppImage tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          # tauri-bundler skips any tool already present in ~/.cache/tauri, so
+          # pre-stage sha256-verified copies there. Otherwise the bundler
+          # downloads them mid-build from mutable sources (raw master branches
+          # and rolling release tags) without any integrity check. Hashes are
+          # trust-on-first-use from 2026-08-28; bump them in a reviewed PR when
+          # upstream legitimately changes.
+          tools_dir="$HOME/.cache/tauri"
+          mkdir -p "$tools_dir"
+          stage_tool() {
+            local name=$1 url=$2 expected=$3 path actual
+            path="$tools_dir/$name"
+            if [[ ! -f "$path" ]] || \
+                [[ "$(sha256sum "$path" | cut -d' ' -f1)" != "$expected" ]]; then
+              curl --fail --location --retry 3 --retry-all-errors -o "$path" "$url"
+            fi
+            actual=$(sha256sum "$path" | cut -d' ' -f1)
+            if [[ "$actual" != "$expected" ]]; then
+              printf 'AppImage tooling checksum mismatch for %s: got %s, expected %s\n' \
+                "$name" "$actual" "$expected" >&2
+              exit 1
+            fi
+            chmod +x "$path"
+          }
+          stage_tool AppRun-x86_64 \
+            https://github.com/tauri-apps/binary-releases/releases/download/apprun-old/AppRun-x86_64 \
+            f30140a43a0a59e46db21bdefdf749b9e9f2c6946e92afabbacf98b8ae73fb4f
+          stage_tool linuxdeploy-x86_64.AppImage \
+            https://github.com/tauri-apps/binary-releases/releases/download/linuxdeploy/linuxdeploy-x86_64.AppImage \
+            e762bea85c8eb0d4b3508d46e5c1f037f717d0f9303ae3b4aafc8b04991fa1ef
+          stage_tool linuxdeploy-plugin-gtk.sh \
+            https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh \
+            cb379f9b0733e9ad9f8bd78f8c2fa038aef2478523bb7d4c8e64ff6a1ea3501a
+          stage_tool linuxdeploy-plugin-gstreamer.sh \
+            https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gstreamer/master/linuxdeploy-plugin-gstreamer.sh \
+            c107b49d84edbffc6ab226ed1007e0626a4f7aa2c3a36b7782bef62351d49e94
+          stage_tool linuxdeploy-plugin-appimage.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage \
+            a45d3e227bc7f397e9cf6bfa4c9507494efa2293357b6e86690a3de2ca992e79
       - name: Build AppImage
         working-directory: app
         env:
           GETNATIVE_LINUX_BACKENDS: cuda-vulkan
           GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}/.deps/ffmpeg-linux-x64
           GETNATIVE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/.deps/ffmpeg-linux-x64/lib
+          # linuxdeploy's bundled patchelf predates modern ELF layouts and
+          # corrupts libvulkan's program headers (.bss globals stay unzeroed,
+          # crashing loader_initialize with free() of a garbage pointer).
+          # Point linuxdeploy at the system patchelf instead.
+          PATCHELF: /usr/bin/patchelf
         run: |
           for attempt in 1 2 3; do
             pnpm tauri build --bundles appimage && exit 0
@@ -127,11 +192,87 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          require_file() {
+            if [[ ! -f "$2" ]]; then
+              printf 'package validation: %s is missing: %s\n' "$1" "$2" >&2
+              return 1
+            fi
+          }
+          require_empty() {
+            local label=$1
+            shift
+            if [[ -n "$*" ]]; then
+              printf 'package validation: forbidden %s found:\n%s\n' "$label" "$*" >&2
+              return 1
+            fi
+          }
+          require_nonempty() {
+            local label=$1 value=$2
+            if [[ -z "$value" ]]; then
+              printf 'package validation: %s was not found\n' "$label" >&2
+              return 1
+            fi
+          }
+          require_sha256() {
+            local label=$1 expected=$2 path=$3 actual
+            actual=$(sha256sum "$path" | cut -d' ' -f1)
+            if [[ "$actual" != "$expected" ]]; then
+              printf 'package validation: %s hash mismatch (%s): expected %s, got %s\n' \
+                "$label" "$path" "$expected" "$actual" >&2
+              return 1
+            fi
+          }
+          require_count() {
+            local label=$1 expected=$2
+            shift 2
+            if [[ "$#" -ne "$expected" ]]; then
+              printf 'package validation: expected %s %s, found %s:\n' \
+                "$expected" "$label" "$#" >&2
+              printf '%s\n' "$@" >&2
+              return 1
+            fi
+          }
+          text_sha256() {
+            local path=$1 output
+            output=$(mktemp "$check_root/text.XXXXXX")
+            objcopy --dump-section ".text=$output" "$path"
+            sha256sum "$output" | cut -d' ' -f1
+          }
+          # Re-run a crashed command under gdb so the failing .so and call
+          # stack land in the log instead of a bare exit code 139.
+          diagnose_crash() {
+            local label=$1
+            shift
+            if ! command -v gdb >/dev/null 2>&1; then
+              sudo apt-get update -qq >/dev/null 2>&1 || true
+              sudo apt-get install -y -qq gdb >/dev/null 2>&1 || true
+            fi
+            command -v gdb >/dev/null 2>&1 || return 0
+            printf '=== gdb backtrace for %s ===\n' "$label" >&2
+            gdb -batch -ex run -ex bt -ex quit --args "$@" >&2 || true
+          }
+          verify_loader_elf() {
+            local label=$1 path=$2
+            readelf -h "$path" | grep -q 'Class:[[:space:]]*ELF64' || {
+              printf 'package validation: %s is not ELF64: %s\n' "$label" "$path" >&2
+              return 1
+            }
+            readelf -h "$path" | grep -q 'Machine:[[:space:]]*Advanced Micro Devices X86-64' || {
+              printf 'package validation: %s has the wrong machine: %s\n' "$label" "$path" >&2
+              return 1
+            }
+            [[ "$(patchelf --print-soname "$path")" == libvulkan.so.1 ]] || {
+              printf 'package validation: %s has the wrong SONAME: %s\n' "$label" "$path" >&2
+              return 1
+            }
+            require_empty "$label unresolved dependencies" \
+              "$(ldd "$path" | sed -n '/not found/p')"
+          }
           bundle_root=app/src-tauri/target/release/bundle
           deb=$(find "$bundle_root/deb" -maxdepth 1 -type f -name '*.deb' -print -quit)
           appimage=$(find "$bundle_root/appimage" -maxdepth 1 -type f -name '*.AppImage' -print -quit)
-          test -n "$deb"
-          test -n "$appimage"
+          require_nonempty deb "$deb"
+          require_nonempty AppImage "$appimage"
 
           check_root=$(mktemp -d)
           trap 'rm -rf -- "$check_root"' EXIT
@@ -142,58 +283,196 @@ jobs:
             "$GITHUB_WORKSPACE/$appimage" --appimage-extract >/dev/null
           )
 
-          for package_root in "$check_root/deb" "$check_root/appimage/squashfs-root"; do
-            test -z "$(find "$package_root" -type f \( \
+          deb_root="$check_root/deb"
+          appimage_root="$check_root/appimage/squashfs-root"
+          for package_root in "$deb_root" "$appimage_root"; do
+            forbidden=$(find "$package_root" -type f \( \
               -name ffmpeg -o -name ffprobe -o \
               -name ffmpeg.exe -o -name ffprobe.exe -o \
               -name nvcc -o -name cuobjdump -o \
               -name glslangValidator -o -name spirv-val -o \
               -name 'libavfilter.so*' -o -name 'libavdevice.so*' -o \
-              -name 'libswresample.so*' \) -print)"
+              -name 'libswresample.so*' \) -print)
+            require_empty "developer/media sidecars" "$forbidden"
             for library in libavformat.so.62 libavcodec.so.62 libavutil.so.60 libswscale.so.9; do
               expected=$(sha256sum ".deps/ffmpeg-linux-x64/lib/$library" | cut -d' ' -f1)
               matches=$(find "$package_root" -type f -name "$library" -print)
-              test -n "$matches"
+              require_nonempty "$library" "$matches"
               while IFS= read -r packaged_library; do
-                test "$(sha256sum "$packaged_library" | cut -d' ' -f1)" = "$expected"
+                require_sha256 "$library" "$expected" "$packaged_library"
               done <<< "$matches"
             done
-            loader=$(find "$package_root" -type f -name libvulkan.so.1 -print)
-            test "$(printf '%s\n' "$loader" | sed '/^$/d' | wc -l)" -eq 1
-            test "$(sha256sum "$loader" | cut -d' ' -f1)" = \
-              "$(sha256sum "$VULKAN_SDK/lib/libvulkan.so.1" | cut -d' ' -f1)"
-            test "$(find "$package_root" -type f \
-              -path '*/share/getnative/licenses/vulkan-loader/LICENSE.txt' | wc -l)" -ge 1
-            test "$(find "$package_root" -type f \
-              -path '*/share/getnative/LICENSE.txt' | wc -l)" -ge 1
+            license=$(find "$package_root" -type f \
+              -path '*/share/getnative/licenses/vulkan-loader/LICENSE.txt' -print -quit)
+            require_file "Vulkan loader license" "$license"
+            license=$(find "$package_root" -type f \
+              -path '*/share/getnative/LICENSE.txt' -print -quit)
+            require_file "project license" "$license"
           done
 
-          for package_root in "$check_root/deb" "$check_root/appimage/squashfs-root"; do
+          source_loader="$VULKAN_SDK/lib/libvulkan.so.1"
+          source_loader_hash=$(sha256sum "$source_loader" | cut -d' ' -f1)
+          source_text_hash=$(text_sha256 "$source_loader")
+
+          mapfile -t deb_loaders < <(find "$deb_root" -type f -name libvulkan.so.1 -print)
+          require_count "deb Vulkan loader" 1 "${deb_loaders[@]}"
+          deb_loader=${deb_loaders[0]}
+          require_sha256 "deb Vulkan loader" "$source_loader_hash" "$deb_loader"
+          verify_loader_elf "deb Vulkan loader" "$deb_loader"
+
+          mapfile -t app_staged_loaders < <(
+            find "$appimage_root" -type f -path '*/bin/libvulkan.so.1' -print
+          )
+          require_count "AppImage staged Vulkan loader" 1 "${app_staged_loaders[@]}"
+          app_staged_loader=${app_staged_loaders[0]}
+          app_dependency_loader="$appimage_root/usr/lib/libvulkan.so.1"
+          require_file "AppImage dependency Vulkan loader" "$app_dependency_loader"
+          mapfile -t app_loaders < <(find "$appimage_root" -type f -name libvulkan.so.1 -print)
+          require_count "classified AppImage Vulkan loaders" 2 "${app_loaders[@]}"
+          for packaged_loader in "$app_staged_loader" "$app_dependency_loader"; do
+            verify_loader_elf "AppImage Vulkan loader" "$packaged_loader"
+            packaged_text_hash=$(text_sha256 "$packaged_loader")
+            if [[ "$packaged_text_hash" != "$source_text_hash" ]]; then
+              printf 'package validation: AppImage Vulkan loader code does not match the pinned SDK: %s\n' \
+                "$packaged_loader" >&2
+              exit 1
+            fi
+          done
+
+          mkdir -p artifacts/linux-x64
+          jq -n \
+            --arg sdk_version "$VULKAN_SDK_VERSION" \
+            --arg source_sha256 "$source_loader_hash" \
+            --arg source_text_sha256 "$source_text_hash" \
+            --arg deb_sha256 "$(sha256sum "$deb_loader" | cut -d' ' -f1)" \
+            --arg app_staged_sha256 "$(sha256sum "$app_staged_loader" | cut -d' ' -f1)" \
+            --arg app_dependency_sha256 "$(sha256sum "$app_dependency_loader" | cut -d' ' -f1)" \
+            '{
+              schema_version: 1,
+              vulkan_sdk_version: $sdk_version,
+              source: {
+                name: "libvulkan.so.1",
+                sha256: $source_sha256,
+                text_sha256: $source_text_sha256
+              },
+              packages: {
+                deb: [{role: "application", sha256: $deb_sha256}],
+                appimage: [
+                  {role: "application", sha256: $app_staged_sha256},
+                  {role: "linuxdeploy-dependency", sha256: $app_dependency_sha256}
+                ]
+              }
+            }' > artifacts/linux-x64/VULKAN-PROVENANCE-linux-x64.json
+
+          runtime_test=$(find build/engine -type f -name getnative_vulkan_analysis_tests \
+            -perm -u+x -print -quit)
+          require_nonempty "Vulkan runtime test" "$runtime_test"
+          preload_root="$check_root/preload"
+          mkdir -p "$preload_root"
+          runtime_index=0
+          for package_root in "$deb_root" "$appimage_root"; do
             engine=$(find "$package_root" -type f -name getnative-engine -print -quit)
-            test -n "$engine"
+            require_nonempty "engine" "$engine"
+            printf 'package validation: [%d] probing engine capabilities: %s\n' \
+              "$runtime_index" "$engine"
+            set +e
             capabilities=$("$engine" capabilities)
-            printf '%s\n' "$capabilities" | grep -q '"id":"cuda","compiled":true'
-            printf '%s\n' "$capabilities" | grep -q '"id":"vulkan","compiled":true'
+            capabilities_status=$?
+            set -e
+            if (( capabilities_status != 0 )); then
+              printf 'package validation: engine capabilities exited %d: %s\n' \
+                "$capabilities_status" "$engine" >&2
+              diagnose_crash "engine capabilities ($engine)" "$engine" capabilities
+              exit 1
+            fi
+            printf '%s\n' "$capabilities" | grep -q '"id":"cuda","compiled":true' || {
+              printf 'package validation: CUDA backend is not compiled in %s\n%s\n' "$engine" "$capabilities" >&2
+              exit 1
+            }
+            printf '%s\n' "$capabilities" | grep -q '"id":"vulkan","compiled":true' || {
+              printf 'package validation: Vulkan backend is not compiled in %s\n%s\n' "$engine" "$capabilities" >&2
+              exit 1
+            }
             provenance=$(find "$package_root" -type f -name build-provenance.json -print -quit)
-            test -n "$provenance"
-            grep -q '"linux_backends": "cuda-vulkan"' "$provenance"
-            grep -q '"cuda_enabled": true' "$provenance"
-            grep -q '"vulkan_enabled": true' "$provenance"
-            grep -q '"cuda_architectures": "75;86;89;120"' "$provenance"
-            grep -q "\"cuda_toolkit_version\": \"$CUDA_TOOLKIT_VERSION\"" "$provenance"
-            grep -q "\"vulkan_sdk_version\": \"$VULKAN_SDK_VERSION\"" "$provenance"
-            grep -q '"name": "libvulkan.so.1"' "$provenance"
-            loader_hash=$(sha256sum "$VULKAN_SDK/lib/libvulkan.so.1" | cut -d' ' -f1)
-            grep -q "\"sha256\": \"$loader_hash\"" "$provenance"
+            require_nonempty "build provenance" "$provenance"
+            grep -q '"linux_backends": "cuda-vulkan"' "$provenance" || {
+              printf 'package validation: Linux backend selection is missing from %s\n' "$provenance" >&2
+              exit 1
+            }
+            jq -e \
+              --arg cuda_version "$CUDA_TOOLKIT_VERSION" \
+              --arg vulkan_version "$VULKAN_SDK_VERSION" \
+              --arg loader_hash "$source_loader_hash" \
+              '.cuda_enabled == true
+                and .vulkan_enabled == true
+                and .cuda_architectures == "75;86;89;120"
+                and .cuda_toolkit_version == $cuda_version
+                and .vulkan_sdk_version == $vulkan_version
+                and .vulkan_runtime == [{
+                  name: "libvulkan.so.1",
+                  source_sha256: $loader_hash
+                }]' "$provenance" >/dev/null || {
+              printf 'package validation: build provenance is inconsistent: %s\n' "$provenance" >&2
+              exit 1
+            }
+            packaged_loader=$(find "$package_root" -type f -path '*/bin/libvulkan.so.1' -print -quit)
+            require_file "packaged application Vulkan loader" "$packaged_loader"
+            loaders_under_test=("$packaged_loader")
+            if [[ "$package_root" == "$appimage_root" ]]; then
+              # The AppImage GUI loads the linuxdeploy-bundled usr/lib copy, not
+              # the staged bin/ copy. Both are ELF-rewritten, so smoke-test both.
+              loaders_under_test+=("$app_dependency_loader")
+            fi
+            loader_index=0
+            for loader_under_test in "${loaders_under_test[@]}"; do
+              package_preload_root="$preload_root/$runtime_index.$loader_index"
+              mkdir -p "$package_preload_root"
+              preload_loader="$package_preload_root/libvulkan.so.1"
+              cp -- "$loader_under_test" "$preload_loader"
+              printf 'package validation: [%d.%d] running Vulkan runtime conformance with %s\n' \
+                "$runtime_index" "$loader_index" "$loader_under_test"
+              set +e
+              runtime_output=$(
+                LD_PRELOAD="$preload_loader" \
+                LD_LIBRARY_PATH="$package_preload_root:${LD_LIBRARY_PATH:-}" \
+                  "$runtime_test" 2>&1
+              )
+              runtime_status=$?
+              set -e
+              printf '%s\n' "$runtime_output"
+              if (( runtime_status != 0 )); then
+                printf 'package validation: Vulkan runtime test exited %d for %s (loader: %s)\n' \
+                  "$runtime_status" "$package_root" "$loader_under_test" >&2
+                diagnose_crash "Vulkan runtime test ($package_root)" \
+                  env LD_PRELOAD="$preload_loader" \
+                    LD_LIBRARY_PATH="$package_preload_root:${LD_LIBRARY_PATH:-}" \
+                    "$runtime_test"
+                exit 1
+              fi
+              printf '%s\n' "$runtime_output" | \
+                grep -q 'Vulkan analysis conformance passed on' || {
+                  printf 'package validation: packaged Vulkan loader runtime test did not execute\n' >&2
+                  exit 1
+                }
+              if printf '%s\n' "$runtime_output" | \
+                  grep -q 'validation-only subcase skipped'; then
+                printf 'package validation: Vulkan validation layer subcase was skipped\n' >&2
+                exit 1
+              fi
+              loader_index=$((loader_index + 1))
+            done
+            runtime_index=$((runtime_index + 1))
           done
       - name: Package checksums
         shell: bash
         run: |
           mkdir -p artifacts/linux-x64
           find app/src-tauri/target/release/bundle -type f \( -name '*.deb' -o -name '*.AppImage' \) -exec cp {} artifacts/linux-x64/ \;
-          test "$(find artifacts/linux-x64 -type f | wc -l)" -eq 2
-          cd artifacts/linux-x64 && sha256sum * > SHA256SUMS-linux-x64.txt
-      - uses: actions/upload-artifact@v4
+          test "$(find artifacts/linux-x64 -type f \( -name '*.deb' -o -name '*.AppImage' \) | wc -l)" -eq 2
+          cd artifacts/linux-x64 && \
+            sha256sum ./*.deb ./*.AppImage VULKAN-PROVENANCE-linux-x64.json \
+              > SHA256SUMS-linux-x64.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: getnative-vf-linux-x64
           path: artifacts/linux-x64
@@ -206,15 +485,17 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v4
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
-      - uses: Jimver/cuda-toolkit@v0.2.36
+      - uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
         with:
           cuda: ${{ env.CUDA_TOOLKIT_VERSION }}
           method: network
-          sub-packages: '["nvcc","cudart","cuobjdump","visual_studio_integration"]'
+          sub-packages: '["nvcc","nvvm","cuobjdump","cudart","crt","nvtx","visual_studio_integration"]'
           use-github-cache: false
           use-local-cache: false
       - name: Verify CUDA toolkit
@@ -228,19 +509,39 @@ jobs:
           if (-not (Test-Path (Join-Path $env:CUDA_PATH "include\cuda.h"))) {
             throw "cuda.h was not found under CUDA_PATH=$env:CUDA_PATH"
           }
+          if (-not (Test-Path (Join-Path $env:CUDA_PATH "include\crt\host_config.h"))) {
+            throw "crt/host_config.h was not found under CUDA_PATH=$env:CUDA_PATH"
+          }
+          $libdevice = Get-ChildItem (Join-Path $env:CUDA_PATH "nvvm") -Recurse `
+            -Filter "libdevice*.bc" -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $libdevice) {
+            throw "NVVM libdevice was not found under CUDA_PATH=$env:CUDA_PATH"
+          }
           & (Join-Path $env:CUDA_PATH "bin\nvcc.exe") --version
-      - name: Resolve Vulkan SDK config path
-        id: vulkan-config
-        shell: pwsh
-        run: |
-          $path = (Resolve-Path ".github/vulkan-sdk/1.4.357.0-windows.json").Path.Replace("\", "/")
-          "path=$path" >> $env:GITHUB_OUTPUT
+          $probeRoot = Join-Path $env:RUNNER_TEMP "getnative-cuda-probe"
+          New-Item -ItemType Directory -Force $probeRoot | Out-Null
+          $probeSource = Join-Path $probeRoot "probe.cu"
+          $probeFatbin = Join-Path $probeRoot "probe.fatbin"
+          @(
+            "#include <cuda_runtime.h>",
+            "__global__ void getnative_cuda_probe() {}"
+          ) | Set-Content -LiteralPath $probeSource -Encoding utf8
+          & (Join-Path $env:CUDA_PATH "bin\nvcc.exe") --fatbin --cudart=none `
+            --machine=64 --generate-code=arch=compute_75,code=sm_75 `
+            $probeSource -o $probeFatbin
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $probeFatbin)) {
+            throw "CUDA fatbin probe failed"
+          }
       - name: Install Vulkan SDK components
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        # Use LunarG's prebuilt Windows SDK. The source-build action can fail
+        # in Vulkan-Loader's MASM step even when the hosted MSVC toolchain is
+        # otherwise healthy.
+        uses: jakoch/install-vulkan-sdk-action@37effcfa045411f8bfbbda26df2fd1b3bf3436fa # v1.6.0
         with:
-          vulkan-config-file: ${{ steps.vulkan-config.outputs.path }}
-          vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang, SPIRV-Tools
-          vulkan-use-cache: true
+          vulkan_version: ${{ env.VULKAN_SDK_VERSION }}
+          install_runtime: true
+          cache: true
       - name: Verify Vulkan SDK
         shell: pwsh
         run: |
@@ -255,42 +556,50 @@ jobs:
           if (-not $includeRoot) {
             throw "Vulkan SDK headers were not found under VULKAN_SDK=$env:VULKAN_SDK"
           }
-          if (-not $vulkanBin -or -not (Test-Path (Join-Path $vulkanBin "vulkan-1.dll"))) {
-            throw "Vulkan SDK loader was not found under VULKAN_SDK=$env:VULKAN_SDK"
+          if (-not $vulkanBin) {
+            throw "Vulkan SDK tools were not found under VULKAN_SDK=$env:VULKAN_SDK"
+          }
+          $loader = Join-Path $vulkanBin "vulkan-1.dll"
+          if (-not (Test-Path $loader)) {
+            $runtimeLoader = Join-Path $env:VULKAN_SDK "runtime\x64\vulkan-1.dll"
+            if (-not (Test-Path $runtimeLoader)) {
+              throw "Vulkan SDK loader was not found under VULKAN_SDK=$env:VULKAN_SDK"
+            }
+            Copy-Item -LiteralPath $runtimeLoader -Destination $loader
           }
           if (-not (Test-Path (Join-Path $vulkanBin "glslangValidator.exe")) -and
               -not (Test-Path (Join-Path $vulkanBin "glslc.exe"))) {
             throw "Vulkan SDK has no glslangValidator.exe or glslc.exe"
           }
-          Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_RUNTIME_PATH=$(Join-Path $vulkanBin 'vulkan-1.dll')"
+          Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_RUNTIME_PATH=$loader"
           Write-Host "VULKAN_SDK=$env:VULKAN_SDK"
           Write-Host "VULKAN_SDK_VERSION=$env:VULKAN_SDK_VERSION"
-          Write-Host "VULKAN_RUNTIME_PATH=$(Join-Path $vulkanBin 'vulkan-1.dll')"
-      - uses: msys2/setup-msys2@v2
+          Write-Host "VULKAN_RUNTIME_PATH=$loader"
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: MSYS
           update: true
           path-type: inherit
           install: diffutils make nasm pkgconf
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.20.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: app/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable # tracks current stable Rust by design
         with:
           targets: x86_64-pc-windows-msvc
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: app/src-tauri
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         id: ffmpeg-cache
         with:
           path: .deps/ffmpeg-windows-x64
@@ -411,7 +720,7 @@ jobs:
           $vulkanRuntime = @($provenance.vulkan_runtime)
           if ($vulkanRuntime.Count -ne 1 -or
               $vulkanRuntime[0].name -ne "vulkan-1.dll" -or
-              $vulkanRuntime[0].sha256 -ne $expectedLoader.ToLower()) {
+              $vulkanRuntime[0].source_sha256 -ne $expectedLoader.ToLower()) {
             throw "portable provenance does not match the packaged Vulkan loader"
           }
       - name: Package checksums
@@ -422,26 +731,200 @@ jobs:
           $archives | ForEach-Object {
             "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
           } | Set-Content artifacts/windows-x64/SHA256SUMS-windows-x64.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: getnative-vf-windows-x64
           path: artifacts/windows-x64
           if-no-files-found: error
 
+  macos-package:
+    name: macOS arm64 package
+    needs: version
+    runs-on: macos-15
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}/.deps/ffmpeg-macos-arm64
+      GETNATIVE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/.deps/ffmpeg-macos-arm64/lib
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify Apple Silicon runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+      - name: Ensure Metal toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! xcrun --find metal >/dev/null 2>&1 || ! xcrun --find metallib >/dev/null 2>&1; then
+            if xcodebuild -help 2>&1 | grep -q -- '-downloadComponent'; then
+              xcode_build="$(xcodebuild -version | awk '/Build version/ {print $3}')"
+              xcodebuild -downloadComponent MetalToolchain -buildVersion "$xcode_build"
+            else
+              echo "Metal compiler tools are unavailable and this Xcode cannot download MetalToolchain" >&2
+              exit 1
+            fi
+          fi
+          xcrun --find metal
+          xcrun --find metallib
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable # tracks current stable Rust by design
+        with:
+          targets: aarch64-apple-darwin
+      - name: Verify packaged Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -vV
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "rustc host=${host}"
+          test "${host}" = aarch64-apple-darwin
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: app/src-tauri
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: ffmpeg-cache
+        with:
+          path: .deps/ffmpeg-macos-arm64
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-macos-arm64-${{ hashFiles('scripts/build-ffmpeg-macos.sh') }}
+      - name: Build pinned FFmpeg SDK
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: scripts/build-ffmpeg-macos.sh .deps/ffmpeg-macos-arm64
+      - name: Verify FFmpeg SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk="$GETNATIVE_FFMPEG_ROOT"
+          test -f "$sdk/include/libavformat/avformat.h"
+          test -f "$sdk/share/ffmpeg/BUILD_INFO.txt"
+          for library in \
+            libavformat.62.dylib libavcodec.62.dylib \
+            libavutil.60.dylib libavfilter.11.dylib libswscale.9.dylib; do
+            test -f "$sdk/lib/$library"
+            if otool -L "$sdk/lib/$library" | tail -n +2 | \
+                grep -Eq "/opt/homebrew|/usr/local|@rpath"; then
+              echo "FFmpeg SDK has a non-self-contained dependency: $library" >&2
+              exit 1
+            fi
+          done
+          grep -Eq '^CONFIG_VIDEOTOOLBOX=yes$' "$sdk/share/ffmpeg/BUILD_INFO.txt"
+      - name: Install JavaScript dependencies
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+      - name: Build macOS application bundle
+        working-directory: app
+        run: pnpm tauri build --bundles app --ci
+      - name: Verify macOS application bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_root="app/src-tauri/target/release/bundle/macos"
+          app_count=$(find "$bundle_root" -maxdepth 1 -type d -name '*.app' -print | wc -l | tr -d ' ')
+          test "$app_count" -eq 1
+          app_bundle=$(find "$bundle_root" -maxdepth 1 -type d -name '*.app' -print -quit)
+          contents="$app_bundle/Contents"
+          engine="$contents/Resources/bin/getnative-engine"
+          gui="$contents/MacOS/getnative-gui"
+          test -x "$gui"
+          test -x "$engine"
+          for library in \
+            libavformat.62.dylib libavcodec.62.dylib \
+            libavutil.60.dylib libswscale.9.dylib; do
+            test -f "$contents/Resources/bin/$library"
+          done
+          test -f "$contents/Resources/build-provenance.json"
+          test -f "$contents/Resources/share/ffmpeg/BUILD_INFO.txt"
+          test -f "$contents/Resources/share/getnative/LICENSE.txt"
+          test -f "$contents/Resources/share/getnative/THIRD_PARTY_NOTICES.md"
+          if find "$contents/Resources" -type f \( -name ffmpeg -o -name ffprobe \) -print | grep -q .; then
+            echo "external FFmpeg executable entered the app bundle" >&2
+            exit 1
+          fi
+          file -b "$engine" | grep -q 'Mach-O 64-bit executable arm64'
+          while IFS= read -r dependency; do
+            case "$dependency" in
+              *"$GITHUB_WORKSPACE"*|*"/opt/homebrew"*|*"/usr/local"*|*"@rpath"*)
+                echo "non-self-contained dependency: $dependency" >&2
+                exit 1
+                ;;
+            esac
+          done < <(otool -L "$engine" | tail -n +2)
+          while IFS= read -r rpath; do
+            case "$rpath" in
+              ""|"@loader_path"|"@loader_path/"*)
+                ;;
+              *)
+                echo "non-self-contained LC_RPATH: $rpath" >&2
+                exit 1
+                ;;
+            esac
+          done < <(otool -l "$engine" | awk '/cmd LC_RPATH/{getline; getline; if ($1=="path") print $2}')
+          capabilities=$(mktemp)
+          "$engine" capabilities > "$capabilities"
+          node - "$capabilities" <<'NODE'
+          const fs = require("node:fs");
+          const capabilities = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          if (capabilities.media?.ffmpeg_abi !== "62.62.60.9") {
+            throw new Error("unexpected FFmpeg ABI");
+          }
+          const metal = capabilities.backends?.find(({ id }) => id === "metal");
+          if (!metal?.compiled || !metal.device_available) {
+            throw new Error("Metal backend is not available in the packaged engine");
+          }
+          NODE
+          node - "$contents/Resources/build-provenance.json" <<'NODE'
+          const fs = require("node:fs");
+          const provenance = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          if (provenance.platform !== "darwin" || !provenance.ctest_passed ||
+              provenance.cuda_enabled || provenance.vulkan_enabled) {
+            throw new Error("unexpected macOS build provenance");
+          }
+          NODE
+      - name: Assemble macOS arm64 archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "JSON.parse(require('fs').readFileSync('app/src-tauri/tauri.conf.json', 'utf8')).version")
+          bundle_root="app/src-tauri/target/release/bundle/macos"
+          app_bundle=$(find "$bundle_root" -maxdepth 1 -type d -name '*.app' -print -quit)
+          artifact_root="artifacts/macos-arm64"
+          archive="$artifact_root/GetNative VF_${version}_arm64.app.zip"
+          mkdir -p "$artifact_root"
+          ditto -c -k --sequesterRsrc --keepParent "$app_bundle" "$archive"
+          (cd "$artifact_root" && shasum -a 256 "$(basename "$archive")" > SHA256SUMS-macos-arm64.txt)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: getnative-vf-macos-arm64
+          path: artifacts/macos-arm64
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
     if: github.event_name == 'push'
-    needs: [linux-package, windows-package]
+    needs: [linux-package, windows-package, macos-package]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: getnative-vf-*
           path: artifacts
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           generate_release_notes: true
           files: artifacts/**/*

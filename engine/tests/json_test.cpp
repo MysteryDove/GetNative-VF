@@ -1,8 +1,11 @@
 #include "../src/cli/json.hpp"
+#include "getnative/number_parse.hpp"
 
+#include <clocale>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 
 namespace {
@@ -65,6 +68,27 @@ void test_roundtrip() {
     expect(reparsed.find("unicode")->string_value == "é帧", "utf8 roundtrip");
 }
 
+void test_parse_finite_double() {
+    double value = 1.0;
+    expect(getnative::parse_finite_double("1.25", value) && value == 1.25,
+           "dot decimal parses");
+    expect(getnative::parse_finite_double("-12.5e2", value) && value == -1250.0,
+           "scientific parses");
+    expect(!getnative::parse_finite_double("", value), "empty input rejected");
+    expect(!getnative::parse_finite_double("1.25xyz", value), "trailing junk rejected");
+    expect(!getnative::parse_finite_double("1,25", value), "comma decimal rejected");
+
+    const char *previous = std::setlocale(LC_NUMERIC, nullptr);
+    std::string previous_locale = previous == nullptr ? std::string{} : previous;
+    if (std::setlocale(LC_NUMERIC, "de_DE.UTF-8") != nullptr
+        || std::setlocale(LC_NUMERIC, "de_DE") != nullptr
+        || std::setlocale(LC_NUMERIC, "German_Germany.1252") != nullptr) {
+        expect(getnative::parse_finite_double("1.25", value) && value == 1.25,
+               "classic locale ignores LC_NUMERIC");
+        if (!previous_locale.empty()) std::setlocale(LC_NUMERIC, previous_locale.c_str());
+    }
+}
+
 void test_rejections() {
     expect_throws([] { (void)parse_json(""); }, "empty input rejected");
     expect_throws([] { (void)parse_json("{} extra"); }, "trailing rejected");
@@ -83,6 +107,7 @@ int main() {
         test_scalars();
         test_structures();
         test_roundtrip();
+        test_parse_finite_double();
         test_rejections();
     } catch (const std::exception& error) {
         std::cerr << "json test failed: " << error.what() << '\n';

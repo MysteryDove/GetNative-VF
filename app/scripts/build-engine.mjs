@@ -17,10 +17,18 @@ const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const appDirectory = resolve(scriptDirectory, "..");
 const repositoryDirectory = resolve(appDirectory, "..");
 const sourceDirectory = join(repositoryDirectory, "engine");
-const buildDirectory = join(repositoryDirectory, "build", "engine");
 const stageDirectory = join(appDirectory, "src-tauri", "bundle-stage");
 const defaultFfmpegRuntimeDirectory = join(appDirectory, "src-tauri", "ffmpeg-runtime");
+// Local macOS SDK produced by scripts/build-ffmpeg-macos.sh; used when the
+// GETNATIVE_FFMPEG_* environment overrides are not set.
+const autoMacosFfmpegSdkDirectory = join(repositoryDirectory, ".deps", "ffmpeg-macos-vt");
+const autoMacosFfmpegSdkAvailable = process.platform === "darwin"
+  && existsSync(join(autoMacosFfmpegSdkDirectory, "include"))
+  && existsSync(join(autoMacosFfmpegSdkDirectory, "lib"));
 const debug = process.argv.includes("--debug");
+// Debug and release use separate build trees so switching dev modes never
+// forces a full rebuild of the other configuration.
+const buildDirectory = join(repositoryDirectory, "build", debug ? "engine-debug" : "engine");
 const skipTests = process.argv.includes("--skip-tests");
 const buildType = debug ? "Debug" : "Release";
 const ffmpegRuntimePatterns = process.platform === "win32"
@@ -140,12 +148,84 @@ function stagedVulkanRuntime() {
   if (!existsSync(runtime)) fail(`staged Vulkan loader was not found: ${runtime}`);
   return [{
     name,
-    sha256: createHash("sha256").update(readFileSync(runtime)).digest("hex"),
+    source_sha256: createHash("sha256").update(readFileSync(runtime)).digest("hex"),
   }];
+}
+
+function macosOtoolDependencies(file) {
+  const result = spawnSync("otool", ["-L", file], { encoding: "utf8" });
+  if (result.status !== 0) fail(`otool -L failed for ${file}`);
+  return (result.stdout || "")
+    .split("\n")
+    .slice(1)
+    .map((line) => {
+      const match = /^\s+(\S+)/u.exec(line);
+      return match ? match[1] : null;
+    })
+    .filter(Boolean);
+}
+
+function macosRpaths(file) {
+  const result = spawnSync("otool", ["-l", file], { encoding: "utf8" });
+  if (result.status !== 0) fail(`otool -l failed for ${file}`);
+  const rpaths = [];
+  const lines = (result.stdout || "").split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!/\bLC_RPATH\b/u.test(lines[index])) continue;
+    const pathLine = lines[index + 2] || "";
+    const match = /^\s*path\s+(\S+)/u.exec(pathLine);
+    if (match) rpaths.push(match[1]);
+  }
+  return rpaths;
+}
+
+function rewriteStagedMacosFfmpeg(enginePath, binaryDirectory, libraryNames) {
+  if (process.platform !== "darwin") return;
+  const stagedLibraries = libraryNames
+    .map((name) => join(binaryDirectory, name))
+    .filter((path) => existsSync(path));
+  const targets = [...stagedLibraries, enginePath].filter((path) => existsSync(path));
+  for (const file of targets) {
+    const isLibrary = stagedLibraries.includes(file);
+    if (isLibrary) {
+      const id = spawnSync(
+        "install_name_tool",
+        ["-id", `@loader_path/${basename(file)}`, file],
+        { encoding: "utf8" },
+      );
+      if (id.status !== 0) fail(`install_name_tool -id failed for ${file}`);
+    }
+    for (const dependency of macosOtoolDependencies(file)) {
+      const dependencyName = basename(dependency);
+      if (!libraryNames.includes(dependencyName)) continue;
+      const rewritten = `@loader_path/${dependencyName}`;
+      if (dependency === rewritten) continue;
+      const change = spawnSync(
+        "install_name_tool",
+        ["-change", dependency, rewritten, file],
+        { encoding: "utf8" },
+      );
+      if (change.status !== 0) {
+        fail(`install_name_tool -change failed for ${file} (${dependency})`);
+      }
+    }
+    for (const rpath of macosRpaths(file)) {
+      if (rpath === "@loader_path" || rpath.startsWith("@loader_path/")) continue;
+      const removed = spawnSync(
+        "install_name_tool",
+        ["-delete_rpath", rpath, file],
+        { encoding: "utf8" },
+      );
+      if (removed.status !== 0) {
+        fail(`install_name_tool -delete_rpath failed for ${file} (${rpath})`);
+      }
+    }
+  }
 }
 
 function stageFfmpegRuntime() {
   const runtimeDirectory = process.env.GETNATIVE_FFMPEG_RUNTIME_DIR
+    || (autoMacosFfmpegSdkAvailable ? join(autoMacosFfmpegSdkDirectory, "lib") : null)
     || (existsSync(defaultFfmpegRuntimeDirectory) ? defaultFfmpegRuntimeDirectory : null);
   if (!runtimeDirectory) {
     if (!debug) {
@@ -237,13 +317,17 @@ function visualStudioEnvironment(baseEnvironment) {
 }
 
 let environment = { ...process.env };
-if (process.env.GETNATIVE_FFMPEG_RUNTIME_DIR) {
-  const runtimeDirectory = resolve(process.env.GETNATIVE_FFMPEG_RUNTIME_DIR);
+const ffmpegLoaderDirectory = process.env.GETNATIVE_FFMPEG_RUNTIME_DIR
+  ? resolve(process.env.GETNATIVE_FFMPEG_RUNTIME_DIR)
+  : autoMacosFfmpegSdkAvailable
+    ? join(autoMacosFfmpegSdkDirectory, "lib")
+    : null;
+if (ffmpegLoaderDirectory) {
   if (process.platform === "win32") {
     replaceEnvironmentEntry(
       environment,
       "PATH",
-      `${runtimeDirectory}${delimiter}${environmentEntry(environment, "PATH") || ""}`,
+      `${ffmpegLoaderDirectory}${delimiter}${environmentEntry(environment, "PATH") || ""}`,
     );
   } else {
     const loaderVariable = process.platform === "darwin"
@@ -252,7 +336,7 @@ if (process.env.GETNATIVE_FFMPEG_RUNTIME_DIR) {
     replaceEnvironmentEntry(
       environment,
       loaderVariable,
-      `${runtimeDirectory}${delimiter}${environmentEntry(environment, loaderVariable) || ""}`,
+      `${ffmpegLoaderDirectory}${delimiter}${environmentEntry(environment, loaderVariable) || ""}`,
     );
   }
 }
@@ -265,9 +349,11 @@ const configureArguments = [
   buildDirectory,
   `-DCMAKE_BUILD_TYPE=${buildType}`,
 ];
-if (process.env.GETNATIVE_FFMPEG_ROOT) {
+const ffmpegRoot = process.env.GETNATIVE_FFMPEG_ROOT
+  || (autoMacosFfmpegSdkAvailable ? autoMacosFfmpegSdkDirectory : null);
+if (ffmpegRoot) {
   configureArguments.push(
-    `-DGETNATIVE_FFMPEG_ROOT=${resolve(process.env.GETNATIVE_FFMPEG_ROOT)}`,
+    `-DGETNATIVE_FFMPEG_ROOT=${resolve(ffmpegRoot)}`,
   );
 }
 
@@ -358,6 +444,11 @@ const vulkanRuntime = stagedVulkanRuntime();
 const executableName = process.platform === "win32" ? "getnative-engine.exe" : "getnative-engine";
 const stagedEngine = join(stageDirectory, "bin", executableName);
 if (!existsSync(stagedEngine)) fail(`staged engine was not found: ${stagedEngine}`);
+rewriteStagedMacosFfmpeg(
+  stagedEngine,
+  join(stageDirectory, "bin"),
+  ffmpegRuntime.map((entry) => entry.name),
+);
 for (const forbidden of ["ffmpeg", "ffprobe", "ffmpeg.exe", "ffprobe.exe"]) {
   if (existsSync(join(stageDirectory, "bin", forbidden))) {
     fail(`external media executable must not be packaged: ${forbidden}`);

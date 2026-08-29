@@ -17,6 +17,7 @@ import { actualBackendLabel } from "../engine/backendSelection";
 import type { ActualBackend } from "../engine/protocol";
 import { verificationRunLabel, verifyCoverageDisplay } from "../engine/verifyResults";
 import { sourceFilterLabel } from "../project/sourceLabel";
+import { Modal } from "../components/Modal";
 
 export { sourceFilterLabel } from "../project/sourceLabel";
 
@@ -30,12 +31,19 @@ export function runActualBackend(
   if (!telemetry || typeof telemetry !== "object" || Array.isArray(telemetry)) return null;
   const values = telemetry as Record<string, unknown>;
   const backend = values.backend;
-  if (backend !== "cpu" && backend !== "cuda" && backend !== "vulkan") return null;
+  if (
+    backend !== "cpu"
+    && backend !== "cuda"
+    && backend !== "vulkan"
+    && backend !== "metal"
+  ) return null;
   const deviceKey = backend === "cuda"
     ? "cuda_device"
     : backend === "vulkan"
       ? "vulkan_device"
-      : null;
+      : backend === "metal"
+        ? "metal_device"
+        : null;
   const device = deviceKey && typeof values[deviceKey] === "string"
     ? values[deviceKey] as string
     : undefined;
@@ -66,6 +74,72 @@ export function runDecodeProvenance(
   return { decoder: values.decoder, zeroCopy: values.zero_copy, fallbackReason };
 }
 
+function runGroupActive(state: ProjectState, group: RunGroup): boolean {
+  return group.memberRunIds.some((id) => ACTIVE_STATUSES.has(state.runsById[id]?.status ?? ""));
+}
+
+export function removeRunGroupFromState(state: ProjectState, groupId: string): ProjectState {
+  const group = state.runGroupsById[groupId];
+  if (!group || runGroupActive(state, group)) return state;
+
+  const runsById = { ...state.runsById };
+  const verificationReviewsByRunId = { ...state.verificationReviewsByRunId };
+  for (const id of group.memberRunIds) {
+    delete runsById[id];
+    delete verificationReviewsByRunId[id];
+  }
+  const runGroupsById = { ...state.runGroupsById };
+  delete runGroupsById[group.id];
+  return { ...state, runsById, runGroupsById, verificationReviewsByRunId };
+}
+
+export function nextHistoryFilters(
+  filters: { runGroupFilter: string; sourceFilter: string },
+  nextState: ProjectState,
+  deleted: { kind: "group"; id: string } | { kind: "run"; run: Run },
+): { runGroupFilter: string; sourceFilter: string } {
+  let runGroupFilter = filters.runGroupFilter;
+  let sourceFilter = filters.sourceFilter;
+  if (deleted.kind === "group") {
+    if (runGroupFilter === deleted.id) runGroupFilter = "all";
+  } else {
+    if (runGroupFilter === `run:${deleted.run.id}`) runGroupFilter = "all";
+    if (
+      deleted.run.runGroupId
+      && runGroupFilter === deleted.run.runGroupId
+      && nextState.runGroupsById[deleted.run.runGroupId] === undefined
+    ) {
+      runGroupFilter = "all";
+    }
+  }
+  if (sourceFilter !== "all") {
+    const sourceStillPresent = Object.values(nextState.runsById).some(
+      (run) => run.sourceId === sourceFilter,
+    );
+    if (!sourceStillPresent) sourceFilter = "all";
+  }
+  return { runGroupFilter, sourceFilter };
+}
+
+export function removeRunFromState(state: ProjectState, runId: string): ProjectState {
+  const run = state.runsById[runId];
+  if (!run || ACTIVE_STATUSES.has(run.status)) return state;
+
+  const runsById = { ...state.runsById };
+  delete runsById[run.id];
+  const verificationReviewsByRunId = { ...state.verificationReviewsByRunId };
+  delete verificationReviewsByRunId[run.id];
+  let runGroupsById = state.runGroupsById;
+  const group = run.runGroupId ? state.runGroupsById[run.runGroupId] : null;
+  if (group) {
+    const memberRunIds = group.memberRunIds.filter((id) => id !== run.id);
+    runGroupsById = { ...state.runGroupsById };
+    if (memberRunIds.length === 0) delete runGroupsById[group.id];
+    else runGroupsById[group.id] = { ...group, memberRunIds };
+  }
+  return { ...state, runsById, runGroupsById, verificationReviewsByRunId };
+}
+
 /**
  * Results: immutable Run/RunGroup history with provenance, compatibility-gated
  * comparison, and structured export. Historical inputs are never edited here.
@@ -84,6 +158,9 @@ export function ResultsPage({
   const [runGroupFilter, setRunGroupFilter] = useState("all");
   const [sourceFilter, setSourceFilter] = useState("all");
   const [notice, setNotice] = useState("");
+  const [pendingDelete, setPendingDelete] = useState<
+    { kind: "group"; id: string } | { kind: "run"; id: string } | null
+  >(null);
 
   const groups = useMemo(
     () =>
@@ -192,55 +269,61 @@ export function ResultsPage({
   }
 
   function groupActive(group: RunGroup): boolean {
-    return group.memberRunIds.some((id) => ACTIVE_STATUSES.has(state.runsById[id]?.status ?? ""));
+    return runGroupActive(state, group);
   }
 
   function deleteGroup(group: RunGroup) {
     if (groupActive(group)) return;
-    if (!window.confirm(t("results.deleteGroupConfirm", { label: group.label || group.groupType }))) {
-      return;
-    }
-    onProjectChange((current) => {
-      const runsById = { ...current.runsById };
-      const verificationReviewsByRunId = { ...current.verificationReviewsByRunId };
-      for (const id of group.memberRunIds) {
-        delete runsById[id];
-        delete verificationReviewsByRunId[id];
-      }
-      const runGroupsById = { ...current.runGroupsById };
-      delete runGroupsById[group.id];
-      return { ...current, runsById, runGroupsById, verificationReviewsByRunId };
-    });
-    setSelectedRuns((current) => {
-      const next = new Set(current);
-      for (const id of group.memberRunIds) next.delete(id);
-      return next;
-    });
+    setPendingDelete({ kind: "group", id: group.id });
   }
 
   function deleteRun(run: Run) {
     if (ACTIVE_STATUSES.has(run.status)) return;
-    if (!window.confirm(t("results.deleteRunConfirm"))) return;
-    onProjectChange((current) => {
-      const runsById = { ...current.runsById };
-      delete runsById[run.id];
-      const verificationReviewsByRunId = { ...current.verificationReviewsByRunId };
-      delete verificationReviewsByRunId[run.id];
-      let runGroupsById = current.runGroupsById;
-      const group = run.runGroupId ? current.runGroupsById[run.runGroupId] : null;
-      if (group) {
-        const memberRunIds = group.memberRunIds.filter((id) => id !== run.id);
-        runGroupsById = { ...current.runGroupsById };
-        if (memberRunIds.length === 0) delete runGroupsById[group.id];
-        else runGroupsById[group.id] = { ...group, memberRunIds };
+    setPendingDelete({ kind: "run", id: run.id });
+  }
+
+  function confirmDelete() {
+    if (!pendingDelete) return;
+    if (pendingDelete.kind === "group") {
+      const group = state.runGroupsById[pendingDelete.id];
+      if (!group || runGroupActive(state, group)) {
+        setPendingDelete(null);
+        return;
       }
-      return { ...current, runsById, runGroupsById, verificationReviewsByRunId };
-    });
-    setSelectedRuns((current) => {
-      const next = new Set(current);
-      next.delete(run.id);
-      return next;
-    });
+      onProjectChange((current) => removeRunGroupFromState(current, pendingDelete.id));
+      setSelectedRuns((current) => {
+        const next = new Set(current);
+        for (const id of group.memberRunIds) next.delete(id);
+        return next;
+      });
+      const nextFilters = nextHistoryFilters(
+        { runGroupFilter, sourceFilter },
+        removeRunGroupFromState(state, pendingDelete.id),
+        { kind: "group", id: pendingDelete.id },
+      );
+      setRunGroupFilter(nextFilters.runGroupFilter);
+      setSourceFilter(nextFilters.sourceFilter);
+    } else {
+      const run = state.runsById[pendingDelete.id];
+      if (!run || ACTIVE_STATUSES.has(run.status)) {
+        setPendingDelete(null);
+        return;
+      }
+      onProjectChange((current) => removeRunFromState(current, pendingDelete.id));
+      setSelectedRuns((current) => {
+        const next = new Set(current);
+        next.delete(pendingDelete.id);
+        return next;
+      });
+      const nextFilters = nextHistoryFilters(
+        { runGroupFilter, sourceFilter },
+        removeRunFromState(state, pendingDelete.id),
+        { kind: "run", run },
+      );
+      setRunGroupFilter(nextFilters.runGroupFilter);
+      setSourceFilter(nextFilters.sourceFilter);
+    }
+    setPendingDelete(null);
   }
 
   function runSelectable(run: Run): { selectable: boolean; reason: "no_results" | "incompatible" | null } {
@@ -438,6 +521,40 @@ export function ResultsPage({
           </section>
         </>
       )}
+
+      {pendingDelete ? (
+        <Modal
+          onClose={() => setPendingDelete(null)}
+          title={t(pendingDelete.kind === "group" ? "results.deleteGroup" : "results.deleteRun")}
+          closeLabel={t("common.close")}
+          actions={
+            <>
+              <button
+                className="secondary-button"
+                type="button"
+                autoFocus
+                onClick={() => setPendingDelete(null)}
+              >
+                {t("common.cancel")}
+              </button>
+              <button className="secondary-button danger-button" type="button" onClick={confirmDelete}>
+                <Trash2 size={14} />
+                {t(pendingDelete.kind === "group" ? "results.deleteGroup" : "results.deleteRun")}
+              </button>
+            </>
+          }
+        >
+          <p className="confirm-dialog-copy">
+            {pendingDelete.kind === "group"
+              ? t("results.deleteGroupConfirm", {
+                  label: state.runGroupsById[pendingDelete.id]?.label
+                    || state.runGroupsById[pendingDelete.id]?.groupType
+                    || pendingDelete.id,
+                })
+              : t("results.deleteRunConfirm")}
+          </p>
+        </Modal>
+      ) : null}
     </div>
   );
 }

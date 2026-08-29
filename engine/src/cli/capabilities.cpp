@@ -42,6 +42,7 @@ std::string json_string(std::string_view value) {
     return result;
 }
 
+#if !defined(__ARM_NEON) && !defined(__ARM_NEON__)
 void write_isa_set(std::ostream &output, const getnative::CpuIsaSet &set) {
     output << '[';
     bool first = true;
@@ -57,6 +58,7 @@ void write_isa_set(std::ostream &output, const getnative::CpuIsaSet &set) {
     append(getnative::CpuIsa::avx512, set.avx512);
     output << ']';
 }
+#endif
 
 } // namespace
 
@@ -72,7 +74,9 @@ void write_capabilities_impl(
 #endif
 ) {
     const char *available = analysis_available ? "true" : "false";
+#if !defined(__ARM_NEON) && !defined(__ARM_NEON__)
     const getnative::CpuDispatchInfo cpu = getnative::cpu_dispatch_info();
+#endif
 #if defined(GETNATIVE_HAS_MEDIA) && defined(GETNATIVE_HAS_CUDA)
     const bool nvdec_available =
         getnative::media::backend_runtime_available(
@@ -111,6 +115,18 @@ void write_capabilities_impl(
         vulkan_video_reason = error.what();
     }
 #endif
+#if defined(GETNATIVE_HAS_MEDIA) && defined(__APPLE__)
+    const bool videotoolbox_runtime = getnative::media::backend_runtime_available(
+        getnative::media::DecoderOptions::Backend::videotoolbox);
+    const auto videotoolbox_codecs = getnative::media::hardware_codecs(
+        getnative::media::DecoderOptions::Backend::videotoolbox);
+#if defined(GETNATIVE_HAS_METAL)
+    const bool metal_zero_copy_available =
+        videotoolbox_runtime && getnative::metal_backend_available();
+#else
+    constexpr bool metal_zero_copy_available = false;
+#endif
+#endif
     output << "{\"schema_version\":2,\"engine\":\"getnative-engine\",\"version\":\"0.2.1\","
               "\"commands\":{\"capabilities\":true,\"geometry\":true,\"analyze\":"
            << available;
@@ -129,7 +145,7 @@ void write_capabilities_impl(
               "{\"id\":\"spline16\",\"parameters\":{\"kind\":\"none\"}},"
               "{\"id\":\"spline36\",\"parameters\":{\"kind\":\"none\"}},"
               "{\"id\":\"spline64\",\"parameters\":{\"kind\":\"none\"}}],"
-              "\"unsupported_features\":[\"blur\",\"spline32\"],"
+              "\"unsupported_features\":[\"spline32\"],"
               "\"features\":{\"verify_frame_ring\":true,\"media_frame_batch\":false,"
               "\"verify_engine_decode\":";
 #if defined(GETNATIVE_HAS_MEDIA)
@@ -162,10 +178,33 @@ void write_capabilities_impl(
         output << ",\"reason\":" << json_string(
             vulkan_video_reason.empty() ? "unavailable" : vulkan_video_reason);
     }
-    output << "}],";
+    output << "},";
 #else
     output << "{\"id\":\"vulkan_video\",\"compiled\":false,\"runtime_device\":false,"
-              "\"codecs\":[],\"zero_copy\":false,\"reason\":\"not compiled\"}],";
+              "\"codecs\":[],\"zero_copy\":false,\"reason\":\"not compiled\"},";
+#endif
+#if defined(__APPLE__)
+    output << "{\"id\":\"videotoolbox\",\"compiled\":true,\"runtime_device\":"
+           << (videotoolbox_runtime ? "true" : "false") << ",\"codecs\":[";
+    for (std::size_t index = 0U; index < videotoolbox_codecs.size(); ++index) {
+        if (index != 0U) output << ',';
+        output << json_string(videotoolbox_codecs[index]);
+    }
+    output << "],\"surface_formats\":[\"420v\",\"420f\",\"x420\",\"xf20\"],\"zero_copy\":"
+           << (metal_zero_copy_available ? "true" : "false");
+    if (!metal_zero_copy_available) {
+        output << ",\"reason\":" << json_string(
+#if defined(GETNATIVE_HAS_METAL)
+            videotoolbox_runtime ? "Metal device is unavailable"
+                                 : "VideoToolbox runtime is unavailable"
+#else
+            "Metal backend is not compiled"
+#endif
+        );
+    }
+    output << "}],";
+#else
+    output << "{\"id\":\"videotoolbox\",\"compiled\":false,\"runtime_device\":false,\"codecs\":[],\"surface_formats\":[\"420v\",\"420f\",\"x420\",\"xf20\"],\"zero_copy\":false,\"reason\":\"not compiled\"}],";
 #endif
 #else
     output << "false,\"media_verify_concurrency\":{\"min\":1,\"max\":8,\"default\":2}},\"decode_backends\":["
@@ -174,7 +213,10 @@ void write_capabilities_impl(
               "{\"id\":\"nvdec\",\"compiled\":false,\"runtime_device\":false,"
               "\"codecs\":[],\"zero_copy\":false,\"reason\":\"not compiled\"},"
               "{\"id\":\"vulkan_video\",\"compiled\":false,\"runtime_device\":false,"
-              "\"codecs\":[],\"zero_copy\":false,\"reason\":\"not compiled\"}],";
+              "\"codecs\":[],\"zero_copy\":false,\"reason\":\"not compiled\"},"
+              "{\"id\":\"videotoolbox\",\"compiled\":false,\"runtime_device\":false,"
+              "\"codecs\":[],\"surface_formats\":[\"420v\",\"420f\",\"x420\",\"xf20\"],"
+              "\"zero_copy\":false,\"reason\":\"not compiled\"}],";
 #endif
     output << "\"media\":{";
 #if defined(GETNATIVE_HAS_MEDIA)
@@ -194,6 +236,15 @@ void write_capabilities_impl(
               "\"p_norms\":{\"minimum\":1,\"maximum\":4294967295},"
               "\"max_half_bandwidth\":29,\"max_forward_width\":30,"
               "\"compiled_isa\":";
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    // The x86 ISA evaluator has no tiers to report on AArch64, where NEON is
+    // architectural baseline and the column/metric kernels always use it.
+    // Report the truth instead of a misleading scalar-only set.
+    output << "[\"scalar\",\"neon\"],\"available_isa\":[\"scalar\",\"neon\"],"
+              "\"selected_isa\":\"neon\",\"math_modes\":[\"production\"],"
+              "\"selected_math_mode\":\"production\",\"selection_reason\":"
+              "\"AArch64 baseline NEON\"}";
+#else
     write_isa_set(output, cpu.compiled);
     output << ",\"available_isa\":";
     write_isa_set(output, cpu.available);
@@ -201,27 +252,38 @@ void write_capabilities_impl(
            << ",\"math_modes\":[\"production\"],\"selected_math_mode\":\"production\","
               "\"selection_reason\":"
            << json_string(cpu.selection_reason) << '}';
+#endif
 #if defined(GETNATIVE_HAS_METAL)
     try {
         const getnative::MetalAnalysisEngine metal;
         const auto &device = metal.device_info();
         output << ",{\"id\":\"metal\",\"compiled\":true,\"device_available\":true,"
-                  "\"analysis_command_available\":false,"
-                  "\"auto_priority\":null,"
+                  "\"analysis_command_available\":"
+               << available
+               << ",\"auto_priority\":30,"
                   "\"axes\":[\"horizontal\",\"vertical\",\"both\"],"
-                  "\"p_norms\":{\"minimum\":1,\"maximum\":1},"
+                  "\"p_norms\":{\"minimum\":"
+               << getnative::metal_minimum_p_norm
+               << ",\"maximum\":" << getnative::metal_maximum_p_norm << "},"
                   "\"max_half_bandwidth\":15,\"max_forward_width\":16,\"device\":"
                << json_string(device.name)
                << ",\"registry_id\":" << device.registry_id
                << ",\"unified_memory\":" << (device.unified_memory ? "true" : "false")
+               << ",\"shared_buffer_direct_write\":true"
+                  ",\"external_source_zero_copy\":true"
+                  ",\"plan_direct_pack\":true"
                << '}';
     } catch (const std::exception &error) {
         output << ",{\"id\":\"metal\",\"compiled\":true,\"device_available\":false,"
                   "\"analysis_command_available\":false,"
                   "\"auto_priority\":null,"
                   "\"axes\":[\"horizontal\",\"vertical\",\"both\"],"
-                  "\"p_norms\":{\"minimum\":1,\"maximum\":1},"
-                  "\"max_half_bandwidth\":15,\"max_forward_width\":16,\"reason\":"
+                  "\"p_norms\":{\"minimum\":"
+               << getnative::metal_minimum_p_norm
+               << ",\"maximum\":" << getnative::metal_maximum_p_norm << "},"
+                  "\"max_half_bandwidth\":15,\"max_forward_width\":16,"
+                  "\"unified_memory\":false,\"shared_buffer_direct_write\":true,"
+                  "\"external_source_zero_copy\":true,\"plan_direct_pack\":true,\"reason\":"
                << json_string(error.what()) << '}';
     }
 #else
@@ -229,6 +291,8 @@ void write_capabilities_impl(
               "\"analysis_command_available\":false,\"auto_priority\":null,"
               "\"axes\":[],\"p_norms\":null,"
               "\"max_half_bandwidth\":null,\"max_forward_width\":null,"
+              "\"unified_memory\":false,\"shared_buffer_direct_write\":false,"
+              "\"external_source_zero_copy\":false,\"plan_direct_pack\":false,"
               "\"reason\":\"not compiled\"}";
 #endif
 #if defined(GETNATIVE_HAS_CUDA)

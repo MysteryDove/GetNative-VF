@@ -628,6 +628,29 @@ void test_period_replay_repeats_interior_rows() {
            "fractional active length plan shape differs");
 }
 
+void test_forward_half_pixel_ties_match_zimg_rounding() {
+    // 1080 -> 552 is 45/23. Several output centers land exactly on a
+    // half-pixel; this catches fast-math reassociation changing the selected
+    // left tap from zimg's deterministic half-up rule.
+    const getnative::AxisPlan plan = getnative::build_axis_plan(
+        {1080, 552, 552.0, 0.0, getnative::Filter::bilinear(),
+         getnative::BorderMode::mirror});
+    constexpr std::array<std::int32_t, 12> tie_rows{
+        112, 202, 247, 382, 427, 472, 742, 787, 832, 877, 922, 967,
+    };
+    for (const std::int32_t row : tie_rows) {
+        const auto begin = plan.forward_offsets[static_cast<std::size_t>(row)];
+        const auto left = plan.forward_indices[begin];
+        const auto expected = static_cast<std::int32_t>(
+            (static_cast<double>(row) + 0.5) * 552.0 / 1080.0 - 0.5);
+        expect(left == expected,
+               "half-pixel forward tie selected the wrong left tap");
+        expect(plan.forward_weights[begin] == 1.0F
+                   && plan.forward_weights[begin + 1U] == 0.0F,
+               "half-pixel forward tie has unexpected weights");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -644,6 +667,7 @@ int main() {
         test_lowest_stable_failure_is_rethrown_after_join();
         test_failure_stops_claiming_and_joins_started_builds();
         test_period_replay_repeats_interior_rows();
+        test_forward_half_pixel_ties_match_zimg_rounding();
         std::cout << "axis planner tests passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception &error) {

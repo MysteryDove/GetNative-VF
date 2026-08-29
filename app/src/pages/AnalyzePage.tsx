@@ -36,7 +36,7 @@ import { HeightResultsPanel } from "../components/HeightResultsPanel";
 import { Modal } from "../components/Modal";
 import { toggleSetValue } from "../utils/collections";
 import { srcFromScanSelection } from "../engine/geometry";
-import { missingFractionalBaseAxis } from "../engine/heightDraft";
+import { invalidKernelBlur, missingFractionalBaseAxis } from "../engine/heightDraft";
 import type { SearchPreset } from "../engine/protocol";
 
 export function AnalyzePage({
@@ -199,11 +199,14 @@ export function AnalyzePage({
         ? t("analyze.fractionalBaseRequired", {
             base: t(missingBaseAxis === "width" ? "analyze.baseWidth" : "analyze.baseHeight"),
           })
+      : invalidKernelBlur(draft.kernelParameters)
+        ? t("analyze.blurInvalid")
       : !work.ok || !plan
         ? t("analyze.runBlocked.invalidGrid")
         : null;
 
-  const canRun = analyzeAvailable && plan !== null && !submitting;
+  const canRun = analyzeAvailable && plan !== null && !submitting
+    && !invalidKernelBlur(draft.kernelParameters);
 
   function handleSetPreset(preset: SearchPreset) {
     setPreset(preset);

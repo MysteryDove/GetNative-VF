@@ -292,9 +292,12 @@ export function ProjectShell({
                         />
                       </span>
                     ) : null}
-                    {group.phase === "running" && group.fpsCurrent != null ? (
+                    {group.phase === "running" && (group.fpsCurrent != null || group.fpsAvg != null) ? (
                       <span className="job-fps">
-                        {formatRate(group.fpsCurrent)} {rateUnit(t, group.rateUnit)} · {t("jobs.fpsAvg")} {formatRate(group.fpsAvg)}
+                        {formatRate(group.fpsCurrent ?? group.fpsAvg)} {rateUnit(t, group.rateUnit)}
+                        {group.fpsCurrent != null && group.fpsAvg != null ? (
+                          <> · {t("jobs.fpsAvg")} {formatRate(group.fpsAvg)}</>
+                        ) : null}
                       </span>
                     ) : null}
                     {group.phase === "completed" && group.fpsAvg != null ? (

@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -32,6 +34,11 @@ extern "C" {
 #include <libavutil/dict.h>
 #include <libavutil/hash.h>
 #include <libavutil/hwcontext.h>
+#if defined(__APPLE__)
+#include <CoreMedia/CoreMedia.h>
+#include <VideoToolbox/VideoToolbox.h>
+#include <libavutil/hwcontext_videotoolbox.h>
+#endif
 #include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
 #include <libswscale/swscale.h>
@@ -44,11 +51,65 @@ extern "C" {
 #include <cuda.h>
 #endif
 
+#if defined(__APPLE__)
+[[nodiscard]] AVPixelFormat select_videotoolbox_format(AVCodecContext *, const AVPixelFormat *formats) {
+    for (const AVPixelFormat *format = formats; *format != AV_PIX_FMT_NONE; ++format)
+        if (*format == AV_PIX_FMT_VIDEOTOOLBOX) return *format;
+    return AV_PIX_FMT_NONE;
+}
+[[nodiscard]] bool decoder_supports_videotoolbox(const AVCodec &decoder) {
+    for (int index = 0;; ++index) {
+        const AVCodecHWConfig *config = avcodec_get_hw_config(&decoder, index);
+        if (config == nullptr) return false;
+        if (config->device_type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX
+            && config->pix_fmt == AV_PIX_FMT_VIDEOTOOLBOX
+            && (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0) return true;
+    }
+}
+[[nodiscard]] std::optional<CMVideoCodecType> videotoolbox_codec_type(
+    const AVCodec &decoder) noexcept {
+    switch (decoder.id) {
+    case AV_CODEC_ID_AV1: return kCMVideoCodecType_AV1;
+    case AV_CODEC_ID_H264: return kCMVideoCodecType_H264;
+    case AV_CODEC_ID_HEVC: return kCMVideoCodecType_HEVC;
+    case AV_CODEC_ID_MPEG1VIDEO: return kCMVideoCodecType_MPEG1Video;
+    case AV_CODEC_ID_MPEG2VIDEO: return kCMVideoCodecType_MPEG2Video;
+    case AV_CODEC_ID_MPEG4: return kCMVideoCodecType_MPEG4Video;
+    case AV_CODEC_ID_PRORES: return kCMVideoCodecType_AppleProRes422;
+    case AV_CODEC_ID_VP9: return kCMVideoCodecType_VP9;
+    default: return std::nullopt;
+    }
+}
+[[nodiscard]] bool videotoolbox_runtime_supports(const AVCodec &decoder) noexcept {
+    const auto codec_type = videotoolbox_codec_type(decoder);
+    return codec_type.has_value() && VTIsHardwareDecodeSupported(*codec_type);
+}
+void configure_videotoolbox_decoder(
+    AVCodecContext &codec, const AVCodec &decoder, std::size_t frame_concurrency) {
+    if (!decoder_supports_videotoolbox(decoder))
+        throw std::runtime_error("FFmpeg decoder exposes no VideoToolbox hardware-device configuration");
+    AVBufferRef *device_ref = nullptr;
+    const int init_result = av_hwdevice_ctx_create(
+        &device_ref, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, nullptr, nullptr, 0);
+    if (init_result < 0) {
+        av_buffer_unref(&device_ref);
+        throw std::runtime_error("av_hwdevice_ctx_create(VideoToolbox) failed");
+    }
+    codec.hw_device_ctx = device_ref;
+    codec.get_format = select_videotoolbox_format;
+    codec.extra_hw_frames = static_cast<int>(8U + frame_concurrency);
+}
+#endif
+
 #if defined(GETNATIVE_HAS_VULKAN)
 extern "C" {
 #include <libavutil/hwcontext_vulkan.h>
 }
 #include <vulkan/vulkan.h>
+#endif
+
+#if defined(__APPLE__)
+#include <CoreVideo/CoreVideo.h>
 #endif
 
 namespace getnative::media {
@@ -239,6 +300,7 @@ template <class Handle>
     case AV_CODEC_ID_VP9:
         return VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR;
 #endif
+
     default:
         return VK_VIDEO_CODEC_OPERATION_NONE_KHR;
     }
@@ -566,11 +628,17 @@ struct BuiltDecoder {
 #else
             throw std::runtime_error("CUDA hardware decode was not compiled");
 #endif
-        } else {
+        } else if (options->backend == DecoderOptions::Backend::vulkan_video) {
 #if defined(GETNATIVE_HAS_VULKAN)
             configure_vulkan_decoder(*codec, *decoder, *options);
 #else
             throw std::runtime_error("Vulkan Video decode was not compiled");
+#endif
+        } else {
+#if defined(__APPLE__)
+            configure_videotoolbox_decoder(*codec, *decoder, options->frame_concurrency);
+#else
+            throw std::runtime_error("VideoToolbox hardware decode is only available on macOS");
 #endif
         }
     }
@@ -597,26 +665,6 @@ struct BuiltDecoder {
     import_index_entries(*stream, index);
     BuiltDecoder built = build_decoder(*stream, options, configuration);
     return {std::move(format), std::move(built.codec), stream, built.decoder};
-}
-
-void reopen_demuxer_for_decode(OpenedDecoder &opened, const std::string &path,
-                               const MediaIndex &index) {
-    AVFormatContext *raw_format = nullptr;
-    check_ffmpeg(avformat_open_input(&raw_format, path.c_str(), nullptr, nullptr),
-                 "avformat_open_input(decode demuxer)");
-    FormatPtr format{raw_format};
-    if (index.stream_index >= format->nb_streams) {
-        check_ffmpeg(avformat_find_stream_info(format.get(), nullptr),
-                     "avformat_find_stream_info(decode demuxer)");
-    }
-    if (index.stream_index >= format->nb_streams
-        || format->streams[index.stream_index]->codecpar->codec_type
-            != AVMEDIA_TYPE_VIDEO) {
-        throw std::runtime_error("decode demuxer has no indexed video stream");
-    }
-    opened.format = std::move(format);
-    opened.stream = opened.format->streams[index.stream_index];
-    import_index_entries(*opened.stream, &index);
 }
 
 [[nodiscard]] const ExtraDataInfo *indexed_decoder_configuration(
@@ -673,9 +721,15 @@ void import_index_entries(AVStream &stream, const MediaIndex *index) {
     if (index == nullptr || index->stream_index_entries.empty()) return;
     for (const StreamIndexEntry &entry : index->stream_index_entries) {
         if (entry.file_position < 0) continue;
+        if (entry.size > static_cast<std::uint32_t>(std::numeric_limits<int>::max())
+            || entry.distance > static_cast<std::uint32_t>(std::numeric_limits<int>::max())
+            || entry.flags > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+            throw std::runtime_error("LWI stream index entry exceeds FFmpeg integer range");
+        }
         const int result = av_add_index_entry(
-            &stream, entry.file_position, entry.timestamp, entry.size,
-            entry.distance, static_cast<int>(entry.flags));
+            &stream, entry.file_position, entry.timestamp,
+            static_cast<int>(entry.size), static_cast<int>(entry.distance),
+            static_cast<int>(entry.flags));
         if (result < 0) {
             throw std::runtime_error("failed to import LWI stream index entry");
         }
@@ -857,13 +911,14 @@ void validate_selected_frames(const MediaIndex &index,
 }
 
 [[nodiscard]] std::vector<IndexedDecodeRun> plan_indexed_decode_runs(
-    const MediaIndex &index, std::span<const FrameIdentity> selected) {
+    const MediaIndex &index, std::span<const FrameIdentity> selected,
+    bool split_dense_at_rap = false) {
     validate_selected_frames(index, selected);
     std::vector<IndexedDecodeRun> runs;
     if (selected.empty()) return runs;
     const std::uint64_t covered = selected.back().frame_index
         - selected.front().frame_index + 1U;
-    const bool dense = selected.size() * 2U >= covered;
+    const bool dense = !split_dense_at_rap && selected.size() * 2U >= covered;
     std::size_t begin = 0U;
     while (begin < selected.size()) {
         const std::uint64_t anchor = selected[begin].keyframe_anchor;
@@ -899,6 +954,20 @@ void validate_selected_frames(const MediaIndex &index,
         begin = end;
     }
     return runs;
+}
+
+// Consecutive RAP-sized runs on one hardware session must be decoded as one
+// bitstream, not as a seek-per-GOP loop. VideoToolbox (and other hardware
+// decoders) can stall after the first GOP if the next run seeks without
+// tearing down the hardware context.
+[[nodiscard]] IndexedDecodeRun merge_indexed_decode_runs(
+    std::span<const IndexedDecodeRun> group) {
+    IndexedDecodeRun merged = group.front();
+    merged.selected_end = group.back().selected_end;
+    merged.end_position = group.back().end_position;
+    merged.end_decode_index = group.back().end_decode_index;
+    merged.streaming = true;
+    return merged;
 }
 
 class IndexedIdentityLookup {
@@ -1200,6 +1269,12 @@ bool backend_compiled(DecoderOptions::Backend backend) noexcept {
 #else
         return false;
 #endif
+    case DecoderOptions::Backend::videotoolbox:
+#if defined(__APPLE__)
+        return true;
+#else
+        return false;
+#endif
     }
     return false;
 }
@@ -1222,6 +1297,12 @@ bool backend_runtime_available(DecoderOptions::Backend backend) noexcept {
         return false;
 #endif
     }
+#if defined(__APPLE__)
+    if (backend == DecoderOptions::Backend::videotoolbox) {
+        return av_hwdevice_find_type_by_name("videotoolbox")
+            == AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
+    }
+#endif
     return false;
 }
 
@@ -1253,6 +1334,19 @@ std::vector<std::string> hardware_codecs(DecoderOptions::Backend backend) {
         return {};
 #endif
     }
+#if defined(__APPLE__)
+    if (backend == DecoderOptions::Backend::videotoolbox) {
+        std::set<std::string> names;
+        void *state = nullptr;
+        while (const AVCodec *codec = av_codec_iterate(&state)) {
+            if (av_codec_is_decoder(codec) && decoder_supports_videotoolbox(*codec)
+                && videotoolbox_runtime_supports(*codec)) {
+                names.emplace(codec->name);
+            }
+        }
+        return {names.begin(), names.end()};
+    }
+#endif
     return {};
 }
 
@@ -2785,14 +2879,15 @@ void decode_selected_hardware_indexed(
     DecodeTelemetry *telemetry) {
     if (selected_frames.empty()) return;
     const auto start = Clock::now();
-    const std::vector<IndexedDecodeRun> runs =
-        plan_indexed_decode_runs(index, selected_frames);
+    const std::size_t requested_sessions = std::clamp<std::size_t>(
+        options.hardware_decode_sessions, 1U, 4U);
+    const std::vector<IndexedDecodeRun> runs = plan_indexed_decode_runs(
+        index, selected_frames, requested_sessions > 1U);
     const IndexedIdentityLookup identity_lookup{index};
-    // Keep one hardware decoder alive across indexed RAP seeks. Multiple
-    // demux/decode slices each pay a separate NVDEC/Vulkan session startup and
-    // cannot reuse codec state across their boundary; analysis still uses the
-    // caller's requested frame_concurrency in the downstream pipeline.
-    constexpr std::size_t worker_count = 1U;
+    // The default remains one persistent hardware decoder. The experimental
+    // multi-session path partitions whole RAP-aligned runs so no decoder
+    // depends on reference state owned by another session.
+    const std::size_t worker_count = std::min(requested_sessions, runs.size());
     std::vector<DecodeTelemetry> worker_telemetry(worker_count);
     std::vector<double> worker_consumer_ms(worker_count, 0.0);
     std::mutex failure_mutex;
@@ -2836,10 +2931,25 @@ void decode_selected_hardware_indexed(
                 current_extradata_index = required_extradata;
             };
 
-            for (std::size_t run_index = run_begin; run_index < run_end; ++run_index) {
+            const auto run_extradata = [&](const IndexedDecodeRun &run)
+                -> std::optional<std::uint32_t> {
+                if (run.decode_anchor >= index.frames.size()) return std::nullopt;
+                return index.frames[run.decode_anchor].extradata_index;
+            };
+
+            for (std::size_t run_index = run_begin; run_index < run_end; ) {
                 if (stop.stop_requested()) throw std::runtime_error("cancelled");
                 if (failed.load(std::memory_order_relaxed)) return;
-                const IndexedDecodeRun &run = runs[run_index];
+                std::size_t group_end = run_index + 1U;
+                const auto group_extradata = run_extradata(runs[run_index]);
+                while (group_end < run_end
+                       && run_extradata(runs[group_end]) == group_extradata) {
+                    ++group_end;
+                }
+                const IndexedDecodeRun run = merge_indexed_decode_runs(
+                    std::span<const IndexedDecodeRun>{
+                        runs.data() + run_index, group_end - run_index});
+                run_index = group_end;
                 std::uint64_t decode_anchor = run.decode_anchor;
                 for (std::size_t attempt = 0U;; ++attempt) {
                     // Every normal run starts at an indexed RAP. Feeding the next
@@ -2959,6 +3069,7 @@ void decode_selected_hardware_indexed(
     if (failure) std::rethrow_exception(failure);
 
     if (telemetry) {
+        telemetry->decode_sessions = worker_count;
         for (const DecodeTelemetry &local : worker_telemetry) {
             telemetry->decoded_frames += local.decoded_frames;
             telemetry->selected_frames += local.selected_frames;
@@ -3137,6 +3248,62 @@ void decode_selected_vulkan(const std::string &path,
             VulkanFrameLock::release_without_submit;
         output.lease = std::move(lease);
         consumer(std::move(output));
+        }, telemetry);
+#endif
+}
+
+void decode_selected_metal(const std::string &path, const MediaIndex &index,
+                           std::span<const FrameIdentity> selected_frames,
+                           const DecoderOptions &options, std::stop_token stop,
+                           const MetalFrameConsumer &consumer,
+                           DecodeTelemetry *telemetry) {
+#if !defined(__APPLE__)
+    (void)path; (void)index; (void)selected_frames; (void)options; (void)stop;
+    (void)consumer; (void)telemetry;
+    throw std::runtime_error("VideoToolbox hardware decode is only available on macOS");
+#else
+    if (options.backend != DecoderOptions::Backend::videotoolbox) {
+        throw std::invalid_argument("decode_selected_metal requires the VideoToolbox backend");
+    }
+    decode_selected_hardware_indexed(
+        path, index, selected_frames, options, stop, "VideoToolbox",
+        [&](AVFrame &source, const FrameIdentity &identity, std::size_t seq) {
+            if (source.format != AV_PIX_FMT_VIDEOTOOLBOX) {
+                throw std::runtime_error("metal_zero_copy_unsupported: VideoToolbox returned a non-hardware frame");
+            }
+            // FFmpeg stores the retained CVPixelBufferRef in data[3] for
+            // AV_PIX_FMT_VIDEOTOOLBOX; data[0..2] are not image planes.
+            CVPixelBufferRef pixel_buffer =
+                reinterpret_cast<CVPixelBufferRef>(source.data[3]);
+            if (pixel_buffer == nullptr || !CVPixelBufferIsPlanar(pixel_buffer)) {
+                throw std::runtime_error("metal_zero_copy_unsupported: VideoToolbox frame has no CVPixelBuffer");
+            }
+            if (CVPixelBufferGetIOSurface(pixel_buffer) == nullptr) {
+                throw std::runtime_error(
+                    "metal_zero_copy_unsupported: VideoToolbox frame has no IOSurface");
+            }
+            const OSType format = CVPixelBufferGetPixelFormatType(pixel_buffer);
+            const char *surface = nullptr;
+            switch (format) {
+            case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: surface = "420v"; break;
+            case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange: surface = "420f"; break;
+            case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange: surface = "x420"; break;
+            case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange: surface = "xf20"; break;
+            default: throw std::runtime_error("metal_zero_copy_unsupported: unsupported VideoToolbox surface format");
+            }
+            MetalFrame output;
+            output.seq = seq;
+            output.identity = identity;
+            update_identity_metadata(output.identity, source);
+            output.width = source.width;
+            output.height = source.height;
+            output.pixel_buffer = reinterpret_cast<std::uintptr_t>(pixel_buffer);
+            output.bit_depth = (format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+                                || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) ? 10 : 8;
+            output.range = frame_range(source);
+            output.surface_format = surface;
+            output.lease = retain_frame(source, "av_frame_clone(VideoToolbox)");
+            consumer(std::move(output));
         }, telemetry);
 #endif
 }

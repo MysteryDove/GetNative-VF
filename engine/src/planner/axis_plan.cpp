@@ -101,7 +101,9 @@ struct ZimgKernel {
           q3((-filter.b - 6.0 * filter.c) / 6.0) {}
 
     [[nodiscard]] double weight(double distance) const noexcept {
-        double x = std::abs(distance);
+        const double stretched = filter.blur == 1.0
+            ? distance : distance / filter.blur;
+        double x = std::abs(stretched);
         switch (filter.type) {
         case KernelType::bilinear:
             return std::max(1.0 - x, 0.0);
@@ -202,11 +204,7 @@ private:
         throw std::invalid_argument(
             "active length and shift must be finite, with positive active length");
     }
-    const std::int32_t support = request.filter.support();
-    if (support > (std::numeric_limits<std::int32_t>::max() - 1) / 2) {
-        throw std::invalid_argument("filter support is too large");
-    }
-    return support;
+    return request.filter.effective_support();
 }
 
 [[nodiscard]] std::size_t checked_geometry_elements(
@@ -258,8 +256,8 @@ make_axis_plan_geometry(const AxisPlanRequest &request) {
 
     const double ratio = static_cast<double>(request.source_size)
         / request.active_length;
-    std::array<std::int32_t, 30> tap_indices{};
-    std::array<std::int32_t, 30> unique_indices{};
+    std::vector<std::int32_t> tap_indices(static_cast<std::size_t>(tap_count));
+    std::vector<std::int32_t> unique_indices(static_cast<std::size_t>(tap_count));
     for (std::int32_t row = 0; row < request.source_size; ++row) {
         const double position = (static_cast<double>(row) + 0.5) / ratio
             + request.shift;
@@ -316,9 +314,11 @@ make_axis_plan_geometry(const AxisPlanRequest &request) {
             geometry->descale_unique_indices.size()));
     }
 
-    const double scale = static_cast<double>(request.source_size)
+    // Keep the scale division from being reassociated under -ffast-math;
+    // exact rational phases must retain zimg's half-pixel tie behavior.
+    volatile const double scale = static_cast<double>(request.source_size)
         / request.active_length;
-    geometry->forward_step = std::min(scale, 1.0);
+    geometry->forward_step = std::min(static_cast<double>(scale), 1.0);
     const double expanded_support = static_cast<double>(support)
         / geometry->forward_step;
     if (!finite_binary64(expanded_support)
@@ -338,7 +338,8 @@ make_axis_plan_geometry(const AxisPlanRequest &request) {
         static_cast<double>(request.destination_size),
         -std::numeric_limits<double>::max());
     for (std::int32_t row = 0; row < request.source_size; ++row) {
-        const double position = (static_cast<double>(row) + 0.5) / scale
+        const double position = (static_cast<double>(row) + 0.5)
+            / static_cast<double>(scale)
             + request.shift;
         const double begin = round_half_up(
             position - static_cast<double>(geometry->forward_filter_size) / 2.0)
@@ -471,10 +472,9 @@ void make_descale_matrix(DoubleCsrView result,
 
     std::vector<std::pair<std::int32_t, double>> row;
     row.reserve(static_cast<std::size_t>(2 * support));
-    // Filter::support() caps Lanczos at 15 taps, so the widest row has 30 taps.
-    std::array<double, 30> tap_weights{};
-    std::array<double, 30> coalesced_weights{};
-    std::array<bool, 30> coalesced_seen{};
+    std::vector<double> tap_weights(static_cast<std::size_t>(2 * support));
+    std::vector<double> coalesced_weights(static_cast<std::size_t>(2 * support));
+    std::vector<bool> coalesced_seen(static_cast<std::size_t>(2 * support));
     PeriodWeightCache period_cache;
     period_cache.enable(rows, request.active_length,
                         static_cast<std::size_t>(2 * support));
@@ -560,8 +560,8 @@ void make_descale_matrix(DoubleCsrView result,
         }
 
         if constexpr (ReuseGeometry) {
-            coalesced_weights.fill(0.0);
-            coalesced_seen.fill(false);
+            std::fill(coalesced_weights.begin(), coalesced_weights.end(), 0.0);
+            std::fill(coalesced_seen.begin(), coalesced_seen.end(), false);
         } else {
             row.clear();
         }
@@ -644,8 +644,10 @@ void make_zimg_forward(DoubleCsrView result,
                        const detail::AxisPlanGeometry *geometry = nullptr) {
     const std::int32_t rows = request.source_size;
     const std::int32_t columns = request.destination_size;
-    const double scale = static_cast<double>(rows) / request.active_length;
-    double step = std::min(scale, 1.0);
+    // Keep the scale division from being reassociated under -ffast-math.
+    // Exact rational phases must retain zimg's half-pixel tie behavior.
+    volatile const double scale = static_cast<double>(rows) / request.active_length;
+    double step = std::min(static_cast<double>(scale), 1.0);
     std::int32_t filter_size = 0;
     if constexpr (ReuseGeometry) {
         if (geometry == nullptr || !geometry_matches(*geometry, request, support)) {
@@ -687,7 +689,8 @@ void make_zimg_forward(DoubleCsrView result,
         double position = 0.0;
         double begin = 0.0;
         if constexpr (!ReuseGeometry) {
-            position = (static_cast<double>(row) + 0.5) / scale + request.shift;
+            position = (static_cast<double>(row) + 0.5) / static_cast<double>(scale)
+                + request.shift;
             begin = round_half_up(
                 position - static_cast<double>(filter_size) / 2.0) + 0.5;
         }

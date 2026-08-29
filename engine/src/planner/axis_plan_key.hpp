@@ -17,6 +17,7 @@ struct PlanKey {
     std::uint64_t b;
     std::uint64_t c;
     std::int32_t taps;
+    std::uint64_t blur;
     BorderMode border;
 
     friend bool operator==(const PlanKey &, const PlanKey &) = default;
@@ -37,6 +38,7 @@ struct PlanKeyHash {
         mix(key.b);
         mix(key.c);
         mix(static_cast<std::uint32_t>(key.taps));
+        mix(key.blur);
         mix(static_cast<std::uint8_t>(key.border));
         return hash;
     }
@@ -52,6 +54,7 @@ struct PlanKeyHash {
         std::bit_cast<std::uint64_t>(request.filter.b),
         std::bit_cast<std::uint64_t>(request.filter.c),
         request.filter.taps,
+        std::bit_cast<std::uint64_t>(request.filter.blur),
         request.border,
     };
 }

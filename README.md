@@ -15,7 +15,9 @@ Grab the latest package from
 
 - **Windows** — portable ZIP; unzip and run `getnative-gui.exe`. Includes CUDA
   and Vulkan acceleration out of the box.
-- **Linux** — portable ZIP; unzip and run `getnative-gui`.
+- **Linux** — `.deb` and AppImage from GitHub Releases.
+- **macOS (Apple Silicon)** — unsigned `.app.zip` from GitHub Releases. Not
+  notarized; Gatekeeper may require a right-click Open the first time.
 
 ## Features
 
@@ -65,10 +67,9 @@ anyone can use.
 
 ## System requirements
 
-- Windows 10+ or a recent Linux distribution (x64)
+- Windows 10+, a recent Linux distribution (x64), or macOS 15+ on Apple Silicon
 - Optional: any recent NVIDIA (CUDA), or Vulkan-capable, GPU for acceleration —
-  the app works fine without one
-- macOS build with Metal support is in active development
+  the app works fine without one. macOS uses Metal.
 
 ## Supported Build Matrix
 
@@ -84,8 +85,8 @@ Linux ARM64 Vulkan builds use the distro packages `glslang-tools`,
 `glslangValidator` is accepted as the shader compiler fallback and SPIR-V is
 architecture-independent. Runtime Vulkan conformance is skipped with the
 existing `SKIP:` contract when no device is available. MoltenVK, Lavapipe
-device testing, Raspberry Pi v3dv evidence, and Tauri ARM64 packaging remain
-out of scope.
+device testing, and Raspberry Pi v3dv evidence remain out of scope. The macOS
+arm64 `.app.zip` is an unsigned CI bundle.
 
 ## License
 

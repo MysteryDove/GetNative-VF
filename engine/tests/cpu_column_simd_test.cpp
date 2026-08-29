@@ -50,6 +50,9 @@ using NamedFilter = std::pair<std::string, getnative::Filter>;
         {"spline16", getnative::Filter::spline16()},
         {"spline36", getnative::Filter::spline36()},
         {"spline64", getnative::Filter::spline64()},
+        {"bicubic-catrom-blur125", getnative::Filter::bicubic(0.0, 0.5, 1.25)},
+        {"spline64-blur125", getnative::Filter::spline64(1.25)},
+        {"spline64-blur150", getnative::Filter::spline64(1.5)},
     };
     for (std::int32_t taps = 1; taps <= 15; ++taps) {
         values.emplace_back(
@@ -274,9 +277,182 @@ void test_materialized_inverse_columns(
     }
 }
 
+void test_materialized_inverse_rows(getnative::detail::ColumnDispatchPolicy policy) {
+    constexpr std::int32_t source_size = 79;
+    constexpr std::int32_t destination_size = 43;
+    constexpr float padding = -913.25F;
+    const std::vector<getnative::BorderMode> borders{
+        getnative::BorderMode::zero,
+        getnative::BorderMode::repeat,
+        getnative::BorderMode::mirror,
+    };
+    const std::vector<std::int32_t> row_counts{
+        0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33,
+    };
+
+    for (const auto &[name, filter] : filters()) {
+        for (const getnative::BorderMode border : borders) {
+            const auto plan = getnative::build_axis_plan({
+                source_size, destination_size, 43.25, -0.1875, filter, border,
+            });
+            for (const std::int32_t rows : row_counts) {
+                const std::ptrdiff_t input_stride = source_size + 3;
+                const std::ptrdiff_t output_stride = destination_size + 5;
+                const std::size_t input_count = static_cast<std::size_t>(
+                    rows > 0 ? (rows - 1) * input_stride + source_size + 7 : 8);
+                const std::size_t output_count = static_cast<std::size_t>(
+                    rows > 0 ? (rows - 1) * output_stride + destination_size + 7 : 8);
+                std::vector<float> input(input_count, padding);
+                for (std::int32_t row = 0; row < rows; ++row) {
+                    for (std::int32_t x = 0; x < source_size; ++x) {
+                        input[static_cast<std::size_t>(row) * input_stride
+                              + static_cast<std::size_t>(x)] = source_value(row, x);
+                    }
+                }
+                const std::vector<float> original_input = input;
+                std::vector<float> scalar(output_count, padding);
+                std::vector<float> actual(output_count, padding);
+                for (std::int32_t row = 0; row < rows; ++row) {
+                    getnative::inverse_axis_f32(
+                        plan, input.data() + static_cast<std::ptrdiff_t>(row) * input_stride,
+                        1,
+                        scalar.data() + static_cast<std::ptrdiff_t>(row) * output_stride,
+                        1);
+                }
+                getnative::detail::inverse_rows_f32(
+                    plan, input.data(), input_stride,
+                    actual.data(), output_stride, rows, policy);
+                expect(input == original_input, "row inverse kernel modified its input");
+                for (std::size_t index = 0; index < actual.size(); ++index) {
+                    expect_same_float(
+                        actual[index], scalar[index],
+                        name + " row inverse differs from scalar at storage index "
+                            + std::to_string(index));
+                }
+            }
+        }
+    }
+}
+
+void test_materialized_forward_rows(getnative::detail::ColumnDispatchPolicy policy) {
+    constexpr std::int32_t source_size = 79;
+    constexpr std::int32_t destination_size = 43;
+    constexpr float padding = -913.25F;
+    const std::vector<getnative::BorderMode> borders{
+        getnative::BorderMode::zero,
+        getnative::BorderMode::repeat,
+        getnative::BorderMode::mirror,
+    };
+    const std::vector<std::int32_t> row_counts{
+        0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33,
+    };
+
+    for (const auto &[name, filter] : filters()) {
+        for (const getnative::BorderMode border : borders) {
+            const auto plan = getnative::build_axis_plan({
+                source_size, destination_size, 43.25, -0.1875, filter, border,
+            });
+            for (const std::int32_t rows : row_counts) {
+                const std::ptrdiff_t input_stride = destination_size + 3;
+                const std::ptrdiff_t output_stride = source_size + 5;
+                const std::size_t input_count = static_cast<std::size_t>(
+                    rows > 0 ? (rows - 1) * input_stride + destination_size + 7 : 8);
+                const std::size_t output_count = static_cast<std::size_t>(
+                    rows > 0 ? (rows - 1) * output_stride + source_size + 7 : 8);
+                std::vector<float> input(input_count, padding);
+                for (std::int32_t row = 0; row < rows; ++row) {
+                    for (std::int32_t x = 0; x < destination_size; ++x) {
+                        input[static_cast<std::size_t>(row) * input_stride
+                              + static_cast<std::size_t>(x)] = source_value(row, x);
+                    }
+                }
+                const std::vector<float> original_input = input;
+                std::vector<float> scalar(output_count, padding);
+                std::vector<float> actual(output_count, padding);
+                for (std::int32_t row = 0; row < rows; ++row) {
+                    getnative::forward_axis_f32(
+                        plan, input.data() + static_cast<std::ptrdiff_t>(row) * input_stride,
+                        1,
+                        scalar.data() + static_cast<std::ptrdiff_t>(row) * output_stride,
+                        1);
+                }
+                getnative::detail::forward_rows_f32(
+                    plan, input.data(), input_stride,
+                    actual.data(), output_stride, rows, policy);
+                expect(input == original_input, "row forward kernel modified its input");
+                for (std::size_t index = 0; index < actual.size(); ++index) {
+                    expect_same_float(
+                        actual[index], scalar[index],
+                        name + " row forward differs from scalar at storage index "
+                            + std::to_string(index));
+                }
+            }
+        }
+    }
+}
+
+void test_materialized_forward_columns(
+    getnative::detail::ColumnDispatchPolicy policy,
+    getnative::CpuIsa selected_isa) {
+    constexpr std::int32_t source_size = 79;
+    constexpr std::int32_t destination_size = 43;
+    constexpr float padding = -913.25F;
+    const std::vector<getnative::BorderMode> borders{
+        getnative::BorderMode::zero,
+        getnative::BorderMode::repeat,
+        getnative::BorderMode::mirror,
+    };
+    const std::vector<std::int32_t> column_counts{
+        0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63,
+    };
+    const std::int32_t lanes = lane_count(selected_isa);
+
+    for (const auto &[name, filter] : filters()) {
+        for (const getnative::BorderMode border : borders) {
+            const auto plan = getnative::build_axis_plan({
+                source_size, destination_size, 43.25, -0.1875, filter, border,
+            });
+            for (const std::int32_t columns : column_counts) {
+                for (std::int32_t base_offset = 0; base_offset < lanes; ++base_offset) {
+                    const std::ptrdiff_t input_stride = columns + 3;
+                    const std::ptrdiff_t output_stride = columns + 5;
+                    const std::size_t input_count = static_cast<std::size_t>(
+                        destination_size * input_stride + base_offset + 7);
+                    const std::size_t output_count = static_cast<std::size_t>(
+                        source_size * output_stride + base_offset + 7);
+                    std::vector<float> input(input_count, padding);
+                    for (std::int32_t row = 0; row < destination_size; ++row) {
+                        for (std::int32_t column = 0; column < columns; ++column) {
+                            input[static_cast<std::size_t>(base_offset)
+                                  + static_cast<std::size_t>(row * input_stride + column)] =
+                                source_value(row, column);
+                        }
+                    }
+                    const std::vector<float> original_input = input;
+                    std::vector<float> scalar(output_count, padding);
+                    std::vector<float> actual(output_count, padding);
+                    getnative::detail::forward_columns_f32(
+                        plan, input.data() + base_offset, input_stride,
+                        scalar.data() + base_offset, output_stride, columns,
+                        getnative::detail::ColumnDispatchPolicy::scalar_only);
+                    getnative::detail::forward_columns_f32(
+                        plan, input.data() + base_offset, input_stride,
+                        actual.data() + base_offset, output_stride, columns, policy);
+                    expect(input == original_input, "forward column kernel modified its input");
+                    for (std::size_t index = 0; index < actual.size(); ++index) {
+                        expect_same_float(
+                            actual[index], scalar[index],
+                            name + " column forward differs from scalar at storage index "
+                                + std::to_string(index));
+                    }
+                }
+            }
+        }
+    }
+}
+
 void test_cropped_inverse_column_ranges(
-    getnative::detail::ColumnDispatchPolicy policy) {
-    constexpr std::int32_t source_size = 53;
+    getnative::detail::ColumnDispatchPolicy policy) {    constexpr std::int32_t source_size = 53;
     constexpr std::int32_t destination_size = 31;
     constexpr std::int32_t columns = 41;
     constexpr std::ptrdiff_t input_stride = columns + 5;
@@ -544,8 +720,8 @@ void test_crop_aware_analysis_matches_full_frame_oracle(
                     name + " crop-aware analysis differs from full-frame oracle");
                 if (axes == getnative::AnalysisAxes::horizontal) {
                     expect(workspace.intermediate.size()
-                               == static_cast<std::size_t>(horizontal.destination_size),
-                           name + " horizontal analysis retains more than one native row");
+                               == static_cast<std::size_t>(horizontal.destination_size) * 4U,
+                           name + " horizontal analysis retains a 4-row inverse band");
                 }
             }
         }
@@ -1119,6 +1295,9 @@ int main(int argc, char **argv) {
         }
         const auto policy = getnative::detail::column_dispatch_policy(request);
         test_materialized_inverse_columns(policy, dispatch.selected);
+        test_materialized_inverse_rows(policy);
+        test_materialized_forward_columns(policy, dispatch.selected);
+        test_materialized_forward_rows(policy);
         test_cropped_inverse_column_ranges(policy);
         test_avx2_b5_row_major_boundaries(policy, dispatch.selected);
         test_axis_and_two_axis_candidates(policy);

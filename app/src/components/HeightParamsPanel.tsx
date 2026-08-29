@@ -1,8 +1,9 @@
-import { RotateCcw, SlidersHorizontal } from "lucide-react";
+import { Check, RotateCcw, SlidersHorizontal } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
 import { kernelDisplayName, profileDisplayName } from "../engine/displayNames";
 import {
+  invalidKernelBlur,
   kernelSignature,
   missingFractionalBaseAxis,
   type HeightDraft,
@@ -221,14 +222,19 @@ export function HeightParamsPanel({
           value={draft.kernelId}
           disabled={kernelOptions.length === 0}
           onChange={(event) => {
+            const blur = draft.kernelParameters.blur;
+            const withBlur = (
+              parameters: HeightDraft["kernelParameters"],
+            ): HeightDraft["kernelParameters"] =>
+              blur === undefined ? parameters : { ...parameters, blur };
             onPatch({
               kernelId: event.target.value,
               kernelParameters:
                 event.target.value === "bicubic"
-                  ? { b: 0, c: 0.5 }
+                  ? withBlur({ b: 0, c: 0.5 })
                   : event.target.value === "lanczos"
-                    ? { taps: 3 }
-                    : {},
+                    ? withBlur({ taps: 3 })
+                    : withBlur({}),
               compareKernels: draft.compareKernels.filter(
                 (item) => item.id !== event.target.value,
               ),
@@ -281,6 +287,31 @@ export function HeightParamsPanel({
         </label>
       ) : null}
 
+      <label className="block">
+        <span>{t("analyze.blur")}</span>
+        <input
+          type="number"
+          step="any"
+          min="0.000001"
+          title={t("analyze.blurHint")}
+          aria-invalid={invalidKernelBlur(draft.kernelParameters) || undefined}
+          value={String(draft.kernelParameters.blur ?? 1)}
+          onChange={(event) =>
+            onPatch({
+              kernelParameters: {
+                ...draft.kernelParameters,
+                blur: event.target.value,
+              },
+            })
+          }
+        />
+      </label>
+      {invalidKernelBlur(draft.kernelParameters) ? (
+        <p className="help-copy warning-copy" role="alert">
+          {t("analyze.blurInvalid")}
+        </p>
+      ) : null}
+
       {kernelOptions.length > 1 ? (
         <fieldset className="metric-fieldset kernel-compare-fieldset">
           <legend>{t("analyze.compareKernels")}</legend>
@@ -308,25 +339,25 @@ export function HeightParamsPanel({
                   );
                   const name = kernelDisplayName(t, kernel.id);
                   return (
-                    <label
+                    <button
                       key={taps != null ? `${kernel.id}@${taps}` : kernel.id}
-                      className="checkbox-row"
+                      className={checked ? "kernel-compare-option active" : "kernel-compare-option"}
+                      type="button"
+                      aria-pressed={checked}
+                      title={taps != null ? `${name} ${taps}` : name}
+                      onClick={() =>
+                        onPatch({
+                          compareKernels: checked
+                            ? draft.compareKernels.filter(
+                                (item) => kernelSignature(item) !== signature,
+                              )
+                            : [...draft.compareKernels, candidate],
+                        })
+                      }
                     >
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={(event) =>
-                          onPatch({
-                            compareKernels: event.target.checked
-                              ? [...draft.compareKernels, candidate]
-                              : draft.compareKernels.filter(
-                                  (item) => kernelSignature(item) !== signature,
-                                ),
-                          })
-                        }
-                      />
+                      <Check className="kernel-compare-check" size={12} aria-hidden="true" />
                       <span>{taps != null ? `${name} ${taps}` : name}</span>
-                    </label>
+                    </button>
                   );
                 });
               })}
@@ -357,7 +388,7 @@ export function HeightParamsPanel({
         </select>
       </label>
       <button
-        className="secondary-button"
+        className="secondary-button profile-defaults-button"
         type="button"
         title={t("analyze.applyProfileDefaults")}
         onClick={onResetProfileDefaults}

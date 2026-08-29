@@ -194,12 +194,24 @@ export function fixedKernelsForDraft(
     const known = capabilities?.payload.kernels.find(
       (candidate) => candidate.id === kernel.id,
     );
+    const parameters = { ...(known?.parameters ?? {}), ...kernel.parameters };
+    if (parameters.blur === undefined && draft.kernelParameters.blur !== undefined) {
+      parameters.blur = draft.kernelParameters.blur;
+    }
     extras.push({
       id: kernel.id,
-      parameters: { ...(known?.parameters ?? {}), ...kernel.parameters },
+      parameters,
     });
   }
   return [primary, ...extras];
+}
+
+export function invalidKernelBlur(
+  parameters: Record<string, string | number | boolean> | undefined,
+): boolean {
+  if (parameters === undefined || parameters.blur === undefined) return false;
+  const blur = Number(parameters.blur);
+  return !Number.isFinite(blur) || blur <= 0;
 }
 
 export function estimateHeightWork(

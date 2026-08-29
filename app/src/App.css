@@ -1190,6 +1190,7 @@ button {
   border-bottom: 1px solid var(--border);
 }
 
+.primary-button,
 .secondary-button,
 .link-button,
 .icon-button {
@@ -1199,6 +1200,53 @@ button {
   gap: 7px;
   border-radius: 5px;
   cursor: pointer;
+}
+
+.primary-button {
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--primary-border);
+  color: var(--primary-text);
+  background: var(--primary-bg);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.primary-button:hover:not(:disabled) {
+  background: var(--success-bg);
+}
+
+.control-select,
+.verify-filter input,
+.verify-filter select {
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border-control);
+  border-radius: 4px;
+  outline: 0;
+  color: var(--text-heading);
+  background: var(--well-bg);
+  font-size: 12px;
+}
+
+.control-select,
+.verify-filter select {
+  cursor: pointer;
+}
+
+.control-select:focus,
+.verify-filter input:focus,
+.verify-filter select:focus {
+  border-color: var(--accent-dim);
+  box-shadow: 0 0 0 2px var(--accent-glow);
+}
+
+.control-select option,
+.verify-filter option {
+  color: var(--text-primary);
+  background: var(--surface-raised);
 }
 
 .secondary-button {
@@ -1215,6 +1263,7 @@ button {
   background: var(--button-hover-bg);
 }
 
+.primary-button:disabled,
 .secondary-button:disabled,
 .link-button:disabled,
 .icon-button:disabled {
@@ -1479,6 +1528,12 @@ button {
 
 .help-copy {
   padding-left: 0;
+}
+
+/* Params-panel hints follow the same 10px block rhythm instead of the
+   generic card padding. */
+.analyze-params .help-copy {
+  padding: 0 0 10px;
 }
 
 .recent-table {
@@ -2238,6 +2293,17 @@ button {
   margin-bottom: 8px;
 }
 
+.verify-fusion-picker-head h3 {
+  margin: 0;
+}
+
+.verify-fusion-picker-head .secondary-button,
+.verify-fusion-actions .secondary-button {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+
 .verify-fusion-run-list {
   display: grid;
   gap: 4px;
@@ -2249,8 +2315,10 @@ button {
   align-items: center;
   gap: 6px;
   min-width: 0;
-  padding: 5px 6px;
+  padding: 5px 8px;
+  border-radius: 4px;
   background: var(--surface-control);
+  font-size: 12px;
 }
 
 .verify-fusion-run > span {
@@ -2262,6 +2330,8 @@ button {
 
 .verify-fusion-run small {
   color: var(--text-meta-dim);
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .verify-fusion-run.is-disabled {
@@ -2362,7 +2432,12 @@ button {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-width: 0;
   padding: 12px 14px;
+}
+
+.analyze-plot > * {
+  min-width: 0;
 }
 
 .analyze-plot-toolbar {
@@ -2709,13 +2784,54 @@ button {
 }
 
 .kernel-compare-list {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
 }
 
-.kernel-compare-list .checkbox-row {
-  margin: 0;
+.kernel-compare-option {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 0;
+  height: 26px;
+  padding: 0 7px;
+  overflow: hidden;
+  border: 1px solid var(--border-control);
+  border-radius: 4px;
+  color: var(--text-subtle);
+  background: var(--surface-inset);
+  font: inherit;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.kernel-compare-check {
+  flex: 0 0 auto;
+  opacity: 0;
+}
+
+.kernel-compare-option:hover {
+  color: var(--text-secondary);
+  background: var(--surface-active);
+}
+
+.kernel-compare-option.active {
+  border-color: var(--primary-border);
+  color: var(--primary-text);
+  background: var(--primary-bg);
+}
+
+.kernel-compare-option.active .kernel-compare-check {
+  opacity: 1;
+}
+
+.kernel-compare-option:focus-visible {
+  outline: 2px solid var(--input-focus);
+  outline-offset: 1px;
 }
 
 .result-table-row {
@@ -2865,11 +2981,18 @@ button {
   stroke-width: 1.6;
 }
 
-.analyze-params label.block {
+/* All params blocks — label-wrapped inputs and bare div radio groups alike —
+   share one vertical rhythm and label typography. */
+.analyze-params .block {
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  margin-bottom: 6px;
+  gap: 4px;
+  margin-bottom: 10px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.analyze-params .block > span {
   font-size: 11px;
   color: var(--text-faint);
 }
@@ -2935,18 +3058,30 @@ button {
   gap: 6px 8px;
 }
 
+/* Grid supplies the spacing; block margins would double it. */
+.metric-grid .block {
+  margin-bottom: 0;
+}
+
 .analyze-run-block {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin-top: 8px;
+  margin-top: 10px;
 }
 
 .analyze-run-block .primary-button {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  width: 100%;
+  height: 32px;
+  padding: 0 10px;
   gap: 6px;
+}
+
+.profile-defaults-button {
+  height: 28px;
+  margin: 0 0 10px;
+  padding: 0 9px;
+  font-size: 11px;
 }
 
 .empty-inline {
@@ -4026,6 +4161,24 @@ button {
   padding-top: 12px;
 }
 
+.confirm-dialog-copy {
+  margin: 0;
+  color: var(--text-subtle);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.danger-button {
+  color: var(--danger-text);
+  border-color: var(--danger-hover-border);
+  background: var(--chip-error-bg);
+}
+
+.danger-button:hover:not(:disabled) {
+  color: var(--danger-hover-text);
+  background: var(--surface-hover);
+}
+
 .geometry-axis {
   display: grid;
   gap: 8px;
@@ -4288,7 +4441,8 @@ button {
 
 .editing-target-row .secondary-button {
   flex-shrink: 0;
-  padding: 3px 8px;
+  height: 28px;
+  padding: 0 8px;
   font-size: 11px;
 }
 
@@ -4301,6 +4455,7 @@ button {
 
 .verify-current-row > select {
   flex-shrink: 0;
+  width: min(300px, 100%);
   max-width: 300px;
 }
 
@@ -4452,12 +4607,9 @@ button {
 
 /* Verify review */
 .verify-review-toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px 16px;
-  min-height: 28px;
+  display: grid;
+  gap: 8px;
+  min-width: 0;
 }
 
 .analyze-layout .verify-review-toolbar h3 {
@@ -4469,6 +4621,10 @@ button {
   flex-wrap: wrap;
   align-items: center;
   gap: 8px 12px;
+}
+
+.verify-review-filters .series-visibility {
+  margin-top: 0;
 }
 
 .verify-review-empty {
@@ -4540,16 +4696,25 @@ button {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
+  color: var(--text-faint);
+  font-size: 11px;
 }
 
-.verify-filter input {
+.verify-filter > span {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.verify-history-source,
+.verify-saved-fusions .verify-filter {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  width: 100%;
+}
+
+.verify-review-filters .verify-filter input {
   width: 90px;
-  height: 26px;
-  padding: 0 8px;
-  border: 1px solid var(--border-control-strong);
-  border-radius: 4px;
-  color: var(--text-primary);
-  background: var(--surface-sunken);
 }
 
 .samples-drop-notice {

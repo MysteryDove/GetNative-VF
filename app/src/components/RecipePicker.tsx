@@ -17,6 +17,7 @@ export function RecipePicker(props: {
   const { t, value, options, onChange, ariaLabel } = props;
   return (
     <select
+      className="control-select"
       aria-label={ariaLabel}
       value={value}
       onChange={(event) => {

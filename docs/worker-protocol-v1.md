@@ -76,9 +76,9 @@ actually used.
 Submits one analysis job. v1 implements `mode: "height"` on CPU and explicit
 CUDA/Vulkan backends (`backend: "cpu" | "cuda" | "vulkan" | "auto"`). `auto`
 prefers CUDA when the device is available and the requested metric is
-supported, then a compatible discrete-GPU Vulkan device for p=1, then CPU.
+supported, then a compatible discrete-GPU Vulkan device for p=1..4, then CPU.
 Integrated, virtual, and software Vulkan devices remain explicitly selectable
-but do not participate in Auto. Explicit Vulkan currently supports p=1. Other
+but do not participate in Auto. Explicit Vulkan supports p=1..4. Other
 modes/backends fail with `unsupported`.
 Inside a worker session, the capability envelope reports
 `analysis_command_available=true` for CPU always and for CUDA/Vulkan when a
@@ -148,9 +148,9 @@ Field rules:
   `destination_size`, `active_length`, and `shift` to all selected backends.
 - `metric.p_norm`: CPU accepts every positive integer in `1..4294967295`.
   CUDA accepts `1..4`; `auto` uses CUDA for `1..4` when a compatible device is
-  available. For p=1, failed or unavailable CUDA initialization continues to
-  an Auto-eligible discrete Vulkan device before CPU. For p=2..4, unavailable
-  CUDA falls back to CPU; p>4 always uses CPU. Explicit Vulkan accepts p=1
+  available. Failed or unavailable CUDA initialization continues to an
+  Auto-eligible discrete Vulkan device for p=1..4 before CPU. p>4 always uses
+  CPU. Explicit Vulkan accepts p=1..4
   only. An invalid explicit accelerator/norm combination fails at submission
   with `unsupported` and is never silently rewritten.
 - `worker_count`: an explicit positive value wins, bounded by hardware and
@@ -448,7 +448,7 @@ tries another compute backend.
 The command selects compute first. Explicit `cuda` and `vulkan` must initialize
 that compute backend or fail with `unsupported`; decoder capability never
 silently changes an explicitly requested compute backend. `auto` tries CUDA,
-then an eligible discrete Vulkan device for p=1, then CPU, emitting
+then an eligible discrete Vulkan device for p=1..4, then CPU, emitting
 `compute_backend_fallback` entries as initialization attempts fail.
 
 CUDA attempts FFmpeg's generic CUDA hardware configuration on the analysis
@@ -460,7 +460,7 @@ timeline semaphore, converts its luma image to the resident F32 storage
 buffer, and updates the frame synchronization state before release. Vulkan
 Video is considered usable only with Vulkan 1.3, a video decode queue,
 timeline semaphores, and the matching codec decode extension. Vulkan compute
-remains limited to p=1.
+supports p=1..4.
 
 Unsupported or failed hardware decode emits one `warning` with
 `code=hardware_decode_fallback` and `from`, `to`, `reason`, and `frame_seq`,

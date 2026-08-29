@@ -130,7 +130,7 @@ if(GETNATIVE_ENABLE_MEDIA)
                 "${GETNATIVE_FFMPEG_${GETNATIVE_FFMPEG_COMPONENT_UPPER}_LIBRARY}")
         endforeach()
         add_library(getnative_ffmpeg INTERFACE)
-        target_include_directories(getnative_ffmpeg INTERFACE
+        target_include_directories(getnative_ffmpeg SYSTEM INTERFACE
             "${GETNATIVE_FFMPEG_INCLUDE_DIR}")
         target_link_libraries(getnative_ffmpeg INTERFACE
             ${GETNATIVE_FFMPEG_LIBRARIES})
@@ -320,11 +320,10 @@ set(GETNATIVE_CORE_SOURCES
     src/planner/plan_store.cpp
 )
 if(NOT GETNATIVE_PLANNER_FP_MODE STREQUAL "strict")
-    # Keep the target strict and relax only the translation units that construct
-    # AxisPlan data. Source-specific options follow the target-wide strict flag.
+    # Keep the target strict and relax only AxisPlan geometry/LDLT construction.
+    # filter.cpp stays strict so blur NaN/Inf checks are not folded away.
     set_property(SOURCE
         src/planner/axis_plan.cpp
-        src/planner/filter.cpp
         APPEND PROPERTY COMPILE_OPTIONS ${GETNATIVE_PLANNER_FP_OPTIONS}
     )
 endif()
@@ -743,6 +742,7 @@ if(GETNATIVE_ENABLE_METAL)
     find_library(GETNATIVE_FOUNDATION_FRAMEWORK Foundation REQUIRED)
     find_library(GETNATIVE_COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
     find_library(GETNATIVE_IMAGEIO_FRAMEWORK ImageIO REQUIRED)
+    find_library(GETNATIVE_METAL_COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
 
     set(GETNATIVE_METAL_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/metal")
     set(GETNATIVE_METAL_AIR "${GETNATIVE_METAL_GENERATED_DIR}/getnative.air")
@@ -753,7 +753,7 @@ if(GETNATIVE_ENABLE_METAL)
         OUTPUT "${GETNATIVE_METAL_AIR}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${GETNATIVE_METAL_GENERATED_DIR}"
         COMMAND "${GETNATIVE_XCRUN}" -sdk macosx metal
-                -Werror -fno-fast-math -ffp-contract=off
+                -Werror -Wno-c++17-extensions -fno-fast-math -ffp-contract=off
                 -c "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal/getnative.metal"
                 -o "${GETNATIVE_METAL_AIR}"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal/getnative.metal"
@@ -786,7 +786,8 @@ if(GETNATIVE_ENABLE_METAL)
     target_include_directories(getnative_metal PUBLIC include PRIVATE "${GETNATIVE_METAL_GENERATED_DIR}")
     target_compile_options(getnative_metal PRIVATE -fobjc-arc)
     target_link_libraries(getnative_metal PUBLIC getnative_core
-        PRIVATE "${GETNATIVE_METAL_FRAMEWORK}" "${GETNATIVE_FOUNDATION_FRAMEWORK}")
+        PRIVATE "${GETNATIVE_METAL_FRAMEWORK}" "${GETNATIVE_FOUNDATION_FRAMEWORK}"
+                "${GETNATIVE_METAL_COREVIDEO_FRAMEWORK}")
 endif()
 
 if(GETNATIVE_ENABLE_MEDIA)
@@ -816,6 +817,18 @@ if(GETNATIVE_ENABLE_MEDIA)
     if(GETNATIVE_ENABLE_VULKAN)
         target_link_libraries(getnative_media PRIVATE Vulkan::Vulkan)
         target_compile_definitions(getnative_media PRIVATE GETNATIVE_HAS_VULKAN=1)
+    endif()
+    if(APPLE)
+        find_library(GETNATIVE_VIDEOTOOLBOX_FRAMEWORK VideoToolbox REQUIRED)
+        find_library(GETNATIVE_COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
+        find_library(GETNATIVE_COREMEDIA_FRAMEWORK CoreMedia REQUIRED)
+        find_library(GETNATIVE_IOSURFACE_FRAMEWORK IOSurface REQUIRED)
+        target_link_libraries(getnative_media PRIVATE
+            "${GETNATIVE_VIDEOTOOLBOX_FRAMEWORK}"
+            "${GETNATIVE_COREVIDEO_FRAMEWORK}"
+            "${GETNATIVE_COREMEDIA_FRAMEWORK}"
+            "${GETNATIVE_IOSURFACE_FRAMEWORK}")
+        target_compile_definitions(getnative_media PRIVATE GETNATIVE_HAS_VIDEOTOOLBOX=1)
     endif()
 endif()
 
@@ -851,7 +864,9 @@ add_executable(getnative-engine
     src/cli/json.cpp
     src/cli/main.cpp
     src/cli/worker.cpp)
-target_link_libraries(getnative-engine PRIVATE getnative_core)
+if(NOT GETNATIVE_ENABLE_METAL)
+    target_link_libraries(getnative-engine PRIVATE getnative_core)
+endif()
 if(GETNATIVE_ENABLE_MEDIA)
     target_link_libraries(getnative-engine PRIVATE getnative_media)
     target_compile_definitions(getnative-engine PRIVATE GETNATIVE_HAS_MEDIA=1)
@@ -873,6 +888,13 @@ if(GETNATIVE_ENABLE_MEDIA AND UNIX AND NOT APPLE)
         BUILD_RPATH "$ORIGIN"
         INSTALL_RPATH "$ORIGIN"
         BUILD_WITH_INSTALL_RPATH TRUE)
+endif()
+if(GETNATIVE_ENABLE_MEDIA AND APPLE AND GETNATIVE_FFMPEG_ROOT)
+    # Build-tree tests resolve the SDK via BUILD_RPATH / absolute dylib IDs.
+    # The install image uses @loader_path; staging rewrites the copied dylibs.
+    set_property(TARGET getnative-engine APPEND PROPERTY
+        BUILD_RPATH "${GETNATIVE_FFMPEG_ROOT}/lib")
+    set_property(TARGET getnative-engine PROPERTY INSTALL_RPATH "@loader_path")
 endif()
 target_compile_features(getnative-engine PRIVATE cxx_std_23)
 getnative_enable_warnings(getnative-engine)
@@ -944,6 +966,12 @@ if(BUILD_TESTING)
     target_compile_features(getnative_json_tests PRIVATE cxx_std_23)
     getnative_enable_warnings(getnative_json_tests)
     add_test(NAME getnative_json_tests COMMAND getnative_json_tests)
+
+    add_executable(getnative_verify_resume_tests tests/verify_resume_test.cpp)
+    target_include_directories(getnative_verify_resume_tests PRIVATE src/cli include)
+    target_compile_features(getnative_verify_resume_tests PRIVATE cxx_std_23)
+    getnative_enable_warnings(getnative_verify_resume_tests)
+    add_test(NAME getnative_verify_resume_tests COMMAND getnative_verify_resume_tests)
 
     add_executable(getnative_utf8_path_tests tests/utf8_path_test.cpp)
     target_link_libraries(getnative_utf8_path_tests PRIVATE getnative_core)
@@ -1083,7 +1111,8 @@ if(BUILD_TESTING)
 
     if(GETNATIVE_ENABLE_METAL)
         add_executable(getnative_metal_tests tests/metal_conformance_test.cpp)
-        target_link_libraries(getnative_metal_tests PRIVATE getnative_metal)
+        target_link_libraries(getnative_metal_tests PRIVATE getnative_metal
+            "${GETNATIVE_METAL_COREVIDEO_FRAMEWORK}")
         target_compile_features(getnative_metal_tests PRIVATE cxx_std_23)
         getnative_enable_warnings(getnative_metal_tests)
         getnative_enable_strict_fp(getnative_metal_tests)

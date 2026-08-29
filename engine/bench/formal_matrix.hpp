@@ -27,7 +27,7 @@
 
 namespace getnative::benchmark::formal {
 
-inline constexpr std::size_t matrix_case_count = 112U;
+inline constexpr std::size_t matrix_case_count = 128U;
 inline constexpr std::string_view primary_case_id = "bicubic-catrom@810";
 inline constexpr std::string_view candidate_contract_id =
     "metal-kernel-matrix-vertical-mirror-v1";
@@ -345,18 +345,22 @@ struct Matrix {
 
 [[nodiscard]] inline Filter parse_filter(const JsonValue::Object &object) {
     const std::string type = as_string(member(object, "type"), "filter.type");
-    if (type == "bilinear") return Filter::bilinear();
+    const auto blur_member = object.find("blur");
+    const double blur = blur_member == object.end()
+        ? 1.0
+        : as_number(blur_member->second, "filter.blur");
+    if (type == "bilinear") return Filter::bilinear(blur);
     if (type == "bicubic") {
         return Filter::bicubic(
             as_number(member(object, "b"), "filter.b"),
-            as_number(member(object, "c"), "filter.c"));
+            as_number(member(object, "c"), "filter.c"), blur);
     }
-    if (type == "spline16") return Filter::spline16();
-    if (type == "spline36") return Filter::spline36();
-    if (type == "spline64") return Filter::spline64();
+    if (type == "spline16") return Filter::spline16(blur);
+    if (type == "spline36") return Filter::spline36(blur);
+    if (type == "spline64") return Filter::spline64(blur);
     if (type == "lanczos") {
         return Filter::lanczos(
-            as_i32(member(object, "taps"), "filter.taps"));
+            as_i32(member(object, "taps"), "filter.taps"), blur);
     }
     throw std::invalid_argument("unknown matrix filter type: " + type);
 }
@@ -523,7 +527,8 @@ struct Case {
 [[nodiscard]] inline bool same_filter(
     const Filter &left, const Filter &right) noexcept {
     return left.type == right.type && left.b == right.b
-        && left.c == right.c && left.taps == right.taps;
+        && left.c == right.c && left.taps == right.taps
+        && left.blur == right.blur;
 }
 
 [[nodiscard]] inline bool is_formal_matrix(
@@ -538,6 +543,8 @@ struct Case {
         {"spline16", Filter::spline16()},
         {"spline36", Filter::spline36()},
         {"spline64", Filter::spline64()},
+        {"spline64-blur125", Filter::spline64(1.25)},
+        {"spline64-blur150", Filter::spline64(1.5)},
         {"lanczos1", Filter::lanczos(1)},
         {"lanczos2", Filter::lanczos(2)},
         {"lanczos3", Filter::lanczos(3)},

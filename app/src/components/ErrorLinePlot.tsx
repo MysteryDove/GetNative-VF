@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { useElementSize } from "../hooks/useElementSize";
 
 export type ErrorPlotDatum = {
@@ -73,9 +73,10 @@ function formatTick(value: number, step: number): string {
 /**
  * Min-max bucket decimation: for dense series, keep per bucket the lowest and
  * highest points (in x order). Preserves the deep valleys that carry the
- * descale answer, unlike naive every-Nth sampling.
+ * descale answer, unlike naive every-Nth sampling. Applied to the visible
+ * window only (see windowSlice), so zooming in re-decimates at full detail.
  */
-function decimateMinMax<T>(points: T[], value: (point: T) => number, maxBuckets: number): T[] {
+export function decimateMinMax<T>(points: T[], value: (point: T) => number, maxBuckets: number): T[] {
   if (points.length <= maxBuckets * 2 || maxBuckets < 1) return points;
   const bucketSize = points.length / maxBuckets;
   const out: T[] = [];
@@ -96,7 +97,22 @@ function decimateMinMax<T>(points: T[], value: (point: T) => number, maxBuckets:
 }
 
 /** Marker budget per series; beyond it markers would drown the SVG DOM. */
-const MAX_MARKERS = 300;
+export const MAX_MARKERS = 300;
+
+/**
+ * Slice an x-sorted series to the visible window, keeping the first point
+ * just outside each edge so polyline segments still span the window boundary
+ * instead of stopping at the first in-range sample. Decimation and the
+ * marker budget both operate on this slice, which is what keeps zoomed views
+ * at full resolution: unzoomed, the slice is the whole series.
+ */
+export function windowSlice<T>(points: T[], x: (point: T) => number, xMin: number, xMax: number): T[] {
+  let lo = 0;
+  while (lo < points.length && x(points[lo]) < xMin) lo += 1;
+  let hi = points.length;
+  while (hi > lo && x(points[hi - 1]) > xMax) hi -= 1;
+  return points.slice(Math.max(0, lo - 1), Math.min(points.length, hi + 1));
+}
 
 /**
  * X values arrive as strings from heterogeneous sources (grid draft, engine
@@ -116,6 +132,9 @@ function samePlotX(a: string | null | undefined, b: string): boolean {
  * numeric X, Relative error on (log) Y, dashed 1e-6 perfect-descale guide.
  * Drag across the plot to zoom into an X range (reported via
  * onZoomRangeChange); double-click or the reset button zooms back out.
+ * Polyline decimation and the marker budget are scoped to the visible
+ * window, so a zoomed view shows every sample instead of a globally
+ * thinned subset.
  */
 export function ErrorLinePlot({
   data,
@@ -212,12 +231,57 @@ export function ErrorLinePlot({
   const innerWidth = Math.max(0, width - margin.left - margin.right);
   const innerHeight = Math.max(0, height - margin.top - margin.bottom);
 
+  const clipId = useId().replace(/:/g, "");
+  const yValue = (metric: number) =>
+    logScale ? Math.log10(metric + 1e-9) : metric;
+
+  /*
+   * Per-series geometry, memoized so drag-to-zoom pointermove re-renders and
+   * marker selection changes don't rebuild paths. Both the polyline
+   * decimation and the marker stride are scoped to the visible X window:
+   * unzoomed this matches the old whole-series behavior, zoomed it reveals
+   * full detail instead of reusing globally thinned points.
+   */
+  const seriesGeometry = useMemo(() => {
+    if (!domain || innerWidth <= 0 || innerHeight <= 0) return [];
+    const xS = (value: number) =>
+      margin.left + ((value - domain.xMin) / (domain.xMax - domain.xMin)) * innerWidth;
+    const yS = (value: number) =>
+      margin.top + (1 - (value - domain.yMin) / (domain.yMax - domain.yMin)) * innerHeight;
+    return series.map(({ runId, points }) => {
+      const visible = windowSlice(points, (point) => Number(point.x), domain.xMin, domain.xMax);
+      const pathPoints = decimateMinMax(
+        visible,
+        (point) => yValue(point.metric),
+        Math.max(64, Math.floor(innerWidth)),
+      );
+      const path = pathPoints
+        .map(
+          (point, index) =>
+            `${index === 0 ? "M" : "L"}${xS(Number(point.x)).toFixed(2)},${yS(yValue(point.metric)).toFixed(2)}`,
+        )
+        .join(" ");
+      const markerStride = Math.max(1, Math.ceil(visible.length / MAX_MARKERS));
+      const markers = visible.map((point) => ({
+        point,
+        cx: xS(Number(point.x)),
+        cy: yS(yValue(point.metric)),
+      }));
+      return {
+        runId,
+        color: points[0]?.color ?? DEFAULT_SERIES_COLOR,
+        lineWidth: points[0]?.lineWidth ?? 1.6,
+        path,
+        markerStride,
+        markers,
+      };
+    });
+  }, [series, domain, innerWidth, innerHeight, logScale]);
+
   if (!domain) return <div ref={hostRef} className="error-plot" />;
 
   const xScale = (value: number) =>
     margin.left + ((value - domain.xMin) / (domain.xMax - domain.xMin)) * innerWidth;
-  const yValue = (metric: number) =>
-    logScale ? Math.log10(metric + 1e-9) : metric;
   const yScale = (value: number) =>
     margin.top + (1 - (value - domain.yMin) / (domain.yMax - domain.yMin)) * innerHeight;
 
@@ -319,6 +383,13 @@ export function ErrorLinePlot({
             strokeWidth={1}
           />
 
+          {/* Series geometry is clipped to the plot frame: the visible-window
+              slice keeps one point outside each edge, and those (plus zoomed
+              line segments) must not paint over the axes. */}
+          <clipPath id={clipId}>
+            <rect x={margin.left} y={margin.top} width={innerWidth} height={innerHeight} />
+          </clipPath>
+
           {/* Drag-to-zoom surface: sits under the markers so marker clicks
               still work; a horizontal drag zooms the X range. */}
           <rect
@@ -393,47 +464,32 @@ export function ErrorLinePlot({
             />
           ) : null}
 
-          {series.map(({ runId, points }) => {
-            const color = points[0]?.color ?? DEFAULT_SERIES_COLOR;
-            const pathPoints = decimateMinMax(
-              points,
-              (point) => yValue(point.metric),
-              Math.max(64, Math.floor(innerWidth)),
-            );
-            const path = pathPoints
-              .map(
-                (point, index) =>
-                  `${index === 0 ? "M" : "L"}${xScale(Number(point.x)).toFixed(2)},${yScale(yValue(point.metric)).toFixed(2)}`,
-              )
-              .join(" ");
-            const markerStride = Math.max(1, Math.ceil(points.length / MAX_MARKERS));
-            return (
-              <g key={runId}>
-                <path d={path} fill="none" stroke={color} strokeWidth={points[0]?.lineWidth ?? 1.6} />
-                {points.map((point, index) => {
-                  const isBest = bestKey === point.key;
-                  const isSelected = samePlotX(selectedX, point.x);
-                  const isValley = !isBest && !isSelected && (valleyKeys?.has(point.key) ?? false);
-                  if (index % markerStride !== 0 && !isBest && !isSelected && !isValley) return null;
-                  return (
-                    <circle
-                      key={point.key}
-                      cx={xScale(Number(point.x))}
-                      cy={yScale(yValue(point.metric))}
-                      r={isBest || isSelected ? 4.5 : isValley ? 5 : 3}
-                      fill={isValley ? "none" : color}
-                      stroke={isSelected || isBest ? undefined : isValley ? color : "none"}
-                      strokeWidth={isBest || isSelected || isValley ? 1.6 : 0}
-                      className={`error-plot-marker${isSelected ? " is-selected" : isBest ? " is-best" : ""}`}
-                      onClick={() => onSelect?.(point.x)}
-                    >
-                      <title>{`${point.label ? `${point.label} · ` : ""}${point.x}: ${point.metric.toExponential(3)}`}</title>
-                    </circle>
-                  );
-                })}
-              </g>
-            );
-          })}
+          {seriesGeometry.map(({ runId, color, lineWidth, path, markerStride, markers }) => (
+            <g key={runId} clipPath={`url(#${clipId})`}>
+              <path d={path} fill="none" stroke={color} strokeWidth={lineWidth} />
+              {markers.map(({ point, cx, cy }, index) => {
+                const isBest = bestKey === point.key;
+                const isSelected = samePlotX(selectedX, point.x);
+                const isValley = !isBest && !isSelected && (valleyKeys?.has(point.key) ?? false);
+                if (index % markerStride !== 0 && !isBest && !isSelected && !isValley) return null;
+                return (
+                  <circle
+                    key={point.key}
+                    cx={cx}
+                    cy={cy}
+                    r={isBest || isSelected ? 4.5 : isValley ? 5 : 3}
+                    fill={isValley ? "none" : color}
+                    stroke={isSelected || isBest ? undefined : isValley ? color : "none"}
+                    strokeWidth={isBest || isSelected || isValley ? 1.6 : 0}
+                    className={`error-plot-marker${isSelected ? " is-selected" : isBest ? " is-best" : ""}`}
+                    onClick={() => onSelect?.(point.x)}
+                  >
+                    <title>{`${point.label ? `${point.label} · ` : ""}${point.x}: ${point.metric.toExponential(3)}`}</title>
+                  </circle>
+                );
+              })}
+            </g>
+          ))}
 
           <text
             className="error-plot-axis-label"

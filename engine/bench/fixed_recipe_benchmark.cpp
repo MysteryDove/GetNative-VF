@@ -56,6 +56,7 @@ struct Configuration {
     std::int32_t height = 1080;
     std::int32_t native_height = 810;
     std::string kernel = "bicubic-catrom";
+    double blur = 1.0;
     bool assert_gates = false;
     bool profile_split_kernels = false;
     std::optional<ProfileArm> profile_arm;
@@ -242,6 +243,8 @@ struct CaseSummary {
             result.native_height = parse_i32(argv[++index]);
         } else if (argument == "--kernel" && index + 1 < argc) {
             result.kernel = argv[++index];
+        } else if (argument == "--blur" && index + 1 < argc) {
+            result.blur = std::stod(argv[++index]);
         } else if (argument == "--profile-arm" && index + 1 < argc) {
             result.profile_arm = parse_profile_arm(argv[++index]);
         } else if (argument == "--profile-split-kernels") {
@@ -256,13 +259,16 @@ struct CaseSummary {
                 "[--frames 1,2,10,100,1000] [--samples N] [--frame-workers N] "
                 "[--ring-size N] [--tile-size N] [--reduction-groups N] "
                 "[--inverse-threads N] [--width N] [--height N] "
-                "[--native-height N] [--kernel NAME] [--json-out PATH] [--assert] "
+                "[--native-height N] [--kernel NAME] [--blur SCALE] [--json-out PATH] [--assert] "
                 "[--profile-arm cpu-serial|cpu-frame|metal] "
                 "[--profile-split-kernels]");
         }
     }
     if (result.native_height >= result.height) {
         throw std::invalid_argument("native height must be smaller than source height");
+    }
+    if (!(result.blur > 0.0) || !std::isfinite(result.blur)) {
+        throw std::invalid_argument("blur must be finite and greater than zero");
     }
     if (result.profile_arm && result.frame_counts.size() != 1U) {
         throw std::invalid_argument("profile mode requires exactly one frame count");
@@ -691,6 +697,7 @@ void run_profile_mode(
               << "profile_mode=true\n"
               << "profile_arm=" << profile_arm_name(arm) << '\n'
               << "kernel=" << config.kernel << '\n'
+              << "blur=" << config.blur << '\n'
               << "frames=" << frame_count << '\n'
               << "samples=" << config.samples << '\n'
               << "effective_workers=" << effective_workers << '\n'
@@ -931,6 +938,7 @@ void append_case_json(std::ostream &output, const CaseSummary &summary) {
            << ",\"height\":" << config.height
            << ",\"native_height\":" << config.native_height
            << ",\"kernel\":" << getnative::benchmark::json_string(config.kernel)
+           << ",\"blur\":" << config.blur
            << ",\"axes\":\"vertical\",\"candidate_count\":1"
            << ",\"predecoded_ring_size\":" << config.ring_size
            << ",\"logical_frame_counts\":[";
@@ -994,7 +1002,9 @@ int main(int argc, char **argv) {
             1U, std::thread::hardware_concurrency());
         const std::size_t worker_limit = config.frame_workers == 0U
             ? detected_workers : config.frame_workers;
-        const Fixture fixture = make_fixture(config, benchmark_filter(config.kernel));
+        auto filter = benchmark_filter(config.kernel);
+        filter.blur = config.blur;
+        const Fixture fixture = make_fixture(config, filter);
         const getnative::MetricSpec metric{5, 5, 5, 5, 0.015F, 1U};
         if (config.profile_arm) {
             run_profile_mode(config, fixture, metric, worker_limit);
@@ -1020,6 +1030,7 @@ int main(int argc, char **argv) {
             if (frame_count >= 100U) all_gates_pass = all_gates_pass && summary.noise_pass;
             std::cout << std::fixed << std::setprecision(3)
                       << "kernel=" << config.kernel
+                      << " blur=" << config.blur
                       << " frames=" << frame_count
                       << " cpu_serial_ms=" << summary.cpu_serial_wall_ms.median
                       << " cpu_parallel_ms=" << summary.cpu_parallel_wall_ms.median

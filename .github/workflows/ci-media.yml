@@ -2,8 +2,26 @@ name: CI Media
 
 on:
   pull_request:
+    paths:
+      - 'engine/CMakeLists.txt'
+      - 'engine/include/getnative/**'
+      - 'engine/src/backend/**'
+      - 'engine/src/cli/**'
+      - 'engine/src/geometry/**'
+      - 'engine/src/media/**'
+      - 'engine/src/planner/**'
+      - 'engine/tests/**'
+      - 'app/src/engine/**'
+      - 'app/src/media/**'
+      - 'app/src-tauri/**'
+      - 'app/scripts/build-engine.mjs'
+      - 'app/package.json'
+      - 'app/pnpm-lock.yaml'
+      - 'scripts/build-ffmpeg-*.sh'
+      - '.github/workflows/ci-media.yml'
   push:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ci-media-${{ github.ref }}
@@ -20,20 +38,22 @@ jobs:
     name: Linux x64 media integration
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install build and test dependencies
         run: >-
           sudo apt-get update && sudo apt-get install -y --no-install-recommends
           build-essential ninja-build nasm patchelf pkg-config zlib1g-dev ffmpeg
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.20.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: app/pnpm-lock.yaml
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         id: ffmpeg-cache
         with:
           path: .deps/ffmpeg-linux-x64
@@ -66,25 +86,27 @@ jobs:
     name: Windows x64 media integration
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: MSYS
           update: true
           path-type: inherit
           install: diffutils make nasm pkgconf
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.20.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: app/pnpm-lock.yaml
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         id: ffmpeg-cache
         with:
           path: .deps/ffmpeg-windows-x64

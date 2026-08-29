@@ -30,7 +30,7 @@ function supportsTask(
 export function selectableBackends(capabilities: EngineEnvelope | null): BackendPreference[] {
   const backends = capabilities?.payload.backends ?? [];
   const options: BackendPreference[] = ["auto"];
-  for (const id of ["cpu", "cuda", "vulkan"] as const) {
+  for (const id of ["cpu", "cuda", "vulkan", "metal"] as const) {
     const backend = backends.find((item) => item.id === id);
     if (backend?.compiled && backend.device_available && backend.analysis_command_available) {
       options.push(id);
@@ -43,12 +43,23 @@ export function verifySelectableBackends(
   capabilities: EngineEnvelope | null,
 ): BackendPreference[] {
   // The legacy frame-asset verify is CPU-only. Engine-side media verify
-  // (verify_engine_decode) supports explicit CUDA/Vulkan — the engine
-  // validates p_norm constraints and runs its own auto fallback chain.
+  // supports explicit accelerators; Metal additionally requires the
+  // VideoToolbox-to-Metal zero-copy path reported by the engine.
   if (capabilities?.payload.features?.verify_engine_decode !== true) {
     return ["auto", "cpu"];
   }
-  return selectableBackends(capabilities);
+  const metal = capabilities?.payload.decode_backends?.find((item) => item.id === "videotoolbox");
+  const metalReady = metal?.compiled === true
+    && metal.runtime_device === true
+    && metal.zero_copy === true;
+  return selectableBackends(capabilities).filter((backend) => backend !== "metal" || metalReady);
+}
+
+function metalVerifyReady(capabilities: EngineEnvelope | null): boolean {
+  const metal = capabilities?.payload.decode_backends?.find((item) => item.id === "videotoolbox");
+  return metal?.compiled === true
+    && metal.runtime_device === true
+    && metal.zero_copy === true;
 }
 
 export function resolveBackendPreference(
@@ -56,6 +67,7 @@ export function resolveBackendPreference(
   backend: BackendPreference,
   pNorm = 1,
   axisMode?: AxisMode,
+  options?: { verify?: boolean },
 ): Exclude<BackendPreference, "auto"> {
   if (backend !== "auto") return backend;
   const backends = capabilities?.payload.backends ?? [];
@@ -66,14 +78,31 @@ export function resolveBackendPreference(
 
   const vulkan = backends.find((item) => item.id === "vulkan");
   if (
-    pNorm === 1 &&
+    pNorm >= 1 && pNorm <= 4 &&
     vulkan?.auto_priority === 20 &&
     vulkan.device_type === "discrete_gpu" &&
     supportsTask(vulkan, pNorm, axisMode)
   ) {
     return "vulkan";
   }
+
+  const metal = backends.find((item) => item.id === "metal");
+  if (
+    metal?.auto_priority === 30 &&
+    pNorm >= 1 && pNorm <= 4 &&
+    supportsTask(metal, pNorm, axisMode)
+    && (!options?.verify || metalVerifyReady(capabilities))
+  ) {
+    return "metal";
+  }
   return "cpu";
+}
+
+export function reconcileBackendPreference(
+  preference: BackendPreference,
+  allowed: BackendPreference[],
+): BackendPreference {
+  return allowed.includes(preference) ? preference : "auto";
 }
 
 export function validateBackendPNorm(
@@ -86,15 +115,13 @@ export function validateBackendPNorm(
     return { ok: false, reason: "p_norm_invalid" };
   }
   const resolved = resolveBackendPreference(capabilities, backend, pNorm, axisMode);
-  if (resolved !== "cpu" && resolved !== "cuda" && resolved !== "vulkan") {
+  if (resolved !== "cpu" && resolved !== "cuda" && resolved !== "vulkan" && resolved !== "metal") {
     return { ok: false, reason: "backend_unsupported" };
   }
   const reported = capabilities?.payload.backends.find((item) => item.id === resolved);
   const range = reported?.p_norms ?? (resolved === "cpu"
     ? { minimum: 1, maximum: 4_294_967_295 }
-    : resolved === "vulkan"
-      ? { minimum: 1, maximum: 1 }
-      : { minimum: 1, maximum: 4 });
+    : { minimum: 1, maximum: 4 });
   return pNorm >= range.minimum && pNorm <= range.maximum
     ? { ok: true }
     : { ok: false, reason: "backend_p_norm_unsupported" };
@@ -103,7 +130,7 @@ export function validateBackendPNorm(
 /**
  * pNorm upper bound for the resolved backend: the engine-reported maximum when
  * known, else the same fallback table validateBackendPNorm uses
- * (cuda → 4, vulkan → 1, cpu/auto/unknown → 4_294_967_295).
+ * (cuda/vulkan/metal → 4, cpu/auto/unknown → 4_294_967_295).
  */
 export function pNormMaximumForBackend(
   capabilities: EngineEnvelope | null,
@@ -112,7 +139,9 @@ export function pNormMaximumForBackend(
   return (
     capabilities?.payload.backends.find((backend) => backend.id === resolvedBackend)
       ?.p_norms?.maximum ??
-    (resolvedBackend === "cuda" ? 4 : resolvedBackend === "vulkan" ? 1 : 4_294_967_295)
+    (resolvedBackend === "cuda"
+      ? 4
+      : resolvedBackend === "vulkan" || resolvedBackend === "metal" ? 4 : 4_294_967_295)
   );
 }
 
@@ -123,11 +152,18 @@ export function backendOptionLabel(
   pNorm = 1,
   axisMode?: AxisMode,
   legacyVerify = false,
+  forVerify = false,
 ): string {
   if (backend !== "auto") return t(`backend.${backend}` as "backend.cpu");
   if (legacyVerify) return t("analyze.backend.autoResolved", { backend: t("backend.cpu") });
   if (!capabilities) return t("analyze.backend.autoDetecting");
-  const resolved = resolveBackendPreference(capabilities, backend, pNorm, axisMode);
+  const resolved = resolveBackendPreference(
+    capabilities,
+    backend,
+    pNorm,
+    axisMode,
+    { verify: forVerify },
+  );
   const resolvedName = t(`backend.${resolved}` as "backend.cpu");
   const device = capabilities.payload.backends.find((item) => item.id === resolved)?.device;
   return device && resolved !== "cpu"

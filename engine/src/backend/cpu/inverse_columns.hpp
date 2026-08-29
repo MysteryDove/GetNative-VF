@@ -69,6 +69,26 @@ inline void inverse_columns_f32(
         0, column_count, policy);
 }
 
+// Row-wise counterpart of inverse_columns_f32 for contiguous (stride-1
+// element) rows: solves `row_count` independent per-row banded inverses.
+// Rows are independent, so SIMD lanes batch four rows through the identical
+// per-row FMA sequence — results stay bit-identical to the scalar loop.
+// Non-NEON targets run the per-row scalar loop directly.
+void inverse_rows_f32(
+    const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
+    float *output, std::ptrdiff_t output_row_stride, std::int32_t row_count,
+    ColumnDispatchPolicy policy = ColumnDispatchPolicy::automatic);
+
+void forward_columns_f32(
+    const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
+    float *output, std::ptrdiff_t output_row_stride, std::int32_t column_count,
+    ColumnDispatchPolicy policy = ColumnDispatchPolicy::automatic);
+
+void forward_rows_f32(
+    const AxisPlan &plan, const float *input, std::ptrdiff_t input_row_stride,
+    float *output, std::ptrdiff_t output_row_stride, std::int32_t row_count,
+    ColumnDispatchPolicy policy = ColumnDispatchPolicy::automatic);
+
 [[nodiscard]] double analyze_axis_candidate_with_column_policy_f32(
     ConstImageView source, const AxisPlan &axis, AnalysisAxes axis_direction,
     const MetricSpec &metric, CpuWorkspace &workspace, ColumnDispatchPolicy policy);

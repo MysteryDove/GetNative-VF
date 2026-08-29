@@ -37,13 +37,70 @@ struct AnalysisJob {
     uint groups_per_candidate;
     uint candidate_count;
     uint maximum_vector_count;
+    uint norm;
+    uint transposed_source;
 };
 
-static inline uint image_index(uint direction, uint vector, uint axis_index, uint width) {
-    return direction == horizontal_axis ? vector * width + axis_index
-                                        : axis_index * width + vector;
+struct LumaNormalizeJob {
+    uint width;
+    uint height;
+    uint bit_depth;
+    uint full_range;
+};
+
+kernel void normalize_luma_r8(
+    texture2d<float, access::read> source [[texture(0)]],
+    device float *destination [[buffer(0)]],
+    constant LumaNormalizeJob &job [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= job.width || gid.y >= job.height) return;
+    float value = source.read(gid).r;
+    if (job.full_range == 0u) value = max(0.0f, (value * 255.0f - 16.0f) / 219.0f);
+    destination[gid.y * job.width + gid.x] = clamp(value, 0.0f, 1.0f);
 }
 
+kernel void normalize_luma_r16(
+    texture2d<float, access::read> source [[texture(0)]],
+    device float *destination [[buffer(0)]],
+    constant LumaNormalizeJob &job [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= job.width || gid.y >= job.height) return;
+    // VideoToolbox 10-bit bi-planar samples are left-aligned in a 16-bit
+    // plane (`code10 << 6`). R16Unorm has already divided by 65535, so recover
+    // the 10-bit code before full/limited expansion.
+    float stored = source.read(gid).r * 65535.0f;
+    float code10 = stored / 64.0f;
+    float value = code10 / 1023.0f;
+    if (job.full_range == 0u) value = max(0.0f, (code10 - 64.0f) / 876.0f);
+    destination[gid.y * job.width + gid.x] = clamp(value, 0.0f, 1.0f);
+}
+
+kernel void transpose_source(
+    device const float *source [[buffer(0)]],
+    device float *destination [[buffer(1)]],
+    constant uint2 &size [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= size.x || gid.y >= size.y) return;
+    destination[gid.x * size.y + gid.y] = source[gid.y * size.x + gid.x];
+}
+
+static inline uint image_index(uint direction, uint vector, uint axis_index,
+                               constant AnalysisJob &job) {
+    if (direction == horizontal_axis && job.transposed_source != 0u) {
+        return axis_index * job.height + vector;
+    }
+    return direction == horizontal_axis ? vector * job.width + axis_index
+                                        : axis_index * job.width + vector;
+}
+
+// fixed_half_bandwidth and bandwidth7_order are template constants so each
+// specialized kernel (b3/b7/b11/b15) gets a lag window sized exactly to its
+// bandwidth: substitution sweeps read back only the last fixed_half_bandwidth
+// outputs, and a register window of that size replaces the device-memory
+// reloads with zero excess shifting. Iteration order matches the memory-loop
+// version exactly, keeping results bit-identical. The generic kernel
+// instantiates <0, false> and keeps memory-loop substitution.
+template <uint fixed_half_bandwidth, bool bandwidth7_order>
 static inline void inverse_axis_impl(
     device const float *source,
     constant AnalysisJob &job,
@@ -54,8 +111,7 @@ static inline void inverse_axis_impl(
     device const float *lower_ld,
     device const float *upper_l,
     device const float *inverse_diagonal,
-    device float *workspace, uint gid,
-    uint fixed_half_bandwidth, bool bandwidth7_order) {
+    device float *workspace, uint gid) {
     const uint candidate = gid / job.maximum_vector_count;
     const uint vector = gid - candidate * job.maximum_vector_count;
     if (candidate >= job.candidate_count) {
@@ -70,6 +126,85 @@ static inline void inverse_axis_impl(
     const uint output_stride = horizontal ? 1u : plan.vector_count;
     device float *output = workspace + plan.workspace_base
         + (horizontal ? vector * plan.destination_size : vector);
+    const uint half_bandwidth = fixed_half_bandwidth == 0u
+        ? plan.half_bandwidth : fixed_half_bandwidth;
+
+    if constexpr (fixed_half_bandwidth != 0u) {
+        // Register lag window sized to the compile-time bandwidth.
+        float lag[fixed_half_bandwidth] = {};
+        for (uint i = 0; i < plan.destination_size; ++i) {
+            float sum = 0.0f;
+            const uint begin = plan.transpose_entries_base
+                + transpose_offsets[plan.transpose_offsets_base + i];
+            const uint end = plan.transpose_entries_base
+                + transpose_offsets[plan.transpose_offsets_base + i + 1];
+            for (uint p = begin; p < end; ++p) {
+                sum += transpose_weights[p]
+                    * source[image_index(plan.direction, vector,
+                                         transpose_indices[p], job)];
+            }
+            const uint available = min(fixed_half_bandwidth, i);
+            #pragma unroll
+            for (uint distance = fixed_half_bandwidth; distance >= 1; --distance) {
+                if (distance <= available) {
+                    sum -= lower_ld[plan.lower_ld_base
+                                    + (distance - 1) * plan.destination_size + i]
+                        * lag[distance - 1];
+                }
+            }
+            const float current = sum
+                * inverse_diagonal[plan.inverse_diagonal_base + i];
+            output[i * output_stride] = current;
+            #pragma unroll
+            for (uint k = fixed_half_bandwidth - 1; k >= 1; --k) lag[k] = lag[k - 1];
+            lag[0] = current;
+        }
+
+        if (plan.destination_size < 2) {
+            return;
+        }
+        // Reverse window seeded with the forward sweep's final outputs;
+        // entries past the end are never read (`available` guards them).
+        float rlag[fixed_half_bandwidth];
+        #pragma unroll
+        for (uint k = 0; k < fixed_half_bandwidth; ++k) {
+            const uint index = plan.destination_size - 1 + k;
+            rlag[k] = index < plan.destination_size
+                ? output[index * output_stride] : 0.0f;
+        }
+        for (uint i = plan.destination_size - 1; i-- > 0;) {
+            float sum = 0.0f;
+            const uint available = min(fixed_half_bandwidth, plan.destination_size - i - 1);
+            if (bandwidth7_order) {
+                // Descale's bandwidth-7 path accumulates backward near-to-far.
+                #pragma unroll
+                for (uint distance = 1; distance <= fixed_half_bandwidth; ++distance) {
+                    if (distance <= available) {
+                        sum += upper_l[plan.upper_l_base
+                                       + (distance - 1) * plan.destination_size + i]
+                            * rlag[distance - 1];
+                    }
+                }
+            } else {
+                // Bandwidth-3 and generic scalar paths accumulate far-to-near.
+                #pragma unroll
+                for (uint distance = fixed_half_bandwidth; distance >= 1; --distance) {
+                    if (distance <= available) {
+                        sum += upper_l[plan.upper_l_base
+                                       + (distance - 1) * plan.destination_size + i]
+                            * rlag[distance - 1];
+                    }
+                }
+            }
+            const float current = output[i * output_stride] - sum;
+            output[i * output_stride] = current;
+            #pragma unroll
+            for (uint k = fixed_half_bandwidth - 1; k >= 1; --k) rlag[k] = rlag[k - 1];
+            rlag[0] = current;
+        }
+        return;
+    }
+
     for (uint i = 0; i < plan.destination_size; ++i) {
         float sum = 0.0f;
         const uint begin = plan.transpose_entries_base
@@ -79,10 +214,8 @@ static inline void inverse_axis_impl(
         for (uint p = begin; p < end; ++p) {
             sum += transpose_weights[p]
                 * source[image_index(plan.direction, vector,
-                                     transpose_indices[p], job.width)];
+                                     transpose_indices[p], job)];
         }
-        const uint half_bandwidth = fixed_half_bandwidth == 0u
-            ? plan.half_bandwidth : fixed_half_bandwidth;
         const uint available = min(half_bandwidth, i);
         for (uint distance = available; distance >= 1; --distance) {
             sum -= lower_ld[plan.lower_ld_base
@@ -98,8 +231,6 @@ static inline void inverse_axis_impl(
     }
     for (uint i = plan.destination_size - 1; i-- > 0;) {
         float sum = 0.0f;
-        const uint half_bandwidth = fixed_half_bandwidth == 0u
-            ? plan.half_bandwidth : fixed_half_bandwidth;
         const uint available = min(half_bandwidth, plan.destination_size - i - 1);
         if (bandwidth7_order
             || (fixed_half_bandwidth == 0u && plan.half_bandwidth == 3u)) {
@@ -133,9 +264,9 @@ kernel void inverse_axis_b3(
     device const float *inverse_diagonal [[buffer(8)]],
     device float *workspace [[buffer(9)]],
     uint gid [[thread_position_in_grid]]) {
-    inverse_axis_impl(source, job, plans, transpose_offsets, transpose_indices,
+    inverse_axis_impl<1u, false>(source, job, plans, transpose_offsets, transpose_indices,
                       transpose_weights, lower_ld, upper_l, inverse_diagonal,
-                      workspace, gid, 1u, false);
+                      workspace, gid);
 }
 
 kernel void inverse_axis_b7(
@@ -150,9 +281,9 @@ kernel void inverse_axis_b7(
     device const float *inverse_diagonal [[buffer(8)]],
     device float *workspace [[buffer(9)]],
     uint gid [[thread_position_in_grid]]) {
-    inverse_axis_impl(source, job, plans, transpose_offsets, transpose_indices,
+    inverse_axis_impl<3u, true>(source, job, plans, transpose_offsets, transpose_indices,
                       transpose_weights, lower_ld, upper_l, inverse_diagonal,
-                      workspace, gid, 3u, true);
+                      workspace, gid);
 }
 
 #define DEFINE_IMAGE_INVERSE_FIXED(NAME, HALF) \
@@ -168,8 +299,8 @@ kernel void NAME( \
     device const float *inverse_diagonal [[buffer(8)]], \
     device float *workspace [[buffer(9)]], \
     uint gid [[thread_position_in_grid]]) { \
-    inverse_axis_impl(source, job, plans, transpose_offsets, transpose_indices, \
-        transpose_weights, lower_ld, upper_l, inverse_diagonal, workspace, gid, HALF, false); \
+    inverse_axis_impl<HALF, false>(source, job, plans, transpose_offsets, transpose_indices, \
+        transpose_weights, lower_ld, upper_l, inverse_diagonal, workspace, gid); \
 }
 
 DEFINE_IMAGE_INVERSE_FIXED(inverse_axis_b11, 5u)
@@ -187,11 +318,12 @@ kernel void inverse_axis_generic(
     device const float *inverse_diagonal [[buffer(8)]],
     device float *workspace [[buffer(9)]],
     uint gid [[thread_position_in_grid]]) {
-    inverse_axis_impl(source, job, plans, transpose_offsets, transpose_indices,
+    inverse_axis_impl<0u, false>(source, job, plans, transpose_offsets, transpose_indices,
                       transpose_weights, lower_ld, upper_l, inverse_diagonal,
-                      workspace, gid, 0u, false);
+                      workspace, gid);
 }
 
+template <uint fixed_half_bandwidth, bool bandwidth7_order>
 static inline void inverse_axis_matrix_impl(
     constant AnalysisJob &job,
     device const AxisPlanDescriptor *plans,
@@ -201,8 +333,7 @@ static inline void inverse_axis_matrix_impl(
     device const float *lower_ld,
     device const float *upper_l,
     device const float *inverse_diagonal,
-    device float *workspace, uint gid,
-    uint fixed_half_bandwidth, bool bandwidth7_order) {
+    device float *workspace, uint gid) {
     const uint candidate = gid / job.maximum_vector_count;
     const uint vector = gid - candidate * job.maximum_vector_count;
     if (candidate >= job.candidate_count) return;
@@ -214,6 +345,76 @@ static inline void inverse_axis_matrix_impl(
     const uint stride = plan.vector_count;
     const uint half_bandwidth = fixed_half_bandwidth == 0u
         ? plan.half_bandwidth : fixed_half_bandwidth;
+
+    if constexpr (fixed_half_bandwidth != 0u) {
+        // Register lag window, mirroring the image inverse path: identical
+        // iteration order, no output reloads from device memory.
+        float lag[fixed_half_bandwidth] = {};
+        for (uint i = 0; i < plan.destination_size; ++i) {
+            float sum = 0.0f;
+            const uint begin = plan.transpose_entries_base
+                + transpose_offsets[plan.transpose_offsets_base + i];
+            const uint end = plan.transpose_entries_base
+                + transpose_offsets[plan.transpose_offsets_base + i + 1];
+            for (uint p = begin; p < end; ++p) {
+                sum += transpose_weights[p]
+                    * input[transpose_indices[p] * stride + vector];
+            }
+            const uint available = min(fixed_half_bandwidth, i);
+            #pragma unroll
+            for (uint distance = fixed_half_bandwidth; distance >= 1; --distance) {
+                if (distance <= available) {
+                    sum -= lower_ld[plan.lower_ld_base
+                                    + (distance - 1) * plan.destination_size + i]
+                        * lag[distance - 1];
+                }
+            }
+            const float current = sum
+                * inverse_diagonal[plan.inverse_diagonal_base + i];
+            output[i * stride] = current;
+            #pragma unroll
+            for (uint k = fixed_half_bandwidth - 1; k >= 1; --k) lag[k] = lag[k - 1];
+            lag[0] = current;
+        }
+        if (plan.destination_size < 2) return;
+        float rlag[fixed_half_bandwidth];
+        #pragma unroll
+        for (uint k = 0; k < fixed_half_bandwidth; ++k) {
+            const uint index = plan.destination_size - 1 + k;
+            rlag[k] = index < plan.destination_size
+                ? output[index * stride] : 0.0f;
+        }
+        for (uint i = plan.destination_size - 1; i-- > 0;) {
+            float sum = 0.0f;
+            const uint available = min(fixed_half_bandwidth, plan.destination_size - i - 1);
+            if (bandwidth7_order) {
+                #pragma unroll
+                for (uint distance = 1; distance <= fixed_half_bandwidth; ++distance) {
+                    if (distance <= available) {
+                        sum += upper_l[plan.upper_l_base
+                                       + (distance - 1) * plan.destination_size + i]
+                            * rlag[distance - 1];
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (uint distance = fixed_half_bandwidth; distance >= 1; --distance) {
+                    if (distance <= available) {
+                        sum += upper_l[plan.upper_l_base
+                                       + (distance - 1) * plan.destination_size + i]
+                            * rlag[distance - 1];
+                    }
+                }
+            }
+            const float current = output[i * stride] - sum;
+            output[i * stride] = current;
+            #pragma unroll
+            for (uint k = fixed_half_bandwidth - 1; k >= 1; --k) rlag[k] = rlag[k - 1];
+            rlag[0] = current;
+        }
+        return;
+    }
+
     for (uint i = 0; i < plan.destination_size; ++i) {
         float sum = 0.0f;
         const uint begin = plan.transpose_entries_base
@@ -267,8 +468,8 @@ kernel void NAME( \
     device const float *inverse_diagonal [[buffer(7)]], \
     device float *workspace [[buffer(8)]], \
     uint gid [[thread_position_in_grid]]) { \
-    inverse_axis_matrix_impl(job, plans, transpose_offsets, transpose_indices, \
-        transpose_weights, lower_ld, upper_l, inverse_diagonal, workspace, gid, HALF, B7_ORDER); \
+    inverse_axis_matrix_impl<HALF, B7_ORDER>(job, plans, transpose_offsets, transpose_indices, \
+        transpose_weights, lower_ld, upper_l, inverse_diagonal, workspace, gid); \
 }
 
 DEFINE_MATRIX_INVERSE(inverse_axis_matrix_b3, 1u, false)
@@ -328,7 +529,7 @@ DEFINE_MATRIX_FORWARD(forward_axis_matrix_b11, 6u)
 DEFINE_MATRIX_FORWARD(forward_axis_matrix_b15, 8u)
 DEFINE_MATRIX_FORWARD(forward_axis_matrix_generic, 0u)
 
-static inline void metric_axis_p1_impl(
+static inline void metric_axis_impl(
     device const float *source,
     constant AnalysisJob &job,
     device const AxisPlanDescriptor *plans,
@@ -379,7 +580,14 @@ static inline void metric_axis_p1_impl(
         }
         const float difference = abs(source[y * job.width + x] - reconstructed);
         if (difference > job.threshold) {
-            sum += difference;
+            float moment = difference;
+            if (job.norm == 2u) moment = difference * difference;
+            if (job.norm == 3u) moment = difference * difference * difference;
+            if (job.norm == 4u) {
+                const float square = difference * difference;
+                moment = square * square;
+            }
+            sum += moment;
         }
 
         const uint next_x = x_offset + stride_x;
@@ -401,7 +609,7 @@ static inline void metric_axis_p1_impl(
     }
 }
 
-kernel void metric_axis_p1_b3(
+kernel void metric_axis_b3(
     device const float *source [[buffer(0)]],
     constant AnalysisJob &job [[buffer(1)]],
     device const AxisPlanDescriptor *plans [[buffer(2)]],
@@ -412,11 +620,11 @@ kernel void metric_axis_p1_b3(
     uint thread_index [[thread_index_in_threadgroup]],
     uint group_index [[threadgroup_position_in_grid]]) {
     threadgroup float reduction[reduction_width];
-    metric_axis_p1_impl(source, job, plans, forward_left, forward_weights,
+    metric_axis_impl(source, job, plans, forward_left, forward_weights,
                         workspace, partials, reduction, thread_index, group_index, 2u, false);
 }
 
-kernel void metric_axis_p1_b7(
+kernel void metric_axis_b7(
     device const float *source [[buffer(0)]],
     constant AnalysisJob &job [[buffer(1)]],
     device const AxisPlanDescriptor *plans [[buffer(2)]],
@@ -427,7 +635,7 @@ kernel void metric_axis_p1_b7(
     uint thread_index [[thread_index_in_threadgroup]],
     uint group_index [[threadgroup_position_in_grid]]) {
     threadgroup float reduction[reduction_width];
-    metric_axis_p1_impl(source, job, plans, forward_left, forward_weights,
+    metric_axis_impl(source, job, plans, forward_left, forward_weights,
                         workspace, partials, reduction, thread_index, group_index, 4u, false);
 }
 
@@ -443,14 +651,14 @@ kernel void NAME( \
     uint thread_index [[thread_index_in_threadgroup]], \
     uint group_index [[threadgroup_position_in_grid]]) { \
     threadgroup float reduction[reduction_width]; \
-    metric_axis_p1_impl(source, job, plans, forward_left, forward_weights, \
+    metric_axis_impl(source, job, plans, forward_left, forward_weights, \
         workspace, partials, reduction, thread_index, group_index, WIDTH, false); \
 }
 
-DEFINE_AXIS_METRIC_FIXED(metric_axis_p1_b11, 6u)
-DEFINE_AXIS_METRIC_FIXED(metric_axis_p1_b15, 8u)
+DEFINE_AXIS_METRIC_FIXED(metric_axis_b11, 6u)
+DEFINE_AXIS_METRIC_FIXED(metric_axis_b15, 8u)
 
-kernel void metric_axis_p1_generic(
+kernel void metric_axis_generic(
     device const float *source [[buffer(0)]],
     constant AnalysisJob &job [[buffer(1)]],
     device const AxisPlanDescriptor *plans [[buffer(2)]],
@@ -461,7 +669,7 @@ kernel void metric_axis_p1_generic(
     uint thread_index [[thread_index_in_threadgroup]],
     uint group_index [[threadgroup_position_in_grid]]) {
     threadgroup float reduction[reduction_width];
-    metric_axis_p1_impl(source, job, plans, forward_left, forward_weights,
+    metric_axis_impl(source, job, plans, forward_left, forward_weights,
                         workspace, partials, reduction, thread_index, group_index, 0u, false);
 }
 
@@ -477,12 +685,12 @@ kernel void NAME( \
     uint thread_index [[thread_index_in_threadgroup]], \
     uint group_index [[threadgroup_position_in_grid]]) { \
     threadgroup float reduction[reduction_width]; \
-    metric_axis_p1_impl(source, job, plans, forward_left, forward_weights, \
+    metric_axis_impl(source, job, plans, forward_left, forward_weights, \
         workspace, partials, reduction, thread_index, group_index, WIDTH, true); \
 }
 
-DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_p1_horizontal_first_b3, 2u)
-DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_p1_horizontal_first_b7, 4u)
-DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_p1_horizontal_first_b11, 6u)
-DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_p1_horizontal_first_b15, 8u)
-DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_p1_horizontal_first_generic, 0u)
+DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_horizontal_first_b3, 2u)
+DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_horizontal_first_b7, 4u)
+DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_horizontal_first_b11, 6u)
+DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_horizontal_first_b15, 8u)
+DEFINE_HORIZONTAL_FIRST_METRIC(metric_axis_horizontal_first_generic, 0u)

@@ -137,6 +137,7 @@ struct DecodeTelemetry {
     std::uint64_t discarded_packets = 0U;
     std::uint64_t host_frame_bytes = 0U;
     std::uint64_t conversion_bytes = 0U;
+    std::size_t decode_sessions = 0U;
     double index_ms = 0.0;
     double decode_ms = 0.0;
     double convert_ms = 0.0;
@@ -211,6 +212,20 @@ struct VulkanFrame {
     std::shared_ptr<void> lease;
 };
 
+// Decoder-owned VideoToolbox surface. The pixel_buffer value is an opaque
+// CVPixelBufferRef on macOS so this public header remains portable.
+struct MetalFrame {
+    std::uint64_t seq = 0U;
+    FrameIdentity identity;
+    std::int32_t width = 0;
+    std::int32_t height = 0;
+    std::uintptr_t pixel_buffer = 0U;
+    std::int32_t bit_depth = 8;
+    std::string range = "unknown";
+    std::string surface_format;
+    std::shared_ptr<void> lease;
+};
+
 struct DecoderOptions {
     // Hardware decode is deliberately opt-in. A caller that cannot provide a
     // compatible device context must use software rather than silently moving
@@ -219,6 +234,7 @@ struct DecoderOptions {
         software,
         cuda,
         vulkan_video,
+        videotoolbox,
     } backend = Backend::software;
     std::uintptr_t native_instance = 0U;
     std::uintptr_t native_physical_device = 0U;
@@ -244,12 +260,16 @@ struct DecoderOptions {
     bool output_luma = true;
     // Number of decoded frames the caller may retain concurrently.
     std::size_t frame_concurrency = 2U;
+    // Independent hardware decoder sessions. Values above one are an
+    // experimental RAP-partitioned path; callers must opt in explicitly.
+    std::size_t hardware_decode_sessions = 1U;
 };
 
 using IndexProgress = std::function<void(std::uint64_t indexed_records)>;
 using FrameConsumer = std::function<void(HostFrame frame)>;
 using CudaFrameConsumer = std::function<void(CudaFrame frame)>;
 using VulkanFrameConsumer = std::function<void(VulkanFrame frame)>;
+using MetalFrameConsumer = std::function<void(MetalFrame frame)>;
 
 [[nodiscard]] bool compiled() noexcept;
 [[nodiscard]] std::string runtime_version();
@@ -349,5 +369,10 @@ void decode_selected_vulkan(const std::string &path, const MediaIndex &index,
                             const DecoderOptions &options, std::stop_token stop,
                             const VulkanFrameConsumer &consumer,
                             DecodeTelemetry *telemetry = nullptr);
+void decode_selected_metal(const std::string &path, const MediaIndex &index,
+                           std::span<const FrameIdentity> selected,
+                           const DecoderOptions &options, std::stop_token stop,
+                           const MetalFrameConsumer &consumer,
+                           DecodeTelemetry *telemetry = nullptr);
 
 } // namespace getnative::media

@@ -72,6 +72,7 @@ struct FilterSpec {
     std::string type;
     double b = 0.0;
     double c = 0.5;
+    double blur = 1.0;
     std::int32_t taps = 0;
     bool control = false;
 };
@@ -518,6 +519,12 @@ struct BicubicGeometryCaseReport {
         if (entry[@"taps"] != nil) {
             filter.taps = checked_i32(require_number(entry[@"taps"], "filter.taps"), "filter.taps");
         }
+        if (entry[@"blur"] != nil) {
+            filter.blur = require_number(entry[@"blur"], "filter.blur").doubleValue;
+        }
+        if (!(filter.blur > 0.0) || !std::isfinite(filter.blur)) {
+            throw std::invalid_argument("filter.blur must be finite and positive");
+        }
         if (entry[@"control"] != nil) {
             filter.control = require_number(entry[@"control"], "filter.control").boolValue;
         }
@@ -549,13 +556,13 @@ struct BicubicGeometryCaseReport {
 }
 
 [[nodiscard]] getnative::Filter make_filter(const FilterSpec &spec) {
-    if (spec.type == "bilinear") return getnative::Filter::bilinear();
-    if (spec.type == "bicubic") return getnative::Filter::bicubic(spec.b, spec.c);
-    if (spec.type == "spline16") return getnative::Filter::spline16();
-    if (spec.type == "spline36") return getnative::Filter::spline36();
-    if (spec.type == "spline64") return getnative::Filter::spline64();
+    if (spec.type == "bilinear") return getnative::Filter::bilinear(spec.blur);
+    if (spec.type == "bicubic") return getnative::Filter::bicubic(spec.b, spec.c, spec.blur);
+    if (spec.type == "spline16") return getnative::Filter::spline16(spec.blur);
+    if (spec.type == "spline36") return getnative::Filter::spline36(spec.blur);
+    if (spec.type == "spline64") return getnative::Filter::spline64(spec.blur);
     if (spec.type == "lanczos" && spec.taps >= 1 && spec.taps <= 8) {
-        return getnative::Filter::lanczos(spec.taps);
+        return getnative::Filter::lanczos(spec.taps, spec.blur);
     }
     throw std::invalid_argument("unsupported matrix filter " + spec.id);
 }
