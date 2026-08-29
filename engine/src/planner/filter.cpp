@@ -39,10 +39,7 @@ std::int32_t Filter::support() const {
 }
 
 std::int32_t Filter::effective_support() const {
-    // Relational checks only: std::isfinite folds to a constant under the
-    // planner's -ffast-math mode, so non-finite blur must be rejected via
-    // comparisons the optimizer cannot assume away.
-    if (!(blur > 0.0) || !(blur <= std::numeric_limits<double>::max())) {
+    if (!(blur > 0.0) || !std::isfinite(blur)) {
         throw std::invalid_argument("blur must be finite and greater than zero");
     }
     constexpr auto maximum_support =

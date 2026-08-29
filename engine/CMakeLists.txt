@@ -320,11 +320,10 @@ set(GETNATIVE_CORE_SOURCES
     src/planner/plan_store.cpp
 )
 if(NOT GETNATIVE_PLANNER_FP_MODE STREQUAL "strict")
-    # Keep the target strict and relax only the translation units that construct
-    # AxisPlan data. Source-specific options follow the target-wide strict flag.
+    # Keep the target strict and relax only AxisPlan geometry/LDLT construction.
+    # filter.cpp stays strict so blur NaN/Inf checks are not folded away.
     set_property(SOURCE
         src/planner/axis_plan.cpp
-        src/planner/filter.cpp
         APPEND PROPERTY COMPILE_OPTIONS ${GETNATIVE_PLANNER_FP_OPTIONS}
     )
 endif()
