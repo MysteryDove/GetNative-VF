@@ -422,14 +422,27 @@ def main():
                   and vulkan_p1["payload"]["telemetry"]["backend"] == "vulkan"
                   and abs(vulkan_error - cpu_error) <= tolerance,
                   json.dumps(vulkan_p1)[:500])
+            for norm in (2, 4):
+                explicit_accepted, explicit = run_analyze_with_accepted(worker, analyze_command(
+                    f"r3vulkan-p{norm}", frame, ["204"], backend="vulkan",
+                    metric={"p_norm": norm}))
+                telemetry = explicit.get("payload", {}).get("telemetry", {})
+                check(f"vulkan-p{norm}-accepted",
+                      explicit["type"] == "result"
+                      and telemetry.get("backend") == "vulkan"
+                      and explicit_accepted is not None
+                      and explicit_accepted.get("backend") == "vulkan"
+                      and explicit_accepted.get("device") == telemetry.get("vulkan_device"),
+                      json.dumps(explicit)[:500])
 
-        worker.send(**analyze_command(
-            "r3vulkan-p2", frame, ["204"], backend="vulkan",
-            metric={"p_norm": 2}))
-        event = worker.read_event()
-        check("vulkan-p2-rejected-at-submit",
-              event["type"] == "error" and event["code"] == "unsupported",
-              json.dumps(event))
+        for norm in (5, 4294967295):
+            worker.send(**analyze_command(
+                f"r3vulkan-p{norm}", frame, ["204"], backend="vulkan",
+                metric={"p_norm": norm}))
+            event = worker.read_event()
+            check(f"vulkan-p{norm}-rejected-at-submit",
+                  event["type"] == "error" and event["code"] == "unsupported",
+                  json.dumps(event))
 
         cpu_max = run_analyze(worker, analyze_command(
             "r3cpu-pmax", frame, ["204"], backend="cpu",
