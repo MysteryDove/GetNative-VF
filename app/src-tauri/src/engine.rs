@@ -240,29 +240,30 @@ pub(crate) fn engine_command(path: &Path) -> Command {
         command.creation_flags(CREATE_NO_WINDOW);
         command
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
         let mut command = Command::new(path);
-        #[cfg(target_os = "macos")]
-        {
-            let runtime = env::var_os("GETNATIVE_FFMPEG_RUNTIME_DIR")
-                .map(PathBuf::from)
-                .filter(|dir| dir.is_dir())
-                .or_else(|| find_macos_ffmpeg_runtime(path));
-            if let Some(runtime) = runtime {
-                let existing = env::var_os("DYLD_LIBRARY_PATH").unwrap_or_default();
-                let value = if existing.is_empty() {
-                    runtime.into_os_string()
-                } else {
-                    let mut value = runtime.into_os_string();
-                    value.push(":");
-                    value.push(existing);
-                    value
-                };
-                command.env("DYLD_LIBRARY_PATH", value);
-            }
+        let runtime = env::var_os("GETNATIVE_FFMPEG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_dir())
+            .or_else(|| find_macos_ffmpeg_runtime(path));
+        if let Some(runtime) = runtime {
+            let existing = env::var_os("DYLD_LIBRARY_PATH").unwrap_or_default();
+            let value = if existing.is_empty() {
+                runtime.into_os_string()
+            } else {
+                let mut value = runtime.into_os_string();
+                value.push(":");
+                value.push(existing);
+                value
+            };
+            command.env("DYLD_LIBRARY_PATH", value);
         }
         command
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        Command::new(path)
     }
 }
 
@@ -304,7 +305,7 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
             || capabilities
                 .decode_backends
                 .iter()
-                .zip(expected.into_iter())
+                .zip(expected)
                 .any(|(backend, id)| {
                     backend.id != id
                         || backend.runtime_device && !backend.compiled
