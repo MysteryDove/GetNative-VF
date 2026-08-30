@@ -822,11 +822,13 @@ if(GETNATIVE_ENABLE_MEDIA)
         target_compile_definitions(getnative_media PRIVATE GETNATIVE_HAS_VULKAN=1)
     endif()
     if(APPLE)
+        find_library(GETNATIVE_COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
         find_library(GETNATIVE_VIDEOTOOLBOX_FRAMEWORK VideoToolbox REQUIRED)
         find_library(GETNATIVE_COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
         find_library(GETNATIVE_COREMEDIA_FRAMEWORK CoreMedia REQUIRED)
         find_library(GETNATIVE_IOSURFACE_FRAMEWORK IOSurface REQUIRED)
         target_link_libraries(getnative_media PRIVATE
+            "${GETNATIVE_COREFOUNDATION_FRAMEWORK}"
             "${GETNATIVE_VIDEOTOOLBOX_FRAMEWORK}"
             "${GETNATIVE_COREVIDEO_FRAMEWORK}"
             "${GETNATIVE_COREMEDIA_FRAMEWORK}"
