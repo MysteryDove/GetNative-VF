@@ -9,7 +9,14 @@
  *   3. windowed prominence filter (depth below the surrounding local maxima),
  * then clusters the surviving valleys across runs (sample x kernel) so
  * heights corroborated by several series rank first.
+ *
+ * Perfect descale (error <= 1e-6) always outranks consensus: a single-point
+ * needle to ~0 is the native kernel even when neighboring kernels dip
+ * together a couple of pixels away.
  */
+
+/** getnative convention: error <= 1e-6 means the candidate perfectly descales. */
+export const PERFECTLY_DESCALE_THRESHOLD = 1e-6;
 
 export type ValleySeriesPoint = {
   x: number;
@@ -116,7 +123,10 @@ export function findSeriesValleys(
   const minProminence = options.minProminence ?? 0.1;
   const horizon =
     options.horizonWindow ?? Math.min(200, Math.max(10, Math.round(n / 40)));
-  const smooth = options.smoothWindow ?? (n >= 5 ? 5 : 3);
+  const requestedSmooth = options.smoothWindow ?? (n >= 5 ? 5 : 3);
+  let smooth = Math.max(1, Math.min(Math.round(requestedSmooth), n));
+  if (smooth % 2 === 0) smooth = Math.max(1, smooth - 1);
+  const half = Math.floor(smooth / 2);
   const ys = movingAverage(
     points.map((point) => Math.log10(Math.max(point.metric, LOG_FLOOR))),
     smooth,
@@ -126,11 +136,17 @@ export function findSeriesValleys(
     if (!(ys[i] < ys[i - 1] && ys[i] <= ys[i + 1])) continue;
     const prominence = windowedProminence(ys, i, horizon);
     if (prominence < minProminence) continue;
+    // Smoothing can shift a needle by a couple of samples; report the raw
+    // minimum in that window so the verdict height/metric match the plot.
+    let best = i;
+    for (let j = Math.max(0, i - half); j <= Math.min(n - 1, i + half); j += 1) {
+      if (points[j].metric < points[best].metric) best = j;
+    }
     out.push({
       runId: series.runId,
-      key: points[i].key,
-      x: points[i].x,
-      metric: points[i].metric,
+      key: points[best].key,
+      x: points[best].x,
+      metric: points[best].metric,
       prominence,
     });
   }
@@ -164,7 +180,19 @@ export function clusterValleys(
         members: cluster,
       };
     })
-    .sort((a, b) => b.score - a.score || b.runCount - a.runCount || a.height - b.height);
+    .sort((a, b) => {
+      const aPerfect = a.deepest.metric <= PERFECTLY_DESCALE_THRESHOLD ? 1 : 0;
+      const bPerfect = b.deepest.metric <= PERFECTLY_DESCALE_THRESHOLD ? 1 : 0;
+      if (aPerfect !== bPerfect) return bPerfect - aPerfect;
+      if (aPerfect) {
+        return (
+          a.deepest.metric - b.deepest.metric ||
+          b.runCount - a.runCount ||
+          a.height - b.height
+        );
+      }
+      return b.score - a.score || b.runCount - a.runCount || a.height - b.height;
+    });
 }
 
 /**
@@ -172,11 +200,37 @@ export function clusterValleys(
  * global minimum as an explicit fallback for trend-only curves where no
  * local valley stands out.
  */
+/** Lowest raw point at or below the perfect-descale threshold, per series. */
+function perfectDescaleMembers(seriesList: ValleySeries[]): ValleyMember[] {
+  const out: ValleyMember[] = [];
+  for (const series of seriesList) {
+    let best: ValleySeriesPoint | null = null;
+    for (const point of series.points) {
+      if (!Number.isFinite(point.x) || !Number.isFinite(point.metric)) continue;
+      if (point.metric > PERFECTLY_DESCALE_THRESHOLD) continue;
+      if (!best || point.metric < best.metric) best = point;
+    }
+    if (best) {
+      out.push({
+        runId: series.runId,
+        key: best.key,
+        x: best.x,
+        metric: best.metric,
+        prominence: 1,
+      });
+    }
+  }
+  return out;
+}
+
 export function detectValleys(
   seriesList: ValleySeries[],
   options: ValleyDetectOptions = {},
 ): ValleyDetection {
-  const members = seriesList.flatMap((series) => findSeriesValleys(series, options));
+  const members = [
+    ...seriesList.flatMap((series) => findSeriesValleys(series, options)),
+    ...perfectDescaleMembers(seriesList),
+  ];
   const candidates = clusterValleys(members, options).slice(0, options.maxCandidates ?? 5);
   let fallback: ValleyDetection["fallback"] = null;
   for (const series of seriesList) {

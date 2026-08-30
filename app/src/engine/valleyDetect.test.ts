@@ -129,6 +129,35 @@ describe("detectValleys", () => {
     expect(fallback?.x).toBe(1000); // edge minimum of the pure trend
   });
 
+  it("ranks a perfect-descale needle over a shallower multi-kernel consensus", () => {
+    // Screenshot case: several kernels dip together near 866 with ~1e-4 error,
+    // while bilinear spikes to 0 at 864. Consensus must not beat perfect descale.
+    const crowd = ["bicubic", "spline16", "spline36", "spline64", "lanczos3"].map(
+      (runId, seed) => ({
+        runId,
+        points: syntheticSeries([{ x: 866, depth: 0.2, width: 2 }], {
+          noise: 0.01,
+          seed: seed + 1,
+        }),
+      }),
+    );
+    const bilinearPoints = syntheticSeries([{ x: 866, depth: 0.2, width: 2 }], {
+      noise: 0.01,
+      seed: 99,
+    }).map((point) =>
+      point.x === 864
+        ? { ...point, metric: 0, key: "bilinear-864" }
+        : point,
+    );
+    const { candidates } = detectValleys([
+      ...crowd,
+      { runId: "bilinear", points: bilinearPoints },
+    ]);
+    expect(candidates[0]?.height).toBe(864);
+    expect(candidates[0]?.deepest.runId).toBe("bilinear");
+    expect(candidates[0]?.deepest.metric).toBeLessThanOrEqual(1e-6);
+  });
+
   it("scopes both candidates and fallback to the points it is given", () => {
     // Simulates the panel's zoom-window filtering: only x in [800, 900].
     const points = syntheticSeries([{ x: 870, depth: 0.4, width: 3 }], {

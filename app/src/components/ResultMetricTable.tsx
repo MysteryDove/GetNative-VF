@@ -1,9 +1,9 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { ArrowDown, ArrowDownUp, ArrowUp } from "lucide-react";
+import { PERFECTLY_DESCALE_THRESHOLD } from "../engine/valleyDetect";
 import type { Translator } from "../i18n";
 
-/** getnative convention: error <= 1e-6 means the candidate perfectly descales. */
-export const PERFECTLY_DESCALE_THRESHOLD = 1e-6;
+export { PERFECTLY_DESCALE_THRESHOLD };
 
 const TABLE_ROW_HEIGHT = 28;
 // Covers the 38vh container plus overscan slack.
