@@ -120,6 +120,27 @@ jobs:
       - name: Build pinned FFmpeg SDK
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         run: scripts/build-ffmpeg-linux.sh .deps/ffmpeg-linux-x64
+      - name: Verify FFmpeg NVDEC and Vulkan hwaccels
+        run: |
+          set -euo pipefail
+          info=.deps/ffmpeg-linux-x64/share/ffmpeg/BUILD_INFO.txt
+          test -f "$info"
+          grep -Eq '^CONFIG_NVDEC=yes$' "$info"
+          grep -Eq '^CONFIG_HEVC_NVDEC_HWACCEL=yes$' "$info"
+          grep -Eq '^CONFIG_H264_NVDEC_HWACCEL=yes$' "$info"
+          grep -Eq '^CONFIG_VULKAN=yes$' "$info"
+          grep -Eq '^CONFIG_HEVC_VULKAN_HWACCEL=yes$' "$info"
+          grep -Eq '^CONFIG_H264_VULKAN_HWACCEL=yes$' "$info"
+          for library in libavformat.so.62 libavcodec.so.62 libavutil.so.60 libswscale.so.9; do
+            path=".deps/ffmpeg-linux-x64/lib/$library"
+            test -f "$path"
+            test "$(patchelf --print-rpath "$path")" = '$ORIGIN'
+            if patchelf --print-needed "$path" | grep -Eq 'libcuda|libcudart|libnvcuvid'; then
+              printf 'package validation: %s links a CUDA driver library\n' "$path" >&2
+              patchelf --print-needed "$path" >&2
+              exit 1
+            fi
+          done
       - name: Install JavaScript dependencies
         working-directory: app
         run: pnpm install --frozen-lockfile
