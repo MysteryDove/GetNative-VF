@@ -357,6 +357,20 @@ img {
   -webkit-user-drag: none;
 }
 
+/* WebKitGTK paints native GTK spinbuttons for type=number. Clicking them can
+   grab the pointer and freeze the UI until the window is resized (GNOME /
+   Wayland AppImage). Hide them even if a number input slips through. */
+input[type="number"] {
+  -webkit-appearance: textfield;
+  appearance: textfield;
+}
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  appearance: none;
+  margin: 0;
+}
+
 button {
   color: inherit;
 }
@@ -3577,8 +3591,43 @@ button {
 }
 
 .frame-timeline {
+  position: relative;
   width: 100%;
-  accent-color: var(--accent);
+  height: 16px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.frame-timeline[aria-disabled="true"] {
+  cursor: default;
+  opacity: 0.45;
+}
+.frame-timeline-track {
+  position: absolute;
+  inset: 6px 0;
+  border-radius: 999px;
+  background: var(--border-track);
+  pointer-events: none;
+}
+.frame-timeline-fill {
+  display: block;
+  width: calc(var(--timeline-ratio, 0) * 100%);
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+}
+.frame-timeline-thumb {
+  position: absolute;
+  top: 50%;
+  left: calc(var(--timeline-ratio, 0) * 100%);
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
 }
 
 .filmstrip {

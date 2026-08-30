@@ -856,10 +856,7 @@ export function VerifyPage({
           <label className="block">
             <span>{t("verify.concurrency")}</span>
             <input
-              type="number"
-              min={concurrencyMin}
-              max={concurrencyMax}
-              step={1}
+              inputMode="numeric"
               value={draft.concurrency}
               aria-invalid={concurrencyInvalid}
               onChange={(event) => patch({ concurrency: Number(event.target.value) })}

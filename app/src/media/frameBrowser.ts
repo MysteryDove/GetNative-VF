@@ -69,7 +69,13 @@ export function dispatchFrameBrowserKey(
   const { frameWindow, previewBusy, select } = deps;
   if (!frameWindow || previewBusy) return;
   const target = event.target as HTMLElement | null;
-  if (target && (target.tagName === "INPUT" || target.tagName === "SELECT" || target.tagName === "TEXTAREA")) {
+  if (
+    target &&
+    (target.tagName === "INPUT" ||
+      target.tagName === "SELECT" ||
+      target.tagName === "TEXTAREA" ||
+      target.getAttribute("role") === "slider")
+  ) {
     return;
   }
   const action = frameStepFromKeyboard(event.key, { shiftKey: event.shiftKey });

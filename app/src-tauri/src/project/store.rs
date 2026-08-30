@@ -315,11 +315,22 @@ pub fn create_project_at_path(
 }
 
 pub fn create_untitled_project(app: &AppHandle) -> Result<OpenedProject, ManifestValidationError> {
-    let path = recovery_path(app)?;
+    create_untitled_at_path(&recovery_path(app)?)
+}
+
+/// The recovery path is a single scratch slot, not a named project. A new
+/// untitled session must replace whatever is already there — even when the
+/// previous recovery file belongs to a different project id. Reusing
+/// `write_manifest_to_path` would return `project_mismatch`. Write atomically
+/// so a failed create leaves the previous recovery file intact.
+fn create_untitled_at_path(path: &Path) -> Result<OpenedProject, ManifestValidationError> {
     let manifest = empty_manifest("Untitled", true);
-    write_manifest_to_path(&path, &manifest)?;
+    let normalized = normalize_project_path(path)?;
+    let bytes = serialize_manifest(&manifest)?;
+    ensure_parent(&normalized)?;
+    write_json_atomically(&normalized, &bytes, "recovery project")?;
     Ok(OpenedProject {
-        storage_path: Some(path.display().to_string()),
+        storage_path: Some(normalized.display().to_string()),
         missing_source_ids: Vec::new(),
         read_only: false,
         schema_status: "supported".to_owned(),
@@ -604,5 +615,22 @@ mod tests {
             project_name_from_path(Path::new("/tmp/Demo.getnative.json")),
             Some("Demo".to_owned())
         );
+    }
+
+    #[test]
+    fn untitled_create_replaces_existing_recovery_with_a_different_id() {
+        let dir = temp_dir();
+        let path = dir.join("untitled.getnative.json");
+        let existing = empty_manifest("Untitled", true);
+        write_manifest_to_path(&path, &existing).unwrap();
+
+        let opened = create_untitled_at_path(&path).unwrap();
+        assert_ne!(opened.manifest.id, existing.id);
+        assert!(opened.manifest.untitled);
+        assert_eq!(
+            open_manifest_at_path(&path).unwrap().manifest.id,
+            opened.manifest.id
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }

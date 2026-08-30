@@ -128,21 +128,14 @@ export function VideoFrameBrowser({
               <LocateFixed size={14} />
             </button>
           </div>
-          <input
-            className="frame-timeline"
-            type="range"
+          <RangeScrubber
             min={0}
             max={maxFrame}
             step={1}
             value={scrubFrame}
-            aria-label={t("media.timeline")}
-            onChange={(event) => onScrubFrameChange(Number(event.target.value))}
-            onPointerUp={(event) => void selectVideoFrame(
-              source, "frame", Number(event.currentTarget.value),
-            )}
-            onKeyUp={(event) => void selectVideoFrame(
-              source, "frame", Number(event.currentTarget.value),
-            )}
+            ariaLabel={t("media.timeline")}
+            onChange={onScrubFrameChange}
+            onCommit={(frame) => void selectVideoFrame(source, "frame", frame)}
           />
           <div className="filmstrip" aria-label={t("media.frameWindow")}>
             {frameWindow.frames.map((frame) => {
@@ -209,27 +202,123 @@ export function VideoFrameBrowser({
               {indexBusy ? t("media.indexingFrames") : t("media.indexUnavailable")}
             </span>
           </div>
-          <input
-            className="frame-timeline"
-            type="range"
+          <RangeScrubber
             min={0}
             max={Math.max(0, source.durationSeconds ?? 0)}
             step={0.001}
             value={Math.min(Number(timeInput) || 0, source.durationSeconds ?? 0)}
             disabled={!source.durationSeconds}
-            aria-label={t("media.timeline")}
-            onChange={(event) => onTimeInputChange(Number(event.target.value).toFixed(3))}
-            onPointerUp={(event) => void selectVideoFrame(
-              source, "timestamp", undefined,
-              Number(event.currentTarget.value),
-            )}
-            onKeyUp={(event) => void selectVideoFrame(
-              source, "timestamp", undefined,
-              Number(event.currentTarget.value),
-            )}
+            ariaLabel={t("media.timeline")}
+            onChange={(seconds) => onTimeInputChange(seconds.toFixed(3))}
+            onCommit={(seconds) => void selectVideoFrame(source, "timestamp", undefined, seconds)}
           />
         </>
       )}
+    </div>
+  );
+}
+
+function snapToStep(raw: number, min: number, max: number, step: number): number {
+  const lo = Number.isFinite(min) ? min : 0;
+  const hi = Number.isFinite(max) ? Math.max(lo, max) : lo;
+  const clamped = Number.isFinite(raw) ? Math.min(hi, Math.max(lo, raw)) : lo;
+  if (!(step > 0) || !Number.isFinite(step)) return clamped;
+  return Math.min(hi, Math.max(lo, lo + Math.round((clamped - lo) / step) * step));
+}
+
+/** CSS slider instead of type=range: WebKitGTK paints GtkScale and can grab the pointer. */
+function RangeScrubber({
+  min,
+  max,
+  step,
+  value,
+  disabled,
+  ariaLabel,
+  onChange,
+  onCommit,
+}: {
+  min: number;
+  max: number;
+  step: number;
+  value: number;
+  disabled?: boolean;
+  ariaLabel: string;
+  onChange: (value: number) => void;
+  onCommit: (value: number) => void;
+}) {
+  const span = Math.max(max - min, 0);
+  const current = snapToStep(value, min, max, step);
+  const ratio = span === 0 ? 0 : (current - min) / span;
+
+  function valueFromClientX(target: HTMLElement, clientX: number) {
+    const rect = target.getBoundingClientRect();
+    const t = rect.width <= 0 ? 0 : Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+    return snapToStep(min + t * span, min, max, step);
+  }
+
+  return (
+    <div
+      className="frame-timeline"
+      role="slider"
+      tabIndex={disabled ? -1 : 0}
+      aria-label={ariaLabel}
+      aria-valuemin={min}
+      aria-valuemax={max}
+      aria-valuenow={current}
+      aria-disabled={disabled || undefined}
+      style={{ ["--timeline-ratio" as string]: String(ratio) }}
+      onPointerDown={(event) => {
+        if (disabled || event.button !== 0) return;
+        event.currentTarget.setPointerCapture(event.pointerId);
+        onChange(valueFromClientX(event.currentTarget, event.clientX));
+      }}
+      onPointerMove={(event) => {
+        if (disabled || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
+        onChange(valueFromClientX(event.currentTarget, event.clientX));
+      }}
+      onPointerUp={(event) => {
+        if (disabled) return;
+        const next = valueFromClientX(event.currentTarget, event.clientX);
+        onChange(next);
+        onCommit(next);
+      }}
+      onKeyDown={(event) => {
+        if (disabled) return;
+        let next: number | null = null;
+        if (event.key === "ArrowLeft" || event.key === "ArrowDown") {
+          next = snapToStep(current - step, min, max, step);
+        } else if (event.key === "ArrowRight" || event.key === "ArrowUp") {
+          next = snapToStep(current + step, min, max, step);
+        } else if (event.key === "Home") {
+          next = min;
+        } else if (event.key === "End") {
+          next = max;
+        } else {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        onChange(next);
+      }}
+      onKeyUp={(event) => {
+        if (disabled) return;
+        if (
+          event.key === "ArrowLeft" ||
+          event.key === "ArrowDown" ||
+          event.key === "ArrowRight" ||
+          event.key === "ArrowUp" ||
+          event.key === "Home" ||
+          event.key === "End"
+        ) {
+          event.stopPropagation();
+          onCommit(current);
+        }
+      }}
+    >
+      <span className="frame-timeline-track" aria-hidden="true">
+        <span className="frame-timeline-fill" />
+      </span>
+      <span className="frame-timeline-thumb" aria-hidden="true" />
     </div>
   );
 }

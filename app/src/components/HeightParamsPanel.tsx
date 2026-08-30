@@ -154,10 +154,9 @@ export function HeightParamsPanel({
           </label>
           <label className="block">
             <span>{t("analyze.step")}</span>
+            {/* text + inputMode: WebKitGTK number spinners freeze the Linux UI */}
             <input
-              type="number"
-              min="0.01"
-              step="0.01"
+              inputMode="decimal"
               value={draft.step}
               onChange={(event) => onPatch({ step: event.target.value })}
             />
@@ -182,9 +181,7 @@ export function HeightParamsPanel({
           <label className="block">
             <span>{t("analyze.step")}</span>
             <input
-              type="number"
-              min="0.01"
-              step="0.01"
+              inputMode="decimal"
               value={draft.step}
               onChange={(event) => onPatch({ step: event.target.value })}
             />
@@ -259,8 +256,7 @@ export function HeightParamsPanel({
             <label className="block" key={parameter}>
               <span>{`Bicubic ${parameter}`}</span>
               <input
-                type="number"
-                step="any"
+                inputMode="decimal"
                 value={String(draft.kernelParameters[parameter] ?? (parameter === "b" ? 0 : 0.5))}
                 onChange={(event) =>
                   onPatch({
@@ -279,7 +275,7 @@ export function HeightParamsPanel({
         <label className="block">
           <span>{t("analyze.lanczosTaps")}</span>
           <input
-            type="number"
+            inputMode="numeric"
             value="3"
             readOnly
             aria-readonly="true"
@@ -290,9 +286,7 @@ export function HeightParamsPanel({
       <label className="block">
         <span>{t("analyze.blur")}</span>
         <input
-          type="number"
-          step="any"
-          min="0.000001"
+          inputMode="decimal"
           title={t("analyze.blurHint")}
           aria-invalid={invalidKernelBlur(draft.kernelParameters) || undefined}
           value={String(draft.kernelParameters.blur ?? 1)}

@@ -33,9 +33,7 @@ export function MetricEditor({
           <label key={key} className="block">
             <span>{label}</span>
             <input
-              type="number"
-              min={0}
-              step={1}
+              inputMode="numeric"
               value={metric[key]}
               disabled={disabled}
               onChange={(event) =>
@@ -48,9 +46,7 @@ export function MetricEditor({
       <label className="block">
         <span>{t("analyze.pixelExclusion")}</span>
         <input
-          type="number"
-          min={0}
-          step="any"
+          inputMode="decimal"
           value={metric.pixelExclusionThreshold}
           disabled={disabled}
           onChange={(event) =>
@@ -61,10 +57,7 @@ export function MetricEditor({
       <label className="block">
         <span>{t("analyze.pNorm")}</span>
         <input
-          type="number"
-          min={1}
-          max={pNormMaximum}
-          step={1}
+          inputMode="numeric"
           value={metric.pNorm}
           disabled={disabled}
           onChange={(event) => onChange({ ...metric, pNorm: Number(event.target.value) })}
