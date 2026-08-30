@@ -260,9 +260,6 @@ struct DecoderOptions {
     bool output_luma = true;
     // Number of decoded frames the caller may retain concurrently.
     std::size_t frame_concurrency = 2U;
-    // Independent hardware decoder sessions. Values above one are an
-    // experimental RAP-partitioned path; callers must opt in explicitly.
-    std::size_t hardware_decode_sessions = 1U;
 };
 
 using IndexProgress = std::function<void(std::uint64_t indexed_records)>;

@@ -24,7 +24,6 @@ export type VerifyDraft = {
   endFrame: string;
   backendPreference: BackendPreference;
   concurrency: number;
-  decodeConcurrency: number;
 };
 
 export function defaultVerifyDraft(backendPreference: BackendPreference = "auto"): VerifyDraft {
@@ -38,7 +37,6 @@ export function defaultVerifyDraft(backendPreference: BackendPreference = "auto"
     endFrame: "",
     backendPreference,
     concurrency: 2,
-    decodeConcurrency: 0,
   };
 }
 
@@ -77,7 +75,6 @@ export type VerifyRunGroupPlan = {
     sourceIds: string[];
     scopeKind: VerifyScopeKind;
     concurrency: number;
-    decodeConcurrency: number;
   };
 };
 
@@ -127,10 +124,6 @@ export function validVerifyConcurrency(value: number): boolean {
   return Number.isInteger(value) && value >= 1 && value <= 8;
 }
 
-export function validDecodeConcurrency(value: number): boolean {
-  return Number.isInteger(value) && value >= 0 && value <= 4;
-}
-
 export function planVerifyRunGroup(input: {
   draft: VerifyDraft;
   recipe: Recipe;
@@ -150,9 +143,6 @@ export function planVerifyRunGroup(input: {
   if (selected.length === 0) return { ok: false, reason: "no_sources" };
   if (!validVerifyConcurrency(input.draft.concurrency)) {
     return { ok: false, reason: "verify_concurrency_invalid" };
-  }
-  if (!validDecodeConcurrency(input.draft.decodeConcurrency)) {
-    return { ok: false, reason: "verify_decode_concurrency_invalid" };
   }
 
   const prefix = input.requestIdPrefix ?? "req";
@@ -189,7 +179,6 @@ export function planVerifyRunGroup(input: {
       scanScope: scope.scope,
       backendPreference: input.draft.backendPreference,
       concurrency: input.draft.concurrency,
-      decodeConcurrency: input.draft.decodeConcurrency,
     };
     const shape = validateVerifyShape(request);
     if (!shape.ok) return { ok: false, reason: shape.code };
@@ -216,7 +205,6 @@ export function planVerifyRunGroup(input: {
         sourceIds: selected.map((source) => source.id),
         scopeKind: input.draft.scopeKind,
         concurrency: input.draft.concurrency,
-        decodeConcurrency: input.draft.decodeConcurrency,
       },
     },
   };

@@ -147,7 +147,7 @@ def verify_begin_command(request_id, candidate, width=320, height=240, **overrid
 
 
 def verify_media_command(request_id, media_path, backend, width=128, height=96,
-                         scan_scope=None, concurrency=None, decode_concurrency=None):
+                         scan_scope=None, concurrency=None):
     command = {
         "protocol_version": 1,
         "type": "verify_media_begin",
@@ -170,8 +170,6 @@ def verify_media_command(request_id, media_path, backend, width=128, height=96,
     }
     if concurrency is not None:
         command["concurrency"] = concurrency
-    if decode_concurrency is not None:
-        command["decode_concurrency"] = decode_concurrency
     return command
 
 
@@ -1244,12 +1242,6 @@ def main():
                 if (vulkan_usable
                         and decode_backends.get("vulkan_video", {}).get("runtime_device")):
                     accelerators.append(("vulkan", "vulkan_video"))
-                metal_usable = (
-                    metal_capability.get("compiled") is True
-                    and metal_capability.get("device_available") is True
-                    and decode_backends.get("videotoolbox", {}).get("runtime_device") is True
-                    and decode_backends.get("videotoolbox", {}).get("zero_copy") is True
-                )
 
                 late_scope = {
                     "selection": "all", "start_frame": 24, "end_frame": 29,
@@ -1340,56 +1332,6 @@ def main():
                           and accelerator_i_telemetry.get("effective_concurrency") == 4,
                           json.dumps({"terminal": accelerator_i_terminal,
                                       "warnings": accelerator_i_warnings})[:1000])
-
-                if metal_usable:
-                    worker.send(**verify_media_command(
-                        "vm-metal-parallel-baseline", media_path, "metal",
-                        concurrency=4, decode_concurrency=1))
-                    baseline_terminal, baseline_results, baseline_warnings = \
-                        collect_verify(worker)
-                    baseline_payload = baseline_terminal.get("payload", {})
-                    baseline_provenance = baseline_payload.get("provenance", {})
-                    baseline_telemetry = baseline_payload.get("telemetry", {})
-                    parallel = Worker()
-                    parallel.send(
-                        protocol_version=1, type="hello",
-                        request_id="vm-metal-parallel-hello")
-                    parallel.read_event()
-                    parallel.send(**verify_media_command(
-                        "vm-metal-parallel", media_path, "metal",
-                        concurrency=4, decode_concurrency=2))
-                    parallel_accepted = parallel.read_event()
-                    parallel_terminal, parallel_results, parallel_warnings = \
-                        collect_verify(parallel)
-                    parallel_payload = parallel_terminal.get("payload", {})
-                    parallel_provenance = parallel_payload.get("provenance", {})
-                    parallel_telemetry = parallel_payload.get("telemetry", {})
-                    parallel_close = (
-                        parallel_results.keys() == baseline_results.keys()
-                        and all(parallel_results[seq] == baseline_results[seq]
-                                for seq in baseline_results)
-                    )
-                    check("verify-media-videotoolbox-parallel-sessions",
-                          baseline_terminal["type"] == "result"
-                          and not baseline_warnings
-                          and baseline_provenance.get("decoder") == "videotoolbox"
-                          and baseline_telemetry.get("decode_sessions") == 1
-                          and parallel_accepted.get("backend") == "metal"
-                          and parallel_terminal["type"] == "result"
-                          and parallel_close and not parallel_warnings
-                          and parallel_provenance.get("decoder") == "videotoolbox"
-                          and parallel_provenance.get("zero_copy") is True
-                          and parallel_telemetry.get("decode_sessions") == 2
-                          and parallel_telemetry.get("host_frame_bytes") == 0
-                          and parallel_telemetry.get("conversion_bytes") == 0,
-                          json.dumps({"terminal": parallel_terminal,
-                                      "warnings": parallel_warnings})[:1200])
-                    parallel.send(
-                        protocol_version=1, type="shutdown",
-                        request_id="vm-metal-parallel-stop")
-                    while parallel.read_event()["type"] != "shutdown":
-                        pass
-                    parallel.wait_exit()
 
                 hevc_accelerators = [
                     (backend, decoder)

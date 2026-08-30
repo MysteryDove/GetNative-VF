@@ -27,7 +27,6 @@ import {
   reconcileReadyVideoSourceIds,
   verificationRuns,
   validVerifyConcurrency,
-  validDecodeConcurrency,
   type VerifyDraft,
 } from "../engine/verifyPlan";
 import { startVerifyRunGroup, type VerifyFrameEntry } from "../engine/executeVerify";
@@ -211,7 +210,6 @@ export function VerifyPage({
   const concurrencyMin = concurrencyCapability?.min ?? 1;
   const concurrencyMax = concurrencyCapability?.max ?? 8;
   const concurrencyInvalid = !validVerifyConcurrency(draft.concurrency);
-  const decodeConcurrencyInvalid = !validDecodeConcurrency(draft.decodeConcurrency);
 
   /** Stable per-run colors (indexed over all runs, not the filtered view). */
   const runColorById = useMemo(
@@ -358,8 +356,6 @@ export function VerifyPage({
           ? t("verify.blocked.noSources")
           : concurrencyInvalid
             ? t("verify.blocked.concurrency")
-            : decodeConcurrencyInvalid
-              ? t("verify.blocked.decodeConcurrency")
           : !plan
             ? t("verify.blocked.invalidPlan")
             : null;
@@ -853,20 +849,6 @@ export function VerifyPage({
                     capabilities?.payload.features?.verify_engine_decode === true,
                   )}
                 </option>
-              ))}
-            </select>
-          </label>
-
-          <label className="block">
-            <span>{t("verify.decodeConcurrency")}</span>
-            <select
-              value={draft.decodeConcurrency}
-              aria-invalid={decodeConcurrencyInvalid}
-              onChange={(event) => patch({ decodeConcurrency: Number(event.target.value) })}
-            >
-              <option value={0}>{t("verify.decodeConcurrencyAuto")}</option>
-              {[1, 2, 3, 4].map((value) => (
-                <option key={value} value={value}>{value}</option>
               ))}
             </select>
           </label>

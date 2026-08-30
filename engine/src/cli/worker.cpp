@@ -257,7 +257,6 @@ struct VerifyJobSpec {
     MetricSpec metric{};
     std::size_t worker_count = 0;
     std::size_t concurrency = kMediaVerifyDefaultConcurrency;
-    std::size_t decode_concurrency = 0U;
     std::int64_t expected_frames = -1;
     BackendChoice requested_backend = BackendChoice::cpu;
     BackendChoice backend = BackendChoice::cpu;
@@ -887,14 +886,6 @@ VerifyJobSpec parse_verify_begin(const JsonValue &command, std::string job_id,
                 "bad_request", "concurrency must be an integer within 1..8");
         }
         spec.concurrency = static_cast<std::size_t>(concurrency);
-    }
-    if (media_mode && command.find("decode_concurrency")) {
-        const double decode_concurrency = require_number(command, "decode_concurrency");
-        if (std::trunc(decode_concurrency) != decode_concurrency
-            || decode_concurrency < 0.0 || decode_concurrency > 4.0) {
-            throw WorkerError("bad_request", "decode_concurrency must be an integer within 0..4");
-        }
-        spec.decode_concurrency = static_cast<std::size_t>(decode_concurrency);
     }
     if (command.find("expected_frames")) {
         spec.expected_frames = require_int64(command, "expected_frames");
@@ -2055,8 +2046,6 @@ public:
             {"backend", JsonValue::string(backend_choice_name(job->verify.backend))},
             {"concurrency", JsonValue::integer(
                 static_cast<std::int64_t>(job->verify.concurrency))},
-            {"decode_concurrency", JsonValue::integer(
-                static_cast<std::int64_t>(job->verify.decode_concurrency))},
             {"suggested_in_flight", JsonValue::integer(
                 static_cast<std::int64_t>(job->verify.concurrency))},
         };
@@ -4340,9 +4329,6 @@ private:
         cuda_decoder_options.frame_concurrency = spec.concurrency;
         vulkan_decoder_options.frame_concurrency = spec.concurrency;
         metal_decoder_options.frame_concurrency = spec.concurrency;
-        metal_decoder_options.hardware_decode_sessions = spec.decode_concurrency == 0U
-            ? 1U
-            : spec.decode_concurrency;
         bool use_cuda_decode = false;
         bool use_vulkan_decode = false;
         bool use_metal_decode = false;

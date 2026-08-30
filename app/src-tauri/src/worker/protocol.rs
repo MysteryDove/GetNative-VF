@@ -497,8 +497,6 @@ pub struct VerifyMediaBeginRequest {
     pub backend: String,
     #[serde(default = "default_media_verify_concurrency")]
     pub concurrency: u32,
-    #[serde(default)]
-    pub decode_concurrency: u32,
     pub geometry: Option<GeometryCommand>,
 }
 
@@ -539,9 +537,6 @@ pub(crate) fn validate_verify_media_begin(request: &VerifyMediaBeginRequest) -> 
     )?;
     if !(1..=8).contains(&request.concurrency) {
         return Err("bad_request: concurrency must be within 1..=8".to_owned());
-    }
-    if request.decode_concurrency > 4 {
-        return Err("bad_request: decodeConcurrency must be within 0..=4".to_owned());
     }
     match request.selection.as_str() {
         "all" | "decoded_i_picture" => {}
@@ -586,7 +581,6 @@ pub(crate) fn verify_media_begin_command(
         "metric": metric_json(&request.metric),
         "backend": request.backend,
         "concurrency": request.concurrency,
-        "decode_concurrency": request.decode_concurrency,
         "resolved_geometry": request.geometry.as_ref().map(|geometry| json!({
             "width": geometry.width,
             "height": geometry.height,

@@ -161,7 +161,6 @@ export type VerifyRequest = {
   scanScope: ScanScope;
   backendPreference: BackendPreference;
   concurrency: number;
-  decodeConcurrency?: number;
 };
 
 export type AnalyzeRequest = HeightAnalyzeRequest | KernelAnalyzeRequest | VerifyRequest;

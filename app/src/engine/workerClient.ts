@@ -92,7 +92,6 @@ export type VerifyMediaJobParams = {
   metric: HeightJobParams["metric"];
   backend?: "cpu" | "cuda" | "vulkan" | "metal" | "auto";
   concurrency: number;
-  decodeConcurrency?: number;
   geometry?: GeometryWire | null;
 };
 
@@ -400,7 +399,6 @@ export class EngineWorkerClient {
           metric: params.metric,
           backend: params.backend ?? "auto",
           concurrency: params.concurrency,
-          decodeConcurrency: params.decodeConcurrency ?? 0,
           geometry: params.geometry ?? null,
         },
       });

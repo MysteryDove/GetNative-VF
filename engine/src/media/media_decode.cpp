@@ -110,6 +110,7 @@ extern "C" {
 
 #if defined(__APPLE__)
 #include <CoreVideo/CoreVideo.h>
+#include "videotoolbox_decode.hpp"
 #endif
 
 namespace getnative::media {
@@ -667,6 +668,49 @@ struct BuiltDecoder {
     return {std::move(format), std::move(built.codec), stream, built.decoder};
 }
 
+#if defined(__APPLE__)
+[[nodiscard]] OpenedDecoder open_demuxer(const std::string &path, std::uint32_t stream_index,
+                                         const MediaIndex *index = nullptr) {
+    AVFormatContext *raw_format = nullptr;
+    check_ffmpeg(avformat_open_input(&raw_format, path.c_str(), nullptr, nullptr),
+                 "avformat_open_input");
+    FormatPtr format{raw_format};
+    check_ffmpeg(avformat_find_stream_info(format.get(), nullptr),
+                 "avformat_find_stream_info");
+    if (stream_index >= format->nb_streams
+        || format->streams[stream_index]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) {
+        throw std::runtime_error("media stream index is not a video stream");
+    }
+    AVStream *stream = format->streams[stream_index];
+    import_index_entries(*stream, index);
+    return {std::move(format), {}, stream, nullptr};
+}
+
+[[nodiscard]] std::unique_ptr<VideotoolboxSession> make_videotoolbox_session(
+    const AVStream &stream, const ExtraDataInfo *configuration,
+    std::size_t max_inflight) {
+    const AVCodecParameters *par = stream.codecpar;
+    const std::uint8_t *extradata = par->extradata;
+    int extradata_size = par->extradata_size;
+    std::uint32_t codec_id = static_cast<std::uint32_t>(par->codec_id);
+    int width = par->width;
+    int height = par->height;
+    if (configuration != nullptr) {
+        if (configuration->codec_id != 0U) codec_id = configuration->codec_id;
+        if (configuration->width > 0) width = configuration->width;
+        if (configuration->height > 0) height = configuration->height;
+        if (!configuration->data.empty()) {
+            extradata = configuration->data.data();
+            extradata_size = static_cast<int>(configuration->data.size());
+        }
+    }
+    auto session = std::make_unique<VideotoolboxSession>(
+        codec_id, width, height, extradata, extradata_size, max_inflight);
+    session->set_timebase(stream.time_base.num, stream.time_base.den);
+    return session;
+}
+#endif
+
 [[nodiscard]] const ExtraDataInfo *indexed_decoder_configuration(
     const MediaIndex &index, std::uint64_t anchor) {
     if (anchor >= index.frames.size()) return nullptr;
@@ -911,14 +955,13 @@ void validate_selected_frames(const MediaIndex &index,
 }
 
 [[nodiscard]] std::vector<IndexedDecodeRun> plan_indexed_decode_runs(
-    const MediaIndex &index, std::span<const FrameIdentity> selected,
-    bool split_dense_at_rap = false) {
+    const MediaIndex &index, std::span<const FrameIdentity> selected) {
     validate_selected_frames(index, selected);
     std::vector<IndexedDecodeRun> runs;
     if (selected.empty()) return runs;
     const std::uint64_t covered = selected.back().frame_index
         - selected.front().frame_index + 1U;
-    const bool dense = !split_dense_at_rap && selected.size() * 2U >= covered;
+    const bool dense = selected.size() * 2U >= covered;
     std::size_t begin = 0U;
     while (begin < selected.size()) {
         const std::uint64_t anchor = selected[begin].keyframe_anchor;
@@ -954,20 +997,6 @@ void validate_selected_frames(const MediaIndex &index,
         begin = end;
     }
     return runs;
-}
-
-// Consecutive RAP-sized runs on one hardware session must be decoded as one
-// bitstream, not as a seek-per-GOP loop. VideoToolbox (and other hardware
-// decoders) can stall after the first GOP if the next run seeks without
-// tearing down the hardware context.
-[[nodiscard]] IndexedDecodeRun merge_indexed_decode_runs(
-    std::span<const IndexedDecodeRun> group) {
-    IndexedDecodeRun merged = group.front();
-    merged.selected_end = group.back().selected_end;
-    merged.end_position = group.back().end_position;
-    merged.end_decode_index = group.back().end_decode_index;
-    merged.streaming = true;
-    return merged;
 }
 
 class IndexedIdentityLookup {
@@ -2879,15 +2908,12 @@ void decode_selected_hardware_indexed(
     DecodeTelemetry *telemetry) {
     if (selected_frames.empty()) return;
     const auto start = Clock::now();
-    const std::size_t requested_sessions = std::clamp<std::size_t>(
-        options.hardware_decode_sessions, 1U, 4U);
-    const std::vector<IndexedDecodeRun> runs = plan_indexed_decode_runs(
-        index, selected_frames, requested_sessions > 1U);
+    const bool videotoolbox =
+        options.backend == DecoderOptions::Backend::videotoolbox;
+    const std::vector<IndexedDecodeRun> runs =
+        plan_indexed_decode_runs(index, selected_frames);
     const IndexedIdentityLookup identity_lookup{index};
-    // The default remains one persistent hardware decoder. The experimental
-    // multi-session path partitions whole RAP-aligned runs so no decoder
-    // depends on reference state owned by another session.
-    const std::size_t worker_count = std::min(requested_sessions, runs.size());
+    constexpr std::size_t worker_count = 1U;
     std::vector<DecodeTelemetry> worker_telemetry(worker_count);
     std::vector<double> worker_consumer_ms(worker_count, 0.0);
     std::mutex failure_mutex;
@@ -2900,8 +2926,21 @@ void decode_selected_hardware_indexed(
             const std::size_t run_end = (worker_index + 1U) * runs.size() / worker_count;
             const ExtraDataInfo *initial_configuration = indexed_decoder_configuration(
                 index, runs[run_begin].decode_anchor);
+#if defined(__APPLE__)
+            OpenedDecoder opened = videotoolbox
+                ? open_demuxer(path, index.stream_index, &index)
+                : open_decoder(
+                    path, index.stream_index, &options, &index, initial_configuration);
+            std::unique_ptr<VideotoolboxSession> vt;
+            if (videotoolbox) {
+                vt = make_videotoolbox_session(
+                    *opened.stream, initial_configuration,
+                    8U + options.frame_concurrency);
+            }
+#else
             OpenedDecoder opened = open_decoder(
                 path, index.stream_index, &options, &index, initial_configuration);
+#endif
             PacketPtr packet{av_packet_alloc()};
             if (!packet) throw std::runtime_error("FFmpeg packet allocation failed");
             std::optional<std::uint32_t> current_extradata_index =
@@ -2920,9 +2959,25 @@ void decode_selected_hardware_indexed(
                         ? std::optional{index.frames[decode_anchor].extradata_index}
                         : std::nullopt;
                 if (current_extradata_index == required_extradata) {
-                    if (force_flush) avcodec_flush_buffers(opened.codec.get());
+#if defined(__APPLE__)
+                    if (force_flush && vt) vt->flush();
+                    else
+#endif
+                    if (force_flush && opened.codec) {
+                        avcodec_flush_buffers(opened.codec.get());
+                    }
                     return;
                 }
+#if defined(__APPLE__)
+                if (vt) {
+                    vt = make_videotoolbox_session(
+                        *opened.stream,
+                        indexed_decoder_configuration(index, decode_anchor),
+                        8U + options.frame_concurrency);
+                    current_extradata_index = required_extradata;
+                    return;
+                }
+#endif
                 BuiltDecoder built = build_decoder(
                     *opened.stream, &options,
                     indexed_decoder_configuration(index, decode_anchor));
@@ -2931,33 +2986,19 @@ void decode_selected_hardware_indexed(
                 current_extradata_index = required_extradata;
             };
 
-            const auto run_extradata = [&](const IndexedDecodeRun &run)
-                -> std::optional<std::uint32_t> {
-                if (run.decode_anchor >= index.frames.size()) return std::nullopt;
-                return index.frames[run.decode_anchor].extradata_index;
-            };
-
-            for (std::size_t run_index = run_begin; run_index < run_end; ) {
+            for (std::size_t run_index = run_begin; run_index < run_end; ++run_index) {
                 if (stop.stop_requested()) throw std::runtime_error("cancelled");
                 if (failed.load(std::memory_order_relaxed)) return;
-                std::size_t group_end = run_index + 1U;
-                const auto group_extradata = run_extradata(runs[run_index]);
-                while (group_end < run_end
-                       && run_extradata(runs[group_end]) == group_extradata) {
-                    ++group_end;
-                }
-                const IndexedDecodeRun run = merge_indexed_decode_runs(
-                    std::span<const IndexedDecodeRun>{
-                        runs.data() + run_index, group_end - run_index});
-                run_index = group_end;
+                const IndexedDecodeRun &run = runs[run_index];
                 std::uint64_t decode_anchor = run.decode_anchor;
                 for (std::size_t attempt = 0U;; ++attempt) {
-                    // Every normal run starts at an indexed RAP. Feeding the next
-                    // RAP resets codec reference state without avcodec_flush_buffers(),
-                    // which would tear down and recreate FFmpeg's H.264/HEVC
-                    // hardware context for every selected I-picture. A retry can
-                    // start before the requested RAP, so reset explicitly there.
-                    configure_decoder(decode_anchor, attempt != 0U);
+                    // Every run starts at an indexed RAP. CUDA/Vulkan reset DPB
+                    // by feeding the next IDR; flushing would tear down the
+                    // hardware context for every selected I-picture. VideoToolbox
+                    // stalls on that pattern, so it flushes (recreates the
+                    // session) at each RAP. Retries always flush because they
+                    // start before the requested RAP.
+                    configure_decoder(decode_anchor, videotoolbox || attempt != 0U);
                     std::uint64_t presentation_cursor = 0U;
                     if (decode_anchor < index.frames.size()
                         && seek_to_keyframe(*opened.format, index,
@@ -3002,6 +3043,62 @@ void decode_selected_hardware_indexed(
                             Clock::now() - consumer_start).count();
                         ++local.selected_frames;
                     };
+#if defined(__APPLE__)
+                    if (vt) {
+                        const auto pump = [&](bool block) {
+                            VideotoolboxFrame output;
+                            while (delivered_count != delivered_flags.size()) {
+                                const bool got = block ? vt->wait_pop(output, stop)
+                                                       : vt->try_pop(output);
+                                block = false;
+                                if (!got) break;
+                                AVFrame probe{};
+                                probe.pts = output.pts;
+                                probe.best_effort_timestamp = output.pts;
+                                probe.pkt_dts = output.dts;
+                                probe.duration = output.duration;
+                                probe.width = output.width;
+                                probe.height = output.height;
+                                probe.format = AV_PIX_FMT_VIDEOTOOLBOX;
+                                probe.data[3] = reinterpret_cast<std::uint8_t *>(
+                                    output.pixel_buffer);
+                                probe.opaque = &output;
+                                process(probe);
+                            }
+                        };
+                        while (delivered_count != delivered_flags.size()
+                               && av_read_frame(opened.format.get(), packet.get()) >= 0) {
+                            if (stop.stop_requested()) {
+                                av_packet_unref(packet.get());
+                                throw std::runtime_error("cancelled");
+                            }
+                            if (failed.load(std::memory_order_relaxed)) {
+                                av_packet_unref(packet.get());
+                                return;
+                            }
+                            if (packet->stream_index == static_cast<int>(index.stream_index)) {
+                                if (run.end_position && packet->pos >= *run.end_position) {
+                                    av_packet_unref(packet.get());
+                                    break;
+                                }
+                                while (!vt->can_submit()
+                                       && delivered_count != delivered_flags.size()) {
+                                    pump(true);
+                                }
+                                if (delivered_count != delivered_flags.size()) {
+                                    vt->submit(
+                                        packet->data, packet->size, packet->pts,
+                                        packet->dts, packet->duration);
+                                    pump(false);
+                                }
+                            }
+                            av_packet_unref(packet.get());
+                        }
+                        vt->finish();
+                        pump(true);
+                    } else
+#endif
+                    {
                     while (delivered_count != delivered_flags.size()
                            && av_read_frame(opened.format.get(), packet.get()) >= 0) {
                         if (stop.stop_requested()) {
@@ -3033,6 +3130,7 @@ void decode_selected_hardware_indexed(
                                 + std::string{backend_name} + " flush)",
                             process);
                         receive_frames(*opened.codec, stop, process);
+                    }
                     }
                     if (delivered_count == delivered_flags.size()) break;
                     // A retry is only safe before this run emitted a surface;
@@ -3302,7 +3400,11 @@ void decode_selected_metal(const std::string &path, const MediaIndex &index,
                                 || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) ? 10 : 8;
             output.range = frame_range(source);
             output.surface_format = surface;
-            output.lease = retain_frame(source, "av_frame_clone(VideoToolbox)");
+            if (source.opaque != nullptr) {
+                output.lease = static_cast<VideotoolboxFrame *>(source.opaque)->lease;
+            } else {
+                output.lease = retain_frame(source, "av_frame_clone(VideoToolbox)");
+            }
             consumer(std::move(output));
         }, telemetry);
 #endif

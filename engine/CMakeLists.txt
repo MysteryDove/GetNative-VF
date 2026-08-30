@@ -794,6 +794,9 @@ if(GETNATIVE_ENABLE_MEDIA)
     add_library(getnative_media STATIC
         src/media/media_decode.cpp
         src/media/media_index.cpp)
+    if(APPLE)
+        target_sources(getnative_media PRIVATE src/media/videotoolbox_decode.cpp)
+    endif()
     target_compile_features(getnative_media PUBLIC cxx_std_23)
     target_include_directories(getnative_media PUBLIC include)
     target_link_libraries(getnative_media PUBLIC ${GETNATIVE_FFMPEG_TARGET})
