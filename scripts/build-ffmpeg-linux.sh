@@ -193,9 +193,12 @@ if ((enabled_vulkan)); then
   done
 fi
 
-allowed_needed='^(linux-vdso\.so\.1|ld-linux-x86-64\.so\.2|libc\.so\.6|libm\.so\.6|libz\.so\.1|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libgcc_s\.so\.1|libstdc\+\+\.so\.6)$'
+# libavformat/libavcodec/libswscale NEEDED the other FFmpeg sonames in this
+# SDK; those are resolved via $ORIGIN. Reject CUDA toolkit/driver and GUI
+# stacks, not the intra-FFmpeg edges.
+allowed_needed='^(linux-vdso\.so\.1|ld-linux-x86-64\.so\.2|libc\.so\.6|libm\.so\.6|libz\.so\.1|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libgcc_s\.so\.1|libstdc\+\+\.so\.6|libiconv\.so\.2|libavcodec\.so\.62|libavformat\.so\.62|libavutil\.so\.60|libswscale\.so\.9)$'
 if ((enabled_vulkan)); then
-  allowed_needed='^(linux-vdso\.so\.1|ld-linux-x86-64\.so\.2|libc\.so\.6|libm\.so\.6|libz\.so\.1|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libgcc_s\.so\.1|libstdc\+\+\.so\.6|libvulkan\.so\.1)$'
+  allowed_needed='^(linux-vdso\.so\.1|ld-linux-x86-64\.so\.2|libc\.so\.6|libm\.so\.6|libz\.so\.1|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libgcc_s\.so\.1|libstdc\+\+\.so\.6|libiconv\.so\.2|libavcodec\.so\.62|libavformat\.so\.62|libavutil\.so\.60|libswscale\.so\.9|libvulkan\.so\.1)$'
 fi
 for library in libavformat.so.62 libavcodec.so.62 libavutil.so.60 libswscale.so.9; do
   test -f "${sdk_dir}/lib/${library}" || {
