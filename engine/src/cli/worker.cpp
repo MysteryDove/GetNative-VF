@@ -3798,19 +3798,22 @@ private:
 #if defined(GETNATIVE_HAS_CUDA)
             if (spec.backend == BackendChoice::cuda) {
                 return cuda_engine_->analyze_axis_batch_f32(
-                    source, chunk, spec.metric, job.stop_source.get_token());
+                    source, chunk, spec.metric, job.stop_source.get_token(),
+                    gpu_stage_profile_from_environment());
             }
 #endif
 #if defined(GETNATIVE_HAS_VULKAN)
             if (spec.backend == BackendChoice::vulkan) {
                 return vulkan_engine_->analyze_axis_batch_f32(
-                    source, chunk, spec.metric, job.stop_source.get_token());
+                    source, chunk, spec.metric, job.stop_source.get_token(),
+                    gpu_stage_profile_from_environment());
             }
 #endif
 #if defined(GETNATIVE_HAS_METAL)
             if (spec.backend == BackendChoice::metal) {
                 return metal_engine_->analyze_axis_batch_f32(
-                    source, chunk, spec.metric, job.stop_source.get_token());
+                    source, chunk, spec.metric, job.stop_source.get_token(),
+                    {}, gpu_stage_profile_from_environment());
             }
 #endif
             throw WorkerError("unsupported", "accelerator backend is unavailable");
@@ -3876,7 +3879,8 @@ private:
                     source, all_candidates, spec.metric, job.stop_source.get_token(),
                     [&](std::size_t done, std::size_t total) {
                         emit_progress(spec, "candidates", done, total);
-                    });
+                    },
+                    gpu_stage_profile_from_environment());
             } catch (const WorkerError &) {
                 throw;
             } catch (const std::exception &error) {
@@ -4735,7 +4739,8 @@ private:
 #if defined(GETNATIVE_HAS_CUDA)
                 error = resident_cuda_engine().analyze_axis_batch_f32(
                     view, candidates, spec.metric,
-                    job.stop_source.get_token()).front().error;
+                    job.stop_source.get_token(),
+                    gpu_stage_profile_from_environment()).front().error;
 #else
                 throw WorkerError("unsupported", "CUDA backend was not compiled");
 #endif
@@ -4743,7 +4748,8 @@ private:
 #if defined(GETNATIVE_HAS_VULKAN)
                 error = resident_vulkan_engine().analyze_axis_batch_f32(
                     view, candidates, spec.metric,
-                    job.stop_source.get_token()).front().error;
+                    job.stop_source.get_token(),
+                    gpu_stage_profile_from_environment()).front().error;
 #else
                 throw WorkerError("unsupported", "Vulkan backend was not compiled");
 #endif
@@ -4751,7 +4757,8 @@ private:
 #if defined(GETNATIVE_HAS_METAL)
                 error = resident_metal_engine().analyze_axis_batch_f32(
                     view, candidates, spec.metric,
-                    job.stop_source.get_token()).front().error;
+                    job.stop_source.get_token(), {},
+                    gpu_stage_profile_from_environment()).front().error;
 #else
                 throw WorkerError("unsupported", "Metal backend was not compiled");
 #endif
@@ -4813,7 +4820,8 @@ private:
                                 const double error =
                                     cuda.analyze_axis_batch_cuda_luma(
                                         view, candidates, spec.metric,
-                                        job.stop_source.get_token()).front().error;
+                                        job.stop_source.get_token(),
+                                        gpu_stage_profile_from_environment()).front().error;
                                 compute_ms.fetch_add(
                                     elapsed_ms(compute_start),
                                     std::memory_order_relaxed);
@@ -4903,7 +4911,8 @@ private:
                                 const double error =
                                     vulkan.analyze_axis_batch_vulkan_luma(
                                         view, candidates, spec.metric,
-                                        job.stop_source.get_token()).front().error;
+                                        job.stop_source.get_token(),
+                                        gpu_stage_profile_from_environment()).front().error;
                                 compute_ms.fetch_add(
                                     elapsed_ms(compute_start),
                                     std::memory_order_relaxed);
@@ -4973,7 +4982,8 @@ private:
                             try {
                                 const double error = metal.analyze_axis_batch_metal_luma(
                                     view, candidates, spec.metric,
-                                    job.stop_source.get_token()).front().error;
+                                    job.stop_source.get_token(),
+                                    gpu_stage_profile_from_environment()).front().error;
                                 compute_ms.fetch_add(
                                     elapsed_ms(start), std::memory_order_relaxed);
                                 return error;

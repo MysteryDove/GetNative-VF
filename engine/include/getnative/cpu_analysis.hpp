@@ -4,6 +4,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <span>
 #include <string>
@@ -33,6 +35,29 @@ struct MetricSpec {
     float threshold = 0.015F;
     std::uint32_t norm = 1U;
 };
+
+// GPU stage timers (CUDA events, Vulkan timestamps, Metal GPUStartTime) stay
+// compiled. Default off so verify/scan do not pay per-dispatch instrumentation.
+// GETNATIVE_GPU_STAGE_PROFILE=1|true|on|stages turns them on for the process.
+enum class GpuStageProfile : std::uint8_t {
+    off,
+    stages,
+};
+
+[[nodiscard]] inline GpuStageProfile gpu_stage_profile_from_environment() noexcept {
+    const char *value = std::getenv("GETNATIVE_GPU_STAGE_PROFILE");
+    if (value == nullptr || *value == '\0') return GpuStageProfile::off;
+    if (std::strcmp(value, "0") == 0 || std::strcmp(value, "off") == 0
+        || std::strcmp(value, "false") == 0 || std::strcmp(value, "no") == 0) {
+        return GpuStageProfile::off;
+    }
+    if (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0
+        || std::strcmp(value, "on") == 0 || std::strcmp(value, "yes") == 0
+        || std::strcmp(value, "stages") == 0) {
+        return GpuStageProfile::stages;
+    }
+    return GpuStageProfile::off;
+}
 
 enum class AnalysisAxes : std::uint8_t {
     horizontal,

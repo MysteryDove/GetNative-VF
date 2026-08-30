@@ -218,20 +218,22 @@ public:
     // in parallel. Reconstruction is fused into the p=1..4 metric.
     [[nodiscard]] std::vector<CandidateResult> analyze_axis_batch_f32(
         ConstImageView source, std::span<const CandidateAnalysis> candidates,
-        const MetricSpec &metric, std::stop_token stop = {});
+        const MetricSpec &metric, std::stop_token stop = {},
+        GpuStageProfile profile = GpuStageProfile::off);
 
     // Converts the decoder-owned luma plane directly into the resident F32
     // source buffer. No frame-sized payload is staged through host memory.
     [[nodiscard]] std::vector<CandidateResult> analyze_axis_batch_cuda_luma(
         const CudaLumaFrameView &source,
         std::span<const CandidateAnalysis> candidates,
-        const MetricSpec &metric, std::stop_token stop = {});
+        const MetricSpec &metric, std::stop_token stop = {},
+        GpuStageProfile profile = GpuStageProfile::off);
 
 private:
     [[nodiscard]] std::vector<CandidateResult> analyze_axis_batch_impl(
         ConstImageView source, const CudaLumaFrameView *cuda_luma,
         std::span<const CandidateAnalysis> candidates,
-        const MetricSpec &metric, std::stop_token stop);
+        const MetricSpec &metric, std::stop_token stop, GpuStageProfile profile);
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

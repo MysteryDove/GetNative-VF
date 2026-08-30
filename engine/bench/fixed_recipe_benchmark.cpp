@@ -469,7 +469,8 @@ void fnv1a_vector(std::uint64_t &hash, const std::vector<T> &values) {
     std::vector<double> values(frame_count);
     for (std::size_t index = 0; index < frame_count; ++index) {
         const auto result = metal.analyze_axis_batch_f32(
-            frame_view(config, fixture, index), candidate, metric);
+            frame_view(config, fixture, index), candidate, metric, {}, {},
+            getnative::GpuStageProfile::stages);
         if (result.size() != 1U || result.front().id != "locked-recipe") {
             throw std::runtime_error("Metal result changed fixed-recipe identity");
         }

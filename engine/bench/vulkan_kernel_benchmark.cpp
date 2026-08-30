@@ -52,7 +52,8 @@ void require_exact(
     engine.reset_analysis_telemetry();
     const auto start = std::chrono::steady_clock::now();
     Sample sample;
-    sample.results = engine.analyze_axis_batch_f32(source, candidates, metric);
+    sample.results = engine.analyze_axis_batch_f32(
+        source, candidates, metric, {}, getnative::GpuStageProfile::stages);
     sample.wall_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - start).count();
     sample.telemetry = engine.runtime_telemetry();

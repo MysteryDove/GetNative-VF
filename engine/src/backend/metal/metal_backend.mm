@@ -1294,7 +1294,8 @@ void MetalAnalysisEngine::preflight_axis_batch(
 std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
     ConstImageView source, std::span<const CandidateAnalysis> candidates,
     const MetricSpec &metric, std::stop_token stop,
-    const std::function<void(std::size_t, std::size_t)> &progress) {
+    const std::function<void(std::size_t, std::size_t)> &progress,
+    GpuStageProfile profile) {
     std::unique_ptr<MetalExecutionSlot, std::function<void(MetalExecutionSlot *)>> slot_guard(
         nullptr, [](MetalExecutionSlot *) {});
     if (active_slot == nullptr) {
@@ -1440,13 +1441,15 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
                     command_error = ns_error(command.error,
                                              "Metal command execution failed");
                 }
-                if (@available(macOS 10.15, *)) {
-                    const double gpu_start = command.GPUStartTime;
-                    const double gpu_end = command.GPUEndTime;
-                    if (std::isfinite(gpu_start) && std::isfinite(gpu_end) &&
-                        gpu_end >= gpu_start) {
-                        const std::scoped_lock lock(impl_->mutex);
-                        impl_->gpu_execution_ms += (gpu_end - gpu_start) * 1000.0;
+                if (profile == GpuStageProfile::stages) {
+                    if (@available(macOS 10.15, *)) {
+                        const double gpu_start = command.GPUStartTime;
+                        const double gpu_end = command.GPUEndTime;
+                        if (std::isfinite(gpu_start) && std::isfinite(gpu_end) &&
+                            gpu_end >= gpu_start) {
+                            const std::scoped_lock lock(impl_->mutex);
+                            impl_->gpu_execution_ms += (gpu_end - gpu_start) * 1000.0;
+                        }
                     }
                 }
             }
@@ -2003,7 +2006,7 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(
 std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_metal_luma(
     const MetalLumaFrameView &source,
     std::span<const CandidateAnalysis> candidates,
-    const MetricSpec &metric, std::stop_token stop) {
+    const MetricSpec &metric, std::stop_token stop, GpuStageProfile profile) {
     if (source.pixel_buffer == 0U || source.width <= 0 || source.height <= 0) {
         throw std::invalid_argument("metal_zero_copy_unsupported: invalid CVPixelBuffer");
     }
@@ -2111,7 +2114,8 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_metal_luma(
         ConstImageView view{
             reinterpret_cast<const float *>(std::uintptr_t{1}),
             source.width, source.height, source.width};
-        return analyze_axis_batch_f32(view, candidates, metric, stop);
+        return analyze_axis_batch_f32(
+            view, candidates, metric, stop, {}, profile);
     }
 }
 

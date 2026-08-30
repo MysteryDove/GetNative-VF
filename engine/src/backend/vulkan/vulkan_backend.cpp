@@ -1642,24 +1642,25 @@ void VulkanAnalysisEngine::preflight_axis_batch(
 
 std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_f32(
     ConstImageView source, std::span<const CandidateAnalysis> candidates,
-    const MetricSpec &metric, std::stop_token stop) {
-    return analyze_axis_batch_impl(source, nullptr, candidates, metric, stop);
+    const MetricSpec &metric, std::stop_token stop, GpuStageProfile profile) {
+    return analyze_axis_batch_impl(
+        source, nullptr, candidates, metric, stop, profile);
 }
 
 std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_vulkan_luma(
     const VulkanLumaFrameView &source,
     std::span<const CandidateAnalysis> candidates,
-    const MetricSpec &metric, std::stop_token stop) {
+    const MetricSpec &metric, std::stop_token stop, GpuStageProfile profile) {
     const ConstImageView geometry{
         nullptr, source.width, source.height, source.width};
     return analyze_axis_batch_impl(
-        geometry, &source, candidates, metric, stop);
+        geometry, &source, candidates, metric, stop, profile);
 }
 
 std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
     ConstImageView source, const VulkanLumaFrameView *device_source,
     std::span<const CandidateAnalysis> candidates,
-    const MetricSpec &metric, std::stop_token stop) {
+    const MetricSpec &metric, std::stop_token stop, GpuStageProfile profile) {
     bool frame_released = false;
     ScopeExit release_frame{[&] {
         if (device_source != nullptr && !frame_released
@@ -1831,7 +1832,8 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
         VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
     check_vk(vkBeginCommandBuffer(slot.command, &begin_info),
              "vkBeginCommandBuffer");
-    if (device_source != nullptr
+    const bool instrument = profile == GpuStageProfile::stages;
+    if (instrument && device_source != nullptr
         && slot.conversion_query_pool != VK_NULL_HANDLE) {
         vkCmdResetQueryPool(slot.command, slot.conversion_query_pool, 0U, 2U);
     }
@@ -1902,7 +1904,7 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
     };
     std::size_t dispatches = 0U;
     if (device_source != nullptr) {
-        if (slot.conversion_query_pool != VK_NULL_HANDLE) {
+        if (instrument && slot.conversion_query_pool != VK_NULL_HANDLE) {
             vkCmdWriteTimestamp(
                 slot.command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 slot.conversion_query_pool, 0U);
@@ -1919,7 +1921,7 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
             slot.command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_READ_BIT);
-        if (slot.conversion_query_pool != VK_NULL_HANDLE) {
+        if (instrument && slot.conversion_query_pool != VK_NULL_HANDLE) {
             vkCmdWriteTimestamp(
                 slot.command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 slot.conversion_query_pool, 1U);
@@ -2034,7 +2036,7 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
     delta.gpu_execution_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - gpu_start).count();
     slot.host_partials.invalidate();
-    if (device_source != nullptr
+    if (instrument && device_source != nullptr
         && slot.conversion_query_pool != VK_NULL_HANDLE) {
         std::array<std::uint64_t, 2U> timestamps{};
         check_vk(vkGetQueryPoolResults(

@@ -268,7 +268,8 @@ struct WaveResult {
     if (concurrency == 1U) {
         const auto start = std::chrono::steady_clock::now();
         const auto results = engine.analyze_axis_batch_f32(
-            fixture.source, fixture.candidates, fixture.metric);
+            fixture.source, fixture.candidates, fixture.metric, {},
+            getnative::GpuStageProfile::stages);
         const auto end = std::chrono::steady_clock::now();
         double checksum = 0.0;
         for (const auto &result : results) checksum += result.error;
@@ -290,7 +291,8 @@ struct WaveResult {
             start_gate.arrive_and_wait();
             try {
                 const auto results = engine.analyze_axis_batch_f32(
-                    fixture.source, fixture.candidates, fixture.metric);
+                    fixture.source, fixture.candidates, fixture.metric, {},
+                    getnative::GpuStageProfile::stages);
                 for (const auto &result : results) checksums[worker] += result.error;
                 rankings[worker] = rank_candidates(results);
             } catch (...) {

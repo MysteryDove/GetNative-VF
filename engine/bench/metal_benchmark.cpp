@@ -412,7 +412,8 @@ void prewarm_retained_cache(
     const auto cpu = getnative::analyze_batch_f32(view, candidates, metric);
     const auto cpu_elapsed = Clock::now() - cpu_start;
     const auto metal_start = Clock::now();
-    const auto gpu = metal.analyze_axis_batch_f32(view, candidates, metric);
+    const auto gpu = metal.analyze_axis_batch_f32(
+        view, candidates, metric, {}, {}, getnative::GpuStageProfile::stages);
     const auto metal_elapsed = Clock::now() - metal_start;
 
     double maximum_error = 0.0;

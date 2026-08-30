@@ -941,7 +941,8 @@ struct WaveResult {
         for (std::size_t iteration = 0;
              iteration < fixture.spec.iterations_per_worker; ++iteration) {
             result.results[0] = engine.analyze_axis_batch_f32(
-                fixture.source, fixture.candidates, fixture.metric);
+                fixture.source, fixture.candidates, fixture.metric, {},
+                getnative::GpuStageProfile::stages);
         }
         const auto end = std::chrono::steady_clock::now();
         result.wall_ms = std::chrono::duration<double, std::milli>(end - begin).count();
@@ -960,7 +961,8 @@ struct WaveResult {
                 for (std::size_t iteration = 0;
                      iteration < fixture.spec.iterations_per_worker; ++iteration) {
                     result.results[worker] = engine.analyze_axis_batch_f32(
-                        fixture.source, fixture.candidates, fixture.metric);
+                        fixture.source, fixture.candidates, fixture.metric, {},
+                        getnative::GpuStageProfile::stages);
                 }
             } catch (...) {
                 failures[worker] = std::current_exception();
@@ -1207,11 +1209,13 @@ void calibrate_fixture_iterations(
     options.kernel_variant = getnative::CudaKernelVariant::cpp_generic;
     getnative::CudaAnalysisEngine engine(options);
     const auto first = engine.analyze_axis_batch_f32(
-        fixture.source, fixture.candidates, fixture.metric);
+        fixture.source, fixture.candidates, fixture.metric, {},
+        getnative::GpuStageProfile::stages);
     SelfTestResult result;
     validate_results(first, cpu, result.validation);
     const auto second = engine.analyze_axis_batch_f32(
-        fixture.source, fixture.candidates, fixture.metric);
+        fixture.source, fixture.candidates, fixture.metric, {},
+        getnative::GpuStageProfile::stages);
     result.repeat_bitwise_stable = first.size() == second.size();
     for (std::size_t index = 0;
          result.repeat_bitwise_stable && index < first.size(); ++index) {

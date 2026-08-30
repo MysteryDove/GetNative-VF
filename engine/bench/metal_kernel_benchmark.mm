@@ -1507,7 +1507,8 @@ struct BicubicTopologyStats {
                                   const getnative::MetricSpec &metric) {
     engine.reset_analysis_telemetry();
     const auto start = Clock::now();
-    auto results = engine.analyze_axis_batch_f32(source, candidates, metric);
+    auto results = engine.analyze_axis_batch_f32(
+        source, candidates, metric, {}, {}, getnative::GpuStageProfile::stages);
     const auto elapsed = Clock::now() - start;
     return {
         std::chrono::duration<double, std::milli>(elapsed).count(),
@@ -1594,8 +1595,12 @@ struct BicubicTopologyStats {
     const auto generic_creation = generic.runtime_telemetry();
     const auto comparison_creation = comparison.runtime_telemetry();
 
-    (void)generic.analyze_axis_batch_f32(source, candidates, matrix.metric);
-    (void)comparison.analyze_axis_batch_f32(source, candidates, matrix.metric);
+    (void)generic.analyze_axis_batch_f32(
+        source, candidates, matrix.metric, {}, {},
+        getnative::GpuStageProfile::stages);
+    (void)comparison.analyze_axis_batch_f32(
+        source, candidates, matrix.metric, {}, {},
+        getnative::GpuStageProfile::stages);
 
     CaseReport report;
     report.benchmark_case = benchmark_case;

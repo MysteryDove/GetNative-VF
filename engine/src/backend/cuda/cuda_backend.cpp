@@ -234,28 +234,14 @@ constexpr std::int32_t minimum_architecture = GETNATIVE_CUDA_MIN_ARCHITECTURE;
     return stream.str();
 }
 
-class CurrentContextGuard {
-public:
-    CurrentContextGuard(const DriverApi &api, CUcontext desired) : api_(&api) {
-        cuda_detail::cuda_check(api, api.ctx_get_current(&previous_), "cuCtxGetCurrent");
-        if (previous_ != desired) {
-            cuda_detail::cuda_check(api, api.ctx_set_current(desired), "cuCtxSetCurrent");
-            changed_ = true;
-        }
-    }
-
-    ~CurrentContextGuard() {
-        if (changed_) (void)api_->ctx_set_current(previous_);
-    }
-
-    CurrentContextGuard(const CurrentContextGuard &) = delete;
-    CurrentContextGuard &operator=(const CurrentContextGuard &) = delete;
-
-private:
-    const DriverApi *api_ = nullptr;
-    CUcontext previous_ = nullptr;
-    bool changed_ = false;
-};
+// Worker/analyze threads stay on the engine context. Skip per-call
+// cuCtxGetCurrent/SetCurrent once this thread has already bound it.
+void bind_analysis_context(const DriverApi &api, CUcontext desired) {
+    thread_local CUcontext bound = nullptr;
+    if (bound == desired) return;
+    cuda_detail::cuda_check(api, api.ctx_set_current(desired), "cuCtxSetCurrent");
+    bound = desired;
+}
 
 class DeviceBuffer {
 public:
@@ -1691,14 +1677,15 @@ void CudaAnalysisEngine::preflight_axis_batch(
 
 std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(
     ConstImageView source, std::span<const CandidateAnalysis> candidates,
-    const MetricSpec &metric, std::stop_token stop) {
-    return analyze_axis_batch_impl(source, nullptr, candidates, metric, stop);
+    const MetricSpec &metric, std::stop_token stop, GpuStageProfile profile) {
+    return analyze_axis_batch_impl(
+        source, nullptr, candidates, metric, stop, profile);
 }
 
 std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_cuda_luma(
     const CudaLumaFrameView &source,
     std::span<const CandidateAnalysis> candidates,
-    const MetricSpec &metric, std::stop_token stop) {
+    const MetricSpec &metric, std::stop_token stop, GpuStageProfile profile) {
     (void)validate_cuda_luma(source);
     const ConstImageView dimensions{
         reinterpret_cast<const float *>(std::uintptr_t{1}),
@@ -1706,13 +1693,14 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_cuda_luma(
         source.height,
         source.width,
     };
-    return analyze_axis_batch_impl(dimensions, &source, candidates, metric, stop);
+    return analyze_axis_batch_impl(
+        dimensions, &source, candidates, metric, stop, profile);
 }
 
 std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
     ConstImageView source, const CudaLumaFrameView *cuda_luma,
     std::span<const CandidateAnalysis> candidates,
-    const MetricSpec &metric, std::stop_token stop) {
+    const MetricSpec &metric, std::stop_token stop, GpuStageProfile profile) {
     validate_source_and_metric(source, metric);
     const bool cuda_device_source = cuda_luma != nullptr;
     const CudaLumaLayout luma_layout = cuda_device_source
@@ -1733,11 +1721,15 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
         stop, source, candidates, impl_->effective_workspace_limit_elements);
     delta.execution_slot_wait_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - wait_start).count();
-    CurrentContextGuard context(*impl_->api, impl_->context);
+    bind_analysis_context(*impl_->api, impl_->context);
     ExecutionSlot &slot = *impl_->slots[slot_index];
     std::shared_ptr<SharedSourceEntry> shared_source;
+    const bool instrument = profile == GpuStageProfile::stages;
+    bool stream_synced = false;
     ScopeExit release_slot{[&] {
-        (void)impl_->api->stream_synchronize(slot.stream);
+        if (!stream_synced) {
+            (void)impl_->api->stream_synchronize(slot.stream);
+        }
         shared_source.reset();
         impl_->release_slot(slot_index);
     }};
@@ -1748,16 +1740,18 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
             throw std::invalid_argument(
                 "CUDA luma frame belongs to a different context");
         }
-        CUcontext pointer_context = nullptr;
-        cuda_detail::cuda_check(
-            *impl_->api,
-            impl_->api->pointer_get_attribute(
-                &pointer_context, CU_POINTER_ATTRIBUTE_CONTEXT,
-                static_cast<CUdeviceptr>(cuda_luma->device_pointer)),
-            "cuPointerGetAttribute(CONTEXT)");
-        if (pointer_context != impl_->context) {
-            throw std::invalid_argument(
-                "CUDA luma pointer belongs to a different context");
+        if (instrument) {
+            CUcontext pointer_context = nullptr;
+            cuda_detail::cuda_check(
+                *impl_->api,
+                impl_->api->pointer_get_attribute(
+                    &pointer_context, CU_POINTER_ATTRIBUTE_CONTEXT,
+                    static_cast<CUdeviceptr>(cuda_luma->device_pointer)),
+                "cuPointerGetAttribute(CONTEXT)");
+            if (pointer_context != impl_->context) {
+                throw std::invalid_argument(
+                    "CUDA luma pointer belongs to a different context");
+            }
         }
     }
     const auto pack_start = std::chrono::steady_clock::now();
@@ -2184,7 +2178,10 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
                 slot.stream, slot.producer_ready.get(), 0U),
             "cuStreamWaitEvent(decoder frame)");
     }
-    slot.events[0].record(slot.stream);
+    const auto record_stage = [&](std::size_t index) {
+        if (instrument) slot.events[index].record(slot.stream);
+    };
+    record_stage(0);
     if (cuda_device_source) {
         CUdeviceptr luma_pointer = static_cast<CUdeviceptr>(
             cuda_luma->device_pointer);
@@ -2230,7 +2227,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
         slot.source_ready = true;
         slot.transposed_source_ready = false;
     }
-    slot.events[1].record(slot.stream);
+    record_stage(1);
     if (!plan_cache_hit) {
         // The pack wrote the staging image directly into pinned memory, so
         // the upload is nine straight H2D copies out of the layout regions —
@@ -2256,7 +2253,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
         }
         delta.plan_upload_bytes = packed.layout.total_bytes;
     }
-    slot.events[2].record(slot.stream);
+    record_stage(2);
 
     update_maximum(impl_->peak_workspace_elements, packed.workspace_elements);
     update_maximum(impl_->peak_working_set_bytes, working_set);
@@ -2335,7 +2332,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
         slot.transposed_source_ready = true;
         ++delta.source_transpose_count;
     }
-    slot.events[3].record(slot.stream);
+    record_stage(3);
 
     for (const PackedBatch::Tile &tile : packed.tiles) {
         std::uint32_t tile_candidate_count = checked_u32(
@@ -2347,7 +2344,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
         CUdeviceptr candidates_pointer = slot.device_candidates.pointer()
             + tile.first_candidate * sizeof(CandidateDescriptor);
 
-        slot.events[4].record(slot.stream);
+        record_stage(4);
         if (tile.has_horizontal) {
             const unsigned int blocks = static_cast<unsigned int>(
                 (static_cast<std::size_t>(height) + inverse_threads - 1U)
@@ -2389,7 +2386,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
                     "cuLaunchKernel(getnative_cuda_inverse_horizontal)");
             }
         }
-        slot.events[5].record(slot.stream);
+        record_stage(5);
         if (tile.has_vertical) {
             const bool paired_vertical =
                 !tile.has_both && launch_policy.paired_vertical;
@@ -2417,7 +2414,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
                     ? "cuLaunchKernel(getnative_cuda_inverse_vertical_pair)"
                     : "cuLaunchKernel(getnative_cuda_inverse_vertical)");
         }
-        slot.events[6].record(slot.stream);
+        record_stage(6);
         if (tile.has_both && !fused_both) {
             void *parameters[] = {
                 &width, &height,
@@ -2434,7 +2431,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
                 pixel_threads, 1U, 0U, parameters,
                 "cuLaunchKernel(getnative_cuda_forward_intermediate)");
         }
-        slot.events[7].record(slot.stream);
+        record_stage(7);
         if (fused_both) {
             void *parameters[] = {
                 &source_pointer, &width,
@@ -2478,7 +2475,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
                 pixel_threads * static_cast<unsigned int>(sizeof(double)),
                 parameters, "cuLaunchKernel(getnative_cuda_metric_finalize)");
         }
-        slot.events[8].record(slot.stream);
+        record_stage(8);
 
         const std::size_t tile_result_bytes = checked_product(
             tile.candidate_count, sizeof(double), "CUDA tile result readback");
@@ -2488,11 +2485,12 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
                 slot.pinned_results.data(), slot.device_results.pointer(),
                 tile_result_bytes, slot.stream),
             "cuMemcpyDtoHAsync_v2(results)");
-        slot.events[9].record(slot.stream);
+        record_stage(9);
         cuda_detail::cuda_check(
             *impl_->api,
             impl_->api->stream_synchronize(slot.stream),
             "cuStreamSynchronize(staged)");
+        stream_synced = true;
 
         if (metric.norm > 1U) {
             auto *tile_results = static_cast<double *>(slot.pinned_results.data());
@@ -2503,27 +2501,29 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
             }
         }
 
-        if (tile.has_horizontal) {
-            if (horizontal_only) {
-                delta.horizontal_fused_ms += elapsed_ms(
-                    *impl_->api, slot.events[4], slot.events[5]);
-            } else {
-                delta.inverse_horizontal_ms += elapsed_ms(
-                    *impl_->api, slot.events[4], slot.events[5]);
+        if (instrument) {
+            if (tile.has_horizontal) {
+                if (horizontal_only) {
+                    delta.horizontal_fused_ms += elapsed_ms(
+                        *impl_->api, slot.events[4], slot.events[5]);
+                } else {
+                    delta.inverse_horizontal_ms += elapsed_ms(
+                        *impl_->api, slot.events[4], slot.events[5]);
+                }
             }
+            if (tile.has_vertical) {
+                delta.inverse_vertical_ms += elapsed_ms(
+                    *impl_->api, slot.events[5], slot.events[6]);
+            }
+            if (tile.has_both && !fused_both) {
+                delta.forward_intermediate_ms += elapsed_ms(
+                    *impl_->api, slot.events[6], slot.events[7]);
+            }
+            delta.metric_ms += elapsed_ms(
+                *impl_->api, slot.events[7], slot.events[8]);
+            delta.result_readback_ms += elapsed_ms(
+                *impl_->api, slot.events[8], slot.events[9]);
         }
-        if (tile.has_vertical) {
-            delta.inverse_vertical_ms += elapsed_ms(
-                *impl_->api, slot.events[5], slot.events[6]);
-        }
-        if (tile.has_both && !fused_both) {
-            delta.forward_intermediate_ms += elapsed_ms(
-                *impl_->api, slot.events[6], slot.events[7]);
-        }
-        delta.metric_ms += elapsed_ms(
-            *impl_->api, slot.events[7], slot.events[8]);
-        delta.result_readback_ms += elapsed_ms(
-            *impl_->api, slot.events[8], slot.events[9]);
         std::memcpy(
             errors.data() + tile.first_candidate,
             slot.pinned_results.data(), tile_result_bytes);
@@ -2533,30 +2533,35 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
         }
     }
     slot.plan_ready = true;
-    if (cuda_device_source) {
-        delta.source_conversion_ms = elapsed_ms(
-            *impl_->api, slot.events[0], slot.events[1]);
-    } else {
-        delta.source_upload_ms = shared_source
-            ? shared_upload_ms
-            : elapsed_ms(*impl_->api, slot.events[0], slot.events[1]);
-    }
-    if (!plan_cache_hit) {
-        delta.plan_upload_ms = elapsed_ms(
-            *impl_->api, slot.events[1], slot.events[2]);
-    }
-    if (shared_source) {
+    if (instrument) {
+        if (cuda_device_source) {
+            delta.source_conversion_ms = elapsed_ms(
+                *impl_->api, slot.events[0], slot.events[1]);
+        } else {
+            delta.source_upload_ms = shared_source
+                ? shared_upload_ms
+                : elapsed_ms(*impl_->api, slot.events[0], slot.events[1]);
+        }
+        if (!plan_cache_hit) {
+            delta.plan_upload_ms = elapsed_ms(
+                *impl_->api, slot.events[1], slot.events[2]);
+        }
+        if (shared_source) {
+            delta.source_transpose_ms = shared_transpose_ms;
+        } else if (packed.has_horizontal) {
+            delta.source_transpose_ms = elapsed_ms(
+                *impl_->api, slot.events[2], slot.events[3]);
+        }
+        delta.gpu_total_ms = elapsed_ms(
+            *impl_->api, slot.events[0], slot.events[9]);
+    } else if (shared_source) {
         delta.source_transpose_ms = shared_transpose_ms;
-    } else if (packed.has_horizontal) {
-        delta.source_transpose_ms = elapsed_ms(
-            *impl_->api, slot.events[2], slot.events[3]);
+        delta.source_upload_ms = shared_upload_ms;
     }
     delta.kernel_ms = delta.source_conversion_ms + delta.source_transpose_ms
         + delta.horizontal_fused_ms + delta.inverse_horizontal_ms
         + delta.inverse_vertical_ms
         + delta.forward_intermediate_ms + delta.metric_ms;
-    delta.gpu_total_ms = elapsed_ms(
-        *impl_->api, slot.events[0], slot.events[9]);
     delta.analyzed_candidate_count = candidates.size();
 
     std::vector<CandidateResult> result;
@@ -2568,7 +2573,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
         }
         result.push_back({candidates[index].id, errors[index]});
     }
-    {
+    if (instrument) {
         const std::scoped_lock telemetry_lock(impl_->telemetry_mutex);
         merge_telemetry(impl_->telemetry, delta);
         impl_->telemetry.peak_workspace_elements =

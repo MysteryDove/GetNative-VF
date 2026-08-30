@@ -129,12 +129,14 @@ public:
     [[nodiscard]] std::vector<CandidateResult> analyze_axis_batch_f32(
         ConstImageView source, std::span<const CandidateAnalysis> candidates,
         const MetricSpec &metric, std::stop_token stop = {},
-        const std::function<void(std::size_t completed, std::size_t total)> &progress = {});
+        const std::function<void(std::size_t completed, std::size_t total)> &progress = {},
+        GpuStageProfile profile = GpuStageProfile::off);
 
     [[nodiscard]] std::vector<CandidateResult> analyze_axis_batch_metal_luma(
         const MetalLumaFrameView &source,
         std::span<const CandidateAnalysis> candidates,
-        const MetricSpec &metric, std::stop_token stop = {});
+        const MetricSpec &metric, std::stop_token stop = {},
+        GpuStageProfile profile = GpuStageProfile::off);
 
 private:
     struct Impl;
