@@ -58,6 +58,7 @@ export function MetricEditor({
         <span>{t("analyze.pNorm")}</span>
         <input
           inputMode="numeric"
+          max={pNormMaximum}
           value={metric.pNorm}
           disabled={disabled}
           onChange={(event) => onChange({ ...metric, pNorm: Number(event.target.value) })}
