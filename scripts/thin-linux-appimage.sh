@@ -35,31 +35,31 @@ if [[ ! -d "$root" ]]; then
   exit 1
 fi
 
-# usr/lib is on LD_LIBRARY_PATH ahead of the host. Anything GIO/GTK/WebKit
-# will load (libmount, glib, wayland, …) must come from the session, or the
-# 22.04 copies shadow Ubuntu 26.04 (MOUNT_2_40, atk-bridge, etc.). Keep only
-# the application runtime we actually ship: FFmpeg and the pinned Vulkan loader.
+# Anything GIO/GTK/WebKit will dlopen must come from the session. linuxdeploy
+# puts 22.04 copies on LD_LIBRARY_PATH/RPATH ahead of Ubuntu 26.04 (libmount
+# MOUNT_2_40, atk-bridge, glib, wayland, …). Keep FFmpeg anywhere, and the
+# pinned Vulkan loader only next to the engine in bin/ so WebKit uses host
+# libvulkan.
 keep_so() {
-  case "$1" in
-    libavformat.so*|libavcodec.so*|libavutil.so*|libswscale.so*|libvulkan.so*)
+  local path=$1 base
+  base=$(basename "$path")
+  case "$base" in
+    libavformat.so*|libavcodec.so*|libavutil.so*|libswscale.so*)
       return 0
+      ;;
+    libvulkan.so*)
+      [[ "$path" == */bin/* ]] && return 0
+      return 1
       ;;
   esac
   return 1
 }
-lib_roots=()
-[[ -d "$root/usr/lib" ]] && lib_roots+=("$root/usr/lib")
-[[ -d "$root/usr/lib64" ]] && lib_roots+=("$root/usr/lib64")
-if ((${#lib_roots[@]})); then
-  while IFS= read -r -d '' path; do
-    if keep_so "$(basename "$path")"; then
-      continue
-    fi
-    rm -f -- "$path"
-  done < <(find "${lib_roots[@]}" \( -type f -o -type l \) \( \
-    -name '*.so' -o -name '*.so.*' \
-  \) -print0)
-fi
+while IFS= read -r -d '' path; do
+  if keep_so "$path"; then
+    continue
+  fi
+  rm -f -- "$path"
+done < <(find "$root" \( -type f -o -type l \) \( -name '*.so' -o -name '*.so.*' \) -print0)
 
 # Also drop directory trees the GTK/GStreamer plugins copy wholesale.
 mapfile -d '' gtk_dirs < <(find "$root" -type d \( \
@@ -113,6 +113,57 @@ if [[ -f "$root/apprun-hooks/linuxdeploy-plugin-gstreamer.sh" ]]; then
   printf '# gstreamer plugins are not bundled in the thin AppImage\n' \
     > "$root/apprun-hooks/linuxdeploy-plugin-gstreamer.sh"
 fi
+
+# DT_RPATH on the GUI binary is inherited by host libgio and would still
+# prefer $APPDIR/usr/lib. The engine keeps $ORIGIN for FFmpeg/Vulkan.
+gui=$(find "$root" -type f -name getnative-gui -print -quit)
+if [[ -n "$gui" ]] && command -v patchelf >/dev/null 2>&1; then
+  patchelf --remove-rpath "$gui" || patchelf --set-rpath '' "$gui" || true
+fi
+
+# linuxdeploy's AppRun prepends $APPDIR/usr/lib after hooks run. Strip those
+# entries so leftover libraries cannot shadow GIO/GTK/WebKit.
+python3 - "$root/AppRun" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+cleanup = r'''
+# Thin AppImage: never let $APPDIR/usr/lib shadow host GIO/GTK/WebKit.
+if [ -n "${LD_LIBRARY_PATH:-}" ] && [ -n "${APPDIR:-}" ]; then
+  filtered=
+  old_ifs=$IFS
+  IFS=:
+  for dir in $LD_LIBRARY_PATH; do
+    case "$dir" in
+      "$APPDIR"/usr/lib|"$APPDIR"/usr/lib/*|"$APPDIR"/usr/lib64|"$APPDIR"/usr/lib64/*|"$APPDIR"/lib|"$APPDIR"/lib/*)
+        continue
+        ;;
+    esac
+    if [ -n "$filtered" ]; then
+      filtered="$filtered:$dir"
+    else
+      filtered="$dir"
+    fi
+  done
+  IFS=$old_ifs
+  if [ -n "$filtered" ]; then
+    export LD_LIBRARY_PATH="$filtered"
+  else
+    unset LD_LIBRARY_PATH
+  fi
+fi
+'''
+idx = text.rfind("\nexec ")
+if idx == -1:
+    idx = text.rfind("\nexec\t")
+if idx == -1:
+    text = text.rstrip() + "\n" + cleanup
+else:
+    text = text[: idx + 1] + cleanup + text[idx + 1 :]
+path.write_text(text)
+PY
 
 dd if="$workdir/in.AppImage" of="$workdir/runtime" bs="$offset" count=1 status=none
 # The Type-2 runtime shipped with linuxdeploy-plugin-appimage only mounts

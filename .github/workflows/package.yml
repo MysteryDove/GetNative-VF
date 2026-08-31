@@ -322,11 +322,14 @@ jobs:
             exit 1
           }
           require_empty "bundled session WebKit/GTK in AppImage" \
-            "$(find "$appimage_root" -type f \( \
-              -name 'libwebkit2gtk*' -o -name 'libgtk-3.so*' -o \
-              -name 'libwayland-client.so*' -o -name 'libglib-2.0.so*' -o \
-              -name 'libgio-2.0.so*' -o -name 'libmount.so*' \
-            \) -print)"
+            "$(find "$appimage_root" \( -type f -o -type l \) \( \
+              -name '*.so' -o -name '*.so.*' \
+            \) ! -name 'libavformat.so*' ! -name 'libavcodec.so*' \
+              ! -name 'libavutil.so*' ! -name 'libswscale.so*' \
+              ! -name 'libvulkan.so*' -print)"
+          require_empty "Vulkan loader outside bin/ in AppImage" \
+            "$(find "$appimage_root" \( -type f -o -type l \) -name 'libvulkan.so*' \
+              ! -path '*/bin/*' -print)"
 
           for package_root in "$deb_root" "$appimage_root"; do
             forbidden=$(find "$package_root" -type f \( \
@@ -368,19 +371,15 @@ jobs:
           )
           require_count "AppImage staged Vulkan loader" 1 "${app_staged_loaders[@]}"
           app_staged_loader=${app_staged_loaders[0]}
-          app_dependency_loader="$appimage_root/usr/lib/libvulkan.so.1"
-          require_file "AppImage dependency Vulkan loader" "$app_dependency_loader"
           mapfile -t app_loaders < <(find "$appimage_root" -type f -name libvulkan.so.1 -print)
-          require_count "classified AppImage Vulkan loaders" 2 "${app_loaders[@]}"
-          for packaged_loader in "$app_staged_loader" "$app_dependency_loader"; do
-            verify_loader_elf "AppImage Vulkan loader" "$packaged_loader"
-            packaged_text_hash=$(text_sha256 "$packaged_loader")
-            if [[ "$packaged_text_hash" != "$source_text_hash" ]]; then
-              printf 'package validation: AppImage Vulkan loader code does not match the pinned SDK: %s\n' \
-                "$packaged_loader" >&2
-              exit 1
-            fi
-          done
+          require_count "classified AppImage Vulkan loaders" 1 "${app_loaders[@]}"
+          verify_loader_elf "AppImage Vulkan loader" "$app_staged_loader"
+          packaged_text_hash=$(text_sha256 "$app_staged_loader")
+          if [[ "$packaged_text_hash" != "$source_text_hash" ]]; then
+            printf 'package validation: AppImage Vulkan loader code does not match the pinned SDK: %s\n' \
+              "$app_staged_loader" >&2
+            exit 1
+          fi
 
           mkdir -p artifacts/linux-x64
           jq -n \
@@ -389,7 +388,6 @@ jobs:
             --arg source_text_sha256 "$source_text_hash" \
             --arg deb_sha256 "$(sha256sum "$deb_loader" | cut -d' ' -f1)" \
             --arg app_staged_sha256 "$(sha256sum "$app_staged_loader" | cut -d' ' -f1)" \
-            --arg app_dependency_sha256 "$(sha256sum "$app_dependency_loader" | cut -d' ' -f1)" \
             '{
               schema_version: 1,
               vulkan_sdk_version: $sdk_version,
@@ -401,8 +399,7 @@ jobs:
               packages: {
                 deb: [{role: "application", sha256: $deb_sha256}],
                 appimage: [
-                  {role: "application", sha256: $app_staged_sha256},
-                  {role: "linuxdeploy-dependency", sha256: $app_dependency_sha256}
+                  {role: "application", sha256: $app_staged_sha256}
                 ]
               }
             }' > artifacts/linux-x64/VULKAN-PROVENANCE-linux-x64.json
@@ -461,11 +458,6 @@ jobs:
             packaged_loader=$(find "$package_root" -type f -path '*/bin/libvulkan.so.1' -print -quit)
             require_file "packaged application Vulkan loader" "$packaged_loader"
             loaders_under_test=("$packaged_loader")
-            if [[ "$package_root" == "$appimage_root" ]]; then
-              # The AppImage GUI loads the linuxdeploy-bundled usr/lib copy, not
-              # the staged bin/ copy. Both are ELF-rewritten, so smoke-test both.
-              loaders_under_test+=("$app_dependency_loader")
-            fi
             loader_index=0
             for loader_under_test in "${loaders_under_test[@]}"; do
               package_preload_root="$preload_root/$runtime_index.$loader_index"
