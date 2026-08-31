@@ -136,7 +136,9 @@ fi
 HOOK
 
 dd if="$workdir/in.AppImage" of="$workdir/runtime" bs="$offset" count=1 status=none
-mksquashfs "$root" "$workdir/fs.squash" -comp xz -all-root -noappend -no-progress >/dev/null
+# The Type-2 runtime shipped with linuxdeploy-plugin-appimage only mounts
+# zlib/gzip and zstd images. xz packs but then --appimage-extract fails.
+mksquashfs "$root" "$workdir/fs.squash" -comp gzip -all-root -noappend -no-progress >/dev/null
 cat "$workdir/runtime" "$workdir/fs.squash" > "$appimage"
 chmod +x "$appimage"
 
