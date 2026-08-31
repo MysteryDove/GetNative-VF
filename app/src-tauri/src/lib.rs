@@ -1,6 +1,7 @@
 mod atomic_file;
 mod engine;
 mod export;
+mod linux_webkit;
 mod media;
 mod prefs;
 mod project;
@@ -8,6 +9,8 @@ mod worker;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    linux_webkit::apply_workarounds();
+
     tauri::Builder::default()
         .manage(worker::WorkerManager::default())
         .setup(|app| {
