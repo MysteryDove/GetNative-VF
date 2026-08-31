@@ -35,52 +35,31 @@ if [[ ! -d "$root" ]]; then
   exit 1
 fi
 
-# Session-integration libraries must match the desktop (GNOME/KDE, IME, AT-SPI).
-# Bundling the build-machine copies is what froze Ubuntu 26.04.
-remove_patterns=(
-  'libgtk-3.so*'
-  'libgtk-4.so*'
-  'libgdk-3.so*'
-  'libgdk-4.so*'
-  'libwebkit2gtk*'
-  'libjavascriptcoregtk*'
-  'libsoup-2*'
-  'libsoup-3*'
-  'libglib-2.0.so*'
-  'libgio-2.0.so*'
-  'libgobject-2.0.so*'
-  'libgmodule-2.0.so*'
-  'libgthread-2.0.so*'
-  'libwayland-*.so*'
-  'libatk-1.0.so*'
-  'libatk-bridge-2.0.so*'
-  'libatspi.so*'
-  'libpango*.so*'
-  'libpangocairo*.so*'
-  'libpangoft2*.so*'
-  'libharfbuzz.so*'
-  'libgdk_pixbuf-2.0.so*'
-  'libepoxy.so*'
-  'libcairo.so*'
-  'libcairo-gobject.so*'
-  'libgst*.so*'
-  'libnotify.so*'
-  'libayatana*.so*'
-  'libdbusmenu*.so*'
-  'libcloudproviders.so*'
-  'libcolord.so*'
-  'librest-*.so*'
-  'libjson-glib-1.0.so*'
-  'libsecret-1.so*'
-)
-
-find_args=()
-for pattern in "${remove_patterns[@]}"; do
-  find_args+=(-o -name "$pattern")
-done
-while IFS= read -r -d '' path; do
-  rm -f -- "$path"
-done < <(find "$root" -type f \( -false "${find_args[@]}" \) -print0)
+# usr/lib is on LD_LIBRARY_PATH ahead of the host. Anything GIO/GTK/WebKit
+# will load (libmount, glib, wayland, …) must come from the session, or the
+# 22.04 copies shadow Ubuntu 26.04 (MOUNT_2_40, atk-bridge, etc.). Keep only
+# the application runtime we actually ship: FFmpeg and the pinned Vulkan loader.
+keep_so() {
+  case "$1" in
+    libavformat.so*|libavcodec.so*|libavutil.so*|libswscale.so*|libvulkan.so*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+lib_roots=()
+[[ -d "$root/usr/lib" ]] && lib_roots+=("$root/usr/lib")
+[[ -d "$root/usr/lib64" ]] && lib_roots+=("$root/usr/lib64")
+if ((${#lib_roots[@]})); then
+  while IFS= read -r -d '' path; do
+    if keep_so "$(basename "$path")"; then
+      continue
+    fi
+    rm -f -- "$path"
+  done < <(find "${lib_roots[@]}" \( -type f -o -type l \) \( \
+    -name '*.so' -o -name '*.so.*' \
+  \) -print0)
+fi
 
 # Also drop directory trees the GTK/GStreamer plugins copy wholesale.
 mapfile -d '' gtk_dirs < <(find "$root" -type d \( \
