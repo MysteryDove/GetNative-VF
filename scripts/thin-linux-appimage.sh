@@ -100,14 +100,10 @@ find "$root" -type f \( \
   -name WebKitGTKInjectedBundle.so -o -name libwebkit2gtkinjectedbundle.so \
 \) -delete
 
-# The stock gtk hook forces GDK_BACKEND=x11 and prepends the host GTK_PATH.
-# The gstreamer hook pins a private plugin registry. Neither belongs in a thin image.
-rm -f -- \
-  "$root/apprun-hooks/linuxdeploy-plugin-gtk.sh" \
-  "$root/apprun-hooks/linuxdeploy-plugin-gstreamer.sh"
-
+# AppRun sources linuxdeploy-plugin-gtk.sh by absolute path. Replace it
+# in place: do not delete (startup would fail) and do not keep GDK_BACKEND=x11.
 mkdir -p "$root/apprun-hooks"
-cat > "$root/apprun-hooks/getnative-webkit-host.sh" <<'HOOK'
+cat > "$root/apprun-hooks/linuxdeploy-plugin-gtk.sh" <<'HOOK'
 # Host WebKitGTK 4.1 is required. This AppImage does not bundle GTK/WebKit
 # so GNOME/KDE input methods and AT-SPI match the session.
 webkit_found=0
@@ -134,6 +130,10 @@ if [ "$webkit_found" -eq 0 ]; then
   exit 1
 fi
 HOOK
+if [[ -f "$root/apprun-hooks/linuxdeploy-plugin-gstreamer.sh" ]]; then
+  printf '# gstreamer plugins are not bundled in the thin AppImage\n' \
+    > "$root/apprun-hooks/linuxdeploy-plugin-gstreamer.sh"
+fi
 
 dd if="$workdir/in.AppImage" of="$workdir/runtime" bs="$offset" count=1 status=none
 # The Type-2 runtime shipped with linuxdeploy-plugin-appimage only mounts

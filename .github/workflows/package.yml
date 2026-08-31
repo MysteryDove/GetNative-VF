@@ -311,11 +311,16 @@ jobs:
           appimage_root="$check_root/appimage/squashfs-root"
 
           require_file "thin WebKit host hook" \
-            "$appimage_root/apprun-hooks/getnative-webkit-host.sh"
-          if [[ -e "$appimage_root/apprun-hooks/linuxdeploy-plugin-gtk.sh" ]]; then
-            printf 'package validation: fat GTK AppRun hook was not removed from the AppImage\n' >&2
+            "$appimage_root/apprun-hooks/linuxdeploy-plugin-gtk.sh"
+          if grep -q 'GDK_BACKEND=x11' "$appimage_root/apprun-hooks/linuxdeploy-plugin-gtk.sh"; then
+            printf 'package validation: AppImage still forces GDK_BACKEND=x11\n' >&2
             exit 1
           fi
+          grep -q 'libwebkit2gtk-4.1.so.0' \
+            "$appimage_root/apprun-hooks/linuxdeploy-plugin-gtk.sh" || {
+            printf 'package validation: AppImage GTK hook does not check host WebKitGTK\n' >&2
+            exit 1
+          }
           require_empty "bundled session WebKit/GTK in AppImage" \
             "$(find "$appimage_root" -type f \( \
               -name 'libwebkit2gtk*' -o -name 'libgtk-3.so*' -o \
