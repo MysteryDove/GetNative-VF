@@ -47,7 +47,7 @@ jobs:
           build-essential ninja-build nasm pkg-config zlib1g-dev
           libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
           libxdo-dev libssl-dev patchelf libfuse2 desktop-file-utils
-          binutils jq libvulkan1 mesa-vulkan-drivers vulkan-tools
+          squashfs-tools binutils jq libvulkan1 mesa-vulkan-drivers vulkan-tools
           vulkan-validationlayers
       - name: Resolve Vulkan SDK config path
         id: vulkan-config
@@ -206,9 +206,12 @@ jobs:
           PATCHELF: /usr/bin/patchelf
         run: |
           for attempt in 1 2 3; do
-            pnpm tauri build --bundles appimage && exit 0
+            pnpm tauri build --bundles appimage && break
             if [ "$attempt" -eq 3 ]; then exit 1; fi
           done
+          appimage=$(find src-tauri/target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' -print -quit)
+          test -n "$appimage"
+          bash ../scripts/thin-linux-appimage.sh "$appimage"
       - name: Verify package media runtime
         shell: bash
         run: |
@@ -306,6 +309,19 @@ jobs:
 
           deb_root="$check_root/deb"
           appimage_root="$check_root/appimage/squashfs-root"
+
+          require_file "thin WebKit host hook" \
+            "$appimage_root/apprun-hooks/getnative-webkit-host.sh"
+          if [[ -e "$appimage_root/apprun-hooks/linuxdeploy-plugin-gtk.sh" ]]; then
+            printf 'package validation: fat GTK AppRun hook was not removed from the AppImage\n' >&2
+            exit 1
+          fi
+          require_empty "bundled session WebKit/GTK in AppImage" \
+            "$(find "$appimage_root" -type f \( \
+              -name 'libwebkit2gtk*' -o -name 'libgtk-3.so*' -o \
+              -name 'libwayland-client.so*' -o -name 'libglib-2.0.so*' \
+            \) -print)"
+
           for package_root in "$deb_root" "$appimage_root"; do
             forbidden=$(find "$package_root" -type f \( \
               -name ffmpeg -o -name ffprobe -o \
