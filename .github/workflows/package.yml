@@ -4,6 +4,15 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      draft_release:
+        description: Create a draft GitHub release after packaging
+        type: boolean
+        default: false
+      tag:
+        description: "Tag for the draft (required if Create a draft is checked), e.g. v0.2.2"
+        type: string
+        required: false
 
 concurrency:
   group: package-${{ github.ref }}
@@ -21,7 +30,37 @@ jobs:
   version:
     name: Validate release version
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.versions.outputs.release_version }}
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
+      - name: Resolve release tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          DRAFT_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.draft_release || false }}
+          INPUT_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || '' }}
+        run: |
+          set -euo pipefail
+          tag=""
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            tag="$REF_NAME"
+          elif [[ "$DRAFT_RELEASE" == "true" ]]; then
+            tag="${INPUT_TAG#"${INPUT_TAG%%[![:space:]]*}"}"
+            tag="${tag%"${tag##*[![:space:]]}"}"
+            if [[ -z "$tag" ]]; then
+              echo "Tag is required when Create a draft GitHub release is checked." >&2
+              echo "Re-run the workflow, enable the draft option, and set Tag to vX.Y.Z." >&2
+              exit 1
+            fi
+          fi
+          if [[ -n "$tag" && ! "$tag" =~ ^v[0-9] ]]; then
+            echo "Tag must look like v0.2.2, got: $tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "resolved tag=${tag:-none}"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
@@ -29,7 +68,10 @@ jobs:
         with:
           node-version: 22
       - name: Check synchronized versions
-        run: node scripts/check-release-version.mjs "${{ github.event_name == 'push' && github.ref_name || '' }}"
+        id: versions
+        run: |
+          node scripts/check-release-version.mjs "${{ steps.tag.outputs.tag }}" \
+            | tee -a "$GITHUB_OUTPUT"
 
   linux-package:
     name: Linux x64 package
@@ -642,7 +684,31 @@ jobs:
       - name: Build pinned FFmpeg SDK
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         shell: msys2 {0}
+        env:
+          GETNATIVE_REQUIRE_FFMPEG_HWACCEL: "1"
         run: scripts/build-ffmpeg-windows.sh .deps/ffmpeg-windows-x64
+      - name: Verify FFmpeg NVDEC and Vulkan hwaccels
+        shell: pwsh
+        run: |
+          $info = ".deps/ffmpeg-windows-x64/share/ffmpeg/BUILD_INFO.txt"
+          if (-not (Test-Path $info -PathType Leaf)) {
+            throw "FFmpeg BUILD_INFO.txt is missing"
+          }
+          $text = (Get-Content $info -Raw) -replace "`r", ""
+          foreach ($flag in @(
+            "CONFIG_FFNVCODEC=yes",
+            "CONFIG_CUDA=yes",
+            "CONFIG_NVDEC=yes",
+            "CONFIG_HEVC_NVDEC_HWACCEL=yes",
+            "CONFIG_H264_NVDEC_HWACCEL=yes",
+            "CONFIG_VULKAN=yes",
+            "CONFIG_HEVC_VULKAN_HWACCEL=yes",
+            "CONFIG_H264_VULKAN_HWACCEL=yes"
+          )) {
+            if ($text -notmatch "(?m)^$([regex]::Escape($flag))$") {
+              throw "FFmpeg SDK is missing $flag"
+            }
+          }
       - name: Install JavaScript dependencies
         working-directory: app
         run: pnpm install --frozen-lockfile
@@ -721,6 +787,24 @@ jobs:
           $packagedLoader = Join-Path $packageRoot "bin\vulkan-1.dll"
           if ((Get-FileHash $packagedLoader -Algorithm SHA256).Hash -ne $expectedLoader) {
             throw "vulkan-1.dll in the portable ZIP does not match the pinned SDK"
+          }
+          $ffmpegInfo = Get-ChildItem $packageRoot -Recurse -File -Filter "BUILD_INFO.txt" |
+            Where-Object { $_.FullName -match "[\\/]ffmpeg[\\/]BUILD_INFO.txt$" } |
+            Select-Object -First 1
+          if (-not $ffmpegInfo) {
+            throw "FFmpeg BUILD_INFO.txt is missing from the portable ZIP"
+          }
+          $ffmpegInfoText = (Get-Content $ffmpegInfo.FullName -Raw) -replace "`r", ""
+          foreach ($flag in @(
+            "CONFIG_NVDEC=yes",
+            "CONFIG_HEVC_NVDEC_HWACCEL=yes",
+            "CONFIG_H264_NVDEC_HWACCEL=yes",
+            "CONFIG_VULKAN=yes",
+            "CONFIG_HEVC_VULKAN_HWACCEL=yes"
+          )) {
+            if ($ffmpegInfoText -notmatch "(?m)^$([regex]::Escape($flag))$") {
+              throw "portable FFmpeg SDK is missing $flag"
+            }
           }
           if (-not (Get-ChildItem $packageRoot -Recurse -File -Filter "zlib-1.3.1.tar.gz")) {
             throw "zlib source archive is missing from the portable ZIP"
@@ -947,13 +1031,18 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: Publish GitHub Release
-    if: github.event_name == 'push'
-    needs: [linux-package, windows-package, macos-package]
+    name: Draft GitHub Release
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.draft_release)
+    needs: [version, linux-package, windows-package, macos-package]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: getnative-vf-*
@@ -961,5 +1050,10 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          generate_release_notes: true
+          draft: true
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: GetNative VF ${{ needs.version.outputs.version }}
+          body_path: docs/release-desc.md
+          fail_on_unmatched_files: true
           files: artifacts/**/*
