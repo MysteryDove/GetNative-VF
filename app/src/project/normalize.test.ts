@@ -301,6 +301,11 @@ export function runPureModuleChecks(): void {
     restoredProjectRoute(state, "overview") === "overview",
     "unknown persisted route must use the caller fallback",
   );
+  state.uiStateByRoute.shell = { lastRoute: "samples" };
+  assert(
+    restoredProjectRoute(state, "overview") === "media",
+    "removed samples route must restore as media",
+  );
 
   const rows = buildBackendRows([
     {

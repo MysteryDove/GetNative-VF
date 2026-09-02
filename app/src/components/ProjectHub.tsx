@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Activity, FolderOpen, FolderSearch, LoaderCircle, Plus, X, Zap } from "lucide-react";
+import { BrandMark } from "./BrandMark";
 import type { Translator } from "../i18n";
 import type { ManifestErrorDto, RecentProjectEntry, RecoveryInfo } from "../project/types";
 import { ErrorNotice, type UiError } from "./ErrorNotice";
@@ -53,9 +54,7 @@ export function ProjectHub({
     <div className="hub-shell">
       <header className="topbar hub-topbar">
         <div className="brand-block">
-          <div className="brand-mark" aria-hidden="true">
-            <Activity size={19} strokeWidth={2.2} />
-          </div>
+          <BrandMark />
           <div>
             <h1>{t("app.name")}</h1>
             <span>{t("app.tagline")}</span>
@@ -66,6 +65,9 @@ export function ProjectHub({
             <span>{t("language.label")}</span>
             <select
               value={locale}
+              disabled
+              aria-disabled="true"
+              title={t("settings.languageHelp")}
               onChange={(event) => onLanguageChange(event.target.value as "zh-CN" | "en")}
             >
               <option value="zh-CN">{t("language.zhCN")}</option>

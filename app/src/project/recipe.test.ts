@@ -5,6 +5,7 @@ import {
   activeRecipe,
   createRecipe,
   deactivateRecipeInState,
+  deleteRecipeInState,
   recipeReadiness,
   removeRecipeInState,
   updateRecipe,
@@ -85,7 +86,6 @@ describe("recipe domain", () => {
     expect(readiness.missing).toContain("geometry");
     expect(readiness.missing).toContain("kernel");
     expect(readiness.missing).toContain("metric");
-    expect(readiness.missing).toContain("profile");
     expect(readiness.missing).toContain("math_mode");
 
     const invalid = createRecipe(
@@ -148,5 +148,19 @@ describe("recipe domain", () => {
     expect(removed.ok).toBe(true);
     if (!removed.ok) return;
     expect(removed.state.recipesById[first.recipe.id]).toBeUndefined();
+  });
+
+  it("deletes the current recipe and points at a remaining one", () => {
+    const state = emptyProjectState({ id: "p1" });
+    const ids = sequencedIds();
+    const first = createRecipe(state, fullPayload(), ids);
+    if (!first.ok) throw new Error("setup");
+    const second = createRecipe(first.state, { name: "Scratch" }, ids);
+    if (!second.ok) throw new Error("setup");
+    const deleted = deleteRecipeInState(second.state, second.recipe.id);
+    expect(deleted.ok).toBe(true);
+    if (!deleted.ok) return;
+    expect(deleted.state.recipesById[second.recipe.id]).toBeUndefined();
+    expect(deleted.state.project.activeRecipeId).toBe(first.recipe.id);
   });
 });

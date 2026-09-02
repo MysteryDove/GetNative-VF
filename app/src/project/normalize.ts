@@ -11,7 +11,7 @@ import type {
   VerificationReview,
   VerificationFusion,
 } from "./types";
-import { profileFor } from "../engine/profiles";
+import { MUF_PROFILE_ID, profileFor } from "../engine/profiles";
 import { recipeReadiness } from "./recipe";
 import { migrateGeometrySnapshot } from "../engine/geometry";
 import { snakeCaseSnapshot } from "./verificationFusion";
@@ -135,8 +135,8 @@ export function openedToProjectState(opened: OpenedProjectDto): ProjectState {
       geometry: migrateGeometrySnapshot(recipe.geometry),
       kernel: recipe.kernel ?? null,
       metric: recipe.metric ?? null,
-      axisMode: recipe.axis_mode ?? profileFor(recipe.profile_id ?? "").default_axis_mode,
-      profileId: recipe.profile_id ?? null,
+      axisMode: recipe.axis_mode ?? profileFor(MUF_PROFILE_ID).default_axis_mode,
+      profileId: MUF_PROFILE_ID,
       mathMode: recipe.math_mode ?? null,
     };
   });
@@ -195,7 +195,7 @@ export function openedToProjectState(opened: OpenedProjectDto): ProjectState {
         pNorm: fusion.compatibility_snapshot.metric.p_norm,
       },
       axisMode: fusion.compatibility_snapshot.axis_mode,
-      profileId: fusion.compatibility_snapshot.profile_id,
+      profileId: MUF_PROFILE_ID,
       mathMode: fusion.compatibility_snapshot.math_mode,
     },
     inputs: fusion.inputs.map((item) => ({
@@ -432,6 +432,7 @@ export function restoredProjectRoute(
   const shell = state.uiStateByRoute.shell;
   if (!shell || typeof shell !== "object" || Array.isArray(shell)) return fallback;
   const lastRoute = (shell as { lastRoute?: unknown }).lastRoute;
+  if (lastRoute === "samples") return "media";
   return typeof lastRoute === "string" && projectRoutes.includes(lastRoute as ProjectRoute)
     ? (lastRoute as ProjectRoute)
     : fallback;

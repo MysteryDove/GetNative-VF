@@ -1,5 +1,6 @@
-import { Activity, Check, X } from "lucide-react";
-import { useCallback, useState } from "react";
+import { Check, X } from "lucide-react";
+import { BrandMark } from "./BrandMark";
+import { memo, useCallback, useEffect, useState } from "react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope, EngineState } from "../engine/types";
 import type { ProjectRoute, ProjectState } from "../project/types";
@@ -12,12 +13,23 @@ import { VerifyPage } from "../pages/VerifyPage";
 import { AnalyzePage } from "../pages/AnalyzePage";
 import { DiagnosticsPage } from "../pages/DiagnosticsPage";
 import { MediaPage } from "../pages/MediaPage";
-import { SamplesPage } from "../pages/SamplesPage";
 import { ErrorNotice, type UiError } from "./ErrorNotice";
 import { runGroupProgress, type ExecutionState } from "../engine/runReducer";
 import type { ExecutionBridge } from "../engine/executeRunGroup";
 import type { ThemeMode } from "../utils/theme";
 import { actualBackendLabel } from "../engine/backendSelection";
+
+const Overview = memo(OverviewPage);
+const Media = memo(MediaPage);
+const Analyze = memo(AnalyzePage);
+const Verify = memo(VerifyPage);
+const Results = memo(ResultsPage);
+const Settings = memo(SettingsPage);
+const Diagnostics = memo(DiagnosticsPage);
+
+function pageClass(id: ProjectRoute, route: ProjectRoute, visited: ReadonlySet<ProjectRoute>): string {
+  return `project-page${route === id ? " is-active" : ""}${visited.has(id) ? " was-visited" : ""}`;
+}
 
 function formatRate(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "—";
@@ -27,6 +39,138 @@ function formatRate(value: number | null | undefined): string {
 function rateUnit(t: Translator, unit: "candidates" | "frames"): string {
   return unit === "frames" ? t("jobs.framesPerSecond") : t("jobs.candidatesPerSecond");
 }
+
+type ProjectPageHostProps = {
+  t: Translator;
+  state: ProjectState;
+  route: ProjectRoute;
+  engineState: EngineState;
+  enginePath: string;
+  engineError: string;
+  capabilities: EngineEnvelope | null;
+  language: "zh-CN" | "en";
+  onLanguageChange: (locale: "zh-CN" | "en") => void;
+  themeMode: ThemeMode;
+  onThemeChange: (mode: ThemeMode) => void;
+  axisPlanCacheDir: string | null;
+  onAxisPlanCacheDirChange: (path: string | null) => Promise<void>;
+  onNavigate: (route: ProjectRoute) => void;
+  onProjectChange: (updater: (state: ProjectState) => ProjectState) => void;
+  onEngineError: (message: string) => void;
+  onGeometrySuccess: () => void;
+  executionBridge: ExecutionBridge;
+  analyzeAvailable: boolean;
+  analyzeSubroute: "height" | "kernel";
+  openDiagnostics: () => void;
+  openMedia: () => void;
+};
+
+/** Isolated from nav collapse so toggling the sidebar does not re-render keep-alive pages. */
+const ProjectPageHost = memo(function ProjectPageHost({
+  t,
+  state,
+  route,
+  engineState,
+  enginePath,
+  engineError,
+  capabilities,
+  language,
+  onLanguageChange,
+  themeMode,
+  onThemeChange,
+  axisPlanCacheDir,
+  onAxisPlanCacheDirChange,
+  onNavigate,
+  onProjectChange,
+  onEngineError,
+  onGeometrySuccess,
+  executionBridge,
+  analyzeAvailable,
+  analyzeSubroute,
+  openDiagnostics,
+  openMedia,
+}: ProjectPageHostProps) {
+  const [visited, setVisited] = useState<ReadonlySet<ProjectRoute>>(() => new Set([route]));
+  useEffect(() => {
+    setVisited((current) => {
+      if (current.has(route)) return current;
+      const next = new Set(current);
+      next.add(route);
+      return next;
+    });
+  }, [route]);
+  return (
+    <div className="project-page-host">
+      {/* Keep every page mounted so route changes preserve local selections and drafts. */}
+      <div className={pageClass("overview", route, visited)} aria-hidden={route !== "overview"}>
+        <Overview
+          t={t}
+          state={state}
+          analyzeAvailable={analyzeAvailable}
+          onNavigate={onNavigate}
+          onProjectChange={onProjectChange}
+        />
+      </div>
+      <div className={pageClass("media", route, visited)} aria-hidden={route !== "media"}>
+        <Media
+          t={t}
+          state={state}
+          active={route === "media"}
+          onProjectChange={onProjectChange}
+        />
+      </div>
+      <div className={pageClass("analyze", route, visited)} aria-hidden={route !== "analyze"}>
+        <Analyze
+          t={t}
+          state={state}
+          capabilities={capabilities}
+          analyzeAvailable={analyzeAvailable}
+          subroute={analyzeSubroute}
+          onOpenDiagnostics={openDiagnostics}
+          onOpenMedia={openMedia}
+          onProjectChange={onProjectChange}
+          executionBridge={executionBridge}
+        />
+      </div>
+      <div className={pageClass("verify", route, visited)} aria-hidden={route !== "verify"}>
+        <Verify
+          t={t}
+          state={state}
+          capabilities={capabilities}
+          analyzeAvailable={analyzeAvailable}
+          onNavigate={onNavigate}
+          onProjectChange={onProjectChange}
+          executionBridge={executionBridge}
+        />
+      </div>
+      <div className={pageClass("results", route, visited)} aria-hidden={route !== "results"}>
+        <Results t={t} state={state} onProjectChange={onProjectChange} />
+      </div>
+      <div className={pageClass("settings", route, visited)} aria-hidden={route !== "settings"}>
+        <Settings
+          t={t}
+          language={language}
+          onLanguageChange={onLanguageChange}
+          themeMode={themeMode}
+          onThemeChange={onThemeChange}
+          axisPlanCacheDir={axisPlanCacheDir}
+          onAxisPlanCacheDirChange={onAxisPlanCacheDirChange}
+        />
+      </div>
+      <div className={pageClass("diagnostics", route, visited)} aria-hidden={route !== "diagnostics"}>
+        <Diagnostics
+          t={t}
+          engineState={engineState}
+          enginePath={enginePath}
+          engineError={engineError}
+          capabilities={capabilities}
+          onEngineError={onEngineError}
+          onGeometrySuccess={onGeometrySuccess}
+        />
+      </div>
+    </div>
+  );
+});
 
 export function ProjectShell({
   t,
@@ -84,20 +228,19 @@ export function ProjectShell({
   // Analyze subroute lives in the shell: the nav sidebar switches between the
   // resolution test and the algorithm test.
   const [analyzeSubroute, setAnalyzeSubroute] = useState<"height" | "kernel">("height");
-  const navigateAnalyze = (subroute: "height" | "kernel") => {
+  const navigateAnalyze = useCallback((subroute: "height" | "kernel") => {
     setAnalyzeSubroute(subroute);
     onNavigate("analyze");
-  };
-  const [pendingAnalyzeSampleIds, setPendingAnalyzeSampleIds] = useState<string[] | null>(null);
-  const consumeAnalyzeSampleSelection = useCallback(() => {
-    setPendingAnalyzeSampleIds(null);
-  }, []);
-  const toggleNav = () => {
+  }, [onNavigate]);
+  const toggleNav = useCallback(() => {
     setNavCollapsed((current) => {
       localStorage.setItem("getnative.navCollapsed", current ? "0" : "1");
       return !current;
     });
-  };
+  }, []);
+  const openSettings = useCallback(() => onNavigate("settings"), [onNavigate]);
+  const openDiagnostics = useCallback(() => onNavigate("diagnostics"), [onNavigate]);
+  const openMedia = useCallback(() => onNavigate("media"), [onNavigate]);
   const counts = {
     sources: countById(state.sourcesById),
     samples: countById(state.samplesById),
@@ -108,9 +251,7 @@ export function ProjectShell({
     <div className={`project-shell ${engineError && route === "diagnostics" ? "has-error" : ""}`}>
       <header className="topbar project-topbar">
         <div className="brand-block">
-          <div className="brand-mark" aria-hidden="true">
-            <Activity size={19} strokeWidth={2.2} />
-          </div>
+          <BrandMark />
           <div className="project-title-block">
             <h1 title={state.project.storagePath ?? undefined}>
               {state.project.untitled ? t("shell.untitled") : state.project.name}
@@ -153,8 +294,8 @@ export function ProjectShell({
           collapsed={navCollapsed}
           onNavigate={onNavigate}
           onToggleCollapse={toggleNav}
-          onSettings={() => onNavigate("settings")}
-          onDiagnostics={() => onNavigate("diagnostics")}
+          onSettings={openSettings}
+          onDiagnostics={openDiagnostics}
           analyzeSubroute={analyzeSubroute}
           onAnalyzeSubroute={navigateAnalyze}
         />
@@ -162,90 +303,30 @@ export function ProjectShell({
         <div className="project-content">
           <div className={`project-page-stack ${projectError ? "has-notice" : ""}`}>
             {projectError ? <ErrorNotice error={projectError} t={t} /> : null}
-            <div className="project-page-host">
-              {/* Keep every page mounted so route changes preserve local selections and drafts. */}
-              <div hidden={route !== "overview"}>
-                <OverviewPage
-                  t={t}
-                  state={state}
-                  analyzeAvailable={analyzeAvailable}
-                  onNavigate={onNavigate}
-                  onProjectChange={onProjectChange}
-                />
-              </div>
-              <div hidden={route !== "media"}>
-                <MediaPage
-                  t={t}
-                  state={state}
-                  active={route === "media"}
-                  onProjectChange={onProjectChange}
-                />
-              </div>
-              <div hidden={route !== "samples"}>
-                <SamplesPage
-                  t={t}
-                  state={state}
-                  active={route === "samples"}
-                  onProjectChange={onProjectChange}
-                  onStartHeightAnalysis={(selectedIds) => {
-                    setPendingAnalyzeSampleIds(selectedIds ?? null);
-                    setAnalyzeSubroute("height");
-                    onNavigate("analyze");
-                  }}
-                />
-              </div>
-              <div hidden={route !== "analyze"}>
-                <AnalyzePage
-                  t={t}
-                  state={state}
-                  capabilities={capabilities}
-                  analyzeAvailable={analyzeAvailable}
-                  subroute={analyzeSubroute}
-                  initialSampleIds={pendingAnalyzeSampleIds}
-                  onInitialSampleSelectionConsumed={consumeAnalyzeSampleSelection}
-                  onOpenDiagnostics={() => onNavigate("diagnostics")}
-                  onOpenSamples={() => onNavigate("samples")}
-                  onProjectChange={onProjectChange}
-                  executionBridge={executionBridge}
-                />
-              </div>
-              <div hidden={route !== "verify"}>
-                <VerifyPage
-                  t={t}
-                  state={state}
-                  capabilities={capabilities}
-                  analyzeAvailable={analyzeAvailable}
-                  onNavigate={onNavigate}
-                  onProjectChange={onProjectChange}
-                  executionBridge={executionBridge}
-                />
-              </div>
-              <div hidden={route !== "results"}>
-                <ResultsPage t={t} state={state} onProjectChange={onProjectChange} />
-              </div>
-              <div hidden={route !== "settings"}>
-                <SettingsPage
-                  t={t}
-                  language={language}
-                  onLanguageChange={onLanguageChange}
-                  themeMode={themeMode}
-                  onThemeChange={onThemeChange}
-                  axisPlanCacheDir={axisPlanCacheDir}
-                  onAxisPlanCacheDirChange={onAxisPlanCacheDirChange}
-                />
-              </div>
-              <div hidden={route !== "diagnostics"}>
-                <DiagnosticsPage
-                  t={t}
-                  engineState={engineState}
-                  enginePath={enginePath}
-                  engineError={engineError}
-                  capabilities={capabilities}
-                  onEngineError={onEngineError}
-                  onGeometrySuccess={onGeometrySuccess}
-                />
-              </div>
-            </div>
+            <ProjectPageHost
+              t={t}
+              state={state}
+              route={route}
+              engineState={engineState}
+              enginePath={enginePath}
+              engineError={engineError}
+              capabilities={capabilities}
+              language={language}
+              onLanguageChange={onLanguageChange}
+              themeMode={themeMode}
+              onThemeChange={onThemeChange}
+              axisPlanCacheDir={axisPlanCacheDir}
+              onAxisPlanCacheDirChange={onAxisPlanCacheDirChange}
+              onNavigate={onNavigate}
+              onProjectChange={onProjectChange}
+              onEngineError={onEngineError}
+              onGeometrySuccess={onGeometrySuccess}
+              executionBridge={executionBridge}
+              analyzeAvailable={analyzeAvailable}
+              analyzeSubroute={analyzeSubroute}
+              openDiagnostics={openDiagnostics}
+              openMedia={openMedia}
+            />
           </div>
 
           <div className="jobs-tray" aria-label={t("jobs.title")}>

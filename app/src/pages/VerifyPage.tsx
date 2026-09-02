@@ -3,7 +3,7 @@ import { ChevronDown, ChevronRight, Download, ScanSearch, Trash2 } from "lucide-
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
 import type { BackendPreference } from "../engine/protocol";
-import { activeRecipe, recipeReadiness, recipesByUpdatedAt } from "../project/recipe";
+import { activeRecipe, deleteRecipeInState, recipeReadiness, recipesByUpdatedAt } from "../project/recipe";
 import { activateRecipe } from "../project/recipeApply";
 import { buildFrameSample, nextSampleOrder } from "../project/samples";
 import { useRunGroupSubmit } from "../hooks/useRunGroupSubmit";
@@ -14,7 +14,7 @@ import { PERFECTLY_DESCALE_THRESHOLD } from "../components/ResultMetricTable";
 import { missingFieldLabels } from "../components/RecipeReviewDialog";
 import { EmptyInlineAction } from "../components/EmptyInlineAction";
 import { RecipePicker } from "../components/RecipePicker";
-import { RunGroupPlanCard } from "../components/RunGroupPlanCard";
+import { MenuSelect } from "../components/MenuSelect";
 import { RunLaunchButton } from "../components/RunLaunchButton";
 import {
   backendOptionLabel,
@@ -208,7 +208,7 @@ export function VerifyPage({
     : null, [state, selectedEligibleRunIds.join("\u0000"), historySource]);
   const concurrencyCapability = capabilities?.payload.features?.media_verify_concurrency;
   const concurrencyMin = concurrencyCapability?.min ?? 1;
-  const concurrencyMax = concurrencyCapability?.max ?? 8;
+  const concurrencyMax = concurrencyCapability?.max ?? 16;
   const concurrencyInvalid = !validVerifyConcurrency(draft.concurrency);
 
   /** Stable per-run colors (indexed over all runs, not the filtered view). */
@@ -344,6 +344,13 @@ export function VerifyPage({
     onProjectChange((current) => activateRecipe(current, recipeId));
   }
 
+  function removeRecipe(recipeId: string) {
+    onProjectChange((current) => {
+      const result = deleteRecipeInState(current, recipeId);
+      return result.ok ? result.state : current;
+    });
+  }
+
   const startBlockedReason = !analyzeAvailable
     ? t("verify.blocked.noCommand")
     : !recipe
@@ -440,6 +447,7 @@ export function VerifyPage({
               value={state.project.activeRecipeId ?? ""}
               options={recipeOptions}
               onChange={changeActiveRecipe}
+              onRemove={removeRecipe}
               ariaLabel={t("verify.selectRecipe")}
             />
             <RecipeSummaryStrip
@@ -515,22 +523,6 @@ export function VerifyPage({
             </ul>
           )}
 
-          {plan ? (
-            <RunGroupPlanCard
-              t={t}
-              title={t("analyze.runGroupPlan")}
-              summary={
-                `${t("analyze.runGroupType", { type: plan.groupType })}` +
-                ` · ${t("analyze.memberCount", { count: String(plan.memberCount) })}`
-              }
-              members={plan.members.map((member) => ({
-                key: member.planKey,
-                title: member.sourceLabel,
-                subtitle: scopeLabel(t, member.scanScope.selection),
-              }))}
-              multiMemberNote={plan.memberCount > 1 ? t("verify.memberPerSource") : null}
-            />
-          ) : null}
         </aside>
 
         <section className="analyze-plot pane">
@@ -538,17 +530,19 @@ export function VerifyPage({
             <h3>{t("verify.reviewTitle")}</h3>
             <label className="verify-filter verify-history-source">
               <span>{t("verify.historySource")}</span>
-              <select
-                className="control-select"
+              <MenuSelect
                 value={historySourceId}
-                onChange={(event) => {
-                  setHistorySourceId(event.target.value);
+                ariaLabel={t("verify.historySource")}
+                options={historySources.map((source) => ({
+                  value: source.id,
+                  label: source.label || source.path,
+                }))}
+                onChange={(sourceId) => {
+                  setHistorySourceId(sourceId);
                   setSelectedFusionRunIds(new Set());
                   setSelectedFusionId(null);
                 }}
-              >
-                {historySources.map((source) => <option key={source.id} value={source.id}>{source.label || source.path}</option>)}
-              </select>
+              />
             </label>
             {runs.length > 0 ? (
               <div className="verify-review-filters">
@@ -821,9 +815,9 @@ export function VerifyPage({
 
           <label className="block">
             <span>{t("analyze.backend")}</span>
-            <select
-              className="backend-select"
+            <MenuSelect
               value={draft.backendPreference}
+              ariaLabel={t("analyze.backend")}
               title={backendOptionLabel(
                 t,
                 draft.backendPreference,
@@ -833,24 +827,22 @@ export function VerifyPage({
                 capabilities?.payload.features?.verify_engine_decode !== true,
                 capabilities?.payload.features?.verify_engine_decode === true,
               )}
-              onChange={(event) =>
-                patch({ backendPreference: event.target.value as BackendPreference })
+              options={verifyBackends.map((backend) => ({
+                value: backend,
+                label: backendOptionLabel(
+                  t,
+                  backend,
+                  capabilities,
+                  recipe?.metric?.pNorm ?? 1,
+                  undefined,
+                  capabilities?.payload.features?.verify_engine_decode !== true,
+                  capabilities?.payload.features?.verify_engine_decode === true,
+                ),
+              }))}
+              onChange={(backend) =>
+                patch({ backendPreference: backend as BackendPreference })
               }
-            >
-              {verifyBackends.map((backend) => (
-                <option key={backend} value={backend}>
-                  {backendOptionLabel(
-                    t,
-                    backend,
-                    capabilities,
-                    recipe?.metric?.pNorm ?? 1,
-                    undefined,
-                    capabilities?.payload.features?.verify_engine_decode !== true,
-                    capabilities?.payload.features?.verify_engine_decode === true,
-                  )}
-                </option>
-              ))}
-            </select>
+            />
           </label>
 
           <label className="block">
@@ -1022,11 +1014,4 @@ function verifyRunConcurrency(
   return Number.isInteger(requested) && requested >= 1
     ? { effective: requested, maxInflight: null }
     : null;
-}
-
-function scopeLabel(t: Translator, selection: string): string {
-  if (selection === "all") return t("verify.scopeFull");
-  if (selection === "decoded_i_picture") return t("verify.ruleIPicture");
-  if (selection === "every_n") return t("verify.ruleEveryN");
-  return selection;
 }

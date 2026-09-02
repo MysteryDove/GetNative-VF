@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import {
   AlertTriangle,
-  ChevronRight,
   FileImage,
   Film,
   FolderPlus,
@@ -20,7 +19,7 @@ import {
   probeMedia,
   type MediaCapabilities,
 } from "../media/service";
-import type { ProjectState, Source } from "../project/types";
+import type { ProjectState, Sample, Source } from "../project/types";
 import { dispatchFrameBrowserKey, findDuplicateSampleId } from "../media/frameBrowser";
 import {
   applyRelinkedProbe,
@@ -75,6 +74,13 @@ export function MediaPage({
   const [dedupPopupId, setDedupPopupId] = useState<number | null>(null);
 
   const selectedSource = selectedSourceId ? state.sourcesById[selectedSourceId] : null;
+  const sampleCountBySourceId = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const sample of Object.values(state.samplesById)) {
+      counts[sample.sourceId] = (counts[sample.sourceId] ?? 0) + 1;
+    }
+    return counts;
+  }, [state.samplesById]);
   const sourceSamples = useMemo(
     () =>
       Object.values(state.samplesById)
@@ -137,7 +143,8 @@ export function MediaPage({
     selectVideoFrame,
     scrubVideoFrame,
   } = useMediaPreview({
-    selectedSource: active ? selectedSource : null,
+    selectedSource,
+    active,
     videoDecodeAvailable: mediaCapabilities?.video_decode_available,
     setError,
     onSourceChanged: markSourceChanged,
@@ -216,15 +223,26 @@ export function MediaPage({
   }
 
   function removeSource(source: Source) {
-    if (Object.values(state.samplesById).some((sample) => sample.sourceId === source.id)) return;
+    if (state.project.readOnly) return;
+    const sampleCount = sampleCountBySourceId[source.id] ?? 0;
+    if (sampleCount > 0) {
+      if (!window.confirm(t("media.removeSourceWithSamplesConfirm", { count: sampleCount }))) return;
+      if (!window.confirm(t("media.removeSourceWithSamplesConfirmAgain", { count: sampleCount }))) return;
+    }
     void cancelSourceImport(source.id).catch(() => undefined);
     onProjectChange((current) => {
       const sourcesById = { ...current.sourcesById };
       delete sourcesById[source.id];
-      return { ...current, sourcesById };
+      const samplesById = { ...current.samplesById };
+      for (const sample of Object.values(samplesById)) {
+        if (sample.sourceId === source.id) delete samplesById[sample.id];
+      }
+      return { ...current, sourcesById, samplesById };
     });
-    const next = sources.find((item) => item.id !== source.id);
-    setSelectedSourceId(next?.id ?? null);
+    if (selectedSourceId === source.id) {
+      const next = sources.find((item) => item.id !== source.id);
+      setSelectedSourceId(next?.id ?? null);
+    }
   }
 
   function handleFrameBrowserKeyDown(
@@ -239,7 +257,7 @@ export function MediaPage({
     });
   }
 
-  function addSample(andContinue: boolean) {
+  function addSample() {
     if (!selectedSource || selectedSource.state !== "ready") return;
     if (selectedSource.kind === "animated") return;
     const selectedFrame = selectedSource.kind === "video" ? frameWindow?.selected : null;
@@ -260,7 +278,7 @@ export function MediaPage({
       label:
         selectedSource.kind === "video"
           ? videoSampleLabel(selectedSource, selectedFrame?.frame_index, t)
-          : selectedSource.label ?? fileName(selectedSource.path),
+          : t("media.kind.still"),
       streamIndex: selectedSource.kind === "video" ? selectedSource.selectedStreamIndex ?? null : null,
       frameIndex: selectedFrame?.frame_index ?? null,
       pts: selectedFrame?.pts ?? null,
@@ -268,13 +286,27 @@ export function MediaPage({
       timestampSeconds: selectedFrame?.timestamp_seconds ?? null,
     });
     onProjectChange((current) => withSample(current, sample));
-    if (andContinue && selectedFrame) {
-      void selectVideoFrame(selectedSource, "frame", selectedFrame.frame_index + 1);
-    }
   }
 
   function removeSample(sampleId: string) {
     onProjectChange((current) => withoutSample(current, sampleId));
+  }
+
+  function setSampleIncluded(sampleId: string, included: boolean) {
+    if (state.project.readOnly) return;
+    onProjectChange((current) => {
+      const sample = current.samplesById[sampleId];
+      if (!sample || sample.included === included) return current;
+      return {
+        ...current,
+        samplesById: { ...current.samplesById, [sampleId]: { ...sample, included } },
+      };
+    });
+  }
+
+  function seekToSample(sample: Sample) {
+    if (!selectedSource || selectedSource.kind !== "video" || sample.frameIndex == null) return;
+    void selectVideoFrame(selectedSource, "frame", sample.frameIndex);
   }
 
   return (
@@ -317,28 +349,49 @@ export function MediaPage({
           </div>
           {sources.length ? (
             <div className="source-list">
-              {sources.map((source) => (
-                <button
-                  className={`source-row ${source.id === selectedSourceId ? "selected" : ""}`}
-                  type="button"
-                  key={source.id}
-                  onClick={() => selectSource(source.id)}
-                >
-                  <span className={`source-kind ${source.state}`}>
-                    {source.kind === "still" ? <FileImage size={16} /> : <Film size={16} />}
-                  </span>
-                  <span className="source-copy">
-                    <strong>{source.label ?? fileName(source.path)}</strong>
-                    <small>
-                      {sourceSummary(source, t)}
-                      {source.state === "probing" && indexProgress[source.id] != null
-                        ? ` · ${t("media.indexedFrames", { count: indexProgress[source.id] })}`
-                        : ""}
-                    </small>
-                  </span>
-                  {source.state === "probing" ? <LoaderCircle className="spin" size={14} /> : null}
-                </button>
-              ))}
+              {sources.map((source) => {
+                const addedCount = sampleCountBySourceId[source.id] ?? 0;
+                return (
+                  <div
+                    className={`source-row ${source.id === selectedSourceId ? "selected" : ""}`}
+                    key={source.id}
+                  >
+                    <button
+                      className="source-row-main"
+                      type="button"
+                      onClick={() => selectSource(source.id)}
+                    >
+                      <span className={`source-kind ${source.state}`}>
+                        {source.kind === "still" ? <FileImage size={16} /> : <Film size={16} />}
+                      </span>
+                      <span className="source-copy">
+                        <strong>{source.label ?? fileName(source.path)}</strong>
+                        <small>
+                          {sourceSummary(source, t)}
+                          {source.state === "probing" && indexProgress[source.id] != null
+                            ? ` · ${t("media.indexedFrames", { count: indexProgress[source.id] })}`
+                            : ""}
+                          {` · ${t("media.addedFrameCount", { count: addedCount })}`}
+                        </small>
+                      </span>
+                      {source.state === "probing" ? <LoaderCircle className="spin" size={14} /> : null}
+                    </button>
+                    <button
+                      className="icon-button"
+                      type="button"
+                      title={t("media.removeSource")}
+                      aria-label={t("media.removeSource")}
+                      disabled={state.project.readOnly}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        removeSource(source);
+                      }}
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           ) : (
             <button className="source-empty" type="button" onClick={() => void pickFiles()}>
@@ -357,8 +410,8 @@ export function MediaPage({
                   <strong>{selectedSource.label ?? fileName(selectedSource.path)}</strong>
                   <span title={selectedSource.path}>{selectedSource.path}</span>
                 </div>
-                <div className="inspector-actions">
-                  {(selectedSource.state === "missing" || selectedSource.state === "error") && (
+                {(selectedSource.state === "missing" || selectedSource.state === "error") ? (
+                  <div className="inspector-actions">
                     <button
                       className="icon-button reveal-button"
                       type="button"
@@ -368,18 +421,8 @@ export function MediaPage({
                     >
                       <RefreshCw size={14} />
                     </button>
-                  )}
-                  <button
-                    className="icon-button"
-                    type="button"
-                    title={t("media.removeSource")}
-                    aria-label={t("media.removeSource")}
-                    disabled={sourceSamples.length > 0 || state.project.readOnly}
-                    onClick={() => removeSource(selectedSource)}
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                </div>
+                  </div>
+                ) : null}
               </div>
 
               <div
@@ -477,17 +520,11 @@ export function MediaPage({
               className="secondary-button primary-command"
               type="button"
               disabled={!selectedSource || selectedSource.state !== "ready" || selectedSource.kind === "animated" || (selectedSource.kind === "video" && !frameWindow) || state.project.readOnly}
-              onClick={() => addSample(false)}
+              onClick={() => addSample()}
             >
               {selectedSource?.kind === "video" ? <Plus size={15} /> : <ImagePlus size={15} />}
               {selectedSource?.kind === "video" ? t("media.addCurrentFrame") : t("media.addImage")}
             </button>
-            {selectedSource?.kind === "video" ? (
-              <button className="secondary-button" type="button" disabled={!frameWindow || state.project.readOnly} onClick={() => addSample(true)}>
-                <ChevronRight size={15} />
-                {t("media.addAndContinue")}
-              </button>
-            ) : null}
             {dedupPopupId != null ? (
               <p className="dedup-popup" role="status">
                 {t("media.alreadySelected")}
@@ -495,17 +532,48 @@ export function MediaPage({
             ) : null}
           </div>
           <div className="selected-sample-list">
-            {sourceSamples.map((sample) => (
-              <div className="selected-sample-row" key={sample.id}>
-                <div>
-                  <strong>{sample.label}</strong>
-                  <span>{sample.frameIndex == null ? dimensionText(selectedSource?.width, selectedSource?.height) : `${t("media.frameNumber")} ${sample.frameIndex} · ${formatSeconds(sample.timestampSeconds)}`}</span>
+            {sourceSamples.map((sample) => {
+              const currentFrame = frameWindow?.selected.frame_index;
+              const isCurrent = sample.frameIndex != null && sample.frameIndex === currentFrame;
+              return (
+                <div
+                  className={`selected-sample-row${sample.included ? "" : " excluded"}${isCurrent ? " current" : ""}`}
+                  key={sample.id}
+                  onClick={() => seekToSample(sample)}
+                >
+                  <strong>
+                    {sample.frameIndex != null ? `#${sample.frameIndex}` : t("media.kind.still")}
+                  </strong>
+                  <label
+                    className="include-switch"
+                    title={sample.included ? t("samples.included") : t("samples.excluded")}
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={sample.included}
+                      disabled={state.project.readOnly}
+                      aria-label={sample.included ? t("samples.included") : t("samples.excluded")}
+                      onChange={(event) => setSampleIncluded(sample.id, event.target.checked)}
+                    />
+                    <span className="include-switch-track" />
+                  </label>
+                  <button
+                    className="icon-button"
+                    type="button"
+                    title={t("samples.remove")}
+                    aria-label={t("samples.remove")}
+                    disabled={state.project.readOnly}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      removeSample(sample.id);
+                    }}
+                  >
+                    <Trash2 size={14} />
+                  </button>
                 </div>
-                <button className="icon-button" type="button" title={t("samples.remove")} aria-label={t("samples.remove")} disabled={state.project.readOnly} onClick={() => removeSample(sample.id)}>
-                  <Trash2 size={14} />
-                </button>
-              </div>
-            ))}
+              );
+            })}
             {!sourceSamples.length ? <p className="selection-empty">{t("media.noSelectedSamples")}</p> : null}
           </div>
         </aside>

@@ -79,8 +79,8 @@ describe("reconcileReadyVideoSourceIds", () => {
 });
 
 describe("resolveScanScope", () => {
-  it("defaults media verification concurrency to two", () => {
-    expect(defaultVerifyDraft().concurrency).toBe(2);
+  it("defaults media verification concurrency to eight", () => {
+    expect(defaultVerifyDraft().concurrency).toBe(8);
   });
   it("builds a full-scan scope and validates ranges", () => {
     const full = resolveScanScope({ ...defaultVerifyDraft(), scopeKind: "full" }, 0);
@@ -142,8 +142,8 @@ describe("planVerifyRunGroup", () => {
     expect(member?.request.recipeRevision).toBe(3);
     expect(member?.request.kernel.id).toBe("bicubic");
     expect(member?.request.scanScope.selection).toBe("all");
-    expect(member?.request.concurrency).toBe(2);
-    expect(result.plan.intentSnapshot.concurrency).toBe(2);
+    expect(member?.request.concurrency).toBe(8);
+    expect(result.plan.intentSnapshot.concurrency).toBe(8);
   });
 
   it("resolves geometry independently for differently sized sources", () => {
@@ -174,8 +174,8 @@ describe("planVerifyRunGroup", () => {
     expect(result.plan.members[1]?.request.geometry.sourceWidth).toBe(1280);
   });
 
-  it("accepts only integer concurrency values from one through eight", () => {
-    for (const concurrency of [1, 2, 4, 8]) {
+  it("accepts only integer concurrency values from one through sixteen", () => {
+    for (const concurrency of [1, 2, 4, 8, 16]) {
       const result = planVerifyRunGroup({
         draft: { ...defaultVerifyDraft(), sourceIds: ["src_1"], concurrency },
         recipe: completeRecipe,
@@ -183,7 +183,7 @@ describe("planVerifyRunGroup", () => {
       });
       expect(result.ok).toBe(true);
     }
-    for (const concurrency of [0, 9, -1, 1.5, Number.NaN]) {
+    for (const concurrency of [0, 17, -1, 1.5, Number.NaN]) {
       const result = planVerifyRunGroup({
         draft: { ...defaultVerifyDraft(), sourceIds: ["src_1"], concurrency },
         recipe: completeRecipe,

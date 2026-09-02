@@ -2,22 +2,20 @@
 
 import type { Translator } from "../i18n";
 import type { ProjectState, Source } from "../project/types";
-import { fileName } from "./importSources";
 import { dimensionText } from "./format";
 import type { MediaCapabilities } from "./service";
 
-/** Sample label for a picked video frame: "Source · Video stream N #frame". */
+/** Sample label for a picked video frame: "#frame", with stream when needed. */
 export function videoSampleLabel(
   source: Source,
   frameIndex: number | undefined,
   t: Translator,
 ): string {
-  const sourceLabel = source.label ?? fileName(source.path);
   const streamLabel =
     source.videoStreams.length > 1
-      ? ` · ${t("media.videoStream")} ${source.selectedStreamIndex ?? "-"}`
+      ? `${t("media.videoStream")} ${source.selectedStreamIndex ?? "-"} · `
       : "";
-  return `${sourceLabel}${streamLabel} #${frameIndex ?? "-"}`;
+  return `${streamLabel}#${frameIndex ?? "-"}`;
 }
 
 /** Identity key for the (source, fingerprint, stream) a preview belongs to. */

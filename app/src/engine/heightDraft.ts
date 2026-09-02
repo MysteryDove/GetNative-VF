@@ -11,7 +11,7 @@ import type {
   BaseMode,
 } from "./protocol";
 import { buildCandidateGrid, workEstimate } from "./candidateGrid";
-import { profileFor, profilesFor } from "./profiles";
+import { MUF_PROFILE_ID, profileFor } from "./profiles";
 
 export const CUDA_MAXIMUM_P_NORM = 4;
 
@@ -42,13 +42,7 @@ export type HeightDraft = {
 };
 
 export function defaultHeightDraft(capabilities: EngineEnvelope | null): HeightDraft {
-  const profiles = profilesFor(capabilities);
-  const defaultProfile =
-    profiles.find((profile) => profile.id.includes("muf"))?.id ??
-    profiles[0]?.id ??
-    "muf-d278cd3";
-
-  return heightDraftForProfile(capabilities, defaultProfile);
+  return heightDraftForProfile(capabilities);
 }
 
 function kernelParametersForProfile(
@@ -65,16 +59,15 @@ function kernelParametersForProfile(
 
 export function heightDraftForProfile(
   capabilities: EngineEnvelope | null,
-  profileId: string,
 ): HeightDraft {
-  const profile = profileFor(profileId, capabilities);
+  const profile = profileFor(MUF_PROFILE_ID, capabilities);
   return {
     preset: "integer_coarse",
     axisMode: profile.default_axis_mode,
     start: profile.default_grid.start,
     stop: profile.default_grid.stop,
     step: profile.default_grid.step,
-    endpointRule: profile.default_grid.endpoint_rule,
+    endpointRule: "inclusive",
     refineSelected: "720",
     refineHalfSpan: "1.0",
     kernelId: profile.default_kernel.id,
@@ -98,14 +91,6 @@ export function heightDraftForProfile(
   };
 }
 
-/** Profile selection itself preserves edits; this explicit action resets the full draft. */
-export function applyProfileDefaults(
-  draft: HeightDraft,
-  capabilities: EngineEnvelope | null,
-): HeightDraft {
-  return heightDraftForProfile(capabilities, draft.profileId);
-}
-
 export function applyPreset(draft: HeightDraft, preset: SearchPreset): HeightDraft {
   if (preset === "integer_coarse") {
     return {
@@ -113,7 +98,7 @@ export function applyPreset(draft: HeightDraft, preset: SearchPreset): HeightDra
       preset,
       start: "500",
       stop: "1000",
-      endpointRule: draft.endpointRule,
+      endpointRule: "inclusive",
       step: "1",
     };
   }
@@ -122,6 +107,7 @@ export function applyPreset(draft: HeightDraft, preset: SearchPreset): HeightDra
       ...draft,
       preset,
       step: "0.1",
+      endpointRule: "inclusive",
       refineHalfSpan: draft.refineHalfSpan || "1.0",
       refineSelected: draft.refineSelected || "720",
     };
@@ -156,7 +142,7 @@ export function resolveHeightGrid(
       start,
       stop,
       step: draft.step,
-      endpointRule: draft.endpointRule,
+      endpointRule: "inclusive",
       gridSemantics: profileFor(draft.profileId).grid_semantics,
       preset: "fractional_refine",
     });
@@ -166,7 +152,7 @@ export function resolveHeightGrid(
     start: draft.start,
     stop: draft.stop,
     step: draft.step,
-    endpointRule: draft.endpointRule,
+    endpointRule: "inclusive",
     gridSemantics: profileFor(draft.profileId).grid_semantics,
     preset: draft.preset,
   });

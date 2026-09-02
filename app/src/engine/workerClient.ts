@@ -16,6 +16,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { EngineEnvelope } from "./types";
+import { MUF_PROFILE_ID } from "./profiles";
 import type {
   AxisMode,
   ActualBackend,
@@ -286,7 +287,7 @@ export class EngineWorkerClient {
       metric: params.metric,
       backend: params.backend ?? "cpu",
       workerCount: params.workerCount,
-      profileId: params.profileId ?? "muf-d278cd3",
+      profileId: MUF_PROFILE_ID,
       endpointRule: params.endpointRule ?? "inclusive",
       baseHeight: params.baseHeight ?? null,
       baseWidth: params.baseWidth ?? null,
@@ -305,7 +306,7 @@ export class EngineWorkerClient {
       metric: params.metric,
       backend: params.backend ?? "cpu",
       workerCount: params.workerCount,
-      profileId: params.profileId ?? "muf-d278cd3",
+      profileId: MUF_PROFILE_ID,
       endpointRule: params.endpointRule ?? "inclusive",
       baseHeight: params.baseHeight ?? null,
       baseWidth: params.baseWidth ?? null,

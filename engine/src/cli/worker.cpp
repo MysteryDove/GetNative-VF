@@ -77,8 +77,11 @@ constexpr std::int64_t kProtocolVersion = 1;
 constexpr std::size_t kPlanChunkSize = 64;
 constexpr std::size_t kCandidateChunkSize = 32;
 constexpr std::size_t kMediaVerifyMinimumConcurrency = 1U;
-constexpr std::size_t kMediaVerifyMaximumConcurrency = 8U;
-constexpr std::size_t kMediaVerifyDefaultConcurrency = 2U;
+constexpr std::size_t kMediaVerifyMaximumConcurrency = 16U;
+constexpr std::size_t kMediaVerifyDefaultConcurrency = 8U;
+// GPU analysis engines independently cap execution slots at 8. Media-verify
+// frame concurrency is a different limit and must not be forwarded here.
+constexpr std::size_t kAnalysisEngineExecutionSlots = 8U;
 
 std::int64_t timestamp_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -883,7 +886,7 @@ VerifyJobSpec parse_verify_begin(const JsonValue &command, std::string job_id,
             || concurrency < static_cast<double>(kMediaVerifyMinimumConcurrency)
             || concurrency > static_cast<double>(kMediaVerifyMaximumConcurrency)) {
             throw WorkerError(
-                "bad_request", "concurrency must be an integer within 1..8");
+                "bad_request", "concurrency must be an integer within 1..16");
         }
         spec.concurrency = static_cast<std::size_t>(concurrency);
     }
@@ -2653,7 +2656,7 @@ private:
         if (!cuda_engine_) {
             log_ << "worker: initializing CUDA analysis engine...\n";
             CudaAnalysisOptions options;
-            options.execution_slots = kMediaVerifyMaximumConcurrency;
+            options.execution_slots = kAnalysisEngineExecutionSlots;
             cuda_engine_.emplace(std::move(options));
             log_ << "worker: CUDA analysis engine initialized on "
                  << cuda_engine_->device_info().name << '\n';
@@ -2667,7 +2670,7 @@ private:
         if (!vulkan_engine_) {
             log_ << "worker: initializing Vulkan analysis engine...\n";
             VulkanAnalysisOptions options;
-            options.execution_slots = kMediaVerifyMaximumConcurrency;
+            options.execution_slots = kAnalysisEngineExecutionSlots;
             vulkan_engine_.emplace(std::move(options));
             log_ << "worker: Vulkan analysis engine initialized on "
                  << vulkan_engine_->device_info().name << '\n';
@@ -2681,7 +2684,7 @@ private:
         if (!metal_engine_) {
             log_ << "worker: initializing Metal analysis engine...\n";
             MetalAnalysisOptions options;
-            options.execution_slots = kMediaVerifyMaximumConcurrency;
+            options.execution_slots = kAnalysisEngineExecutionSlots;
             metal_engine_.emplace(std::move(options));
             log_ << "worker: Metal analysis engine initialized on "
                  << metal_engine_->device_info().name << '\n';

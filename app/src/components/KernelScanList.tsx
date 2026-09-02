@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Plus } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
 import type { KernelRef } from "../engine/protocol";
@@ -15,6 +16,15 @@ import {
 } from "../engine/kernelDraft";
 import { kernelSignature } from "../engine/heightDraft";
 
+function AddKernelsButton({ t, onClick }: { t: Translator; onClick: () => void }) {
+  return (
+    <button className="kernel-add-button" type="button" onClick={onClick}>
+      <Plus size={13} strokeWidth={2.4} />
+      {t("analyze.k.scanList.add")}
+    </button>
+  );
+}
+
 function kernelChipLabel(t: Translator, kernel: KernelRef): string {
   const name = kernelDisplayName(t, kernel.id);
   const params = Object.entries(kernel.parameters);
@@ -23,32 +33,19 @@ function kernelChipLabel(t: Translator, kernel: KernelRef): string {
 }
 
 /**
- * The hand-built scan list: candidate chips with remove/apply affordances.
- * Selection is by signature, not index: entries can be removed mid-list.
+ * The hand-built scan list: candidate chips with a remove affordance.
+ * Entries are keyed by signature so they can be removed mid-list.
  */
 export function KernelScanList({
   t,
   draft,
   work,
-  selectedSignature,
-  onSelectSignature,
   onDraftChange,
-  selectedKernel,
-  inheritMetric,
-  onApplyKernel,
-  notice,
 }: {
   t: Translator;
   draft: KernelDraft;
   work: number;
-  selectedSignature: string | null;
-  onSelectSignature: (updater: (current: string | null) => string | null) => void;
   onDraftChange: (updater: (current: KernelDraft) => KernelDraft) => void;
-  selectedKernel: KernelRef | null;
-  inheritMetric: boolean;
-  onApplyKernel: (kernel: KernelRef | null, includeDivergedMetric: boolean) => void;
-  /** applyNotice || submitNotice from the panel. */
-  notice: string | null;
 }) {
   function handleRemoveKernel(index: number) {
     onDraftChange((current) => removeKernelFromScanList(current, index));
@@ -89,55 +86,22 @@ export function KernelScanList({
           {renderedKernels.map(({ kernel, index }) => {
             const signature = kernelSignature(kernel);
             return (
-              <button
-                type="button"
-                className={`candidate-chip ${selectedSignature === signature ? "selected" : ""}`}
-                key={signature}
-                onClick={() =>
-                  onSelectSignature((current) =>
-                    current === signature ? null : signature,
-                  )
-                }
-              >
+              <span className="candidate-chip" key={signature}>
                 {kernelChipLabel(t, kernel)}
-                <span
+                <button
+                  type="button"
                   className="chip-remove"
-                  role="button"
                   aria-label={t("analyze.k.scanList.remove")}
                   title={t("analyze.k.scanList.remove")}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    handleRemoveKernel(index);
-                  }}
+                  onClick={() => handleRemoveKernel(index)}
                 >
                   ×
-                </span>
-              </button>
+                </button>
+              </span>
             );
           })}
         </div>
         <p className="help-copy">{t("analyze.k.sequenceExact")}</p>
-        <div className="analyze-table-toolbar">
-          <button
-            className="secondary-button"
-            type="button"
-            disabled={!selectedKernel}
-            onClick={() => onApplyKernel(selectedKernel, false)}
-          >
-            {t("analyze.k.applyToRecipe")}
-          </button>
-          {!inheritMetric ? (
-            <button
-              className="secondary-button"
-              type="button"
-              disabled={!selectedKernel}
-              onClick={() => onApplyKernel(selectedKernel, true)}
-            >
-              {t("analyze.k.applyWithDivergedMetric")}
-            </button>
-          ) : null}
-          {notice ? <span className="help-copy">{notice}</span> : null}
-        </div>
       </div>
     </div>
   );
@@ -160,6 +124,7 @@ export function KernelScanListBuilder({
   const tapsRange = lanczosTapsRange(capabilities);
 
   function patch(partial: Partial<KernelDraft>) {
+    setAddNotice("");
     onDraftChange((current) => ({ ...current, ...partial }));
   }
 
@@ -218,10 +183,12 @@ export function KernelScanListBuilder({
     );
   }
 
+  const parameterized = draft.addFamily === "bicubic" || draft.addFamily === "lanczos";
+
   return (
     <fieldset className="metric-fieldset">
       <legend>{t("analyze.k.scanList.addSection")}</legend>
-      <div className="kernel-group-chips">
+      <div className="kernel-family-grid">
         {KERNEL_FAMILY_ORDER.map((family) => (
           <button
             key={family}
@@ -232,33 +199,30 @@ export function KernelScanListBuilder({
             {kernelDisplayName(t, family)}
           </button>
         ))}
+        {!parameterized ? <AddKernelsButton t={t} onClick={handleAddFamily} /> : null}
       </div>
 
       {draft.addFamily === "bicubic" ? (
         <>
-          <div className="metric-grid">
-            <label className="block">
-              <span>b</span>
-              <input
-                value={draft.bicubicB}
-                onChange={(event) => patch({ bicubicB: event.target.value })}
-              />
-            </label>
-            <label className="block">
-              <span>c</span>
-              <input
-                value={draft.bicubicC}
-                onChange={(event) => patch({ bicubicC: event.target.value })}
-              />
-            </label>
+          <div className="kernel-add-row">
+            <div className="metric-grid">
+              <label className="block">
+                <span>b</span>
+                <input
+                  value={draft.bicubicB}
+                  onChange={(event) => patch({ bicubicB: event.target.value })}
+                />
+              </label>
+              <label className="block">
+                <span>c</span>
+                <input
+                  value={draft.bicubicC}
+                  onChange={(event) => patch({ bicubicC: event.target.value })}
+                />
+              </label>
+            </div>
+            <AddKernelsButton t={t} onClick={handleAddFamily} />
           </div>
-          <button
-            className="secondary-button"
-            type="button"
-            onClick={handleAddFamily}
-          >
-            {t("analyze.k.scanList.add")}
-          </button>
           <details className="grid-range">
             <summary>{t("analyze.k.scanList.gridRanges")}</summary>
             <div className="grid-range-body">
@@ -284,10 +248,11 @@ export function KernelScanListBuilder({
               ))}
               <p className="help-copy">{t("analyze.k.gridEndpoints")}</p>
               <button
-                className="secondary-button"
+                className="kernel-add-button"
                 type="button"
                 onClick={handleAddBicubicGrid}
               >
+                <Plus size={13} strokeWidth={2.4} />
                 {t("analyze.k.scanList.addGrid")}
               </button>
             </div>
@@ -319,24 +284,10 @@ export function KernelScanListBuilder({
               </button>
             ))}
           </div>
-          <button
-            className="secondary-button"
-            type="button"
-            onClick={handleAddFamily}
-          >
-            {t("analyze.k.scanList.add")}
-          </button>
+          <div className="kernel-family-grid">
+            <AddKernelsButton t={t} onClick={handleAddFamily} />
+          </div>
         </>
-      ) : null}
-
-      {draft.addFamily !== "bicubic" && draft.addFamily !== "lanczos" ? (
-        <button
-          className="secondary-button"
-          type="button"
-          onClick={handleAddFamily}
-        >
-          {t("analyze.k.scanList.add")}
-        </button>
       ) : null}
 
       {addNotice ? <p className="help-copy warning-copy">{addNotice}</p> : null}

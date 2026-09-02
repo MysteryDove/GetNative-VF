@@ -33,7 +33,6 @@ import {
   planHeightRunGroup,
 } from "./runGroupPlan";
 import {
-  applyProfileDefaults,
   defaultHeightDraft,
   fixedKernelsForDraft,
   kernelSignature,
@@ -134,29 +133,13 @@ describe("GUI-3 analysis foundation", () => {
       start: "0.01", stop: "0.19", step: "0.01", endpointRule: "inclusive",
       gridSemantics: "repeated_addition",
     });
-    const indexed = resolveCandidateSequence({
-      start: "0.01", stop: "0.19", step: "0.01", endpointRule: "inclusive",
-      gridSemantics: "index_multiplication",
-    });
-    const fixed = resolveCandidateSequence({
-      start: "0.01", stop: "0.19", step: "0.01", endpointRule: "inclusive",
-      gridSemantics: "decimal_fixed_point",
-    });
     assert(
       repeated.ok && repeated.candidates[repeated.candidates.length - 1] === "0.18",
       "MUF repeated-addition stop",
     );
-    assert(
-      indexed.ok && indexed.candidates[indexed.candidates.length - 1] === "0.19",
-      "getnative indexed stop",
-    );
-    assert(
-      fixed.ok && fixed.candidates[fixed.candidates.length - 1] === "0.19",
-      "modern fixed-point stop",
-    );
   });
 
-  it("uses MUF defaults and only resets edits through the explicit profile action", () => {
+  it("uses muvsfunc defaults", () => {
     const draft = defaultHeightDraft(null);
     assert(draft.profileId === "muf-d278cd3", "MUF is the default profile");
     assert(draft.axisMode === "h_plus_w", "MUF defaults to H+W");
@@ -166,12 +149,6 @@ describe("GUI-3 analysis foundation", () => {
     assert(draft.metric.pixelExclusionThreshold === 0.015, "MUF threshold");
     assert(draft.kernelParameters.b === 0 && draft.kernelParameters.c === 0.5, "MUF bicubic");
     assert(draft.baseHeight === "" && draft.baseWidth === "", "MUF bases unspecified");
-
-    const edited = { ...draft, profileId: "modern", start: "701", axisMode: "h_only" as const };
-    assert(edited.start === "701" && edited.axisMode === "h_only", "profile selection preserves edits");
-    const reset = applyProfileDefaults(edited, null);
-    assert(reset.profileId === "modern" && reset.start === "500", "explicit reset applies profile grid");
-    assert(reset.axisMode === "h_plus_w", "explicit reset applies profile axis");
 
     const fractional = resolveHeightGrid({
       ...draft,
@@ -183,8 +160,8 @@ describe("GUI-3 analysis foundation", () => {
     });
     assert(fractional.ok, "fractional grid resolves");
     if (fractional.ok) {
-      assert(fractional.grid.endpointRule === "exclusive_stop", "fractional endpoint is preserved");
-      assert(fractional.grid.candidates.join(",") === "719.5,720", "exclusive fractional endpoint");
+      assert(fractional.grid.endpointRule === "inclusive", "height draft always includes stop");
+      assert(fractional.grid.candidates.join(",") === "719.5,720,720.5", "inclusive fractional endpoint");
     }
   });
 

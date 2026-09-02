@@ -1,5 +1,15 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+
+/** Tauri's UnlistenFn may return a promise that rejects if the listener is already gone. */
+function releaseUnlisten(stop: (() => void | Promise<void>) | undefined): void {
+  if (!stop) return;
+  try {
+    void Promise.resolve(stop()).catch(() => undefined);
+  } catch {
+    // Plugin threw synchronously (listeners[eventId] already missing).
+  }
+}
 
 /**
  * Window-level file drag/drop hook (Tauri webview drag events). Returns true
@@ -8,13 +18,16 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
  */
 export function useFileDrop(onPaths: (paths: string[]) => void, enabled = true): boolean {
   const [dropActive, setDropActive] = useState(false);
+  const onPathsRef = useRef(onPaths);
+  onPathsRef.current = onPaths;
+
   useEffect(() => {
     if (!enabled) {
       setDropActive(false);
       return;
     }
     let disposed = false;
-    let unlisten: (() => void) | undefined;
+    let unlisten: (() => void | Promise<void>) | undefined;
     getCurrentWebview()
       .onDragDropEvent((event) => {
         if (event.payload.type === "enter" || event.payload.type === "over") {
@@ -23,18 +36,18 @@ export function useFileDrop(onPaths: (paths: string[]) => void, enabled = true):
           setDropActive(false);
         } else if (event.payload.type === "drop") {
           setDropActive(false);
-          onPaths(event.payload.paths);
+          onPathsRef.current(event.payload.paths);
         }
       })
       .then((stop) => {
-        if (disposed) stop();
+        if (disposed) releaseUnlisten(stop);
         else unlisten = stop;
       })
       .catch(() => undefined);
     return () => {
       disposed = true;
-      unlisten?.();
+      releaseUnlisten(unlisten);
     };
-  }, [enabled, onPaths]);
+  }, [enabled]);
   return dropActive;
 }

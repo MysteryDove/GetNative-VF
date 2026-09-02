@@ -1,7 +1,7 @@
-import { Check, RotateCcw, SlidersHorizontal } from "lucide-react";
+import { SlidersHorizontal } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
-import { kernelDisplayName, profileDisplayName } from "../engine/displayNames";
+import { kernelDisplayName } from "../engine/displayNames";
 import {
   invalidKernelBlur,
   kernelSignature,
@@ -10,19 +10,31 @@ import {
 } from "../engine/heightDraft";
 import type { BaseMode, KernelRef, SearchPreset } from "../engine/protocol";
 import { backendOptionLabel } from "../engine/backendSelection";
-import { MetricEditor } from "./MetricEditor";
+import { MetricEditor, MetricSpecSection, metricSpecSummary } from "./MetricEditor";
+import { MenuSelect } from "./MenuSelect";
 import { RunLaunchButton } from "./RunLaunchButton";
+
+const LANCZOS_COMPARE_TAPS = [3, 4] as const;
+
+function compareKernelTaps(kernelId: string): Array<number | null> {
+  return kernelId === "lanczos" ? [...LANCZOS_COMPARE_TAPS] : [null];
+}
+
+function isPrimaryCompareOption(draft: HeightDraft, kernelId: string, taps: number | null): boolean {
+  if (kernelId !== draft.kernelId) return false;
+  if (kernelId === "lanczos") return taps === Number(draft.kernelParameters.taps ?? 3);
+  return true;
+}
 
 /**
  * Height-scan parameter form (right-hand pane): grid preset/axis/range,
- * kernel selection + compare set, profile, backend, metric spec, launch.
+ * kernel selection + compare set, backend, metric spec, launch.
  */
 export function HeightParamsPanel({
   t,
   draft,
   capabilities,
   backends,
-  kernelCount,
   resolvedBackend,
   pNormMaximum,
   canRun,
@@ -30,14 +42,14 @@ export function HeightParamsPanel({
   runBlockedReason,
   onPatch,
   onSetPreset,
-  onResetProfileDefaults,
   onRun,
+  metricSpecOpen,
+  onMetricSpecOpenChange,
 }: {
   t: Translator;
   draft: HeightDraft;
   capabilities: EngineEnvelope | null;
   backends: HeightDraft["backendPreference"][];
-  kernelCount: number;
   resolvedBackend: string;
   pNormMaximum: number;
   canRun: boolean;
@@ -45,11 +57,11 @@ export function HeightParamsPanel({
   runBlockedReason: string | null;
   onPatch: (partial: Partial<HeightDraft>) => void;
   onSetPreset: (preset: SearchPreset) => void;
-  onResetProfileDefaults: () => void;
   onRun: () => void;
+  metricSpecOpen: boolean;
+  onMetricSpecOpenChange: (open: boolean) => void;
 }) {
   const kernelOptions = capabilities?.payload.kernels ?? [];
-  const profileOptions = capabilities?.payload.profiles ?? [];
   const missingBaseAxis = missingFractionalBaseAxis(draft);
   const baseModes: BaseMode[] = ["integer", "odd", "even"];
   const baseModeField = (axis: "height" | "width") => axis === "height" ? "baseHeightMode" : "baseWidthMode";
@@ -58,28 +70,48 @@ export function HeightParamsPanel({
     const mode = axis === "height" ? draft.baseHeightMode : draft.baseWidthMode;
     const label = axis === "height" ? t("analyze.baseHeight") : t("analyze.baseWidth");
     return (
-      <div className="block" key={axis}>
+      <label className="block" key={axis}>
         <span>{label}</span>
-        <div className="button-radio base-mode-radio" role="radiogroup" aria-label={label}>
+        <select
+          value={mode}
+          aria-label={label}
+          onChange={(event) =>
+            onPatch({
+              [baseModeField(axis)]: event.target.value as BaseMode,
+              [baseValueField(axis)]: "",
+            })
+          }
+        >
           {baseModes.map((item) => (
-            <button
-              key={item}
-              type="button"
-              role="radio"
-              aria-checked={mode === item}
-              className={mode === item ? "active" : ""}
-              onClick={() => onPatch({
-                [baseModeField(axis)]: item,
-                [baseValueField(axis)]: "",
-              })}
-            >
+            <option key={item} value={item}>
               {t(`analyze.baseMode.${item}`)}
-            </button>
+            </option>
           ))}
-        </div>
-      </div>
+        </select>
+      </label>
     );
   };
+  const showBaseHeight = draft.axisMode !== "w_only";
+  const showBaseWidth = draft.axisMode !== "h_only";
+  const blurField = (
+    <label className="block">
+      <span>{t("analyze.blur")}</span>
+      <input
+        inputMode="decimal"
+        title={t("analyze.blurHint")}
+        aria-invalid={invalidKernelBlur(draft.kernelParameters) || undefined}
+        value={String(draft.kernelParameters.blur ?? 1)}
+        onChange={(event) =>
+          onPatch({
+            kernelParameters: {
+              ...draft.kernelParameters,
+              blur: event.target.value,
+            },
+          })
+        }
+      />
+    </label>
+  );
 
   return (
     <aside className="analyze-params pane">
@@ -137,7 +169,7 @@ export function HeightParamsPanel({
       </div>
 
       {draft.preset === "fractional_refine" ? (
-        <>
+        <div className="range-grid">
           <label className="block">
             <span>{t("analyze.refineSelected")}</span>
             <input
@@ -161,9 +193,9 @@ export function HeightParamsPanel({
               onChange={(event) => onPatch({ step: event.target.value })}
             />
           </label>
-        </>
+        </div>
       ) : (
-        <>
+        <div className="range-grid">
           <label className="block">
             <span>{t("analyze.start")}</span>
             <input
@@ -186,25 +218,20 @@ export function HeightParamsPanel({
               onChange={(event) => onPatch({ step: event.target.value })}
             />
           </label>
-        </>
+        </div>
       )}
 
-      <label className="block">
-        <span>{t("analyze.endpointRule")}</span>
-        <select
-          value={draft.endpointRule}
-          onChange={(event) =>
-            onPatch({ endpointRule: event.target.value as HeightDraft["endpointRule"] })
-          }
-        >
-          <option value="inclusive">{t("analyze.endpoint.inclusive")}</option>
-          <option value="exclusive_stop">{t("analyze.endpoint.exclusive")}</option>
-        </select>
-      </label>
-
-      {draft.axisMode !== "w_only" ? renderBaseMode("height") : null}
-      {draft.axisMode !== "h_only" ? renderBaseMode("width") : null}
-      <p className="help-copy">{t("analyze.baseParityHint")}</p>
+      {showBaseHeight && showBaseWidth ? (
+        <div className="metric-grid">
+          {renderBaseMode("height")}
+          {renderBaseMode("width")}
+        </div>
+      ) : (
+        <>
+          {showBaseHeight ? renderBaseMode("height") : null}
+          {showBaseWidth ? renderBaseMode("width") : null}
+        </>
+      )}
       {missingBaseAxis ? (
         <p className="help-copy warning-copy" role="alert">
           {t("analyze.fractionalBaseRequired", {
@@ -215,43 +242,46 @@ export function HeightParamsPanel({
 
       <label className="block">
         <span>{t("analyze.fixedKernel")}</span>
-        <select
+        <MenuSelect
           value={draft.kernelId}
           disabled={kernelOptions.length === 0}
-          onChange={(event) => {
+          ariaLabel={t("analyze.fixedKernel")}
+          options={
+            kernelOptions.length === 0
+              ? [{ value: draft.kernelId, label: draft.kernelId }]
+              : kernelOptions.map((kernel) => ({
+                  value: kernel.id,
+                  label: kernelDisplayName(t, kernel.id),
+                }))
+          }
+          onChange={(kernelId) => {
             const blur = draft.kernelParameters.blur;
             const withBlur = (
               parameters: HeightDraft["kernelParameters"],
             ): HeightDraft["kernelParameters"] =>
               blur === undefined ? parameters : { ...parameters, blur };
             onPatch({
-              kernelId: event.target.value,
+              kernelId,
               kernelParameters:
-                event.target.value === "bicubic"
+                kernelId === "bicubic"
                   ? withBlur({ b: 0, c: 0.5 })
-                  : event.target.value === "lanczos"
+                  : kernelId === "lanczos"
                     ? withBlur({ taps: 3 })
                     : withBlur({}),
-              compareKernels: draft.compareKernels.filter(
-                (item) => item.id !== event.target.value,
-              ),
+              compareKernels: draft.compareKernels.filter((item) => {
+                if (item.id !== kernelId) return true;
+                if (kernelId === "lanczos") {
+                  return Number(item.parameters.taps) !== 3;
+                }
+                return false;
+              }),
             });
           }}
-        >
-          {kernelOptions.length === 0 ? (
-            <option value={draft.kernelId}>{draft.kernelId}</option>
-          ) : (
-            kernelOptions.map((kernel) => (
-              <option key={kernel.id} value={kernel.id}>
-                {kernelDisplayName(t, kernel.id)}
-              </option>
-            ))
-          )}
-        </select>
+        />
       </label>
 
       {draft.kernelId === "bicubic" ? (
-        <div className="metric-grid">
+        <div className="range-grid">
           {(["b", "c"] as const).map((parameter) => (
             <label className="block" key={parameter}>
               <span>{`Bicubic ${parameter}`}</span>
@@ -269,37 +299,24 @@ export function HeightParamsPanel({
               />
             </label>
           ))}
+          {blurField}
         </div>
-      ) : null}
-      {draft.kernelId === "lanczos" ? (
-        <label className="block">
-          <span>{t("analyze.lanczosTaps")}</span>
-          <input
-            inputMode="numeric"
-            value="3"
-            readOnly
-            aria-readonly="true"
-          />
-        </label>
-      ) : null}
-
-      <label className="block">
-        <span>{t("analyze.blur")}</span>
-        <input
-          inputMode="decimal"
-          title={t("analyze.blurHint")}
-          aria-invalid={invalidKernelBlur(draft.kernelParameters) || undefined}
-          value={String(draft.kernelParameters.blur ?? 1)}
-          onChange={(event) =>
-            onPatch({
-              kernelParameters: {
-                ...draft.kernelParameters,
-                blur: event.target.value,
-              },
-            })
-          }
-        />
-      </label>
+      ) : draft.kernelId === "lanczos" ? (
+        <div className="metric-grid">
+          <label className="block">
+            <span>{t("analyze.lanczosTaps")}</span>
+            <input
+              inputMode="numeric"
+              value="3"
+              readOnly
+              aria-readonly="true"
+            />
+          </label>
+          {blurField}
+        </div>
+      ) : (
+        blurField
+      )}
       {invalidKernelBlur(draft.kernelParameters) ? (
         <p className="help-copy warning-copy" role="alert">
           {t("analyze.blurInvalid")}
@@ -307,95 +324,61 @@ export function HeightParamsPanel({
       ) : null}
 
       {kernelOptions.length > 1 ? (
-        <fieldset className="metric-fieldset kernel-compare-fieldset">
-          <legend>{t("analyze.compareKernels")}</legend>
-          <div className="kernel-compare-list">
-            {kernelOptions
-              .filter((kernel) => kernel.id !== draft.kernelId)
-              .flatMap((kernel) => {
-                // Capability parameters describe a family, not a runnable
-                // candidate. Generate the required explicit parameters here.
-                const variants: Array<number | null> = kernel.id === "lanczos" ? [3] : [null];
-                return variants.map((taps) => {
-                  let parameters: KernelRef["parameters"] = {};
-                  if (kernel.id === "lanczos" && taps != null) {
-                    parameters = { taps };
-                  } else if (kernel.id === "bicubic") {
-                    parameters = { b: 0, c: 0.5 };
-                  }
-                  const candidate: KernelRef = {
-                    id: kernel.id,
-                    parameters,
-                  };
-                  const signature = kernelSignature(candidate);
-                  const checked = draft.compareKernels.some(
-                    (item) => kernelSignature(item) === signature,
-                  );
-                  const name = kernelDisplayName(t, kernel.id);
-                  return (
-                    <button
-                      key={taps != null ? `${kernel.id}@${taps}` : kernel.id}
-                      className={checked ? "kernel-compare-option active" : "kernel-compare-option"}
-                      type="button"
-                      aria-pressed={checked}
-                      title={taps != null ? `${name} ${taps}` : name}
-                      onClick={() =>
-                        onPatch({
-                          compareKernels: checked
-                            ? draft.compareKernels.filter(
-                                (item) => kernelSignature(item) !== signature,
-                              )
-                            : [...draft.compareKernels, candidate],
-                        })
-                      }
-                    >
-                      <Check className="kernel-compare-check" size={12} aria-hidden="true" />
-                      <span>{taps != null ? `${name} ${taps}` : name}</span>
-                    </button>
-                  );
-                });
-              })}
+        <div className="block">
+          <span>{t("analyze.compareKernels")}</span>
+          <div className="kernel-compare-list" role="group" aria-label={t("analyze.compareKernels")}>
+            {kernelOptions.flatMap((kernel) => {
+              // Capability parameters describe a family, not a runnable
+              // candidate. Generate the required explicit parameters here.
+              return compareKernelTaps(kernel.id).flatMap((taps) => {
+                if (isPrimaryCompareOption(draft, kernel.id, taps)) return [];
+                let parameters: KernelRef["parameters"] = {};
+                if (kernel.id === "lanczos" && taps != null) {
+                  parameters = { taps };
+                } else if (kernel.id === "bicubic") {
+                  parameters = { b: 0, c: 0.5 };
+                }
+                const candidate: KernelRef = {
+                  id: kernel.id,
+                  parameters,
+                };
+                const signature = kernelSignature(candidate);
+                const checked = draft.compareKernels.some(
+                  (item) => kernelSignature(item) === signature,
+                );
+                const name = kernelDisplayName(t, kernel.id);
+                const label = taps != null ? `${name} ${taps}` : name;
+                return (
+                  <button
+                    key={taps != null ? `${kernel.id}@${taps}` : kernel.id}
+                    className={checked ? "kernel-compare-option active" : "kernel-compare-option"}
+                    type="button"
+                    aria-pressed={checked}
+                    title={label}
+                    onClick={() =>
+                      onPatch({
+                        compareKernels: checked
+                          ? draft.compareKernels.filter(
+                              (item) => kernelSignature(item) !== signature,
+                            )
+                          : [...draft.compareKernels, candidate],
+                      })
+                    }
+                  >
+                    {label}
+                  </button>
+                );
+              });
+            })}
           </div>
-          {draft.compareKernels.length > 0 ? (
-            <p className="help-copy">
-              {t("analyze.compareKernelsHelp", { count: String(kernelCount) })}
-            </p>
-          ) : null}
-        </fieldset>
+        </div>
       ) : null}
 
       <label className="block">
-        <span>{t("diagnostics.profile")}</span>
-        <select
-          value={draft.profileId}
-          onChange={(event) => onPatch({ profileId: event.target.value })}
-        >
-          {profileOptions.length === 0 ? (
-            <option value={draft.profileId}>{draft.profileId}</option>
-          ) : (
-            profileOptions.map((profile) => (
-              <option key={profile.id} value={profile.id}>
-                {profileDisplayName(t, profile.id)}
-              </option>
-            ))
-          )}
-        </select>
-      </label>
-      <button
-        className="secondary-button profile-defaults-button"
-        type="button"
-        title={t("analyze.applyProfileDefaults")}
-        onClick={onResetProfileDefaults}
-      >
-        <RotateCcw size={14} />
-        {t("analyze.applyProfileDefaults")}
-      </button>
-
-      <label className="block">
         <span>{t("analyze.backend")}</span>
-        <select
-          className="backend-select"
+        <MenuSelect
           value={draft.backendPreference}
+          ariaLabel={t("analyze.backend")}
           title={backendOptionLabel(
             t,
             draft.backendPreference,
@@ -403,28 +386,30 @@ export function HeightParamsPanel({
             draft.metric.pNorm,
             draft.axisMode,
           )}
-          onChange={(event) =>
+          options={backends.map((backend) => ({
+            value: backend,
+            label: backendOptionLabel(
+              t,
+              backend,
+              capabilities,
+              draft.metric.pNorm,
+              draft.axisMode,
+            ),
+          }))}
+          onChange={(backend) =>
             onPatch({
-              backendPreference: event.target.value as HeightDraft["backendPreference"],
+              backendPreference: backend as HeightDraft["backendPreference"],
             })
           }
-        >
-          {backends.map((backend) => (
-            <option key={backend} value={backend}>
-              {backendOptionLabel(
-                t,
-                backend,
-                capabilities,
-                draft.metric.pNorm,
-                draft.axisMode,
-              )}
-            </option>
-          ))}
-        </select>
+        />
       </label>
 
-      <fieldset className="metric-fieldset">
-        <legend>{t("analyze.metricSpec")}</legend>
+      <MetricSpecSection
+        t={t}
+        open={metricSpecOpen}
+        onOpenChange={onMetricSpecOpenChange}
+        summary={metricSpecSummary(draft.metric)}
+      >
         <MetricEditor
           t={t}
           metric={draft.metric}
@@ -436,7 +421,7 @@ export function HeightParamsPanel({
             {t("analyze.pNormUnsupported", { backend: resolvedBackend })}
           </span>
         ) : null}
-      </fieldset>
+      </MetricSpecSection>
 
       <RunLaunchButton
         t={t}

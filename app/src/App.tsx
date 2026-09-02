@@ -3,7 +3,6 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   createTranslator,
   DEFAULT_LOCALE,
-  isLocaleCode,
   type LocaleCode,
   type Translator,
 } from "./i18n";
@@ -90,9 +89,7 @@ function App() {
   useEffect(() => {
     invoke<AppPreferences>("app_get_preferences")
       .then((prefs) => {
-        if (isLocaleCode(prefs.language)) {
-          setLocale(prefs.language);
-        }
+        setLocale(DEFAULT_LOCALE);
         if (isThemeMode(prefs.theme)) {
           setThemeMode(prefs.theme);
           storeThemeMode(prefs.theme);
@@ -246,14 +243,15 @@ function App() {
   }, [busy, project, t]);
 
   async function changeLanguage(next: LocaleCode) {
-    setLocale(next);
+    if (next !== DEFAULT_LOCALE) return;
+    setLocale(DEFAULT_LOCALE);
     try {
       await invoke<AppPreferences>("app_set_language", {
-        request: { language: next },
+        request: { language: DEFAULT_LOCALE },
       });
     } catch (error) {
       const uiError = {
-        summary: createTranslator(next)("app.error.languageSave"),
+        summary: createTranslator(DEFAULT_LOCALE)("app.error.languageSave"),
         detail: String(error),
       };
       if (project) {
@@ -457,6 +455,7 @@ function App() {
   }
 
   function handleNavigate(nextRoute: ProjectRoute) {
+    if (nextRoute === "samples") nextRoute = "media";
     if (nextRoute === route) return;
     setRoute(nextRoute);
     setProject((current) =>

@@ -373,6 +373,18 @@ input[type="number"]::-webkit-outer-spin-button {
 
 button {
   color: inherit;
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease,
+    box-shadow 140ms ease,
+    opacity 140ms ease,
+    outline-color 140ms ease;
+}
+
+select,
+input {
+  transition: border-color 140ms ease, box-shadow 140ms ease, background-color 140ms ease;
 }
 
 .topbar {
@@ -404,10 +416,17 @@ button {
   width: 34px;
   height: 34px;
   flex: 0 0 auto;
-  border: 1px solid var(--brand-border);
-  border-radius: 6px;
-  color: var(--accent);
-  background: var(--brand-bg);
+  overflow: hidden;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+}
+
+.brand-mark img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 .brand-block h1,
@@ -1263,6 +1282,243 @@ button {
   background: var(--surface-raised);
 }
 
+.recipe-picker {
+  position: relative;
+  min-width: 0;
+}
+
+.recipe-picker-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border-control);
+  border-radius: 4px;
+  color: var(--text-heading);
+  background: var(--well-bg);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.recipe-picker-trigger svg {
+  flex-shrink: 0;
+  transition: transform 160ms ease;
+}
+
+.recipe-picker.open .recipe-picker-trigger svg {
+  transform: rotate(180deg);
+}
+
+.recipe-picker-trigger span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recipe-picker.open .recipe-picker-trigger,
+.recipe-picker-trigger:focus-visible {
+  border-color: var(--accent-dim);
+  box-shadow: 0 0 0 2px var(--accent-glow);
+  outline: 0;
+}
+
+.recipe-picker-menu {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 4px);
+  right: 0;
+  left: 0;
+  margin: 0;
+  padding: 4px;
+  max-height: 240px;
+  overflow: auto;
+  border: 1px solid var(--border-control);
+  border-radius: 4px;
+  background: var(--surface-raised);
+  box-shadow: 0 8px 20px var(--shadow-popup);
+  list-style: none;
+  transform-origin: top center;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(-6px);
+  transition:
+    opacity 160ms ease,
+    transform 160ms ease,
+    visibility 160ms ease;
+}
+
+.recipe-picker.open .recipe-picker-menu {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: none;
+}
+
+.recipe-picker-menu li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 0;
+  border-radius: 3px;
+  transition: background-color 140ms ease;
+}
+
+.recipe-picker-menu li:hover,
+.recipe-picker-menu li.selected {
+  background: var(--surface-hover);
+}
+
+.recipe-picker-option {
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  overflow: hidden;
+  border: 0;
+  background: transparent;
+  color: var(--text-heading);
+  font-size: 12px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.menu-select {
+  position: relative;
+  display: block;
+  min-width: 0;
+  width: 100%;
+}
+
+.menu-select-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border-control);
+  border-radius: 4px;
+  color: var(--text-heading);
+  background: var(--well-bg);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.menu-select-trigger:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.menu-select-trigger svg {
+  flex-shrink: 0;
+  transition: transform 160ms ease;
+}
+
+.menu-select.open .menu-select-trigger svg {
+  transform: rotate(180deg);
+}
+
+.menu-select-trigger span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.menu-select.open .menu-select-trigger,
+.menu-select-trigger:focus-visible {
+  border-color: var(--accent-dim);
+  box-shadow: 0 0 0 2px var(--accent-glow);
+  outline: 0;
+}
+
+.menu-select-menu {
+  position: fixed;
+  z-index: 50;
+  margin: 0;
+  padding: 4px;
+  overflow: auto;
+  border: 1px solid var(--border-control);
+  border-radius: 4px;
+  background: var(--surface-raised);
+  box-shadow: 0 8px 20px var(--shadow-popup);
+  list-style: none;
+  transform-origin: top center;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(-6px);
+  transition:
+    opacity 160ms ease,
+    transform 160ms ease,
+    visibility 160ms ease;
+}
+
+.menu-select-menu.open-up {
+  transform-origin: bottom center;
+  transform: translateY(6px);
+}
+
+.menu-select-menu.open {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: none;
+}
+
+.menu-select-menu li {
+  border-radius: 3px;
+  transition: background-color 140ms ease;
+}
+
+.menu-select-menu li:hover,
+.menu-select-menu li.selected {
+  background: var(--surface-hover);
+}
+
+.menu-select-option {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  overflow: hidden;
+  border: 0;
+  background: transparent;
+  color: var(--text-heading);
+  font-size: 12px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.recipe-picker-remove {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 3px;
+  color: var(--text-disabled);
+  background: transparent;
+  cursor: pointer;
+}
+
+.recipe-picker-remove:hover {
+  color: var(--danger);
+  background: var(--surface-control);
+}
+
 .secondary-button {
   height: 34px;
   padding: 0 12px;
@@ -1332,6 +1588,12 @@ button {
   border-radius: 4px;
   color: var(--text-primary);
   background: var(--surface-sunken);
+}
+
+.language-field select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  color: var(--text-placeholder);
 }
 
 .language-field.block {
@@ -1604,28 +1866,25 @@ button {
   grid-template-columns: 176px minmax(0, 1fr);
   min-height: 0;
   overflow: hidden;
+  transition: grid-template-columns 180ms ease;
 }
 
 .project-body.nav-collapsed {
   grid-template-columns: 56px minmax(0, 1fr);
 }
 
-.project-body.nav-collapsed .nav-item {
-  grid-template-columns: 1fr;
-  justify-items: center;
-  min-height: 40px;
-  padding: 6px 4px;
-}
-
+/* Labels stay in flow and fade; overflow on the item clips them as the
+   column tweens. display:none / grid-template snap was a hitch on frame 0. */
 .project-body.nav-collapsed .nav-item span,
 .project-body.nav-collapsed .nav-item small {
-  display: none;
+  opacity: 0;
 }
 
 .project-nav {
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto;
   min-height: 0;
+  overflow: hidden;
   border-right: 1px solid var(--border-panel);
   background: var(--surface-raised);
 }
@@ -1644,7 +1903,7 @@ button {
 
 .nav-item {
   display: grid;
-  grid-template-columns: 18px minmax(0, 1fr) auto;
+  grid-template-columns: 18px minmax(0, 1fr) minmax(0, auto);
   align-items: center;
   gap: 8px;
   min-height: 34px;
@@ -1655,6 +1914,8 @@ button {
   background: transparent;
   text-align: left;
   cursor: pointer;
+  overflow: hidden;
+  transition: background-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
 }
 
 .nav-item span {
@@ -1662,11 +1923,16 @@ button {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 12px;
+  opacity: 1;
+  transition: opacity 140ms ease;
 }
 
 .nav-item small {
+  overflow: hidden;
   color: var(--text-disabled);
   font-size: 10px;
+  opacity: 1;
+  transition: opacity 140ms ease;
 }
 
 .nav-item:hover {
@@ -1680,72 +1946,18 @@ button {
   box-shadow: inset 0 0 0 1px var(--nav-active-ring);
 }
 
-/* Analyze nav group: expandable row with subroute entries beneath it. */
-.nav-group-row {
-  display: flex;
-  align-items: stretch;
-  gap: 2px;
-}
-
-.nav-group-row .nav-item {
-  flex: 1;
-  min-width: 0;
-}
-
-.nav-group-toggle {
+.nav-letter {
   display: grid;
   place-items: center;
-  width: 22px;
-  border: 0;
-  border-radius: 5px;
-  color: var(--text-disabled);
-  background: transparent;
-  cursor: pointer;
-}
-
-.nav-group-toggle:hover {
-  color: var(--text-primary);
-  background: var(--surface-hover);
-}
-
-.nav-group-toggle svg {
-  transform: rotate(-90deg);
-  transition: transform 0.12s ease;
-}
-
-.nav-group-toggle svg.open {
-  transform: none;
-}
-
-.nav-subitems {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  margin: 2px 0 4px 25px;
-  padding-left: 9px;
-  border-left: 1px solid var(--border);
-}
-
-.nav-subitem {
-  min-height: 26px;
-  padding: 0 8px;
-  border: 0;
-  border-radius: 4px;
-  color: var(--text-dim);
-  background: transparent;
-  font-size: 11px;
-  text-align: left;
-  cursor: pointer;
-}
-
-.nav-subitem:hover {
-  color: var(--text-primary);
-  background: var(--surface-hover);
-}
-
-.nav-subitem.active {
-  color: var(--text-bright);
-  background: var(--nav-active-bg);
+  width: 16px;
+  height: 16px;
+  font-family: "Iowan Old Style", Palatino, "Palatino Linotype", "Times New Roman", serif;
+  font-size: 15px;
+  font-style: italic;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  user-select: none;
 }
 
 .project-content {
@@ -1763,6 +1975,7 @@ button {
 
 .project-page-stack,
 .project-page-host {
+  position: relative;
   min-height: 0;
   overflow: hidden;
 }
@@ -1785,11 +1998,54 @@ button {
   height: 100%;
 }
 
-/* Route keep-alive wrappers retain page state without affecting the host grid. */
-.project-page-host > div {
+/* Keep-alive pages stay laid out (plots/video keep their size) so switching
+   is an opacity crossfade instead of a display:none reflow then fade. */
+.project-page-host > div,
+.project-page {
   min-height: 0;
-  height: 100%;
   overflow: hidden;
+}
+
+.project-page {
+  position: absolute;
+  inset: 0;
+  height: auto;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  z-index: 0;
+  transition: opacity 160ms ease, visibility 0s linear 160ms;
+}
+
+.project-page.is-active {
+  inset: 0;
+  width: auto;
+  height: auto;
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  z-index: 1;
+  transition: opacity 160ms ease, visibility 0s linear 0s;
+}
+
+/* Frozen last size: inactive pages must not stretch with the nav column tween
+   or their plots' ResizeObservers fire every interpolated width. */
+.project-page:not(.is-active) {
+  contain-intrinsic-size: auto auto;
+  inset: auto;
+  top: 0;
+  left: 0;
+  right: auto;
+  bottom: auto;
+  width: auto;
+  height: auto;
+}
+
+/* Skip layout of pages the user has never opened. Once visited, keep the
+   layer warm — content-visibility:hidden on every hide rebuilt the Check
+   plot on each return and felt like a hitch. */
+.project-page:not(.is-active):not(.was-visited) {
+  content-visibility: hidden;
 }
 
 .project-page-host > div > .page-panel,
@@ -1990,7 +2246,7 @@ button {
 }
 
 .button-radio button {
-  height: 26px;
+  height: 28px;
   padding: 0 10px;
   border: 1px solid var(--border-control);
   border-radius: 4px;
@@ -2014,8 +2270,13 @@ button {
 /* Scan-list chip remove affordance */
 .candidate-chip .chip-remove {
   margin-left: 6px;
+  padding: 0;
+  border: 0;
   color: var(--text-placeholder);
+  background: transparent;
+  font: inherit;
   font-weight: 600;
+  cursor: pointer;
 }
 
 .candidate-chip:hover .chip-remove {
@@ -2040,6 +2301,7 @@ button {
   cursor: pointer;
   user-select: none;
   list-style: none;
+  transition: color 140ms ease, background-color 140ms ease;
 }
 
 .grid-range summary::-webkit-details-marker {
@@ -2064,6 +2326,21 @@ button {
 .grid-range-body {
   border-top: 1px solid var(--border-faint);
   padding: 6px 10px 10px;
+}
+
+.grid-range[open] .grid-range-body {
+  animation: collapse-in 160ms ease;
+}
+
+@keyframes collapse-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .grid-range-row {
@@ -2237,15 +2514,48 @@ button {
 
 /* Keep-alive subroute wrapper: hands the remaining page height to
    .analyze-layout so each column is exactly window-height. */
-.analyze-subroute-host {
+.analyze-subroute-stack {
+  position: relative;
   flex: 1;
   min-height: 0;
-  display: flex;
-  flex-direction: column;
 }
 
-.analyze-subroute-host[hidden] {
-  display: none;
+.analyze-subroute-host {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  z-index: 0;
+  transition: opacity 160ms ease, visibility 0s linear 160ms;
+}
+
+.analyze-subroute-host.is-active {
+  inset: 0;
+  width: auto;
+  height: auto;
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  z-index: 1;
+  transition: opacity 160ms ease, visibility 0s linear 0s;
+}
+
+.analyze-subroute-host:not(.is-active) {
+  contain-intrinsic-size: auto auto;
+  inset: auto;
+  top: 0;
+  left: 0;
+  right: auto;
+  bottom: auto;
+  width: auto;
+  height: auto;
+}
+
+.analyze-subroute-host:not(.is-active):not(.was-visited) {
+  content-visibility: hidden;
 }
 
 .analyze-layout {
@@ -2447,6 +2757,7 @@ button {
   flex-direction: column;
   gap: 8px;
   min-width: 0;
+  min-height: 0;
   padding: 12px 14px;
 }
 
@@ -2509,6 +2820,7 @@ button {
 /* Kernel results table header: title, excluded-results toggle, apply action. */
 .analyze-table-toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
 }
@@ -2517,8 +2829,56 @@ button {
   margin: 0;
 }
 
-.analyze-table-toolbar .primary-button {
+.analyze-table-toolbar .primary-button,
+.recipe-promote-group {
   margin-left: auto;
+}
+
+.recipe-promote-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.recipe-promote {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex-shrink: 0;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border-control);
+  border-radius: 5px;
+  color: var(--text-meta);
+  background: var(--surface-control);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.recipe-promote:hover:not(:disabled) {
+  border-color: var(--success-border);
+  color: var(--accent);
+  background: var(--accent-glow);
+}
+
+.recipe-promote.ready {
+  border-color: var(--accent);
+  color: var(--accent-on-fill);
+  background: var(--accent);
+}
+
+.recipe-promote.ready:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: var(--accent-on-fill);
+}
+
+.recipe-promote:disabled {
+  opacity: 1;
+  cursor: not-allowed;
 }
 
 .candidate-preview-meta {
@@ -2536,6 +2896,8 @@ button {
 }
 
 .candidate-chip {
+  display: inline-flex;
+  align-items: center;
   padding: 2px 6px;
   border-radius: 4px;
   border: 1px solid var(--border-control);
@@ -2543,6 +2905,7 @@ button {
   color: var(--chip-text);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+  outline: 1px solid transparent;
 }
 
 .candidate-chip.muted {
@@ -2552,6 +2915,10 @@ button {
 .candidate-chip.selected,
 .result-table-row.selected {
   outline: 1px solid var(--selection-outline);
+}
+
+.result-table-row.selected {
+  outline-offset: -1px;
 }
 
 .frame-keyboard-help {
@@ -2602,6 +2969,47 @@ button {
   margin-top: 4px;
   font-size: 11px;
   color: var(--text-faint);
+}
+
+.analyze-sample-list > li.sample-tree-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sample-tree-source {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.sample-tree-source strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sample-tree-source small {
+  flex: 0 0 auto;
+  color: var(--text-disabled);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+}
+
+.sample-tree-frames {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0 0 0 10px;
+  border-left: 1px solid var(--border);
+  list-style: none;
 }
 
 .analyze-sample-list li.hidden-series {
@@ -2736,8 +3144,24 @@ button {
   flex-direction: column;
   max-height: 38vh;
   overflow: auto;
+  overflow-anchor: none;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   border: 1px solid var(--border);
   border-radius: 4px;
+}
+
+.height-results-table .result-table {
+  /* Header + ~8 rows; the 20-row set scrolls inside instead of growing the pane. */
+  max-height: calc(28px * 9);
+}
+
+
+
+.result-table-head,
+.result-table-row,
+.result-table-spacer {
+  flex: 0 0 auto;
 }
 
 .result-table-head,
@@ -2800,32 +3224,34 @@ button {
 .kernel-compare-list {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 4px;
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--border-control);
+  border-radius: 4px;
+  background: var(--border-control);
 }
 
 .kernel-compare-option {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 4px;
   min-width: 0;
-  height: 26px;
-  padding: 0 7px;
+  height: 28px;
+  padding: 0 10px;
   overflow: hidden;
-  border: 1px solid var(--border-control);
-  border-radius: 4px;
+  border: 0;
+  border-radius: 0;
   color: var(--text-subtle);
   background: var(--surface-inset);
   font: inherit;
-  font-size: 11px;
+  font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
   cursor: pointer;
 }
 
-.kernel-compare-check {
-  flex: 0 0 auto;
-  opacity: 0;
+.kernel-compare-option:last-child:nth-child(odd) {
+  grid-column: 1 / -1;
 }
 
 .kernel-compare-option:hover {
@@ -2833,19 +3259,15 @@ button {
   background: var(--surface-active);
 }
 
-.kernel-compare-option.active {
-  border-color: var(--primary-border);
+.kernel-compare-option.active,
+.kernel-compare-option.active:hover {
   color: var(--primary-text);
   background: var(--primary-bg);
 }
 
-.kernel-compare-option.active .kernel-compare-check {
-  opacity: 1;
-}
-
 .kernel-compare-option:focus-visible {
   outline: 2px solid var(--input-focus);
-  outline-offset: 1px;
+  outline-offset: -2px;
 }
 
 .result-table-row {
@@ -3053,10 +3475,10 @@ button {
 }
 
 .metric-fieldset {
-  margin: 6px 0 8px;
-  padding: 6px 8px 8px;
+  margin: 0 0 10px;
+  padding: 8px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 4px;
   min-width: 0;
 }
 
@@ -3066,10 +3488,95 @@ button {
   color: var(--text-faint);
 }
 
+.metric-fieldset-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.metric-fieldset-chevron {
+  flex-shrink: 0;
+  transition: transform 160ms ease;
+}
+
+.metric-fieldset-chevron.open {
+  transform: rotate(90deg);
+}
+
+.collapsible {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 180ms ease;
+}
+
+.collapsible.open {
+  grid-template-rows: 1fr;
+}
+
+.collapsible-inner {
+  overflow: hidden;
+  min-height: 0;
+  transition: padding-top 180ms ease;
+}
+
+.collapsible.open .collapsible-inner {
+  padding-top: 8px;
+}
+
+.metric-fieldset-toggle:hover {
+  color: var(--text-subtle);
+}
+
+.metric-fieldset-summary {
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  color: var(--text-disabled);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metric-fieldset-toggle + .metric-grid,
+.metric-fieldset-toggle + .checkbox-row,
+.metric-fieldset-toggle + .collapsible.open {
+  margin-top: 0;
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 6px 8px;
+}
+
+.analyze-params > .metric-grid {
+  margin-bottom: 10px;
+}
+
+.metric-grid .block > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.analyze-params .range-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px 8px;
+  margin-bottom: 10px;
+}
+
+.analyze-params .range-grid .block {
+  margin-bottom: 0;
 }
 
 /* Grid supplies the spacing; block margins would double it. */
@@ -3089,13 +3596,6 @@ button {
   height: 32px;
   padding: 0 10px;
   gap: 6px;
-}
-
-.profile-defaults-button {
-  height: 28px;
-  margin: 0 0 10px;
-  padding: 0 9px;
-  font-size: 11px;
 }
 
 .empty-inline {
@@ -3152,16 +3652,9 @@ button {
     grid-template-columns: 56px minmax(0, 1fr);
   }
 
-  .nav-item {
-    grid-template-columns: 1fr;
-    justify-items: center;
-    min-height: 40px;
-    padding: 6px 4px;
-  }
-
   .nav-item span,
   .nav-item small {
-    display: none;
+    opacity: 0;
   }
 
   .stat-strip {
@@ -3329,17 +3822,35 @@ button {
 
 .source-row {
   display: grid;
-  grid-template-columns: 28px minmax(0, 1fr) 16px;
+  grid-template-columns: minmax(0, 1fr) 28px;
   align-items: center;
+  gap: 4px;
   width: 100%;
   min-height: 54px;
   padding: 7px 8px;
-  border: 0;
   border-bottom: 1px solid var(--border-faint);
   color: var(--source-row-text);
   background: transparent;
+  transition: background-color 140ms ease, box-shadow 140ms ease;
+}
+
+.source-row-main {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 16px;
+  align-items: center;
+  min-width: 0;
+  min-height: 40px;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
   text-align: left;
   cursor: pointer;
+}
+
+.source-row .icon-button {
+  width: 26px;
+  height: 26px;
 }
 
 .source-row:hover,
@@ -3759,7 +4270,8 @@ button {
   width: 100%;
 }
 
-.primary-command:not(:disabled) {
+.primary-command:not(:disabled),
+.primary-command:hover:not(:disabled) {
   border-color: var(--primary-border);
   color: var(--primary-text);
   background: var(--primary-bg);
@@ -3807,35 +4319,92 @@ button {
 
 .selected-sample-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 28px;
+  grid-template-columns: minmax(0, 1fr) 34px 28px;
   align-items: center;
   gap: 6px;
-  min-height: 50px;
-  padding: 7px 8px;
+  min-height: 48px;
+  padding: 10px 10px;
   border-bottom: 1px solid var(--border-faint);
+  cursor: pointer;
 }
 
-.selected-sample-row > div {
-  min-width: 0;
+.selected-sample-row:hover,
+.selected-sample-row.current {
+  background: var(--surface-hover);
 }
 
-.selected-sample-row strong,
-.selected-sample-row span {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.selected-sample-row.current {
+  box-shadow: inset 2px 0 var(--accent);
+}
+
+.selected-sample-row.excluded strong {
+  opacity: 0.45;
 }
 
 .selected-sample-row strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: 12px;
 }
 
-.selected-sample-row span {
-  margin-top: 3px;
-  color: var(--text-meta-dim);
-  font-size: 9px;
+.include-switch {
+  position: relative;
+  display: inline-flex;
+  width: 32px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
+.include-switch input {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.include-switch input:disabled {
+  cursor: not-allowed;
+}
+
+.include-switch-track {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 99px;
+  background: var(--border-track);
+  pointer-events: none;
+  transition: background-color 140ms ease;
+}
+
+.include-switch-track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(15, 20, 18, 0.28);
+  transition: transform 140ms ease;
+}
+
+.include-switch input:checked + .include-switch-track {
+  background: var(--accent);
+}
+
+.include-switch input:checked + .include-switch-track::after {
+  transform: translateX(14px);
+}
+
+.include-switch input:focus-visible + .include-switch-track {
+  box-shadow: 0 0 0 2px var(--accent-glow);
 }
 
 .drop-overlay {
@@ -4210,6 +4779,10 @@ button {
   padding-top: 12px;
 }
 
+.modal-card .dense-table .dense-row:last-child {
+  border-bottom: none;
+}
+
 .confirm-dialog-copy {
   margin: 0;
   color: var(--text-subtle);
@@ -4483,7 +5056,8 @@ button {
   margin: 4px 0 2px;
 }
 
-.editing-target-row select {
+.editing-target-row select,
+.editing-target-row .recipe-picker {
   flex: 1;
   min-width: 0;
 }
@@ -4502,7 +5076,8 @@ button {
   gap: 14px;
 }
 
-.verify-current-row > select {
+.verify-current-row > select,
+.verify-current-row .recipe-picker {
   flex-shrink: 0;
   width: min(300px, 100%);
   max-width: 300px;
@@ -4646,8 +5221,66 @@ button {
 .kernel-group-chips {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 4px;
   margin: 8px 0;
+}
+
+.kernel-family-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  margin: 6px 0;
+}
+
+.kernel-family-grid > .candidate-chip,
+.kernel-family-grid > .kernel-add-button {
+  width: 100%;
+  min-width: 0;
+  min-height: 28px;
+  justify-content: center;
+  padding: 4px 6px;
+}
+
+.kernel-add-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  align-items: end;
+  margin: 6px 0;
+}
+
+.kernel-add-row .metric-grid {
+  display: contents;
+}
+
+.kernel-add-row .kernel-add-button {
+  width: 100%;
+}
+
+.kernel-add-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  flex-shrink: 0;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--success-border);
+  border-radius: 4px;
+  color: var(--accent);
+  background: var(--accent-glow);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.kernel-family-grid > .kernel-add-button {
+  height: auto;
+}
+
+.kernel-add-button:hover:not(:disabled) {
+  background: var(--success-bg);
 }
 
 .result-table-row.perfect span:first-child {
@@ -4768,4 +5401,38 @@ button {
 
 .samples-drop-notice {
   margin: 4px 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button,
+  select,
+  input,
+  .nav-item,
+  .candidate-chip,
+  .source-row,
+  .recipe-picker-menu,
+  .recipe-picker-trigger svg,
+  .recipe-picker-menu li,
+  .menu-select-menu,
+  .menu-select-trigger svg,
+  .menu-select-menu li,
+  .metric-fieldset-chevron,
+  .collapsible,
+  .collapsible-inner,
+  .grid-range summary,
+  .grid-range summary::before {
+    transition: none;
+  }
+
+  .grid-range[open] .grid-range-body {
+    animation: none;
+  }
+
+  .project-page,
+  .analyze-subroute-host,
+  .project-body,
+  .nav-item span,
+  .nav-item small {
+    transition: none;
+  }
 }

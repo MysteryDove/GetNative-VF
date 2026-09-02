@@ -179,11 +179,14 @@ void test_profiles() {
     expect(muf.has_value(), "muf profile parses");
     expect(getnative::profile(*muf).default_grid == getnative::GridSemantics::repeated_addition,
            "muf defaults to repeated addition");
-    expect(getnative::profile(getnative::CompatibilityProfile::getfnative_44c8d0f).default_crop == 10,
-           "GetFnative crop default is ten");
+    expect(!getnative::parse_profile("getfnative-44c8d0f").has_value(),
+           "GetFnative profile is not advertised");
+    expect(!getnative::parse_profile("modern").has_value(),
+           "modern profile is not advertised");
     const auto &muf_profile = getnative::profile(*muf);
     expect(muf_profile.default_axis == getnative::DefaultAxisMode::height_plus_width,
            "MUF defaults to H+W");
+    expect(muf_profile.default_crop == 5, "MUF crop default is five");
     expect(muf_profile.default_start == "500" && muf_profile.default_stop == "1000"
                && muf_profile.default_step == "1",
            "MUF default range matches upstream");

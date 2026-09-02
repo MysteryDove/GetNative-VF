@@ -54,7 +54,6 @@ export function DiagnosticsPage({
   onGeometrySuccess: () => void;
 }) {
   const [geometryMode, setGeometryMode] = useState<GeometryMode>("standard");
-  const [profile, setProfile] = useState("muf-d278cd3");
   const [sourceWidth, setSourceWidth] = useState("1488");
   const [sourceHeight, setSourceHeight] = useState("837");
   const [activeWidth, setActiveWidth] = useState("1488");
@@ -71,7 +70,6 @@ export function DiagnosticsPage({
   }, []);
 
   const analysisAvailable = capabilities?.payload.commands.analyze ?? false;
-  const profiles = capabilities?.payload.profiles ?? [];
   const kernels = capabilities?.payload.kernels ?? [];
   const backendRows = useMemo(
     () => buildBackendRows(capabilities?.payload.backends),
@@ -91,7 +89,7 @@ export function DiagnosticsPage({
     try {
       const result = await invoke<GeometryEnvelope>("engine_geometry", {
         request: {
-          profile,
+          profile: "muf-d278cd3",
           mode: geometryMode,
           sourceWidth: requiredNumeric(sourceWidth, t("diagnostics.sourceW"), t),
           sourceHeight: requiredNumeric(sourceHeight, t("diagnostics.sourceH"), t),
@@ -148,18 +146,6 @@ export function DiagnosticsPage({
               <SlidersHorizontal size={17} />
               <h2>{t("diagnostics.geometry")}</h2>
             </div>
-            <label className="select-field first-field">
-              <span>{t("diagnostics.profile")}</span>
-              <div>
-                <select value={profile} onChange={(event) => setProfile(event.target.value)}>
-                  {profiles.map((item) => (
-                    <option value={item.id} key={item.id}>
-                      {profileLabel(item.id, t)}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </label>
             <div className="axis-switch" aria-label={t("diagnostics.mode")}>
               {(["standard", "pro"] as GeometryMode[]).map((item) => (
                 <button
@@ -197,9 +183,7 @@ export function DiagnosticsPage({
           <div className="analysis-toolbar">
             <div>
               <h2>{t("diagnostics.preview")}</h2>
-              <span>
-                {profileLabel(profile, t)} / {geometryModeLabel(geometryMode, t)}
-              </span>
+              <span>{geometryModeLabel(geometryMode, t)}</span>
             </div>
           </div>
 
@@ -304,13 +288,6 @@ export function DiagnosticsPage({
       </main>
     </div>
   );
-}
-
-function profileLabel(id: string, t: Translator): string {
-  if (id === "muf-d278cd3") return t("profile.muf-d278cd3");
-  if (id === "getfnative-44c8d0f") return t("profile.getfnative-44c8d0f");
-  if (id === "modern") return t("profile.modern");
-  return id;
 }
 
 function geometryModeLabel(mode: GeometryMode, t: Translator): string {

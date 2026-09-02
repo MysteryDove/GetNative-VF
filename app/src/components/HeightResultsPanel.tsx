@@ -19,6 +19,8 @@ import {
 import { detectValleys, type ValleySeries } from "../engine/valleyDetect";
 import { sourceFilterLabel } from "../project/sourceLabel";
 
+const HEIGHT_TABLE_LIMIT = 20;
+
 /** Display a measured height with up to two decimals, trimming zeros. */
 function formatHeight(value: number): string {
   return Number(value.toFixed(2)).toString();
@@ -515,7 +517,7 @@ export function HeightResultsPanel({
         )}
       </div>
 
-      <div className="analyze-table-host">
+      <div className="analyze-table-host height-results-table">
         <button
           type="button"
           className="analyze-table-toggle"
@@ -528,7 +530,11 @@ export function HeightResultsPanel({
             <ChevronDown size={14} />
           )}
           <span>{t("analyze.resultsTable")}</span>
-          <span className="analyze-table-count">{tableRows.length}</span>
+          <span className="analyze-table-count">
+            {tableRows.length > HEIGHT_TABLE_LIMIT
+              ? `${HEIGHT_TABLE_LIMIT} / ${tableRows.length}`
+              : tableRows.length}
+          </span>
         </button>
         {!isTableCollapsed ? (
           <>
@@ -567,6 +573,8 @@ export function HeightResultsPanel({
                 metricColumnIndex={1}
                 columnTemplate="72px 96px minmax(80px, 1fr) 88px 72px"
                 rows={tableRows}
+                defaultMetricSort="asc"
+                limit={HEIGHT_TABLE_LIMIT}
               />
             ) : (
               <div>

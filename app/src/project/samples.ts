@@ -12,6 +12,24 @@ export function includedSamples(state: ProjectState): Sample[] {
     .sort((a, b) => a.order - b.order);
 }
 
+/** Group items by `sourceId`, preserving first-seen source order. */
+export function groupBySourceId<T extends { sourceId: string }>(
+  items: T[],
+): Array<{ sourceId: string; items: T[] }> {
+  const groups: Array<{ sourceId: string; items: T[] }> = [];
+  const indexBySource = new Map<string, number>();
+  for (const item of items) {
+    const existing = indexBySource.get(item.sourceId);
+    if (existing == null) {
+      indexBySource.set(item.sourceId, groups.length);
+      groups.push({ sourceId: item.sourceId, items: [item] });
+    } else {
+      groups[existing].items.push(item);
+    }
+  }
+  return groups;
+}
+
 /** Limit an included Sample list to a one-shot selection passed into Analyze. */
 export function selectedAnalysisSamples(
   samples: Sample[],

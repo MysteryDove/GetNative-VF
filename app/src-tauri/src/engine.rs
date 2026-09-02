@@ -552,11 +552,7 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
     {
         return Err("getnative-engine analysis availability is inconsistent".to_owned());
     }
-    let expected_profiles = [
-        ("muf-d278cd3", "repeated_addition", "1", 5),
-        ("getfnative-44c8d0f", "index_multiplication", "0.25", 10),
-        ("modern", "decimal_fixed_point", "1", 5),
-    ];
+    let expected_profiles = [("muf-d278cd3", "repeated_addition", "1", 5)];
     if capabilities.profiles.len() != expected_profiles.len()
         || capabilities
             .profiles
@@ -633,10 +629,7 @@ pub async fn engine_geometry(app: AppHandle, request: GeometryRequest) -> Result
 }
 
 fn geometry_args(request: GeometryRequest) -> Result<Vec<String>, String> {
-    if !matches!(
-        request.profile.as_str(),
-        "muf-d278cd3" | "getfnative-44c8d0f" | "modern"
-    ) {
+    if request.profile.as_str() != "muf-d278cd3" {
         return Err("unknown compatibility profile".to_owned());
     }
     if !matches!(request.mode.as_str(), "standard" | "pro") {
@@ -714,9 +707,7 @@ mod tests {
                 {"id": "vulkan", "compiled": false, "device_available": false, "analysis_command_available": false, "auto_priority": null, "axes": [], "p_norms": null, "max_half_bandwidth": null, "max_forward_width": null, "reason": "not compiled"}
             ],
             "profiles": [
-                {"id": "muf-d278cd3", "grid_semantics": "repeated_addition", "default_grid": {"start": "500", "stop": "1000", "step": "1", "endpoint_rule": "inclusive"}, "default_axis_mode": "h_plus_w", "default_crop": 5, "default_threshold": 0.015, "threshold_comparison": "strict_greater_than", "default_kernel": {"id": "bicubic", "b": 0.0, "c": 0.5, "taps": 3}},
-                {"id": "getfnative-44c8d0f", "grid_semantics": "index_multiplication", "default_grid": {"start": "500", "stop": "1000", "step": "0.25", "endpoint_rule": "inclusive"}, "default_axis_mode": "h_plus_w", "default_crop": 10, "default_threshold": 0.015, "threshold_comparison": "strict_greater_than", "default_kernel": {"id": "bicubic", "b": 0.0, "c": 0.5, "taps": 3}},
-                {"id": "modern", "grid_semantics": "decimal_fixed_point", "default_grid": {"start": "500", "stop": "1000", "step": "1", "endpoint_rule": "inclusive"}, "default_axis_mode": "h_plus_w", "default_crop": 5, "default_threshold": 0.015, "threshold_comparison": "strict_greater_than", "default_kernel": {"id": "bicubic", "b": 0.0, "c": 0.5, "taps": 3}}
+                {"id": "muf-d278cd3", "grid_semantics": "repeated_addition", "default_grid": {"start": "500", "stop": "1000", "step": "1", "endpoint_rule": "inclusive"}, "default_axis_mode": "h_plus_w", "default_crop": 5, "default_threshold": 0.015, "threshold_comparison": "strict_greater_than", "default_kernel": {"id": "bicubic", "b": 0.0, "c": 0.5, "taps": 3}}
             ]
         })
     }
@@ -745,7 +736,7 @@ mod tests {
 
     fn geometry_request(mode: &str) -> GeometryRequest {
         GeometryRequest {
-            profile: "modern".to_owned(),
+            profile: "muf-d278cd3".to_owned(),
             mode: mode.to_owned(),
             source_width: 1920.0,
             source_height: 1080.0,

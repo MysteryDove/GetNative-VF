@@ -149,7 +149,7 @@ void write_capabilities_impl(
               "\"features\":{\"verify_frame_ring\":true,\"media_frame_batch\":false,"
               "\"verify_engine_decode\":";
 #if defined(GETNATIVE_HAS_MEDIA)
-    output << "true,\"media_verify_concurrency\":{\"min\":1,\"max\":8,\"default\":2}},\"decode_backends\":["
+    output << "true,\"media_verify_concurrency\":{\"min\":1,\"max\":16,\"default\":8}},\"decode_backends\":["
               "{\"id\":\"software\",\"compiled\":true,\"runtime_device\":true,"
               "\"codecs\":[\"*\"],\"zero_copy\":false},";
 #if defined(GETNATIVE_HAS_CUDA)
@@ -207,7 +207,7 @@ void write_capabilities_impl(
     output << "{\"id\":\"videotoolbox\",\"compiled\":false,\"runtime_device\":false,\"codecs\":[],\"surface_formats\":[\"420v\",\"420f\",\"x420\",\"xf20\"],\"zero_copy\":false,\"reason\":\"not compiled\"}],";
 #endif
 #else
-    output << "false,\"media_verify_concurrency\":{\"min\":1,\"max\":8,\"default\":2}},\"decode_backends\":["
+    output << "false,\"media_verify_concurrency\":{\"min\":1,\"max\":16,\"default\":8}},\"decode_backends\":["
               "{\"id\":\"software\",\"compiled\":false,\"runtime_device\":false,"
               "\"codecs\":[],\"zero_copy\":false,\"reason\":\"not compiled\"},"
               "{\"id\":\"nvdec\",\"compiled\":false,\"runtime_device\":false,"

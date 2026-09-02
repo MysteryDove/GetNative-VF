@@ -1,8 +1,7 @@
 import { useState } from "react";
-import { SlidersHorizontal } from "lucide-react";
+import { Check, SlidersHorizontal } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
-import { profileDisplayName } from "../engine/displayNames";
 import type {
   BackendPreference,
   KernelRef,
@@ -10,7 +9,7 @@ import type {
 } from "../engine/protocol";
 import type { KernelDraft } from "../engine/kernelDraft";
 import { profileFor } from "../engine/profiles";
-import { kernelSignature, selectableBackends } from "../engine/heightDraft";
+import { selectableBackends } from "../engine/heightDraft";
 import { startKernelRunGroup, type ExecutionBridge } from "../engine/executeRunGroup";
 import { applyPayloadToCurrentRecipe } from "../project/recipeApply";
 import { useRunGroupSubmit } from "../hooks/useRunGroupSubmit";
@@ -18,13 +17,15 @@ import { useKernelPlan } from "../hooks/useKernelPlan";
 import type { ProjectState } from "../project/types";
 import { BlockedState } from "../components/BlockedState";
 import { KernelScanList, KernelScanListBuilder } from "../components/KernelScanList";
-import { MetricEditor } from "../components/MetricEditor";
+import { MetricEditor, MetricSpecSection, metricSpecSummary } from "../components/MetricEditor";
 import { ResultMetricTable } from "../components/ResultMetricTable";
 import { KernelMetricPlot } from "../components/KernelMetricPlot";
-import { RunGroupPlanCard } from "../components/RunGroupPlanCard";
 import { RunLaunchButton } from "../components/RunLaunchButton";
+import { MenuSelect } from "../components/MenuSelect";
 import { backendOptionLabel } from "../engine/backendSelection";
 import { toggleSetValue } from "../utils/collections";
+import { groupBySourceId } from "../project/samples";
+import { fileName } from "../media/importSources";
 
 export function KernelAnalyzePanel({
   t,
@@ -42,6 +43,9 @@ export function KernelAnalyzePanel({
   onOpenDiagnostics,
   onProjectChange,
   executionBridge,
+  metricSpecOpen,
+  onMetricSpecOpenChange,
+  onPersistMetric,
 }: {
   t: Translator;
   state: ProjectState;
@@ -60,9 +64,10 @@ export function KernelAnalyzePanel({
   onOpenDiagnostics: () => void;
   onProjectChange: (updater: (state: ProjectState) => ProjectState) => void;
   executionBridge: ExecutionBridge;
+  metricSpecOpen: boolean;
+  onMetricSpecOpenChange: (open: boolean) => void;
+  onPersistMetric: (metric: MetricSpec) => void;
 }) {
-  // Selection is by signature, not index: entries can be removed mid-list.
-  const [selectedSignature, setSelectedSignature] = useState<string | null>(null);
   const [applyNotice, setApplyNotice] = useState("");
   const { submitting, notice: submitNotice, submit: submitRunGroup } = useRunGroupSubmit();
   /** Samples excluded from the kernel test (default: every included sample). */
@@ -109,9 +114,6 @@ export function KernelAnalyzePanel({
     showExcludedResults,
     onSelectResultKey: setSelectedResultKey,
   });
-
-  const selectedKernel =
-    draft.scanList.find((kernel) => kernelSignature(kernel) === selectedSignature) ?? null;
 
   /** Apply a kernel (id + parameters) to the current Recipe (its geometry is already there). */
   function applyKernelRefToCurrentRecipe(kernel: KernelRef | null, includeDivergedMetric: boolean) {
@@ -206,57 +208,47 @@ export function KernelAnalyzePanel({
         {includedSamples.length === 0 ? (
           <p className="empty-copy">{t("analyze.noSamples")}</p>
         ) : (
-          <ul className="analyze-sample-list kernel-sample-list">
-            {includedSamples.map((sample) => {
-              const source = state.sourcesById[sample.sourceId];
-              const dims = sampleDims[sample.id];
-              const excluded = excludedSampleIds.has(sample.id);
+          <ul className="analyze-sample-list kernel-sample-list sample-tree">
+            {groupBySourceId(includedSamples).map((group) => {
+              const source = state.sourcesById[group.sourceId];
+              const sourceLabel = source?.label || (source?.path ? fileName(source.path) : group.sourceId);
               return (
-                <li key={sample.id} className={excluded ? "hidden-series" : ""}>
-                  <label className="kernel-sample-option">
-                    <input
-                      type="checkbox"
-                      className="sample-check"
-                      checked={!excluded}
-                      aria-label={t("samples.include")}
-                      onChange={() => toggleSampleExcluded(sample.id)}
-                    />
-                    <div>
-                      <strong>{sample.label || sample.id}</strong>
-                      <span>
-                        {source?.label || source?.path || sample.sourceId}
-                        {sample.frameIndex != null ? ` · #${sample.frameIndex}` : ""}
-                        {dims ? ` · ${dims.width}×${dims.height}` : ""}
-                      </span>
-                      {sample.tags.length ? (
-                        <span className="sample-tags">
-                          {sample.tags.map((tag) => (
-                            <span className="sample-tag" key={tag}>
-                              {tag}
-                            </span>
-                          ))}
-                        </span>
-                      ) : null}
-                    </div>
-                  </label>
+                <li className="sample-tree-group" key={group.sourceId}>
+                  <div className="sample-tree-source">
+                    <strong>{sourceLabel}</strong>
+                    <small>{group.items.length}</small>
+                  </div>
+                  <ul className="sample-tree-frames">
+                    {group.items.map((sample) => {
+                      const dims = sampleDims[sample.id];
+                      const excluded = excludedSampleIds.has(sample.id);
+                      return (
+                        <li key={sample.id} className={excluded ? "hidden-series" : ""}>
+                          <label className="kernel-sample-option">
+                            <input
+                              type="checkbox"
+                              className="sample-check"
+                              checked={!excluded}
+                              aria-label={t("samples.include")}
+                              onChange={() => toggleSampleExcluded(sample.id)}
+                            />
+                            <div>
+                              <strong>
+                                {sample.frameIndex != null ? `#${sample.frameIndex}` : (sample.label || sample.id)}
+                              </strong>
+                              {dims ? <span>{`${dims.width}×${dims.height}`}</span> : null}
+                            </div>
+                          </label>
+                        </li>
+                      );
+                    })}
+                  </ul>
                 </li>
               );
             })}
           </ul>
         )}
 
-        {plan ? (
-          <RunGroupPlanCard
-            t={t}
-            title={t("analyze.runGroupPlan")}
-            summary={
-              `${t("analyze.runGroupType", { type: plan.groupType })}` +
-              ` · ${t("analyze.memberCount", { count: String(plan.memberCount) })}`
-            }
-            workEstimate={t("analyze.workEstimate", { count: String(plan.workEstimate) })}
-            multiMemberNote={plan.memberCount > 1 ? t("analyze.k.memberPerSample") : null}
-          />
-        ) : null}
       </aside>
 
       <section className="analyze-plot pane">
@@ -284,13 +276,7 @@ export function KernelAnalyzePanel({
           t={t}
           draft={draft}
           work={work}
-          selectedSignature={selectedSignature}
-          onSelectSignature={setSelectedSignature}
           onDraftChange={onDraftChange}
-          selectedKernel={selectedKernel}
-          inheritMetric={inheritMetric}
-          onApplyKernel={applyKernelRefToCurrentRecipe}
-          notice={applyNotice || submitNotice}
         />
 
         <div className="analyze-table-host">
@@ -306,14 +292,20 @@ export function KernelAnalyzePanel({
                 <span>{t("analyze.showExcludedResults")}</span>
               </label>
             ) : null}
-            <button
-              className="primary-button"
-              type="button"
-              disabled={!selectedResultKey}
-              onClick={applySelectedResultKernel}
-            >
-              {t("analyze.k.setRecipeKernel")}
-            </button>
+            <div className="recipe-promote-group">
+              {applyNotice || submitNotice ? (
+                <span className="help-copy">{applyNotice || submitNotice}</span>
+              ) : null}
+              <button
+                className={`recipe-promote ${selectedResultKey ? "ready" : ""}`}
+                type="button"
+                disabled={!selectedResultKey}
+                onClick={applySelectedResultKernel}
+              >
+                <Check size={14} strokeWidth={2.4} />
+                {t("analyze.k.setRecipeKernel")}
+              </button>
+            </div>
           </div>
           {resultSamples.length > 1 ? (
             <div className="kernel-group-chips">
@@ -409,26 +401,10 @@ export function KernelAnalyzePanel({
         <fieldset className="metric-fieldset">
           <legend>{t("analyze.k.geometryParams")}</legend>
           <label className="block">
-            <span>{t("diagnostics.profile")}</span>
-            <select
-              value={draft.profileId}
-              onChange={(event) => patch({ profileId: event.target.value })}
-            >
-              {(capabilities?.payload.profiles ?? []).map((profile) => (
-                <option key={profile.id} value={profile.id}>
-                  {profileDisplayName(t, profile.id)}
-                </option>
-              ))}
-              {(capabilities?.payload.profiles ?? []).length === 0 ? (
-                <option value={draft.profileId}>{draft.profileId}</option>
-              ) : null}
-            </select>
-          </label>
-          <label className="block">
             <span>{t("analyze.backend")}</span>
-            <select
-              className="backend-select"
+            <MenuSelect
               value={draft.backendPreference}
+              ariaLabel={t("analyze.backend")}
               title={backendOptionLabel(
                 t,
                 draft.backendPreference,
@@ -436,27 +412,29 @@ export function KernelAnalyzePanel({
                 draft.metric.pNorm,
                 kernelAxisMode,
               )}
-              onChange={(event) =>
-                patch({ backendPreference: event.target.value as BackendPreference })
+              options={selectableBackends(capabilities).map((backend) => ({
+                value: backend,
+                label: backendOptionLabel(
+                  t,
+                  backend,
+                  capabilities,
+                  draft.metric.pNorm,
+                  kernelAxisMode,
+                ),
+              }))}
+              onChange={(backend) =>
+                patch({ backendPreference: backend as BackendPreference })
               }
-            >
-              {selectableBackends(capabilities).map((backend) => (
-                <option key={backend} value={backend}>
-                  {backendOptionLabel(
-                    t,
-                    backend,
-                    capabilities,
-                    draft.metric.pNorm,
-                    kernelAxisMode,
-                  )}
-                </option>
-              ))}
-            </select>
+            />
           </label>
         </fieldset>
 
-        <fieldset className="metric-fieldset">
-          <legend>{t("analyze.metricSpec")}</legend>
+        <MetricSpecSection
+          t={t}
+          open={metricSpecOpen}
+          onOpenChange={onMetricSpecOpenChange}
+          summary={metricSpecSummary(inheritMetric ? inheritedMetric : draft.metric)}
+        >
           <label className="checkbox-row">
             <input
               type="checkbox"
@@ -474,7 +452,10 @@ export function KernelAnalyzePanel({
                 t={t}
                 metric={draft.metric}
                 pNormMaximum={pNormMaximum}
-                onChange={(metric) => patch({ metric })}
+                onChange={(metric) => {
+                  patch({ metric });
+                  onPersistMetric(metric);
+                }}
               />
             </>
           )}
@@ -483,7 +464,7 @@ export function KernelAnalyzePanel({
               {t("analyze.pNormUnsupported", { backend: resolvedBackend })}
             </p>
           ) : null}
-        </fieldset>
+        </MetricSpecSection>
 
         <RunLaunchButton
           t={t}

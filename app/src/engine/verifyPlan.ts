@@ -36,7 +36,7 @@ export function defaultVerifyDraft(backendPreference: BackendPreference = "auto"
     startFrame: "",
     endFrame: "",
     backendPreference,
-    concurrency: 2,
+    concurrency: 8,
   };
 }
 
@@ -121,7 +121,7 @@ export function resolveScanScope(
 }
 
 export function validVerifyConcurrency(value: number): boolean {
-  return Number.isInteger(value) && value >= 1 && value <= 8;
+  return Number.isInteger(value) && value >= 1 && value <= 16;
 }
 
 export function planVerifyRunGroup(input: {

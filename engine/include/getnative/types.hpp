@@ -9,8 +9,6 @@ namespace getnative {
 
 enum class CompatibilityProfile {
     muf_d278cd3,
-    getfnative_44c8d0f,
-    modern,
 };
 
 enum class GridSemantics {

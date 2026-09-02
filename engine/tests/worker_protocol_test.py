@@ -338,7 +338,7 @@ def main():
         # accepts a valid p=2 norm. The grid is deliberately one candidate so
         # the generated decimal sequence is checked against the request.
         profiled = run_analyze(worker, analyze_command(
-            "r3p", frame, ["204"], axis_mode="h_only", profile_id="modern",
+            "r3p", frame, ["204"], axis_mode="h_only", profile_id="muf-d278cd3",
             endpoint_rule="exclusive_stop", base_height="201", base_width="321",
             grid={"start": "204", "stop": "205", "step": "1"},
             metric={"crop_left": 5, "crop_right": 5, "crop_top": 5,
@@ -475,7 +475,7 @@ def main():
               event["type"] == "error" and event["code"] == "bad_request",
               json.dumps(event))
         worker.send(**analyze_command(
-            "r3bad-grid", frame, ["204"], profile_id="modern",
+            "r3bad-grid", frame, ["204"], profile_id="muf-d278cd3",
             grid={"start": "204", "stop": "205"}))
         event = worker.read_event()
         check("malformed-grid-bad-request",
@@ -1067,10 +1067,10 @@ def main():
                       json.dumps(hello))
                 check("verify-media-concurrency-advertised",
                       hello.get("media_verify_concurrency")
-                      == {"min": 1, "max": 8, "default": 2},
+                      == {"min": 1, "max": 16, "default": 8},
                       json.dumps(hello))
 
-                for index, invalid in enumerate((0, 9, -1, 1.5, "two")):
+                for index, invalid in enumerate((0, 17, -1, 1.5, "two")):
                     worker.send(**verify_media_command(
                         f"vm-invalid-{index}", media_path, "cpu",
                         concurrency=invalid))
@@ -1109,20 +1109,20 @@ def main():
                       and len(cpu_results) == 30 and not cpu_warnings
                       and set(cpu_results) == set(range(30))
                       and cpu_provenance.get("decoder") == "software"
-                      and cpu_accepted.get("concurrency") == 2
-                      and cpu_telemetry.get("requested_concurrency") == 2
-                      and cpu_telemetry.get("effective_concurrency") == 2
+                      and cpu_accepted.get("concurrency") == 8
+                      and cpu_telemetry.get("requested_concurrency") == 8
+                      and cpu_telemetry.get("effective_concurrency") == 8
                       and cpu_coverage == {
                           "selection": "all", "eligible_frames": 30,
                           "selected_frames": 30, "processed_frames": 30,
                           "failed_frames": 0,
                       }
                       and cpu_terminal.get("last_progress_coverage") == cpu_coverage
-                      and 1 <= cpu_telemetry.get("max_inflight", 0) <= 2,
+                      and 1 <= cpu_telemetry.get("max_inflight", 0) <= 8,
                       json.dumps({"terminal": cpu_terminal,
                                   "warnings": cpu_warnings})[:800])
 
-                for concurrency in (1, 4, 8):
+                for concurrency in (1, 8, 16):
                     worker.send(**verify_media_command(
                         f"vm-cpu-c{concurrency}", media_path, "cpu",
                         concurrency=concurrency))

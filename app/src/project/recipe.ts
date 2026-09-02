@@ -6,7 +6,7 @@ import type {
   MetricSpec,
 } from "../engine/protocol";
 import { validateMetricSpec } from "../engine/shapeGuards";
-import { profileFor } from "../engine/profiles";
+import { MUF_PROFILE_ID, profileFor } from "../engine/profiles";
 import type { ProjectState, Recipe } from "./types";
 
 /**
@@ -61,8 +61,8 @@ export function createRecipe(
     geometry: input.geometry ?? null,
     kernel: input.kernel ?? null,
     metric: input.metric ?? null,
-    axisMode: input.axisMode ?? profileFor(input.profileId ?? "").default_axis_mode,
-    profileId: input.profileId ?? null,
+    axisMode: input.axisMode ?? profileFor(MUF_PROFILE_ID).default_axis_mode,
+    profileId: MUF_PROFILE_ID,
     mathMode: input.mathMode ?? null,
   };
   return {
@@ -93,7 +93,7 @@ export function updateRecipe(
     ...(patch.kernel !== undefined ? { kernel: patch.kernel } : {}),
     ...(patch.metric !== undefined ? { metric: patch.metric } : {}),
     ...(patch.axisMode !== undefined ? { axisMode: patch.axisMode } : {}),
-    ...(patch.profileId !== undefined ? { profileId: patch.profileId } : {}),
+    ...(patch.profileId !== undefined ? { profileId: MUF_PROFILE_ID } : {}),
     ...(patch.mathMode !== undefined ? { mathMode: patch.mathMode } : {}),
     updatedAt: nowIso,
   };
@@ -165,6 +165,32 @@ export function removeRecipeInState(
   const recipesById = { ...state.recipesById };
   delete recipesById[recipeId];
   return { ok: true, state: { ...state, recipesById } };
+}
+
+/** Remove a Recipe; if it is current, point `active_recipe_id` at another. */
+export function deleteRecipeInState(
+  state: ProjectState,
+  recipeId: string,
+): { ok: true; state: ProjectState } | { ok: false; reason: string } {
+  const recipe = state.recipesById[recipeId];
+  if (!recipe) return { ok: false, reason: "recipe_missing" };
+  const recipesById = { ...state.recipesById };
+  delete recipesById[recipeId];
+  let activeRecipeId = state.project.activeRecipeId;
+  if (activeRecipeId === recipeId) {
+    const fallback = Object.values(recipesById).sort((a, b) =>
+      b.updatedAt.localeCompare(a.updatedAt),
+    )[0];
+    activeRecipeId = fallback?.id ?? null;
+  }
+  return {
+    ok: true,
+    state: {
+      ...state,
+      recipesById,
+      project: { ...state.project, activeRecipeId },
+    },
+  };
 }
 
 export function activeRecipe(state: ProjectState): Recipe | null {

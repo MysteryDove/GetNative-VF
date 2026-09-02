@@ -6,12 +6,14 @@ import {
   activateRecipe,
   applyPayloadToCurrentRecipe,
 } from "../project/recipeApply";
-import { activeRecipe, createRecipe } from "../project/recipe";
+import { activeRecipe, createRecipe, deleteRecipeInState } from "../project/recipe";
 import {
   includedSamples as selectIncludedSamples,
   hiddenResultSampleIds as resolveHiddenResultSampleIds,
   selectedAnalysisSamples,
+  groupBySourceId,
 } from "../project/samples";
+import { fileName } from "../media/importSources";
 import { useRunGroupSubmit } from "../hooks/useRunGroupSubmit";
 import { useHeightDraft } from "../hooks/useHeightDraft";
 import { startHeightRunGroup, type ExecutionBridge } from "../engine/executeRunGroup";
@@ -24,7 +26,6 @@ import {
 import type { ProjectState } from "../project/types";
 import { EmptyInlineAction } from "../components/EmptyInlineAction";
 import { RecipePicker } from "../components/RecipePicker";
-import { RunGroupPlanCard } from "../components/RunGroupPlanCard";
 import {
   ApplyGeometryDialog,
   type ApplyGeometryValues,
@@ -32,12 +33,13 @@ import {
 import { plotSeriesColor } from "../components/ErrorLinePlot";
 import { RecipeSummaryStrip } from "../components/RecipeSummaryStrip";
 import { HeightParamsPanel } from "../components/HeightParamsPanel";
+import { analyzeViewState } from "../project/analyzeView";
 import { HeightResultsPanel } from "../components/HeightResultsPanel";
 import { Modal } from "../components/Modal";
 import { toggleSetValue } from "../utils/collections";
 import { srcFromScanSelection } from "../engine/geometry";
 import { invalidKernelBlur, missingFractionalBaseAxis } from "../engine/heightDraft";
-import type { SearchPreset } from "../engine/protocol";
+import type { MetricSpec, SearchPreset } from "../engine/protocol";
 
 export function AnalyzePage({
   t,
@@ -48,7 +50,7 @@ export function AnalyzePage({
   initialSampleIds,
   onInitialSampleSelectionConsumed,
   onOpenDiagnostics,
-  onOpenSamples,
+  onOpenMedia,
   onProjectChange,
   executionBridge,
 }: {
@@ -61,7 +63,7 @@ export function AnalyzePage({
   initialSampleIds?: readonly string[] | null;
   onInitialSampleSelectionConsumed?: () => void;
   onOpenDiagnostics: () => void;
-  onOpenSamples: () => void;
+  onOpenMedia: () => void;
   onProjectChange: (updater: (state: ProjectState) => ProjectState) => void;
   executionBridge: ExecutionBridge;
 }) {
@@ -86,6 +88,17 @@ export function AnalyzePage({
   // draft also survives leaving and returning to Analyze during the session.
   const [kernelDraft, setKernelDraft] = useState<KernelDraft | null>(null);
   const [kernelInheritMetric, setKernelInheritMetric] = useState(true);
+  const [visitedSubroute, setVisitedSubroute] = useState<ReadonlySet<"height" | "kernel">>(
+    () => new Set([subroute]),
+  );
+  useEffect(() => {
+    setVisitedSubroute((current) => {
+      if (current.has(subroute)) return current;
+      const next = new Set(current);
+      next.add(subroute);
+      return next;
+    });
+  }, [subroute]);
 
   const includedSamples = useMemo(
     () => selectIncludedSamples(state),
@@ -123,11 +136,9 @@ export function AnalyzePage({
     draft,
     patch,
     setPreset,
-    resetToProfileDefaults,
     refineAroundHeight,
     grid,
     work,
-    kernels,
     backends,
     resolvedBackend,
     pNormMaximum,
@@ -137,7 +148,29 @@ export function AnalyzePage({
     includedSamples: analysisSamples,
     sourcesById: state.sourcesById,
     subroute,
+    initialMetric: analyzeViewState(state).metric,
   });
+
+  const persistAnalyzeView = useCallback(
+    (partial: { metricSpecOpen?: boolean; metric?: MetricSpec | null }) => {
+      onProjectChange((current) => ({
+        ...current,
+        uiStateByRoute: {
+          ...current.uiStateByRoute,
+          analyze: { ...analyzeViewState(current), ...partial },
+        },
+      }));
+    },
+    [onProjectChange],
+  );
+
+  const handleDraftPatch = useCallback(
+    (partial: Parameters<typeof patch>[0]) => {
+      patch(partial);
+      if (partial.metric) persistAnalyzeView({ metric: partial.metric });
+    },
+    [patch, persistAnalyzeView],
+  );
 
   // Seed the kernel draft lazily: capabilities can arrive after first render.
   useEffect(() => {
@@ -280,6 +313,13 @@ export function AnalyzePage({
     onProjectChange((current) => activateRecipe(current, recipeId));
   }
 
+  function removeRecipe(recipeId: string) {
+    onProjectChange((current) => {
+      const result = deleteRecipeInState(current, recipeId);
+      return result.ok ? result.state : current;
+    });
+  }
+
   /** Locale text the apply/naming layer needs. */
   const applyLabels = {
     defaultName: t("recipe.defaultName"),
@@ -377,6 +417,7 @@ export function AnalyzePage({
                 value={currentRecipe?.id ?? ""}
                 options={recipeOptions}
                 onChange={changeCurrentRecipe}
+                onRemove={removeRecipe}
                 ariaLabel={t("recipe.strip.active")}
               />
             ) : null}
@@ -393,7 +434,8 @@ export function AnalyzePage({
         </div>
       </div>
 
-      <div className="analyze-subroute-host" hidden={subroute !== "kernel"}>
+      <div className="analyze-subroute-stack">
+      <div className={`analyze-subroute-host${subroute === "kernel" ? " is-active" : ""}${visitedSubroute.has("kernel") ? " was-visited" : ""}`} aria-hidden={subroute !== "kernel"}>
         {kernelDraft ? (
           <KernelAnalyzePanel
             t={t}
@@ -411,81 +453,62 @@ export function AnalyzePage({
             onOpenDiagnostics={onOpenDiagnostics}
             onProjectChange={onProjectChange}
             executionBridge={executionBridge}
+            metricSpecOpen={analyzeViewState(state).metricSpecOpen}
+            onMetricSpecOpenChange={(open) => persistAnalyzeView({ metricSpecOpen: open })}
+            onPersistMetric={(metric) => persistAnalyzeView({ metric })}
           />
         ) : null}
       </div>
 
-      <div className="analyze-subroute-host" hidden={subroute !== "height"}>
+      <div className={`analyze-subroute-host${subroute === "height" ? " is-active" : ""}${visitedSubroute.has("height") ? " was-visited" : ""}`} aria-hidden={subroute !== "height"}>
         <div className="analyze-layout">
           <aside className="analyze-samples pane">
             <h3>{t("analyze.samplesTitle")}</h3>
             {includedSamples.length === 0 ? (
-              <EmptyInlineAction label={t("nav.samples")} onClick={onOpenSamples}>
+              <EmptyInlineAction label={t("nav.media")} onClick={onOpenMedia}>
                 <p>{t("analyze.noSamples")}</p>
               </EmptyInlineAction>
             ) : (
-              <ul className="analyze-sample-list">
-                {includedSamples.map((sample, index) => {
-                  const source = state.sourcesById[sample.sourceId];
-                  const hidden = hiddenSampleIds.has(sample.id);
+              <ul className="analyze-sample-list sample-tree">
+                {groupBySourceId(includedSamples).map((group) => {
+                  const source = state.sourcesById[group.sourceId];
+                  const sourceLabel = source?.label || (source?.path ? fileName(source.path) : group.sourceId);
                   return (
-                    <li key={sample.id} className={hidden ? "hidden-series" : ""}>
-                      <span className="swatch" style={{ background: plotSeriesColor(index) }} />
-                      <div>
-                        <strong>{sample.label || sample.id}</strong>
-                        <span>
-                          {source?.label || source?.path || sample.sourceId}
-                          {sample.frameIndex != null ? ` · #${sample.frameIndex}` : ""}
-                        </span>
-                        {sample.tags.length ? (
-                          <span className="sample-tags">
-                            {sample.tags.map((tag) => (
-                              <span className="sample-tag" key={tag}>
-                                {tag}
-                              </span>
-                            ))}
-                          </span>
-                        ) : null}
-                        <label className="series-visibility">
-                          <input
-                            type="checkbox"
-                            checked={!hidden}
-                            onChange={() => toggleSampleVisibility(sample.id)}
-                          />
-                          <span>{t("analyze.seriesVisible")}</span>
-                        </label>
+                    <li className="sample-tree-group" key={group.sourceId}>
+                      <div className="sample-tree-source">
+                        <strong>{sourceLabel}</strong>
+                        <small>{group.items.length}</small>
                       </div>
+                      <ul className="sample-tree-frames">
+                        {group.items.map((sample) => {
+                          const index = includedSamples.indexOf(sample);
+                          const hidden = hiddenSampleIds.has(sample.id);
+                          return (
+                            <li key={sample.id} className={hidden ? "hidden-series" : ""}>
+                              <span className="swatch" style={{ background: plotSeriesColor(index) }} />
+                              <div>
+                                <strong>
+                                  {sample.frameIndex != null ? `#${sample.frameIndex}` : (sample.label || sample.id)}
+                                </strong>
+                                <label className="series-visibility">
+                                  <input
+                                    type="checkbox"
+                                    checked={!hidden}
+                                    onChange={() => toggleSampleVisibility(sample.id)}
+                                  />
+                                  <span>{t("analyze.seriesVisible")}</span>
+                                </label>
+                              </div>
+                            </li>
+                          );
+                        })}
+                      </ul>
                     </li>
                   );
                 })}
               </ul>
             )}
 
-            {plan ? (
-              <RunGroupPlanCard
-                t={t}
-                title={t("analyze.runGroupPlan")}
-                summary={
-                  `${t("analyze.runGroupType", { type: plan.groupType })}` +
-                  ` · ${t("analyze.memberCount", { count: String(plan.memberCount) })}`
-                }
-                workEstimate={t("analyze.workEstimate", { count: String(plan.workEstimate) })}
-                members={plan.members.map((member) => ({
-                  key: member.planKey,
-                  title: member.sampleLabel,
-                  subtitle:
-                    `${member.kernel.id} · ${member.heightGrid.candidates.length} h · ` +
-                    t("analyze.resolvedBase", {
-                      width: member.request.baseWidth ?? "integer",
-                      height: member.request.baseHeight ?? "integer",
-                    }),
-                }))}
-                truncateAt={12}
-                multiMemberNote={
-                  plan.memberCount > 1 ? t("analyze.runGroupIsNotSingleRun") : null
-                }
-              />
-            ) : null}
           </aside>
 
           <HeightResultsPanel
@@ -514,18 +537,19 @@ export function AnalyzePage({
             draft={draft}
             capabilities={capabilities}
             backends={backends}
-            kernelCount={kernels.length}
             resolvedBackend={resolvedBackend}
             pNormMaximum={pNormMaximum}
             canRun={canRun}
             submitting={submitting}
             runBlockedReason={runBlockedReason}
-            onPatch={patch}
+            onPatch={handleDraftPatch}
             onSetPreset={handleSetPreset}
-            onResetProfileDefaults={resetToProfileDefaults}
             onRun={startRun}
+            metricSpecOpen={analyzeViewState(state).metricSpecOpen}
+            onMetricSpecOpenChange={(open) => persistAnalyzeView({ metricSpecOpen: open })}
           />
         </div>
+      </div>
       </div>
       {applyDialogOpen && applySourceDims ? (
         <ApplyGeometryDialog

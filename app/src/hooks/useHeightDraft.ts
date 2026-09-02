@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { EngineEnvelope } from "../engine/types";
 import {
   applyPreset,
-  applyProfileDefaults,
   defaultHeightDraft,
   estimateHeightWork,
   fixedKernelsForDraft,
@@ -11,7 +10,7 @@ import {
   selectableBackends,
   type HeightDraft,
 } from "../engine/heightDraft";
-import type { SearchPreset } from "../engine/protocol";
+import type { MetricSpec, SearchPreset } from "../engine/protocol";
 import {
   planHeightRunGroup,
   type HeightRunGroupPlan,
@@ -29,19 +28,29 @@ export function useHeightDraft({
   includedSamples,
   sourcesById,
   subroute,
+  initialMetric,
 }: {
   capabilities: EngineEnvelope | null;
   includedSamples: Sample[];
   sourcesById: ProjectState["sourcesById"];
   /** Owned by the shell nav; only gates plan building (height subroute only). */
   subroute: "height" | "kernel";
+  initialMetric?: MetricSpec | null;
 }) {
-  const [draft, setDraft] = useState<HeightDraft>(() => defaultHeightDraft(capabilities));
+  const [draft, setDraft] = useState<HeightDraft>(() => {
+    const next = defaultHeightDraft(capabilities);
+    if (initialMetric) next.metric = { ...initialMetric };
+    return next;
+  });
   const [draftSeeded, setDraftSeeded] = useState(Boolean(capabilities));
 
   useEffect(() => {
     if (draftSeeded || !capabilities) return;
-    setDraft(defaultHeightDraft(capabilities));
+    setDraft((current) => {
+      const next = defaultHeightDraft(capabilities);
+      next.metric = { ...current.metric };
+      return next;
+    });
     setDraftSeeded(true);
   }, [capabilities, draftSeeded]);
 
@@ -83,10 +92,6 @@ export function useHeightDraft({
     setDraft((current) => applyPreset(current, preset));
   }, []);
 
-  const resetToProfileDefaults = useCallback(() => {
-    setDraft((current) => applyProfileDefaults(current, capabilities));
-  }, [capabilities]);
-
   /** Refine the grid around a height picked from the results plot/table. */
   const refineAroundHeight = useCallback((height: string) => {
     setDraft((current) =>
@@ -106,7 +111,6 @@ export function useHeightDraft({
     draft,
     patch,
     setPreset,
-    resetToProfileDefaults,
     refineAroundHeight,
     grid,
     work,

@@ -10,7 +10,7 @@ const catalogs: Record<LocaleCode, Record<MessageKey, string>> = {
   en,
 };
 
-export const DEFAULT_LOCALE: LocaleCode = "zh-CN";
+export const DEFAULT_LOCALE: LocaleCode = "en";
 
 export function isLocaleCode(value: string): value is LocaleCode {
   return value === "zh-CN" || value === "en";

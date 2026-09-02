@@ -6,9 +6,9 @@ use tauri::{AppHandle, Manager};
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AppLanguage {
     #[serde(rename = "zh-CN")]
-    #[default]
     ZhCn,
     #[serde(rename = "en")]
+    #[default]
     En,
 }
 
@@ -38,7 +38,7 @@ pub struct AppPreferences {
 impl Default for AppPreferences {
     fn default() -> Self {
         Self {
-            language: AppLanguage::ZhCn,
+            language: AppLanguage::En,
             axis_plan_cache_dir: None,
             theme: AppTheme::System,
         }
@@ -148,8 +148,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_language_is_zh_cn() {
-        assert_eq!(AppPreferences::default().language, AppLanguage::ZhCn);
+    fn default_language_is_en() {
+        assert_eq!(AppPreferences::default().language, AppLanguage::En);
     }
 
     #[test]

@@ -1,5 +1,43 @@
+import type { ReactNode } from "react";
+import { ChevronRight } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { MetricSpec } from "../engine/protocol";
+
+export function metricSpecSummary(metric: MetricSpec): string {
+  return `${metric.cropLeft}/${metric.cropRight}/${metric.cropTop}/${metric.cropBottom} · ${metric.pixelExclusionThreshold} · p=${metric.pNorm}`;
+}
+
+export function MetricSpecSection({
+  t,
+  open,
+  onOpenChange,
+  summary,
+  children,
+}: {
+  t: Translator;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  summary?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="metric-fieldset">
+      <button
+        type="button"
+        className="metric-fieldset-toggle"
+        aria-expanded={open}
+        onClick={() => onOpenChange(!open)}
+      >
+        <ChevronRight size={14} className={`metric-fieldset-chevron${open ? " open" : ""}`} />
+        <span>{t("analyze.metricSpec")}</span>
+        {!open && summary ? <span className="metric-fieldset-summary">{summary}</span> : null}
+      </button>
+      <div className={`collapsible${open ? " open" : ""}`} aria-hidden={!open} inert={!open}>
+        <div className="collapsible-inner">{children}</div>
+      </div>
+    </div>
+  );
+}
 
 /**
  * Shared MetricSpec editor (crop ×4 + pixelExclusion + pNorm inputs) used by
@@ -20,8 +58,7 @@ export function MetricEditor({
   disabled?: boolean;
 }) {
   return (
-    <>
-      <div className="metric-grid">
+    <div className="metric-grid">
         {(
           [
             ["cropLeft", t("analyze.cropLeft")],
@@ -42,28 +79,27 @@ export function MetricEditor({
             />
           </label>
         ))}
-      </div>
-      <label className="block">
-        <span>{t("analyze.pixelExclusion")}</span>
-        <input
-          inputMode="decimal"
-          value={metric.pixelExclusionThreshold}
-          disabled={disabled}
-          onChange={(event) =>
-            onChange({ ...metric, pixelExclusionThreshold: Number(event.target.value) })
-          }
-        />
-      </label>
-      <label className="block">
-        <span>{t("analyze.pNorm")}</span>
-        <input
-          inputMode="numeric"
-          max={pNormMaximum}
-          value={metric.pNorm}
-          disabled={disabled}
-          onChange={(event) => onChange({ ...metric, pNorm: Number(event.target.value) })}
-        />
-      </label>
-    </>
+        <label className="block">
+          <span title={t("analyze.pixelExclusion")}>{t("analyze.pixelExclusion")}</span>
+          <input
+            inputMode="decimal"
+            value={metric.pixelExclusionThreshold}
+            disabled={disabled}
+            onChange={(event) =>
+              onChange({ ...metric, pixelExclusionThreshold: Number(event.target.value) })
+            }
+          />
+        </label>
+        <label className="block">
+          <span>{t("analyze.pNorm")}</span>
+          <input
+            inputMode="numeric"
+            max={pNormMaximum}
+            value={metric.pNorm}
+            disabled={disabled}
+            onChange={(event) => onChange({ ...metric, pNorm: Number(event.target.value) })}
+          />
+        </label>
+    </div>
   );
 }

@@ -51,6 +51,9 @@ export function SettingsPage({
           <span>{t("language.label")}</span>
           <select
             value={language}
+            disabled
+            aria-disabled="true"
+            title={t("settings.languageHelp")}
             onChange={(event) => onLanguageChange(event.target.value as "zh-CN" | "en")}
           >
             <option value="zh-CN">{t("language.zhCN")}</option>

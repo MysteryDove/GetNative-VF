@@ -57,12 +57,15 @@ export function useIndexProgress(
 
 export function useMediaPreview({
   selectedSource,
+  active = true,
   videoDecodeAvailable,
   setError,
   onSourceChanged,
   onSourceMissing,
 }: {
   selectedSource: Source | null;
+  /** When false, keep the last preview and cancel in-flight decodes. */
+  active?: boolean;
   videoDecodeAvailable: boolean | undefined;
   setError: (detail: string) => void;
   onSourceChanged: (sourceId: string, detail: string) => void;
@@ -308,9 +311,15 @@ export function useMediaPreview({
       : "";
 
   useEffect(() => {
+    if (!active) {
+      cancelPendingScrub();
+      void activeMediaTask.current?.cancel().catch(() => undefined);
+      return;
+    }
     const sessionId = ++sourceSessionId.current;
     // Same source already on screen (e.g. autosave rebuilt state objects with
-    // fresh identities): keep the preview instead of reloading it.
+    // fresh identities, or returning to Media after visiting another route):
+    // keep the preview instead of reloading it.
     if (previewKeyRef.current === selectedPreviewKey && previewUrlRef.current) return;
     previewKeyRef.current = selectedPreviewKey;
     cancelPendingScrub();
@@ -335,7 +344,7 @@ export function useMediaPreview({
       );
     }
     // selectedSource is read from the render that produced selectedPreviewKey.
-  }, [initializeVideoSource, videoDecodeAvailable, selectedPreviewKey, showPreview, swapPreviewUrl, swapThumbnailUrls, cancelPendingScrub]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [active, initializeVideoSource, videoDecodeAvailable, selectedPreviewKey, showPreview, swapPreviewUrl, swapThumbnailUrls, cancelPendingScrub]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Revoke the live object URL only on unmount; in-flight swaps own their URLs.
   useEffect(

@@ -1,5 +1,5 @@
 import type { Translator } from "../i18n";
-import { kernelDisplayName, profileDisplayName } from "../engine/displayNames";
+import { kernelDisplayName } from "../engine/displayNames";
 import { recipeReadiness } from "../project/recipe";
 import type { Recipe } from "../project/types";
 import { Modal } from "./Modal";
@@ -102,12 +102,6 @@ export function RecipeReviewDialog({
                 ` · ${t("analyze.pixelExclusion")} ${recipe.metric.pixelExclusionThreshold}` +
                 ` · p=${recipe.metric.pNorm}`
               : t("recipe.fieldMissing")}
-          </span>
-        </div>
-        <div className="dense-row">
-          <strong>{t("recipe.field.profile")}</strong>
-          <span>
-            {recipe.profileId ? profileDisplayName(t, recipe.profileId) : t("recipe.fieldMissing")}
           </span>
         </div>
         <div className="dense-row">

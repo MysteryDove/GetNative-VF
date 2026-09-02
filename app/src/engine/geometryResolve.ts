@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { GeometryEnvelope } from "./types";
 import type { AxisMode, GeometrySnapshot } from "./protocol";
 import { resolveGeometryValues } from "./geometry";
+import { MUF_PROFILE_ID } from "./profiles";
 
 export type GeometryResolveInput = {
   profileId: string;
@@ -34,7 +35,7 @@ export async function resolveGeometrySnapshot(input: GeometryResolveInput): Prom
   const mode = input.baseHeight == null && input.baseWidth == null ? "standard" : "pro";
   const result = await invoke<GeometryEnvelope>("engine_geometry", {
     request: {
-      profile: input.profileId,
+      profile: MUF_PROFILE_ID,
       mode,
       sourceWidth: input.sourceWidth,
       sourceHeight: input.sourceHeight,

@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useMemo, useRef, useState, type ReactNode, type UIEvent } from "react";
 import { ArrowDown, ArrowDownUp, ArrowUp } from "lucide-react";
 import { PERFECTLY_DESCALE_THRESHOLD } from "../engine/valleyDetect";
 import type { Translator } from "../i18n";
@@ -8,6 +8,16 @@ export { PERFECTLY_DESCALE_THRESHOLD };
 const TABLE_ROW_HEIGHT = 28;
 // Covers the 38vh container plus overscan slack.
 const TABLE_VIEWPORT = 480;
+const TABLE_OVERSCAN = 10;
+
+function tableWindowFor(scrollTop: number, length: number): { start: number; end: number } {
+  const start = Math.max(0, Math.floor(scrollTop / TABLE_ROW_HEIGHT) - TABLE_OVERSCAN);
+  const end = Math.min(
+    length,
+    Math.ceil((scrollTop + TABLE_VIEWPORT) / TABLE_ROW_HEIGHT) + TABLE_OVERSCAN,
+  );
+  return { start, end };
+}
 
 export type ResultMetricTableRow = {
   key: string;
@@ -30,6 +40,9 @@ export function ResultMetricTable({
   metricColumnIndex,
   columnTemplate,
   rows,
+  defaultMetricSort = "none",
+  limit,
+  scrollable = true,
 }: {
   t: Translator;
   ariaLabel: string;
@@ -39,33 +52,45 @@ export function ResultMetricTable({
   /** grid-template-columns for head and rows. */
   columnTemplate: string;
   rows: ResultMetricTableRow[];
+  defaultMetricSort?: "none" | "asc" | "desc";
+  /** After sorting, keep only the first N rows. */
+  limit?: number;
+  scrollable?: boolean;
 }) {
-  const [metricSort, setMetricSort] = useState<"none" | "asc" | "desc">("none");
+  const [metricSort, setMetricSort] = useState<"none" | "asc" | "desc">(defaultMetricSort);
   const [scrollTop, setScrollTop] = useState(0);
+  const windowRef = useRef({ start: 0, end: 0 });
 
   const sortedRows = useMemo(() => {
-    if (metricSort === "none") return rows;
-    const factor = metricSort === "asc" ? 1 : -1;
-    return [...rows].sort((a, b) => (a.metric - b.metric) * factor);
-  }, [rows, metricSort]);
+    const ordered = metricSort === "none"
+      ? rows
+      : [...rows].sort((a, b) => (a.metric - b.metric) * (metricSort === "asc" ? 1 : -1));
+    return limit != null ? ordered.slice(0, limit) : ordered;
+  }, [rows, metricSort, limit]);
 
-  const tableWindow = useMemo(() => {
-    const start = Math.max(0, Math.floor(scrollTop / TABLE_ROW_HEIGHT) - 10);
-    const end = Math.min(
-      sortedRows.length,
-      Math.ceil((scrollTop + TABLE_VIEWPORT) / TABLE_ROW_HEIGHT) + 10,
-    );
-    return { start, end };
-  }, [scrollTop, sortedRows.length]);
+  const windowed = scrollable;
+  const tableWindow = useMemo(
+    () => windowed ? tableWindowFor(scrollTop, sortedRows.length) : { start: 0, end: sortedRows.length },
+    [scrollTop, sortedRows.length, windowed],
+  );
+  windowRef.current = tableWindow;
+
+  function handleScroll(event: UIEvent<HTMLDivElement>) {
+    if (!windowed) return;
+    const next = tableWindowFor(event.currentTarget.scrollTop, sortedRows.length);
+    const prev = windowRef.current;
+    if (next.start === prev.start && next.end === prev.end) return;
+    setScrollTop(event.currentTarget.scrollTop);
+  }
 
   const gridStyle = { gridTemplateColumns: columnTemplate };
 
   return (
     <div
-      className="result-table"
+      className={`result-table${windowed ? "" : " result-table-static"}`}
       role="table"
       aria-label={ariaLabel}
-      onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+      onScroll={windowed ? handleScroll : undefined}
     >
       <div className="result-table-head" role="row" style={gridStyle}>
         {columns.map((label, index) =>
@@ -96,7 +121,11 @@ export function ResultMetricTable({
           ),
         )}
       </div>
-      <div style={{ height: tableWindow.start * TABLE_ROW_HEIGHT }} aria-hidden="true" />
+      <div
+        className="result-table-spacer"
+        style={{ height: tableWindow.start * TABLE_ROW_HEIGHT }}
+        aria-hidden="true"
+      />
       {sortedRows.slice(tableWindow.start, tableWindow.end).map((row) => {
         const className = [
           "result-table-row",
@@ -130,6 +159,7 @@ export function ResultMetricTable({
         );
       })}
       <div
+        className="result-table-spacer"
         style={{ height: (sortedRows.length - tableWindow.end) * TABLE_ROW_HEIGHT }}
         aria-hidden="true"
       />

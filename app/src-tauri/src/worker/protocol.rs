@@ -239,10 +239,7 @@ pub(crate) fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), Str
             request.axis_mode
         ));
     }
-    if !matches!(
-        request.profile_id.as_str(),
-        "muf-d278cd3" | "getfnative-44c8d0f" | "modern"
-    ) {
+    if request.profile_id.as_str() != "muf-d278cd3" {
         return Err(format!(
             "bad_request: unknown profileId {}",
             request.profile_id
@@ -611,7 +608,7 @@ mod tests {
             "axisMode": "h_only",
             "kernel": {"id": "bicubic", "b": 0.0, "c": 0.5},
             "candidates": ["230", "231.5"],
-            "profileId": "getfnative-44c8d0f",
+            "profileId": "muf-d278cd3",
             "endpointRule": "exclusive_stop",
             "baseHeight": "241",
             "baseWidth": "321",
@@ -634,7 +631,7 @@ mod tests {
             json!({"id": "bicubic", "b": 0.0, "c": 0.5})
         );
         assert_eq!(command["metric"]["p_norm"], json!(1));
-        assert_eq!(command["profile_id"], json!("getfnative-44c8d0f"));
+        assert_eq!(command["profile_id"], json!("muf-d278cd3"));
         assert_eq!(command["endpoint_rule"], json!("exclusive_stop"));
         assert_eq!(command["base_height"], json!("241"));
         assert_eq!(command["base_width"], json!("321"));

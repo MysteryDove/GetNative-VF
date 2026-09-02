@@ -1,10 +1,10 @@
 import type { Translator } from "../i18n";
-import { kernelDisplayName, profileDisplayName } from "../engine/displayNames";
+import { kernelDisplayName } from "../engine/displayNames";
 import type { Recipe } from "../project/types";
 
 /**
  * One-line Recipe identity + semantic summary (revision, canvas, kernel,
- * profile, math mode, pixel exclusion). Shared by the Verify page strip and
+ * math mode, pixel exclusion). Shared by the Verify page strip and
  * the Analyze page current-recipe strip so the rendering never drifts.
  */
 export function RecipeSummaryStrip({
@@ -44,7 +44,6 @@ export function RecipeSummaryStrip({
               (recipe.geometry.needsReview ? ` · ${t("recipe.missing.geometryReview")}` : "")
             : ""}
           {recipe.kernel?.id ? ` · ${kernelDisplayName(t, recipe.kernel.id)}` : ""}
-          {recipe.profileId ? ` · ${profileDisplayName(t, recipe.profileId)}` : ""}
           {recipe.mathMode ? ` · ${recipe.mathMode}` : ""}
           {recipe.metric
             ? ` · ${t("analyze.pixelExclusion")} ${recipe.metric.pixelExclusionThreshold}`

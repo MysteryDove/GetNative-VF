@@ -193,8 +193,8 @@ describe("startVerifyRunGroup", () => {
     expect(liveBatches.map((frame) => frame.frameIndex)).toEqual([0, 2, 4]);
     expect(queued[0]?.mode).toBe("verify");
     expect(queued[0]?.total).toBe(0);
-    expect(mediaParams).toMatchObject([{ concurrency: 2 }]);
-    expect((run?.inputSnapshot as { concurrency?: number }).concurrency).toBe(2);
+    expect(mediaParams).toMatchObject([{ concurrency: 8 }]);
+    expect((run?.inputSnapshot as { concurrency?: number }).concurrency).toBe(8);
   });
 
   it("retains and sorts all 34,072 frame metrics for the terminal write", async () => {

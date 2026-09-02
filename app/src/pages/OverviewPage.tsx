@@ -34,7 +34,7 @@ export function OverviewPage({
     blockers.push({ message: t("overview.blocker.missingMedia"), route: "media" });
   }
   if (!flags.hasSamples) {
-    blockers.push({ message: t("overview.blocker.noSamples"), route: "samples" });
+    blockers.push({ message: t("overview.blocker.noSamples"), route: "media" });
   }
   if (!analyzeAvailable) {
     blockers.push({ message: t("overview.blocker.heightUnavailable"), route: "analyze" });

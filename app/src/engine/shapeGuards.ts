@@ -117,10 +117,10 @@ export function validateVerifyShape(request: VerifyRequest): ShapeGuardResult {
     return fail("verify_geometry_required", "Verification Recipe must include geometry");
   }
   if (!Number.isInteger(request.concurrency)
-      || request.concurrency < 1 || request.concurrency > 8) {
+      || request.concurrency < 1 || request.concurrency > 16) {
     return fail(
       "verify_concurrency_invalid",
-      "Verification concurrency must be an integer within 1..8",
+      "Verification concurrency must be an integer within 1..16",
     );
   }
   const scope = request.scanScope;
