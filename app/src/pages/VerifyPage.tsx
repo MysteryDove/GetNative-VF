@@ -2,12 +2,23 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, Download, ScanSearch, Trash2 } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
-import type { BackendPreference } from "../engine/protocol";
+import type { BackendPreference, MetricSpec } from "../engine/protocol";
 import { activeRecipe, deleteRecipeInState, recipeReadiness, recipesByUpdatedAt } from "../project/recipe";
 import { activateRecipe } from "../project/recipeApply";
 import { buildFrameSample, nextSampleOrder } from "../project/samples";
 import { useRunGroupSubmit } from "../hooks/useRunGroupSubmit";
 import { RecipeSummaryStrip } from "../components/RecipeSummaryStrip";
+import { MetricEditor, MetricSpecSection, metricSpecSummary, metricsEqual } from "../components/MetricEditor";
+import { analyzeViewState } from "../project/analyzeView";
+import { defaultHeightDraft } from "../engine/heightDraft";
+import {
+  backendOptionLabel,
+  pNormMaximumForBackend,
+  reconcileBackendPreference,
+  resolveBackendPreference,
+  validateBackendPNorm,
+  verifySelectableBackends,
+} from "../engine/backendSelection";
 import { DEFAULT_SERIES_COLOR, ErrorLinePlot, plotSeriesColor, type ErrorPlotDatum } from "../components/ErrorLinePlot";
 import { toggleSetValue } from "../utils/collections";
 import { PERFECTLY_DESCALE_THRESHOLD } from "../components/ResultMetricTable";
@@ -17,16 +28,13 @@ import { RecipePicker } from "../components/RecipePicker";
 import { MenuSelect } from "../components/MenuSelect";
 import { RunLaunchButton } from "../components/RunLaunchButton";
 import {
-  backendOptionLabel,
-  reconcileBackendPreference,
-  verifySelectableBackends,
-} from "../engine/backendSelection";
-import {
   defaultVerifyDraft,
+  GPU_VERIFY_CONCURRENCY_MAX,
   planVerifyRunGroup,
   reconcileReadyVideoSourceIds,
-  verificationRuns,
   validVerifyConcurrency,
+  verificationRuns,
+  verifyConcurrencyMaximum,
   type VerifyDraft,
 } from "../engine/verifyPlan";
 import { startVerifyRunGroup, type VerifyFrameEntry } from "../engine/executeVerify";
@@ -40,7 +48,7 @@ import {
 } from "../engine/verifyResults";
 import type { ExecutionBridge } from "../engine/executeRunGroup";
 import type { ProjectRoute, ProjectState, Run } from "../project/types";
-import { buildVerificationFusion, fusionEligibility } from "../project/verificationFusion";
+import { buildVerificationFusion, fusionEligibility, prepareFusionRuns } from "../project/verificationFusion";
 import { buildVerificationFusionCsv, buildVerificationFusionJson, saveArtifact } from "../project/export";
 
 /**
@@ -66,6 +74,8 @@ export function VerifyPage({
   executionBridge: ExecutionBridge;
 }) {
   const [draft, setDraft] = useState<VerifyDraft>(() => defaultVerifyDraft());
+  const [inheritMetric, setInheritMetric] = useState(true);
+  const [metricSpecOpen, setMetricSpecOpen] = useState(false);
   const { submitting, notice: submitNotice, submit: submitRunGroup } = useRunGroupSubmit();
   const [notice, setNotice] = useState("");
   const [liveFrameRevision, setLiveFrameRevision] = useState(0);
@@ -113,6 +123,20 @@ export function VerifyPage({
   const recipe = activeRecipe(state);
   const recipeOptions = useMemo(() => recipesByUpdatedAt(state), [state.recipesById]);
   const recipeGaps = recipe ? recipeReadiness(recipe) : null;
+  const inheritedMetric = useMemo<MetricSpec>(
+    () =>
+      analyzeViewState(state).metric
+      ?? recipe?.metric
+      ?? defaultHeightDraft(null).metric,
+    [state.uiStateByRoute.analyze, recipe?.metric],
+  );
+  const scanMetric = inheritMetric ? inheritedMetric : (draft.metric ?? inheritedMetric);
+
+  useEffect(() => {
+    if (!inheritMetric) return;
+    if (draft.metric && metricsEqual(draft.metric, inheritedMetric)) return;
+    setDraft((current) => ({ ...current, metric: inheritedMetric }));
+  }, [inheritMetric, inheritedMetric, draft.metric]);
   const readyVideos = useMemo(
     () =>
       Object.values(state.sourcesById).filter(
@@ -151,12 +175,12 @@ export function VerifyPage({
   const plan = useMemo(() => {
     if (!recipe) return null;
     const result = planVerifyRunGroup({
-      draft,
+      draft: { ...draft, metric: scanMetric },
       recipe,
       sourcesById: state.sourcesById,
     });
     return result.ok ? result.plan : null;
-  }, [draft, recipe, state.sourcesById]);
+  }, [draft, recipe, scanMetric, state.sourcesById]);
 
   const runs = useMemo(
     () => verificationRuns(state).filter((run) => !historySourceId || run.sourceId === historySourceId),
@@ -206,10 +230,35 @@ export function VerifyPage({
   const fusionBuild = useMemo(() => historySource && selectedEligibleRunIds.length >= 2
     ? buildVerificationFusion({ state, runIds: selectedEligibleRunIds, sourceId: historySource.id })
     : null, [state, selectedEligibleRunIds.join("\u0000"), historySource]);
+  const resolvedVerifyBackend = resolveBackendPreference(
+    capabilities,
+    draft.backendPreference,
+    scanMetric.pNorm,
+    recipe?.axisMode,
+    { verify: true },
+  );
   const concurrencyCapability = capabilities?.payload.features?.media_verify_concurrency;
   const concurrencyMin = concurrencyCapability?.min ?? 1;
-  const concurrencyMax = concurrencyCapability?.max ?? 16;
-  const concurrencyInvalid = !validVerifyConcurrency(draft.concurrency);
+  const concurrencyMax = verifyConcurrencyMaximum(
+    resolvedVerifyBackend,
+    concurrencyCapability?.max ?? 16,
+    concurrencyCapability?.gpu_max ?? GPU_VERIFY_CONCURRENCY_MAX,
+  );
+  const concurrencyInvalid = !validVerifyConcurrency(draft.concurrency, concurrencyMax);
+  useEffect(() => {
+    setDraft((current) =>
+      current.concurrency > concurrencyMax
+        ? { ...current, concurrency: concurrencyMax }
+        : current,
+    );
+  }, [concurrencyMax]);
+  const pNormMaximum = pNormMaximumForBackend(capabilities, resolvedVerifyBackend);
+  const pNormSupported = validateBackendPNorm(
+    capabilities,
+    draft.backendPreference,
+    scanMetric.pNorm,
+    recipe?.axisMode,
+  ).ok;
 
   /** Stable per-run colors (indexed over all runs, not the filtered view). */
   const runColorById = useMemo(
@@ -225,6 +274,12 @@ export function VerifyPage({
       ),
     [runs, state.sourcesById, state.recipesById, t],
   );
+  const fusionColor = plotSeriesColor(runs.length);
+  const fusionLegendLabel = selectedFusion
+    ? t("verify.fusionLegend", {
+        recipes: selectedFusion.inputs.map((input) => input.recipeName).join(" + "),
+      })
+    : "";
   const plotData = useMemo<ErrorPlotDatum[]>(
     () =>
       runs
@@ -241,16 +296,29 @@ export function VerifyPage({
               label: runLabelById.get(run.id),
             })),
         )
-        .concat(selectedFusion ? selectedFusion.frames.map((frame) => ({
-          key: `${selectedFusion.id}-${frame.frameIndex}`,
-          runId: selectedFusion.id,
-          x: String(frame.frameIndex),
-          metric: frame.fusedError,
-          color: "#111827",
-          lineWidth: 3,
-          label: `Fusion: ${frame.candidates.map((candidate) => `${selectedFusion.inputs.find((input) => input.recipeId === candidate.recipeId)?.recipeName ?? candidate.recipeId}=${candidate.error}`).join(", ")}`,
-        })) : []),
-    [runs, hiddenRunIds, liveFrames, runColorById, runLabelById, selectedFusion],
+        .concat(
+          selectedFusion && !hiddenRunIds.has(selectedFusion.id)
+            ? selectedFusion.frames.map((frame) => ({
+                key: `${selectedFusion.id}-${frame.frameIndex}`,
+                runId: selectedFusion.id,
+                x: String(frame.frameIndex),
+                metric: frame.fusedError,
+                color: fusionColor,
+                lineWidth: 3,
+                label: fusionLegendLabel,
+              }))
+            : [],
+        ),
+    [
+      runs,
+      hiddenRunIds,
+      liveFrames,
+      runColorById,
+      runLabelById,
+      selectedFusion,
+      fusionColor,
+      fusionLegendLabel,
+    ],
   );
 
   /** Highest-error frame inside the zoomed range, across visible runs. */
@@ -299,7 +367,7 @@ export function VerifyPage({
     if (!anchorId || anchorId === run.id) return null;
     const anchor = state.runsById[anchorId];
     if (!anchor) return "run_missing";
-    const pair = buildVerificationFusion({ state, runIds: [anchor.id, run.id], sourceId: historySource.id });
+    const pair = prepareFusionRuns({ state, runIds: [anchor.id, run.id], sourceId: historySource.id });
     return pair.ok ? null : pair.reason;
   }
 
@@ -362,7 +430,10 @@ export function VerifyPage({
         : draft.sourceIds.length === 0
           ? t("verify.blocked.noSources")
           : concurrencyInvalid
-            ? t("verify.blocked.concurrency")
+            ? t("verify.blocked.concurrency", {
+                min: String(concurrencyMin),
+                max: String(concurrencyMax),
+              })
           : !plan
             ? t("verify.blocked.invalidPlan")
             : null;
@@ -625,7 +696,7 @@ export function VerifyPage({
               ) : null}
             </div>
           ) : null}
-          {runs.length > 1 ? (
+          {runs.length > 1 || selectedFusion ? (
             <div className="plot-legend">
               {runs.map((run) => (
                 <label key={run.id} className="plot-legend-item">
@@ -638,6 +709,17 @@ export function VerifyPage({
                   <span>{runLabelById.get(run.id)}</span>
                 </label>
               ))}
+              {selectedFusion ? (
+                <label className="plot-legend-item">
+                  <input
+                    type="checkbox"
+                    checked={!hiddenRunIds.has(selectedFusion.id)}
+                    onChange={() => toggleRunVisible(selectedFusion.id)}
+                  />
+                  <span className="swatch" style={{ background: fusionColor }} />
+                  <span>{fusionLegendLabel}</span>
+                </label>
+              ) : null}
             </div>
           ) : null}
           {runs.length === 0 ? (
@@ -704,11 +786,61 @@ export function VerifyPage({
               </div>
             </div>
           ) : null}
-          {selectedFusion && selectedFusionFrame != null ? (() => {
-            const frame = selectedFusion.frames.find((entry) => entry.frameIndex === selectedFusionFrame);
+          {selectedFusion && selectedFusion.frames.length > 0 ? (() => {
+            const frames = selectedFusion.frames;
+            let frameIndex = frames.findIndex((entry) => entry.frameIndex === selectedFusionFrame);
+            if (frameIndex < 0) {
+              frameIndex = frames.reduce((best, entry, index) =>
+                Math.abs(entry.frameIndex - (selectedFusionFrame ?? entry.frameIndex))
+                  < Math.abs(frames[best].frameIndex - (selectedFusionFrame ?? frames[best].frameIndex))
+                  ? index
+                  : best, 0);
+            }
+            const frame = frames[frameIndex];
             return frame ? (
               <div className="verify-fusion-frame-detail">
-                <label className="verify-filter"><span>{t("verify.fusionFrame")}</span><select className="control-select" value={String(selectedFusionFrame)} onChange={(event) => setSelectedFusionFrame(Number(event.target.value))}>{selectedFusion.frames.map((entry) => <option key={entry.frameIndex} value={entry.frameIndex}>#{entry.frameIndex}</option>)}</select></label>
+                <label className="verify-filter">
+                  <span>{t("verify.fusionFrame")}</span>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={frameIndex <= 0}
+                    onClick={() => setSelectedFusionFrame(frames[frameIndex - 1].frameIndex)}
+                  >
+                    ‹
+                  </button>
+                  <input
+                    inputMode="numeric"
+                    value={selectedFusionFrame ?? frame.frameIndex}
+                    onChange={(event) => {
+                      const next = Number(event.target.value);
+                      if (!Number.isInteger(next)) return;
+                      setSelectedFusionFrame(next);
+                    }}
+                    onBlur={() => {
+                      const target = selectedFusionFrame ?? frame.frameIndex;
+                      const nearest = frames.reduce((best, entry) =>
+                        Math.abs(entry.frameIndex - target) < Math.abs(best.frameIndex - target)
+                          ? entry
+                          : best);
+                      setSelectedFusionFrame(nearest.frameIndex);
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={frameIndex >= frames.length - 1}
+                    onClick={() => setSelectedFusionFrame(frames[frameIndex + 1].frameIndex)}
+                  >
+                    ›
+                  </button>
+                  <span className="help-copy">
+                    {t("verify.fusionFrameOf", {
+                      current: String(frameIndex + 1),
+                      total: String(frames.length),
+                    })}
+                  </span>
+                </label>
                 <span>{t("verify.fusionWinner", { recipe: selectedFusion.inputs.find((input) => input.recipeId === frame.winnerRecipeId)?.recipeName ?? frame.winnerRecipeId, error: frame.fusedError.toPrecision(6) })}</span>
                 <span>{frame.candidates.map((candidate) => `${selectedFusion.inputs.find((input) => input.recipeId === candidate.recipeId)?.recipeName ?? candidate.recipeId}: ${candidate.error.toPrecision(6)}`).join(" · ")}</span>
               </div>
@@ -822,7 +954,7 @@ export function VerifyPage({
                 t,
                 draft.backendPreference,
                 capabilities,
-                recipe?.metric?.pNorm ?? 1,
+                scanMetric.pNorm,
                 undefined,
                 capabilities?.payload.features?.verify_engine_decode !== true,
                 capabilities?.payload.features?.verify_engine_decode === true,
@@ -833,7 +965,7 @@ export function VerifyPage({
                   t,
                   backend,
                   capabilities,
-                  recipe?.metric?.pNorm ?? 1,
+                  scanMetric.pNorm,
                   undefined,
                   capabilities?.payload.features?.verify_engine_decode !== true,
                   capabilities?.payload.features?.verify_engine_decode === true,
@@ -860,8 +992,46 @@ export function VerifyPage({
                   max: String(concurrencyMax),
                 })}
               </small>
+            ) : resolvedVerifyBackend !== "cpu" ? (
+              <small className="help-copy">
+                {t("verify.concurrencyGpuCap", { max: String(concurrencyMax) })}
+              </small>
             ) : null}
           </label>
+
+          <MetricSpecSection
+            t={t}
+            open={metricSpecOpen}
+            onOpenChange={setMetricSpecOpen}
+            summary={metricSpecSummary(scanMetric)}
+          >
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={inheritMetric}
+                onChange={(event) => setInheritMetric(event.target.checked)}
+              />
+              <span>{t("analyze.k.inheritMetric")}</span>
+            </label>
+            {inheritMetric ? (
+              <p className="help-copy">{t("verify.inheritMetricNote")}</p>
+            ) : (
+              <>
+                <p className="help-copy warning-copy">{t("verify.metricDiverged")}</p>
+                <MetricEditor
+                  t={t}
+                  metric={scanMetric}
+                  pNormMaximum={pNormMaximum}
+                  onChange={(metric) => patch({ metric })}
+                />
+              </>
+            )}
+            {!pNormSupported ? (
+              <p className="help-copy warning-copy">
+                {t("analyze.pNormUnsupported", { backend: resolvedVerifyBackend })}
+              </p>
+            ) : null}
+          </MetricSpecSection>
 
           <RunLaunchButton
             t={t}

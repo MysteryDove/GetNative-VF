@@ -197,6 +197,67 @@ describe("startVerifyRunGroup", () => {
     expect((run?.inputSnapshot as { concurrency?: number }).concurrency).toBe(8);
   });
 
+  it("sends the planned MetricSpec even when the Recipe still has a different crop", async () => {
+    const draft = {
+      ...defaultVerifyDraft(),
+      sourceIds: ["src_1"],
+      metric: {
+        cropLeft: 5,
+        cropRight: 5,
+        cropTop: 5,
+        cropBottom: 5,
+        pixelExclusionThreshold: 0.015,
+        pNorm: 1,
+      },
+    };
+    const planned = planVerifyRunGroup({
+      draft,
+      recipe: {
+        ...recipe,
+        metric: {
+          cropLeft: 5,
+          cropRight: 1200,
+          cropTop: 5,
+          cropBottom: 300,
+          pixelExclusionThreshold: 0.015,
+          pNorm: 1,
+        },
+      },
+      sourcesById: { src_1: video },
+      nowMs: 1,
+      requestIdPrefix: "t",
+    });
+    expect(planned.ok).toBe(true);
+    if (!planned.ok) return;
+
+    const { worker, mediaParams } = makeFakeWorker([0.1]);
+    let state: ProjectState = emptyProjectState({ id: "p1" });
+    state.sourcesById.src_1 = video;
+    await startVerifyRunGroup({
+      plan: planned.plan,
+      recipe: {
+        ...recipe,
+        metric: {
+          cropLeft: 5,
+          cropRight: 1200,
+          cropTop: 5,
+          cropBottom: 300,
+          pixelExclusionThreshold: 0.015,
+          pNorm: 1,
+        },
+      },
+      state,
+      onProjectChange: (updater) => {
+        state = updater(state);
+      },
+      bridge: { queue: () => {}, cancel: () => {} },
+      deps: { worker, nowMs: () => 1000 },
+    });
+    expect(mediaParams).toMatchObject([
+      { metric: { cropLeft: 5, cropRight: 5, cropTop: 5, cropBottom: 5, threshold: 0.015, pNorm: 1 } },
+    ]);
+  });
+
   it("retains and sorts all 34,072 frame metrics for the terminal write", async () => {
     const draft = { ...defaultVerifyDraft(), sourceIds: ["src_1"], scopeKind: "full" as const };
     const planned = planVerifyRunGroup({

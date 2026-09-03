@@ -5,6 +5,8 @@ import {
   planVerifyRunGroup,
   reconcileReadyVideoSourceIds,
   resolveScanScope,
+  validVerifyConcurrency,
+  verifyConcurrencyMaximum,
 } from "./verifyPlan";
 import type { Recipe, Source } from "../project/types";
 
@@ -144,6 +146,37 @@ describe("planVerifyRunGroup", () => {
     expect(member?.request.scanScope.selection).toBe("all");
     expect(member?.request.concurrency).toBe(8);
     expect(result.plan.intentSnapshot.concurrency).toBe(8);
+    expect(member?.request.metric.cropRight).toBe(10);
+  });
+
+  it("uses a draft MetricSpec override instead of the Recipe metric", () => {
+    const result = planVerifyRunGroup({
+      draft: {
+        ...defaultVerifyDraft(),
+        sourceIds: ["src_1"],
+        metric: {
+          cropLeft: 5,
+          cropRight: 1200,
+          cropTop: 5,
+          cropBottom: 300,
+          pixelExclusionThreshold: 0.015,
+          pNorm: 1,
+        },
+      },
+      recipe: completeRecipe,
+      sourcesById: { src_1: video },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.plan.members[0]?.request.metric).toEqual({
+      cropLeft: 5,
+      cropRight: 1200,
+      cropTop: 5,
+      cropBottom: 300,
+      pixelExclusionThreshold: 0.015,
+      pNorm: 1,
+    });
+    expect(completeRecipe.metric?.cropRight).toBe(10);
   });
 
   it("resolves geometry independently for differently sized sources", () => {
@@ -172,6 +205,17 @@ describe("planVerifyRunGroup", () => {
     expect(result.plan.members[1]?.request.geometry.srcWidth).toBe(1152);
     expect(result.plan.members[0]?.request.geometry.sourceWidth).toBe(1920);
     expect(result.plan.members[1]?.request.geometry.sourceWidth).toBe(1280);
+  });
+
+  it("caps GPU Check concurrency at eight", () => {
+    expect(verifyConcurrencyMaximum("cpu")).toBe(16);
+    expect(verifyConcurrencyMaximum("cuda")).toBe(8);
+    expect(verifyConcurrencyMaximum("vulkan")).toBe(8);
+    expect(verifyConcurrencyMaximum("metal")).toBe(8);
+    expect(verifyConcurrencyMaximum("auto")).toBe(8);
+    expect(validVerifyConcurrency(16)).toBe(true);
+    expect(validVerifyConcurrency(16, 8)).toBe(false);
+    expect(validVerifyConcurrency(8, 8)).toBe(true);
   });
 
   it("accepts only integer concurrency values from one through sixteen", () => {

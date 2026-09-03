@@ -260,6 +260,7 @@ struct VerifyJobSpec {
     MetricSpec metric{};
     std::size_t worker_count = 0;
     std::size_t concurrency = kMediaVerifyDefaultConcurrency;
+    std::size_t requested_concurrency = kMediaVerifyDefaultConcurrency;
     std::int64_t expected_frames = -1;
     BackendChoice requested_backend = BackendChoice::cpu;
     BackendChoice backend = BackendChoice::cpu;
@@ -889,6 +890,7 @@ VerifyJobSpec parse_verify_begin(const JsonValue &command, std::string job_id,
                 "bad_request", "concurrency must be an integer within 1..16");
         }
         spec.concurrency = static_cast<std::size_t>(concurrency);
+        spec.requested_concurrency = spec.concurrency;
     }
     if (command.find("expected_frames")) {
         spec.expected_frames = require_int64(command, "expected_frames");
@@ -947,6 +949,17 @@ VerifyJobSpec parse_verify_begin(const JsonValue &command, std::string job_id,
     (void)media_mode;
 #endif
     return spec;
+}
+
+void cap_media_verify_concurrency(VerifyJobSpec &spec) {
+    if (spec.requested_concurrency == 0U) {
+        spec.requested_concurrency = spec.concurrency;
+    }
+    const bool gpu = spec.backend == BackendChoice::cuda
+        || spec.backend == BackendChoice::vulkan
+        || spec.backend == BackendChoice::metal;
+    if (!gpu || spec.concurrency <= kAnalysisEngineExecutionSlots) return;
+    spec.concurrency = kAnalysisEngineExecutionSlots;
 }
 
 std::size_t effective_verify_workers(const VerifyJobSpec &spec) {
@@ -1628,7 +1641,7 @@ public:
             {"type", JsonValue::string("hello_ok")},
             {"request_id", JsonValue::string(request_id)},
             {"timestamp_ms", JsonValue::integer(timestamp_ms())},
-            {"engine_version", JsonValue::string("0.2.2")},
+            {"engine_version", JsonValue::string("0.2.3")},
             {"commands", JsonValue::object({
                 {"analyze", JsonValue::boolean(true)},
                 {"cancel", JsonValue::boolean(true)},
@@ -1654,6 +1667,7 @@ public:
                 {"min", JsonValue::integer(kMediaVerifyMinimumConcurrency)},
                 {"max", JsonValue::integer(kMediaVerifyMaximumConcurrency)},
                 {"default", JsonValue::integer(kMediaVerifyDefaultConcurrency)},
+                {"gpu_max", JsonValue::integer(kAnalysisEngineExecutionSlots)},
             })},
         }));
     }
@@ -2038,6 +2052,7 @@ public:
         const std::string job_id = "job-" + std::to_string(next_job_++);
         VerifyJobSpec spec = parse_verify_begin(command, job_id, true);
         select_media_verify_backend(spec);
+        cap_media_verify_concurrency(spec);
         auto job = std::make_shared<Job>(std::move(spec));
         std::vector<std::pair<std::string, JsonValue>> accepted = {
             {"protocol_version", JsonValue::integer(kProtocolVersion)},
@@ -4325,6 +4340,19 @@ private:
         for (const auto &fallback : spec.fallback_chain) {
             emit_verify_fallback(spec, fallback);
         }
+        if (spec.requested_concurrency > spec.concurrency) {
+            emit(JsonValue::object({
+                {"protocol_version", JsonValue::integer(kProtocolVersion)},
+                {"type", JsonValue::string("warning")},
+                {"request_id", JsonValue::string(spec.request_id)},
+                {"job_id", JsonValue::string(spec.job_id)},
+                {"timestamp_ms", JsonValue::integer(timestamp_ms())},
+                {"code", JsonValue::string("concurrency_clamped")},
+                {"message", JsonValue::string(
+                    "GPU analysis slots cap media verification concurrency at "
+                    + std::to_string(spec.concurrency))},
+            }));
+        }
         check_cancelled(job);
 
 
@@ -4347,12 +4375,6 @@ private:
 #endif
 #if defined(GETNATIVE_HAS_CUDA)
         if (spec.backend == BackendChoice::cuda
-            && resident_cuda_engine().options().execution_slots < spec.concurrency) {
-            throw WorkerError(
-                "media_concurrency_unavailable",
-                "CUDA cannot reserve the requested media verification concurrency");
-        }
-        if (spec.backend == BackendChoice::cuda
             && media::backend_runtime_available(
                 media::DecoderOptions::Backend::cuda)) {
             const bool already_fell_back = std::any_of(
@@ -4369,12 +4391,6 @@ private:
         }
 #endif
 #if defined(GETNATIVE_HAS_VULKAN)
-        if (spec.backend == BackendChoice::vulkan
-            && resident_vulkan_engine().options().execution_slots < spec.concurrency) {
-            throw WorkerError(
-                "media_concurrency_unavailable",
-                "Vulkan cannot reserve the requested media verification concurrency");
-        }
         if (spec.backend == BackendChoice::vulkan
             && media::backend_runtime_available(
                 media::DecoderOptions::Backend::vulkan_video)) {
@@ -5244,7 +5260,7 @@ private:
                                 - device_convert_ms))},
                     {"readback_ms", JsonValue::number(readback_ms)},
                     {"requested_concurrency", JsonValue::integer(
-                        static_cast<std::int64_t>(spec.concurrency))},
+                        static_cast<std::int64_t>(spec.requested_concurrency))},
                     {"effective_concurrency", JsonValue::integer(
                         static_cast<std::int64_t>(spec.concurrency))},
                     {"max_inflight", JsonValue::integer(

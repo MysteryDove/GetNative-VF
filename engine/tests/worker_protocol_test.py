@@ -1067,7 +1067,7 @@ def main():
                       json.dumps(hello))
                 check("verify-media-concurrency-advertised",
                       hello.get("media_verify_concurrency")
-                      == {"min": 1, "max": 16, "default": 8},
+                      == {"min": 1, "max": 16, "default": 8, "gpu_max": 8},
                       json.dumps(hello))
 
                 for index, invalid in enumerate((0, 17, -1, 1.5, "two")):

@@ -7,7 +7,7 @@ import type {
   MetricSpec,
 } from "./protocol";
 import { buildCandidateGrid } from "./candidateGrid";
-import { kernelSignature } from "./heightDraft";
+import { invalidKernelBlur, kernelSignature } from "./heightDraft";
 
 /**
  * Kernel Analysis (算法测试) draft: one fixed geometry per Sample source shape,
@@ -45,6 +45,8 @@ export type KernelDraft = {
   cStart: string;
   cStop: string;
   cStep: string;
+  /** Add-form kernel blur; baked into each added candidate when valid and ≠ 1. */
+  addBlur: string;
   /** Target native height used to resolve the fixed geometry per source shape. */
   baseHeight: string;
   baseWidth: string;
@@ -82,6 +84,7 @@ export function defaultKernelDraft(
     cStart: "0",
     cStop: "1",
     cStep: "0.2",
+    addBlur: "1",
     baseHeight: base?.baseHeight ?? "720",
     baseWidth: base?.baseWidth ?? "",
     metric: { ...metric },
@@ -96,6 +99,30 @@ function parseNonNegativeDecimal(value: string): number | null {
   if (!/^\d+(\.\d+)?$/.test(trimmed)) return null;
   const n = Number(trimmed);
   return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/**
+ * Add-form blur contribution. Default 1 is omitted so chips and signatures
+ * stay identical to kernels that never set blur. Invalid values refuse add.
+ */
+export function addBlurParameters(
+  draft: Pick<KernelDraft, "addBlur">,
+): { ok: true; parameters: { blur?: number } } | { ok: false } {
+  const raw = draft.addBlur ?? "1";
+  if (invalidKernelBlur({ blur: raw })) return { ok: false };
+  const blur = Number(raw);
+  return { ok: true, parameters: blur === 1 ? {} : { blur } };
+}
+
+/** Attach add-form blur onto a kernel ref; null when the blur field is invalid. */
+export function withAddBlurParams(
+  draft: Pick<KernelDraft, "addBlur">,
+  kernel: KernelRef,
+): KernelRef | null {
+  const blur = addBlurParameters(draft);
+  if (!blur.ok) return null;
+  if (blur.parameters.blur === undefined) return kernel;
+  return { id: kernel.id, parameters: { ...kernel.parameters, blur: blur.parameters.blur } };
 }
 
 /**
@@ -183,12 +210,18 @@ export function addBicubicGridToScanList(
   });
   if (!cGrid.ok) return cGrid;
 
+  const blur = addBlurParameters(draft);
+  if (!blur.ok) return { ok: false, reason: "invalid_blur" };
+
   let current = draft;
   let added = 0;
   let skipped = 0;
   for (const b of bGrid.grid.candidates) {
     for (const c of cGrid.grid.candidates) {
-      const result = addKernelToScanList(current, { id: "bicubic", parameters: { b, c } });
+      const result = addKernelToScanList(current, {
+        id: "bicubic",
+        parameters: { b, c, ...blur.parameters },
+      });
       current = result.draft;
       if (result.added) added += 1;
       else skipped += 1;

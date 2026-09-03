@@ -7,6 +7,17 @@ export function metricSpecSummary(metric: MetricSpec): string {
   return `${metric.cropLeft}/${metric.cropRight}/${metric.cropTop}/${metric.cropBottom} · ${metric.pixelExclusionThreshold} · p=${metric.pNorm}`;
 }
 
+export function metricsEqual(left: MetricSpec, right: MetricSpec): boolean {
+  return (
+    left.cropLeft === right.cropLeft
+    && left.cropRight === right.cropRight
+    && left.cropTop === right.cropTop
+    && left.cropBottom === right.cropBottom
+    && left.pixelExclusionThreshold === right.pixelExclusionThreshold
+    && left.pNorm === right.pNorm
+  );
+}
+
 export function MetricSpecSection({
   t,
   open,

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   addBicubicGridToScanList,
+  addBlurParameters,
   addKernelToScanList,
   bicubicRefFromDraft,
   clearScanList,
@@ -10,6 +11,7 @@ import {
   normalizeKernelRef,
   removeKernelFromScanList,
   resolveKernelCandidates,
+  withAddBlurParams,
 } from "./kernelDraft";
 import type { EngineEnvelope } from "./types";
 import type { MetricSpec } from "./protocol";
@@ -40,6 +42,7 @@ describe("kernel scan list", () => {
     ]);
     expect(seeded.baseHeight).toBe("720");
     expect(seeded.baseWidth).toBe("");
+    expect(seeded.addBlur).toBe("1");
 
     const carried = defaultKernelDraft(metric, "muf-d278cd3", "raw", "auto", {
       baseHeight: "810",
@@ -161,6 +164,59 @@ describe("kernel scan list", () => {
     });
     expect(bicubicRefFromDraft({ ...draft(), bicubicB: "-1" })).toBeNull();
     expect(bicubicRefFromDraft({ ...draft(), bicubicC: "" })).toBeNull();
+  });
+
+  it("omits default blur and bakes non-default blur into added kernels", () => {
+    expect(addBlurParameters(draft())).toEqual({ ok: true, parameters: {} });
+    expect(addBlurParameters({ ...draft(), addBlur: "1.25" })).toEqual({
+      ok: true,
+      parameters: { blur: 1.25 },
+    });
+    expect(addBlurParameters({ ...draft(), addBlur: "0" }).ok).toBe(false);
+    expect(addBlurParameters({ ...draft(), addBlur: "" }).ok).toBe(false);
+
+    const plain = withAddBlurParams(draft(), { id: "bilinear", parameters: {} });
+    expect(plain).toEqual({ id: "bilinear", parameters: {} });
+    const widened = withAddBlurParams(
+      { ...draft(), addBlur: "1.25" },
+      { id: "bilinear", parameters: {} },
+    );
+    expect(widened).toEqual({ id: "bilinear", parameters: { blur: 1.25 } });
+    expect(withAddBlurParams({ ...draft(), addBlur: "0" }, { id: "spline36", parameters: {} })).toBeNull();
+
+    const start = clearScanList(draft());
+    const first = addKernelToScanList(
+      start,
+      withAddBlurParams({ ...start, addBlur: "1.25" }, { id: "bilinear", parameters: {} })!,
+    );
+    expect(first.added).toBe(true);
+    expect(first.draft.scanList[0]).toEqual({ id: "bilinear", parameters: { blur: 1.25 } });
+    const sameBlur = addKernelToScanList(first.draft, {
+      id: "bilinear",
+      parameters: { blur: 1.25 },
+    });
+    expect(sameBlur.added).toBe(false);
+    const differentBlur = addKernelToScanList(first.draft, { id: "bilinear", parameters: {} });
+    expect(differentBlur.added).toBe(true);
+  });
+
+  it("applies add-form blur to the bicubic grid", () => {
+    const base = clearScanList({
+      ...draft(),
+      addBlur: "1.5",
+      bStop: "0",
+      bStep: "0.2",
+      cStop: "0",
+      cStep: "0.5",
+    });
+    const result = addBicubicGridToScanList(base);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.added).toBe(1);
+    expect(result.draft.scanList[0]?.parameters).toEqual({ b: 0, c: 0, blur: 1.5 });
+
+    const invalid = addBicubicGridToScanList({ ...base, addBlur: "0" });
+    expect(invalid.ok).toBe(false);
   });
 
   it("filters the scan list to engine-reported kernels at resolve time", () => {

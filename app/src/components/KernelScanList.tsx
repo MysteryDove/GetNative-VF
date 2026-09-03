@@ -11,10 +11,11 @@ import {
   lanczosRefsFromDraft,
   lanczosTapsRange,
   removeKernelFromScanList,
+  withAddBlurParams,
   KERNEL_FAMILY_ORDER,
   type KernelDraft,
 } from "../engine/kernelDraft";
-import { kernelSignature } from "../engine/heightDraft";
+import { invalidKernelBlur, kernelSignature } from "../engine/heightDraft";
 
 function AddKernelsButton({ t, onClick }: { t: Translator; onClick: () => void }) {
   return (
@@ -128,15 +129,31 @@ export function KernelScanListBuilder({
     onDraftChange((current) => ({ ...current, ...partial }));
   }
 
+  const addBlurValue = draft.addBlur ?? "1";
+  const addBlurInvalid = invalidKernelBlur({ blur: addBlurValue });
+
   function handleAddKernels(refs: KernelRef[]) {
-    if (!refs.length) {
+    if (addBlurInvalid) {
+      setAddNotice(t("analyze.blurInvalid"));
+      return;
+    }
+    const attached: KernelRef[] = [];
+    for (const ref of refs) {
+      const withBlur = withAddBlurParams(draft, ref);
+      if (!withBlur) {
+        setAddNotice(t("analyze.blurInvalid"));
+        return;
+      }
+      attached.push(withBlur);
+    }
+    if (!attached.length) {
       setAddNotice(t("analyze.k.scanList.invalidParams"));
       return;
     }
     let addedAny = false;
     onDraftChange((current) => {
       let next = current;
-      for (const ref of refs) {
+      for (const ref of attached) {
         const result = addKernelToScanList(next, ref);
         next = result.draft;
         addedAny = addedAny || result.added;
@@ -171,7 +188,11 @@ export function KernelScanListBuilder({
   function handleAddBicubicGrid() {
     const result = addBicubicGridToScanList(draft);
     if (!result.ok) {
-      setAddNotice(t("analyze.k.scanList.invalidParams"));
+      setAddNotice(
+        result.reason === "invalid_blur"
+          ? t("analyze.blurInvalid")
+          : t("analyze.k.scanList.invalidParams"),
+      );
       return;
     }
     onDraftChange(() => result.draft);
@@ -201,6 +222,24 @@ export function KernelScanListBuilder({
         ))}
         {!parameterized ? <AddKernelsButton t={t} onClick={handleAddFamily} /> : null}
       </div>
+
+      <div className="metric-grid">
+        <label className="block">
+          <span>{t("analyze.blur")}</span>
+          <input
+            inputMode="decimal"
+            title={t("analyze.blurHint")}
+            aria-invalid={addBlurInvalid || undefined}
+            value={addBlurValue}
+            onChange={(event) => patch({ addBlur: event.target.value })}
+          />
+        </label>
+      </div>
+      {addBlurInvalid ? (
+        <p className="help-copy warning-copy" role="alert">
+          {t("analyze.blurInvalid")}
+        </p>
+      ) : null}
 
       {draft.addFamily === "bicubic" ? (
         <>

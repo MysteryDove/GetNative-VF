@@ -106,6 +106,19 @@ export const MAX_MARKERS = 300;
  * marker budget both operate on this slice, which is what keeps zoomed views
  * at full resolution: unzoomed, the slice is the whole series.
  */
+/** Loop min/max — `Math.min(...n)` throws RangeError once n exceeds the apply limit. */
+export function extent(values: ArrayLike<number>): { min: number; max: number } | null {
+  if (values.length === 0) return null;
+  let min = values[0];
+  let max = values[0];
+  for (let i = 1; i < values.length; i += 1) {
+    const value = values[i];
+    if (value < min) min = value;
+    if (value > max) max = value;
+  }
+  return { min, max };
+}
+
 export function windowSlice<T>(points: T[], x: (point: T) => number, xMin: number, xMax: number): T[] {
   let lo = 0;
   while (lo < points.length && x(points[lo]) < xMin) lo += 1;
@@ -188,9 +201,13 @@ export function ErrorLinePlot({
 
   const domain = useMemo(() => {
     if (!flat.length) return null;
-    const xs = flat.map((point) => Number(point.x));
-    let xMin = Math.min(...xs);
-    let xMax = Math.max(...xs);
+    let xMin = Infinity;
+    let xMax = -Infinity;
+    for (const point of flat) {
+      const x = Number(point.x);
+      if (x < xMin) xMin = x;
+      if (x > xMax) xMax = x;
+    }
     if (xMax - xMin < 1e-9) {
       xMin -= 0.5;
       xMax += 0.5;
@@ -210,13 +227,22 @@ export function ErrorLinePlot({
       xMax = zoomDomain.xMax > zoomDomain.xMin ? zoomDomain.xMax : zoomDomain.xMin + 1e-9;
     }
     if (logScale) {
-      const logs = yPoints.map((point) => Math.log10(point.metric + 1e-9));
-      const yMin = Math.floor(Math.min(...logs, Math.log10(threshold)));
-      const yMax = Math.ceil(Math.max(...logs));
+      let logMin = Math.log10(threshold);
+      let logMax = logMin;
+      for (const point of yPoints) {
+        const log = Math.log10(point.metric + 1e-9);
+        if (log < logMin) logMin = log;
+        if (log > logMax) logMax = log;
+      }
+      const yMin = Math.floor(logMin);
+      const yMax = Math.ceil(logMax);
       return { xMin, xMax, yMin, yMax: yMax <= yMin ? yMin + 1 : yMax };
     }
-    const yMax = Math.max(...yPoints.map((point) => point.metric), threshold) * 1.05;
-    return { xMin, xMax, yMin: 0, yMax };
+    let metricMax = threshold;
+    for (const point of yPoints) {
+      if (point.metric > metricMax) metricMax = point.metric;
+    }
+    return { xMin, xMax, yMin: 0, yMax: metricMax * 1.05 };
   }, [flat, logScale, threshold, zoomDomain]);
 
   function resetZoom() {

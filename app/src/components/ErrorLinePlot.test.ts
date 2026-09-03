@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decimateMinMax, MAX_MARKERS, windowSlice } from "./ErrorLinePlot";
+import { decimateMinMax, extent, MAX_MARKERS, windowSlice } from "./ErrorLinePlot";
 
 type Pt = { x: number; y: number };
 
@@ -9,6 +9,18 @@ function series(n: number, x0 = 500, step = 1, y: (x: number) => number = (x) =>
     return { x, y: y(x) };
   });
 }
+
+describe("extent", () => {
+  it("returns null for an empty list", () => {
+    expect(extent([])).toBeNull();
+  });
+
+  it("does not throw on arrays larger than Math.min apply limits", () => {
+    const values = Float64Array.from({ length: 80_000 }, (_, i) => i - 40_000);
+    const result = extent(values);
+    expect(result).toEqual({ min: -40000, max: 39999 });
+  });
+});
 
 describe("windowSlice", () => {
   const points = series(11, 0, 1); // x = 0..10

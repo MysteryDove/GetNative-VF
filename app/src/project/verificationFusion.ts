@@ -151,13 +151,18 @@ function runMetadata(run: Run, state: ProjectState): {
 
 export type FusionBuildResult = { ok: true; fusion: VerificationFusion } | { ok: false; reason: string };
 
-export function buildVerificationFusion(input: {
+type PreparedFusion = {
+  source: Source;
+  orderedRuns: Run[];
+  orderedMetas: Array<NonNullable<ReturnType<typeof runMetadata>>>;
+};
+
+/** Compatibility + ordering only. Does not allocate the per-frame union. */
+export function prepareFusionRuns(input: {
   state: ProjectState;
   runIds: string[];
   sourceId: string;
-  id?: string;
-  createdAt?: string;
-}): FusionBuildResult {
+}): { ok: true; prepared: PreparedFusion } | { ok: false; reason: string } {
   const source = input.state.sourcesById[input.sourceId];
   if (!source) return { ok: false, reason: "source_missing" };
   if (input.runIds.length < 2) return { ok: false, reason: "need_two_runs" };
@@ -186,6 +191,20 @@ export function buildVerificationFusion(input: {
   if (orderedMetas.some((meta) => meta.axisMode !== first.axisMode)) return { ok: false, reason: "axis_mode_mismatch" };
   if (orderedMetas.some((meta) => meta.profileId !== first.profileId)) return { ok: false, reason: "profile_mismatch" };
   if (orderedMetas.some((meta) => meta.mathMode !== first.mathMode)) return { ok: false, reason: "math_mode_mismatch" };
+  return { ok: true, prepared: { source, orderedRuns, orderedMetas } };
+}
+
+export function buildVerificationFusion(input: {
+  state: ProjectState;
+  runIds: string[];
+  sourceId: string;
+  id?: string;
+  createdAt?: string;
+}): FusionBuildResult {
+  const prepared = prepareFusionRuns(input);
+  if (!prepared.ok) return prepared;
+  const { source, orderedRuns, orderedMetas } = prepared.prepared;
+  const first = orderedMetas[0];
 
   const byFrame = new Map<number, VerificationFusionCandidate[]>();
   orderedRuns.forEach((run, index) => {

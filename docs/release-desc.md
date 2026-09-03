@@ -1,4 +1,4 @@
-macOS is now a first-class release: Metal analysis, VideoToolbox decode, and an Apple Silicon app bundle. Windows and Linux packages also pick up a Vulkan compute backend.
+macOS is now a first-class release: Metal analysis, VideoToolbox decode, and an Apple Silicon app bundle. Windows and Linux packages also pick up a Vulkan compute backend. The desktop app folds sample picking into Media, keeps project pages alive across navigation, and lets Check run more frames in flight.
 
 ## New Features
 - macOS Metal analysis — the engine can run scans and verification on Apple Silicon GPUs, with blur-aware planning on that path.
@@ -7,7 +7,15 @@ macOS is now a first-class release: Metal analysis, VideoToolbox decode, and an 
 - macOS arm64 app — GitHub Releases now include an unsigned `GetNative VF_<version>_arm64.app.zip`.
 - Vulkan compute backend — Windows and Linux packages can analyze on Vulkan when a device is available, alongside CUDA and CPU.
 - Blur-aware planning — blur is part of the plan key and fixtures, so blurred recipes reproduce instead of silently mismatching.
-- Analysis UI — tighter analysis controls, result history, and more consistent parameter block / label typography.
+- Media owns samples — the separate Samples page is gone. Add stills and video frames, include/exclude, and remove sources (with their frames) on Media.
+- Keep-alive project shell — Overview, Media, Resolution Test, Algorithm Test, Check, Results, and Settings stay mounted. Switching pages is a short fade; plot zoom, recipe drafts, and the last media preview survive the round trip.
+- Collapsible navigation — the sidebar collapses to icons and the page content resizes with it (180ms). Labels fade with the column instead of popping off.
+- Resolution Test results — the table defaults to sort by error, keeps the top 20, and scrolls in place next to the plot.
+- Algorithm Test kernel picker — kernels add as a family grid of chips, with Blur on the add form; a scan result can be set as the recipe kernel without a separate apply-from-list step.
+- Check MetricSpec — inherits Resolution Test by default and can be unlinked for the scan without rewriting the Recipe.
+- Check frame concurrency — default 8; CPU maximum 16, GPU (CUDA/Vulkan/Metal/auto-GPU) maximum 8.
+- Custom menus and motion — native `<select>` / spinner widgets are replaced with in-app menus and the same short motion on buttons, dropdowns, and the nav collapse (avoids the Linux WebKit pointer-grab issue on more controls).
+- Analysis chrome — tighter parameter blocks, recipe picker / apply-to-current-recipe dialog, result history, and a brand mark on the project chrome.
 
 ## Bug Fixes
 - Rank a perfect single-point descale (error 0) over a nearby shallower multi-kernel valley.
@@ -21,11 +29,19 @@ macOS is now a first-class release: Metal analysis, VideoToolbox decode, and an 
 - Link CoreFoundation for native VideoToolbox decode.
 - Replace WebKitGTK native number spinners and range sliders so Linux text fields do not grab the pointer.
 - Let Quick Analysis replace the untitled recovery slot instead of failing with a project-mismatch error.
+- Clamp GPU Check concurrency to 8 (analysis slot limit) instead of erroring when the UI asked for more.
+- Color Check fusion curves from the plot palette, with a legend checkbox, and avoid crashing full-video fusion plots (extent loops + numeric frame picker).
+- Keep media preview frames when leaving the Media page; returning no longer re-decodes from scratch.
+- Swallow a Tauri file-drop unlisten rejection when leaving Media (harmless console `listeners[eventId].handlerId` error).
+- Stop the result-table scrollbar from hitching against scroll anchoring while virtualizing.
+- Show the duplicate-sample notice only after Add, and clear it when the kernel family or parameters change.
+- Drop the extra divider on the Apply to Current Recipe dialog.
 
 ## Performance
 - Batch inverse rows through NEON on AArch64.
 - Port Metal register lag windows and a packed plan arena from the DSMVC work.
 - Gate GPU stage timers behind `GETNATIVE_GPU_STAGE_PROFILE` (off by default) and bind the CUDA analysis context once per thread.
+- Pages you have already opened keep their plot layers; collapsing the nav does not relayout hidden Check/Analyze curves, and plot canvases wait until the width tween settles before reallocating.
 
 ## Packaging
 - Pin the macOS FFmpeg SDK flow (VideoToolbox-enabled, self-contained dylibs).
@@ -37,7 +53,9 @@ macOS is now a first-class release: Metal analysis, VideoToolbox decode, and an 
 ## Notes
 - The macOS build is not notarized. Gatekeeper may require a right-click → Open the first time, or clear quarantine with `xattr` (see below).
 - Linux AppImage needs host WebKitGTK 4.1. Prefer the `.deb` on Ubuntu (apt installs WebKitGTK for you).
-- No breaking changes to project files or the worker protocol for existing 0.2.1 recipes.
+- The interface language is English for this release (the language control is kept, disabled, for compatibility).
+- Compatibility profile is muvsfunc getnative (`muf-d278cd3`) only. Other profile ids in older manifests are coerced to that contract.
+- Existing 0.2.1 project files still open. Sample lists now live on Media; Check concurrency in new runs is 1–16 on CPU and 1–8 on GPU.
 
 ## macOS: unsigned app (Gatekeeper / xattr)
 

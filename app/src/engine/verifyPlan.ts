@@ -1,13 +1,15 @@
-import type { BackendPreference, ScanScope, VerifyRequest } from "./protocol";
+import type { BackendPreference, MetricSpec, ScanScope, VerifyRequest } from "./protocol";
 import { validateVerifyShape } from "./shapeGuards";
 import { recipeReadiness } from "../project/recipe";
 import type { ProjectState, Recipe, Run, RunGroup, Source } from "../project/types";
 import { geometryForSource } from "./geometry";
+import { metricCompatibilityKey } from "./runGroupPlan";
 
 /**
  * Whole-video Verification (全视频检查) setup. One member VerificationRun per
- * selected Source; every Run snapshots the current Recipe. Recipe
- * semantics are never edited here.
+ * selected Source; every Run snapshots the current Recipe geometry/kernel.
+ * MetricSpec may be overridden on the draft (inherit from Resolution Test or
+ * edited locally) without rewriting the Recipe.
  */
 
 export type VerifyScopeKind = "full" | "preview";
@@ -24,6 +26,8 @@ export type VerifyDraft = {
   endFrame: string;
   backendPreference: BackendPreference;
   concurrency: number;
+  /** When set, the scan uses this MetricSpec instead of `recipe.metric`. */
+  metric?: MetricSpec;
 };
 
 export function defaultVerifyDraft(backendPreference: BackendPreference = "auto"): VerifyDraft {
@@ -120,8 +124,19 @@ export function resolveScanScope(
   };
 }
 
-export function validVerifyConcurrency(value: number): boolean {
-  return Number.isInteger(value) && value >= 1 && value <= 16;
+export const GPU_VERIFY_CONCURRENCY_MAX = 8;
+
+export function verifyConcurrencyMaximum(
+  resolvedBackend: string,
+  capabilityMax = 16,
+  gpuMax = GPU_VERIFY_CONCURRENCY_MAX,
+): number {
+  if (resolvedBackend === "cpu") return capabilityMax;
+  return Math.min(capabilityMax, gpuMax);
+}
+
+export function validVerifyConcurrency(value: number, maximum = 16): boolean {
+  return Number.isInteger(value) && value >= 1 && value <= maximum;
 }
 
 export function planVerifyRunGroup(input: {
@@ -136,7 +151,7 @@ export function planVerifyRunGroup(input: {
   // recipeReadiness guarantees geometry/kernel/metric are present.
   const recipeGeometry = input.recipe.geometry!;
   const recipeKernel = input.recipe.kernel!;
-  const recipeMetric = input.recipe.metric!;
+  const recipeMetric = input.draft.metric ?? input.recipe.metric!;
   const selected = input.draft.sourceIds
     .map((id) => input.sourcesById[id])
     .filter((source): source is Source => Boolean(source));
@@ -183,7 +198,7 @@ export function planVerifyRunGroup(input: {
     const shape = validateVerifyShape(request);
     if (!shape.ok) return { ok: false, reason: shape.code };
     members.push({
-      planKey: `${source.id}::${input.recipe.id}@${input.recipe.revision}`,
+      planKey: `${source.id}::${input.recipe.id}@${input.recipe.revision}::${metricCompatibilityKey(recipeMetric)}`,
       sourceId: source.id,
       sourceLabel: source.label || source.path,
       scanScope: scope.scope,

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(getnative_engine VERSION 0.2.2 LANGUAGES C CXX)
+project(getnative_engine VERSION 0.2.3 LANGUAGES C CXX)
 
 include(CTest)
 find_package(Threads REQUIRED)

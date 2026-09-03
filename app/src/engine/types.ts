@@ -101,6 +101,7 @@ export type EngineEnvelope = {
         min: number;
         max: number;
         default: number;
+        gpu_max?: number;
       };
     };
     decode_backends?: DecodeBackendCapability[];
