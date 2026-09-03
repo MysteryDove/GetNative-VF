@@ -220,10 +220,76 @@ void import_index_entries(AVStream &stream, const MediaIndex *index);
 }
 
 void configure_cuda_decoder(AVCodecContext &codec, const AVCodec &decoder,
+                            const DecoderOptions &options);
+#endif
+
+[[nodiscard]] bool decoder_supports_hwdevice(
+    const AVCodec &decoder, AVHWDeviceType type, AVPixelFormat pix_fmt) {
+    for (int index = 0;; ++index) {
+        const AVCodecHWConfig *config = avcodec_get_hw_config(&decoder, index);
+        if (config == nullptr) return false;
+        if (config->device_type == type && config->pix_fmt == pix_fmt
+            && (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0) {
+            return true;
+        }
+    }
+}
+
+[[nodiscard]] AVPixelFormat select_listed_format(
+    const AVPixelFormat *formats, AVPixelFormat wanted) {
+    for (const AVPixelFormat *format = formats;
+         *format != AV_PIX_FMT_NONE; ++format) {
+        if (*format == wanted) return *format;
+    }
+    return AV_PIX_FMT_NONE;
+}
+
+AVPixelFormat select_vaapi_format(AVCodecContext *, const AVPixelFormat *formats) {
+    return select_listed_format(formats, AV_PIX_FMT_VAAPI);
+}
+
+AVPixelFormat select_d3d11_format(AVCodecContext *, const AVPixelFormat *formats) {
+    return select_listed_format(formats, AV_PIX_FMT_D3D11);
+}
+
+#if !defined(GETNATIVE_HAS_CUDA)
+AVPixelFormat select_cuda_format(AVCodecContext *, const AVPixelFormat *formats) {
+    return select_listed_format(formats, AV_PIX_FMT_CUDA);
+}
+#endif
+
+void configure_standalone_hw_decoder(
+    AVCodecContext &codec, const AVCodec &decoder, AVHWDeviceType type,
+    AVPixelFormat pix_fmt,
+    AVPixelFormat (*get_format)(AVCodecContext *, const AVPixelFormat *),
+    std::size_t frame_concurrency, const char *label) {
+    if (!decoder_supports_hwdevice(decoder, type, pix_fmt)) {
+        throw std::runtime_error(
+            std::string{"FFmpeg decoder exposes no "} + label
+            + " hardware-device configuration");
+    }
+    AVBufferRef *device_ref = nullptr;
+    const int init_result =
+        av_hwdevice_ctx_create(&device_ref, type, nullptr, nullptr, 0);
+    if (init_result < 0) {
+        av_buffer_unref(&device_ref);
+        throw std::runtime_error(
+            std::string{"av_hwdevice_ctx_create("} + label + ") failed");
+    }
+    codec.hw_device_ctx = device_ref;
+    codec.get_format = get_format;
+    codec.extra_hw_frames = static_cast<int>(
+        std::max<std::size_t>(16U, 8U + frame_concurrency));
+}
+
+#if defined(GETNATIVE_HAS_CUDA)
+void configure_cuda_decoder(AVCodecContext &codec, const AVCodec &decoder,
                             const DecoderOptions &options) {
     if (options.native_context == 0U || options.native_queue == 0U) {
-        throw std::runtime_error(
-            "CUDA hardware decode requires a shared context and stream");
+        configure_standalone_hw_decoder(
+            codec, decoder, AV_HWDEVICE_TYPE_CUDA, AV_PIX_FMT_CUDA,
+            select_cuda_format, options.frame_concurrency, "CUDA");
+        return;
     }
     if (!decoder_supports_cuda(decoder)) {
         throw std::runtime_error(
@@ -245,6 +311,13 @@ void configure_cuda_decoder(AVCodecContext &codec, const AVCodec &decoder,
     codec.hw_device_ctx = device_ref;
     codec.get_format = select_cuda_format;
     codec.extra_hw_frames = static_cast<int>(8U + options.frame_concurrency);
+}
+#else
+void configure_cuda_decoder(AVCodecContext &codec, const AVCodec &decoder,
+                            const DecoderOptions &options) {
+    configure_standalone_hw_decoder(
+        codec, decoder, AV_HWDEVICE_TYPE_CUDA, AV_PIX_FMT_CUDA,
+        select_cuda_format, options.frame_concurrency, "CUDA");
 }
 #endif
 
@@ -624,18 +697,22 @@ struct BuiltDecoder {
         ? 0 : 1;
     if (options != nullptr && options->backend != DecoderOptions::Backend::software) {
         if (options->backend == DecoderOptions::Backend::cuda) {
-#if defined(GETNATIVE_HAS_CUDA)
             configure_cuda_decoder(*codec, *decoder, *options);
-#else
-            throw std::runtime_error("CUDA hardware decode was not compiled");
-#endif
+        } else if (options->backend == DecoderOptions::Backend::vaapi) {
+            configure_standalone_hw_decoder(
+                *codec, *decoder, AV_HWDEVICE_TYPE_VAAPI, AV_PIX_FMT_VAAPI,
+                select_vaapi_format, options->frame_concurrency, "VAAPI");
+        } else if (options->backend == DecoderOptions::Backend::d3d11va) {
+            configure_standalone_hw_decoder(
+                *codec, *decoder, AV_HWDEVICE_TYPE_D3D11VA, AV_PIX_FMT_D3D11,
+                select_d3d11_format, options->frame_concurrency, "D3D11VA");
         } else if (options->backend == DecoderOptions::Backend::vulkan_video) {
 #if defined(GETNATIVE_HAS_VULKAN)
             configure_vulkan_decoder(*codec, *decoder, *options);
 #else
             throw std::runtime_error("Vulkan Video decode was not compiled");
 #endif
-        } else {
+        } else if (options->backend == DecoderOptions::Backend::videotoolbox) {
 #if defined(__APPLE__)
             configure_videotoolbox_decoder(*codec, *decoder, options->frame_concurrency);
 #else
@@ -1283,24 +1360,33 @@ std::string runtime_version() {
         + std::to_string(major(swscale_version()));
 }
 
+[[nodiscard]] bool ffmpeg_has_hwdevice(AVHWDeviceType type) noexcept {
+    const char *name = av_hwdevice_get_type_name(type);
+    return name != nullptr && av_hwdevice_find_type_by_name(name) == type;
+}
+
+[[nodiscard]] bool probe_hwdevice(AVHWDeviceType type) noexcept {
+    if (!ffmpeg_has_hwdevice(type)) return false;
+    AVBufferRef *ref = nullptr;
+    const int err = av_hwdevice_ctx_create(&ref, type, nullptr, nullptr, 0);
+    av_buffer_unref(&ref);
+    return err >= 0;
+}
+
 bool backend_compiled(DecoderOptions::Backend backend) noexcept {
     switch (backend) {
     case DecoderOptions::Backend::software: return true;
     case DecoderOptions::Backend::cuda:
-#if defined(GETNATIVE_HAS_CUDA)
-        return true;
-#else
-        return false;
-#endif
+        return ffmpeg_has_hwdevice(AV_HWDEVICE_TYPE_CUDA);
+    case DecoderOptions::Backend::vaapi:
+        return ffmpeg_has_hwdevice(AV_HWDEVICE_TYPE_VAAPI);
+    case DecoderOptions::Backend::d3d11va:
+        return ffmpeg_has_hwdevice(AV_HWDEVICE_TYPE_D3D11VA);
     case DecoderOptions::Backend::vulkan_video:
-#if defined(GETNATIVE_HAS_VULKAN)
-        return true;
-#else
-        return false;
-#endif
+        return ffmpeg_has_hwdevice(AV_HWDEVICE_TYPE_VULKAN);
     case DecoderOptions::Backend::videotoolbox:
 #if defined(__APPLE__)
-        return true;
+        return ffmpeg_has_hwdevice(AV_HWDEVICE_TYPE_VIDEOTOOLBOX);
 #else
         return false;
 #endif
@@ -1309,45 +1395,77 @@ bool backend_compiled(DecoderOptions::Backend backend) noexcept {
 }
 
 bool backend_runtime_available(DecoderOptions::Backend backend) noexcept {
-    // The media layer does not create a second accelerator device. Hardware
-    // decode is enabled by the worker only after the analysis owner supplies
-    // a native context on the selected device.
     if (backend == DecoderOptions::Backend::software) return true;
-#if defined(GETNATIVE_HAS_CUDA)
     if (backend == DecoderOptions::Backend::cuda) {
-        return av_hwdevice_find_type_by_name("cuda") == AV_HWDEVICE_TYPE_CUDA;
+        return probe_hwdevice(AV_HWDEVICE_TYPE_CUDA);
     }
-#endif
+    if (backend == DecoderOptions::Backend::vaapi) {
+        return probe_hwdevice(AV_HWDEVICE_TYPE_VAAPI);
+    }
+    if (backend == DecoderOptions::Backend::d3d11va) {
+        return probe_hwdevice(AV_HWDEVICE_TYPE_D3D11VA);
+    }
     if (backend == DecoderOptions::Backend::vulkan_video) {
-#if defined(GETNATIVE_HAS_VULKAN)
-        return av_hwdevice_find_type_by_name("vulkan")
-            == AV_HWDEVICE_TYPE_VULKAN;
-#else
-        return false;
-#endif
+        return ffmpeg_has_hwdevice(AV_HWDEVICE_TYPE_VULKAN);
     }
 #if defined(__APPLE__)
     if (backend == DecoderOptions::Backend::videotoolbox) {
-        return av_hwdevice_find_type_by_name("videotoolbox")
-            == AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
+        return ffmpeg_has_hwdevice(AV_HWDEVICE_TYPE_VIDEOTOOLBOX);
     }
 #endif
     return false;
 }
 
+const char *decoder_backend_id(DecoderOptions::Backend backend) noexcept {
+    switch (backend) {
+    case DecoderOptions::Backend::software: return "software";
+    case DecoderOptions::Backend::cuda: return "nvdec";
+    case DecoderOptions::Backend::vaapi: return "vaapi";
+    case DecoderOptions::Backend::d3d11va: return "d3d11va";
+    case DecoderOptions::Backend::vulkan_video: return "vulkan_video";
+    case DecoderOptions::Backend::videotoolbox: return "videotoolbox";
+    }
+    return "software";
+}
+
+DecoderOptions::Backend preferred_host_hwdec() noexcept {
+#if defined(_WIN32)
+    if (backend_runtime_available(DecoderOptions::Backend::d3d11va)) {
+        return DecoderOptions::Backend::d3d11va;
+    }
+#endif
+    if (backend_runtime_available(DecoderOptions::Backend::cuda)) {
+        return DecoderOptions::Backend::cuda;
+    }
+#if !defined(_WIN32) && !defined(__APPLE__)
+    if (backend_runtime_available(DecoderOptions::Backend::vaapi)) {
+        return DecoderOptions::Backend::vaapi;
+    }
+#endif
+    return DecoderOptions::Backend::software;
+}
+
+[[nodiscard]] std::vector<std::string> hardware_codecs_for(
+    AVHWDeviceType type, AVPixelFormat pix_fmt) {
+    std::set<std::string> names;
+    void *state = nullptr;
+    while (const AVCodec *codec = av_codec_iterate(&state)) {
+        if (!av_codec_is_decoder(codec)
+            || !decoder_supports_hwdevice(*codec, type, pix_fmt)) continue;
+        names.emplace(codec->name);
+    }
+    return {names.begin(), names.end()};
+}
+
 std::vector<std::string> hardware_codecs(DecoderOptions::Backend backend) {
     if (backend == DecoderOptions::Backend::cuda) {
-#if defined(GETNATIVE_HAS_CUDA)
-        std::set<std::string> names;
-        void *state = nullptr;
-        while (const AVCodec *codec = av_codec_iterate(&state)) {
-            if (!av_codec_is_decoder(codec) || !decoder_supports_cuda(*codec)) continue;
-            names.emplace(codec->name);
-        }
-        return {names.begin(), names.end()};
-#else
-        return {};
-#endif
+        return hardware_codecs_for(AV_HWDEVICE_TYPE_CUDA, AV_PIX_FMT_CUDA);
+    }
+    if (backend == DecoderOptions::Backend::vaapi) {
+        return hardware_codecs_for(AV_HWDEVICE_TYPE_VAAPI, AV_PIX_FMT_VAAPI);
+    }
+    if (backend == DecoderOptions::Backend::d3d11va) {
+        return hardware_codecs_for(AV_HWDEVICE_TYPE_D3D11VA, AV_PIX_FMT_D3D11);
     }
     if (backend == DecoderOptions::Backend::vulkan_video) {
 #if defined(GETNATIVE_HAS_VULKAN)

@@ -2030,19 +2030,11 @@ public:
                     "FFmpeg CUDA hardware decode is unavailable", 0U});
             }
         } else if (spec.backend == BackendChoice::vulkan) {
-            std::string reason;
-            if (!media::backend_runtime_available(
-                    media::DecoderOptions::Backend::vulkan_video)) {
-                reason = "FFmpeg Vulkan hardware decode is unavailable";
-#if defined(GETNATIVE_HAS_VULKAN)
-            } else if (!resident_vulkan_engine().device_info().video_decode_available) {
-                reason = resident_vulkan_engine().device_info().video_decode_reason;
-#endif
-            }
-            if (!reason.empty()) {
+            if (media::preferred_host_hwdec()
+                == media::DecoderOptions::Backend::software) {
                 spec.fallback_chain.push_back({
-                    "hardware_decode_fallback", "vulkan_video", "software",
-                    std::move(reason), 0U});
+                    "hardware_decode_fallback", "host_hwdec", "software",
+                    "VAAPI/D3D11VA/NVDEC hardware decode is unavailable", 0U});
             }
         }
     }
@@ -2555,7 +2547,7 @@ private:
 #if defined(GETNATIVE_HAS_MEDIA)
     static bool matches_media_decoder(std::string_view value) {
         return value == "auto" || value == "software" || value == "nvdec"
-            || value == "vulkan_video";
+            || value == "vaapi" || value == "d3d11va" || value == "vulkan_video";
     }
 
     static bool matches_media_target(std::string_view value) {
@@ -4359,19 +4351,16 @@ private:
         const auto index_start = std::chrono::steady_clock::now();
         media::MediaIndex index;
         media::DecoderOptions cuda_decoder_options;
-        media::DecoderOptions vulkan_decoder_options;
         media::DecoderOptions metal_decoder_options;
+        media::DecoderOptions host_hw_options;
         cuda_decoder_options.frame_concurrency = spec.concurrency;
-        vulkan_decoder_options.frame_concurrency = spec.concurrency;
         metal_decoder_options.frame_concurrency = spec.concurrency;
+        host_hw_options.frame_concurrency = spec.concurrency;
         bool use_cuda_decode = false;
-        bool use_vulkan_decode = false;
         bool use_metal_decode = false;
+        bool use_host_hw_decode = false;
 #if !defined(GETNATIVE_HAS_CUDA)
         (void)use_cuda_decode;
-#endif
-#if !defined(GETNATIVE_HAS_VULKAN)
-        (void)use_vulkan_decode;
 #endif
 #if defined(GETNATIVE_HAS_CUDA)
         if (spec.backend == BackendChoice::cuda
@@ -4390,47 +4379,16 @@ private:
             }
         }
 #endif
-#if defined(GETNATIVE_HAS_VULKAN)
-        if (spec.backend == BackendChoice::vulkan
-            && media::backend_runtime_available(
-                media::DecoderOptions::Backend::vulkan_video)) {
+        if (spec.backend == BackendChoice::vulkan) {
             const bool already_fell_back = std::any_of(
                 spec.fallback_chain.begin(), spec.fallback_chain.end(),
                 [](const VerifyJobSpec::Fallback &fallback) {
                     return fallback.code == "hardware_decode_fallback";
                 });
             if (!already_fell_back) {
-                VulkanAnalysisEngine &vulkan = resident_vulkan_engine();
-                const VulkanNativeContextInfo &native = vulkan.native_context();
-                vulkan_decoder_options.backend =
-                    media::DecoderOptions::Backend::vulkan_video;
-                vulkan_decoder_options.native_instance = native.instance;
-                vulkan_decoder_options.native_physical_device =
-                    native.physical_device;
-                vulkan_decoder_options.native_device = native.device;
-                vulkan_decoder_options.native_queue = native.compute_queue;
-                vulkan_decoder_options.native_compute_queue_family =
-                    native.compute_queue_family;
-                vulkan_decoder_options.native_decode_queue_family =
-                    native.decode_queue_family;
-                vulkan_decoder_options.native_video_codec_operations =
-                    native.video_codec_operations;
-                vulkan_decoder_options.native_instance_api_version =
-                    native.instance_api_version;
-                vulkan_decoder_options.native_timeline_semaphore =
-                    native.timeline_semaphore;
-                vulkan_decoder_options.native_device_extensions =
-                    native.enabled_device_extensions;
-                vulkan_decoder_options.native_queue_lock_opaque = &vulkan;
-                vulkan_decoder_options.lock_native_queue = [](void *opaque) {
-                    static_cast<VulkanAnalysisEngine *>(opaque)->lock_native_queue();
-                };
-                vulkan_decoder_options.unlock_native_queue = [](void *opaque) {
-                    static_cast<VulkanAnalysisEngine *>(opaque)->unlock_native_queue();
-                };
+                host_hw_options.backend = media::preferred_host_hwdec();
             }
         }
-#endif
         const auto index_progress = [&](std::uint64_t decoded) {
             if (job.cancel_requested.load(std::memory_order_relaxed)) return;
             // Total remains unknown during preparation. Once indexing
@@ -4496,28 +4454,13 @@ private:
                         media::DecoderOptions{}, job.stop_source.get_token(),
                         index_progress).index;
                 }
-            } else if (vulkan_decoder_options.backend
-                       == media::DecoderOptions::Backend::vulkan_video) {
-                try {
-                    index = media::ensure_index(
-                        input.path, input.stream_index, input.cache_directory,
-                        vulkan_decoder_options, job.stop_source.get_token(),
-                        index_progress).index;
-                    use_vulkan_decode = true;
-                } catch (const std::exception &error) {
-                    if (job.cancel_requested.load(std::memory_order_relaxed)) {
-                        throw;
-                    }
-                    const VerifyJobSpec::Fallback fallback{
-                        "hardware_decode_fallback", "vulkan_video", "software",
-                        error.what(), 0U};
-                    spec.fallback_chain.push_back(fallback);
-                    emit_verify_fallback(spec, fallback);
-                    index = media::ensure_index(
-                        input.path, input.stream_index, input.cache_directory,
-                        media::DecoderOptions{}, job.stop_source.get_token(),
-                        index_progress).index;
-                }
+            } else if (host_hw_options.backend
+                       != media::DecoderOptions::Backend::software) {
+                index = media::ensure_index(
+                    input.path, input.stream_index, input.cache_directory,
+                    media::DecoderOptions{}, job.stop_source.get_token(),
+                    index_progress).index;
+                use_host_hw_decode = true;
             } else if (!use_metal_decode) {
                 index = media::ensure_index(
                     input.path, input.stream_index, input.cache_directory,
@@ -4891,64 +4834,11 @@ private:
                 }
             }
 #endif
-#if defined(GETNATIVE_HAS_VULKAN)
-            if (spec.backend == BackendChoice::vulkan && use_vulkan_decode) {
+            if (spec.backend == BackendChoice::vulkan && use_host_hw_decode
+                && host_hw_options.backend != media::DecoderOptions::Backend::software) {
                 try {
-                    VulkanAnalysisEngine &vulkan = resident_vulkan_engine();
-                    vulkan_decoder_options.expected_bit_depth = index.bit_depth;
-                    MediaVerifyPipeline<media::VulkanFrame> pipeline{
-                        spec.concurrency, job.stop_source.get_token(),
-                        [&](const media::VulkanFrame &frame) {
-                            if (frame.width != spec.width
-                                || frame.height != spec.height) {
-                                throw WorkerError(
-                                    "media_resolution_changed",
-                                    "decoded media resolution changed during verification");
-                            }
-                            VulkanLumaFrameView view;
-                            view.image = frame.image;
-                            view.image_format = frame.image_format;
-                            view.view_format = frame.view_format;
-                            view.aspect_mask = frame.aspect_mask;
-                            view.width = frame.width;
-                            view.height = frame.height;
-                            view.bit_depth = frame.bit_depth;
-                            view.normalized_sample_bits =
-                                frame.normalized_sample_bits;
-                            view.layout = frame.layout;
-                            view.access = frame.access;
-                            view.queue_family = frame.queue_family;
-                            view.semaphore = frame.semaphore;
-                            view.semaphore_value = frame.semaphore_value;
-                            view.sync_opaque = frame.sync_opaque;
-                            view.mark_submitted = frame.mark_submitted;
-                            view.release_without_submit =
-                                frame.release_without_submit;
-                            const auto compute_start =
-                                std::chrono::steady_clock::now();
-                            try {
-                                const double error =
-                                    vulkan.analyze_axis_batch_vulkan_luma(
-                                        view, candidates, spec.metric,
-                                        job.stop_source.get_token(),
-                                        gpu_stage_profile_from_environment()).front().error;
-                                compute_ms.fetch_add(
-                                    elapsed_ms(compute_start),
-                                    std::memory_order_relaxed);
-                                return error;
-                            } catch (const WorkerError &) {
-                                throw;
-                            } catch (const std::exception &error) {
-                                if (job.stop_source.stop_requested()) {
-                                    throw WorkerError(
-                                        "cancelled", "Vulkan analysis cancelled");
-                                }
-                                throw WorkerError(
-                                    "compute_error",
-                                    std::string{"Vulkan analysis failed: "}
-                                        + error.what());
-                            }
-                        },
+                    MediaVerifyPipeline<media::HostFrame> pipeline{
+                        spec.concurrency, job.stop_source.get_token(), analyze_host,
                         [&](std::uint64_t seq,
                             const media::FrameIdentity &identity, double error,
                             std::uint64_t analyzed) {
@@ -4956,17 +4846,15 @@ private:
                         },
                         [&] { job.stop_source.request_stop(); }};
                     pipeline.run([&](auto consume) {
-                        media::decode_selected_vulkan(
-                            input.path, index, selected, vulkan_decoder_options,
+                        media::decode_selected_indexed(
+                            input.path, index, selected, host_hw_options,
                             job.stop_source.get_token(), std::move(consume),
                             &decode_telemetry);
                     });
                     max_inflight = std::max(max_inflight, pipeline.max_inflight());
-                    surface_lease_peak = std::max(
-                        surface_lease_peak, pipeline.max_inflight());
                     queue_wait_ms += pipeline.queue_wait_ms();
-                    actual_decoder = "vulkan_video";
-                    zero_copy = true;
+                    actual_decoder = media::decoder_backend_id(host_hw_options.backend);
+                    zero_copy = false;
                     decoded = true;
                 } catch (const WorkerError &) {
                     throw;
@@ -4975,13 +4863,13 @@ private:
                         throw WorkerError("cancelled", "media decode cancelled");
                     }
                     const VerifyJobSpec::Fallback fallback{
-                        "hardware_decode_fallback", "vulkan_video", "software",
-                        error.what(), completed};
+                        "hardware_decode_fallback",
+                        media::decoder_backend_id(host_hw_options.backend),
+                        "software", error.what(), completed};
                     spec.fallback_chain.push_back(fallback);
                     emit_verify_fallback(spec, fallback);
                 }
             }
-#endif
 #if defined(__APPLE__) && defined(GETNATIVE_HAS_METAL)
             if (spec.backend == BackendChoice::metal && use_metal_decode) {
                 try {

@@ -29,6 +29,7 @@ macOS is now a first-class release: Metal analysis, VideoToolbox decode, and an 
 - Link CoreFoundation for native VideoToolbox decode.
 - Replace WebKitGTK native number spinners and range sliders so Linux text fields do not grab the pointer.
 - Let Quick Analysis replace the untitled recovery slot instead of failing with a project-mismatch error.
+- Vulkan Check decodes with VAAPI (Linux Intel/AMD), D3D11VA (Windows), or NVDEC and copies luma to compute, instead of FFmpeg Vulkan Video.
 - Clamp GPU Check concurrency to 8 (analysis slot limit) instead of erroring when the UI asked for more.
 - Color Check fusion curves from the plot palette, with a legend checkbox, and avoid crashing full-video fusion plots (extent loops + numeric frame picker).
 - Keep media preview frames when leaving the Media page; returning no longer re-decodes from scratch.

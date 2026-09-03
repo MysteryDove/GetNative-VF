@@ -67,6 +67,7 @@ extra_cflags=()
 hwaccel_list=""
 enabled_nvdec=0
 enabled_vulkan=0
+enabled_vaapi=0
 
 if [[ -f "${nvch_dir}/include/ffnvcodec/dynlink_cuda.h" ]]; then
   # ffnvcodec lives in configure's HWACCEL_AUTODETECT list, so the global
@@ -104,6 +105,15 @@ if [[ -n "$vulkan_include" ]]; then
   enabled_vulkan=1
 else
   echo "note: Vulkan SDK headers missing; Vulkan hwaccels disabled" >&2
+fi
+if pkg-config --exists libva 2>/dev/null; then
+  # Host libva/libva-drm, same model as libvulkan: decode at runtime on
+  # Intel/AMD. Copy-out to system memory is the Check ingest path.
+  hwaccel_switches+=(--enable-vaapi)
+  hwaccel_list+="${hwaccel_list:+,}h264_vaapi,hevc_vaapi,mpeg2_vaapi,vp9_vaapi"
+  enabled_vaapi=1
+else
+  echo "note: libva missing; VAAPI hwaccels disabled" >&2
 fi
 if [[ -n "$hwaccel_list" ]]; then
   hwaccel_switches+=(--enable-hwaccel="$hwaccel_list")
@@ -192,13 +202,19 @@ if ((enabled_vulkan)); then
     require_config "CONFIG_$(printf '%s' "$hwaccel" | tr '[:lower:]' '[:upper:]')_VULKAN_HWACCEL"
   done
 fi
+if ((enabled_vaapi)); then
+  require_config CONFIG_VAAPI
+  for hwaccel in h264 hevc; do
+    require_config "CONFIG_$(printf '%s' "$hwaccel" | tr '[:lower:]' '[:upper:]')_VAAPI_HWACCEL"
+  done
+fi
 
 # libavformat/libavcodec/libswscale NEEDED the other FFmpeg sonames in this
 # SDK; those are resolved via $ORIGIN. Reject CUDA toolkit/driver and GUI
 # stacks, not the intra-FFmpeg edges.
 allowed_needed='^(linux-vdso\.so\.1|ld-linux-x86-64\.so\.2|libc\.so\.6|libm\.so\.6|libz\.so\.1|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libgcc_s\.so\.1|libstdc\+\+\.so\.6|libiconv\.so\.2|libavcodec\.so\.62|libavformat\.so\.62|libavutil\.so\.60|libswscale\.so\.9)$'
-if ((enabled_vulkan)); then
-  allowed_needed='^(linux-vdso\.so\.1|ld-linux-x86-64\.so\.2|libc\.so\.6|libm\.so\.6|libz\.so\.1|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libgcc_s\.so\.1|libstdc\+\+\.so\.6|libiconv\.so\.2|libavcodec\.so\.62|libavformat\.so\.62|libavutil\.so\.60|libswscale\.so\.9|libvulkan\.so\.1)$'
+if ((enabled_vulkan)) || ((enabled_vaapi)); then
+  allowed_needed='^(linux-vdso\.so\.1|ld-linux-x86-64\.so\.2|libc\.so\.6|libm\.so\.6|libz\.so\.1|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libgcc_s\.so\.1|libstdc\+\+\.so\.6|libiconv\.so\.2|libavcodec\.so\.62|libavformat\.so\.62|libavutil\.so\.60|libswscale\.so\.9|libvulkan\.so\.1|libva\.so\.2|libva-drm\.so\.2|libdrm\.so\.2)$'
 fi
 for library in libavformat.so.62 libavcodec.so.62 libavutil.so.60 libswscale.so.9; do
   test -f "${sdk_dir}/lib/${library}" || {

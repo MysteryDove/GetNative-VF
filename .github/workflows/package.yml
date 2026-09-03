@@ -90,7 +90,7 @@ jobs:
           libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
           libxdo-dev libssl-dev patchelf libfuse2 desktop-file-utils
           squashfs-tools binutils jq libvulkan1 mesa-vulkan-drivers vulkan-tools
-          vulkan-validationlayers
+          vulkan-validationlayers libva-dev libdrm-dev
       - name: Resolve Vulkan SDK config path
         id: vulkan-config
         shell: bash
@@ -162,7 +162,7 @@ jobs:
       - name: Build pinned FFmpeg SDK
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         run: scripts/build-ffmpeg-linux.sh .deps/ffmpeg-linux-x64
-      - name: Verify FFmpeg NVDEC and Vulkan hwaccels
+      - name: Verify FFmpeg NVDEC, Vulkan, and VAAPI hwaccels
         run: |
           set -euo pipefail
           info=.deps/ffmpeg-linux-x64/share/ffmpeg/BUILD_INFO.txt
@@ -173,6 +173,9 @@ jobs:
           grep -Eq '^CONFIG_VULKAN=yes$' "$info"
           grep -Eq '^CONFIG_HEVC_VULKAN_HWACCEL=yes$' "$info"
           grep -Eq '^CONFIG_H264_VULKAN_HWACCEL=yes$' "$info"
+          grep -Eq '^CONFIG_VAAPI=yes$' "$info"
+          grep -Eq '^CONFIG_HEVC_VAAPI_HWACCEL=yes$' "$info"
+          grep -Eq '^CONFIG_H264_VAAPI_HWACCEL=yes$' "$info"
           for library in libavformat.so.62 libavcodec.so.62 libavutil.so.60 libswscale.so.9; do
             path=".deps/ffmpeg-linux-x64/lib/$library"
             test -f "$path"
@@ -681,7 +684,7 @@ jobs:
         with:
           path: .deps/ffmpeg-windows-x64
           key: ffmpeg-${{ env.FFMPEG_VERSION }}-windows-x64-msvc-hwaccel-${{ hashFiles('scripts/build-ffmpeg-windows.sh') }}
-      - name: Check cached FFmpeg NVDEC and Vulkan hwaccels
+      - name: Check cached FFmpeg NVDEC, Vulkan, and D3D11VA hwaccels
         id: ffmpeg-hwaccel
         shell: pwsh
         run: |
@@ -693,7 +696,10 @@ jobs:
             "CONFIG_H264_NVDEC_HWACCEL=yes",
             "CONFIG_VULKAN=yes",
             "CONFIG_HEVC_VULKAN_HWACCEL=yes",
-            "CONFIG_H264_VULKAN_HWACCEL=yes"
+            "CONFIG_H264_VULKAN_HWACCEL=yes",
+            "CONFIG_D3D11VA=yes",
+            "CONFIG_HEVC_D3D11VA_HWACCEL=yes",
+            "CONFIG_H264_D3D11VA_HWACCEL=yes"
           )
           $info = ".deps/ffmpeg-windows-x64/share/ffmpeg/BUILD_INFO.txt"
           $valid = $false
@@ -717,7 +723,7 @@ jobs:
         env:
           GETNATIVE_REQUIRE_FFMPEG_HWACCEL: "1"
         run: scripts/build-ffmpeg-windows.sh .deps/ffmpeg-windows-x64
-      - name: Verify FFmpeg NVDEC and Vulkan hwaccels
+      - name: Verify FFmpeg NVDEC, Vulkan, and D3D11VA hwaccels
         shell: pwsh
         run: |
           $info = ".deps/ffmpeg-windows-x64/share/ffmpeg/BUILD_INFO.txt"
@@ -733,7 +739,10 @@ jobs:
             "CONFIG_H264_NVDEC_HWACCEL=yes",
             "CONFIG_VULKAN=yes",
             "CONFIG_HEVC_VULKAN_HWACCEL=yes",
-            "CONFIG_H264_VULKAN_HWACCEL=yes"
+            "CONFIG_H264_VULKAN_HWACCEL=yes",
+            "CONFIG_D3D11VA=yes",
+            "CONFIG_HEVC_D3D11VA_HWACCEL=yes",
+            "CONFIG_H264_D3D11VA_HWACCEL=yes"
           )) {
             if ($text -notmatch "(?m)^$([regex]::Escape($flag))$") {
               throw "FFmpeg SDK is missing $flag"
@@ -830,7 +839,10 @@ jobs:
             "CONFIG_HEVC_NVDEC_HWACCEL=yes",
             "CONFIG_H264_NVDEC_HWACCEL=yes",
             "CONFIG_VULKAN=yes",
-            "CONFIG_HEVC_VULKAN_HWACCEL=yes"
+            "CONFIG_HEVC_VULKAN_HWACCEL=yes",
+            "CONFIG_D3D11VA=yes",
+            "CONFIG_HEVC_D3D11VA_HWACCEL=yes",
+            "CONFIG_H264_D3D11VA_HWACCEL=yes"
           )) {
             if ($ffmpegInfoText -notmatch "(?m)^$([regex]::Escape($flag))$") {
               throw "portable FFmpeg SDK is missing $flag"

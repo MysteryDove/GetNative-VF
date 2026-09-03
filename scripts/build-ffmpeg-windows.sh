@@ -164,6 +164,7 @@ hwaccel_includes=""
 hwaccel_list=""
 enabled_nvdec=0
 enabled_vulkan=0
+enabled_d3d11va=0
 if [[ -f "${nvch_unix}/include/ffnvcodec/dynlink_cuda.h" ]]; then
   nvch_windows=$(windows_path "$nvch_unix")
   # ffnvcodec lives in configure's HWACCEL_AUTODETECT list, so the global
@@ -303,6 +304,11 @@ if [[ -n "$vulkan_include_unix" ]]; then
 else
   echo "note: Vulkan SDK headers missing; Vulkan hwaccels disabled" >&2
 fi
+# D3D11VA is the Windows native decoder for Intel/AMD (and a copy path on
+# NVIDIA). It uses the Windows SDK; no extra third-party package.
+hwaccel_switches+=(--enable-d3d11va)
+hwaccel_list+="${hwaccel_list:+,}h264_d3d11va,h264_d3d11va2,hevc_d3d11va,hevc_d3d11va2,mpeg2_d3d11va,vp9_d3d11va,vp9_d3d11va2"
+enabled_d3d11va=1
 if [[ -n "$hwaccel_list" ]]; then
   hwaccel_switches+=(--enable-hwaccel="$hwaccel_list")
 fi
@@ -317,8 +323,8 @@ if [[ "$require_hwaccel" == "1" ]]; then
     exit 1
   fi
 fi
-printf 'FFmpeg hwaccel: nvdec=%s vulkan=%s list=%s\n' \
-  "$enabled_nvdec" "$enabled_vulkan" "${hwaccel_list:-none}"
+printf 'FFmpeg hwaccel: nvdec=%s vulkan=%s d3d11va=%s list=%s\n' \
+  "$enabled_nvdec" "$enabled_vulkan" "$enabled_d3d11va" "${hwaccel_list:-none}"
 
 # With MSYS argument conversion disabled, FFmpeg's MSVC archive probe passes
 # @/dev/null literally to lib.exe. Translate that one response file while
@@ -425,6 +431,13 @@ if ((enabled_vulkan)); then
   require_config CONFIG_VULKAN
   for hwaccel in av1 h264 hevc vp9; do
     require_config "CONFIG_$(printf '%s' "$hwaccel" | tr '[:lower:]' '[:upper:]')_VULKAN_HWACCEL"
+  done
+fi
+if ((enabled_d3d11va)); then
+  require_config CONFIG_D3D11VA
+  for hwaccel in h264 hevc; do
+    require_config "CONFIG_$(printf '%s' "$hwaccel" | tr '[:lower:]' '[:upper:]')_D3D11VA_HWACCEL"
+    require_config "CONFIG_$(printf '%s' "$hwaccel" | tr '[:lower:]' '[:upper:]')_D3D11VA2_HWACCEL"
   done
 fi
 

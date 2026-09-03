@@ -63,7 +63,7 @@ export type BackendCapability = {
 };
 
 export type DecodeBackendCapability = {
-  id: "software" | "nvdec" | "vulkan_video" | "videotoolbox";
+  id: "software" | "nvdec" | "vaapi" | "d3d11va" | "vulkan_video" | "videotoolbox";
   compiled: boolean;
   runtime_device: boolean;
   codecs: string[];

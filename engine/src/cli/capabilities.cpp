@@ -77,11 +77,29 @@ void write_capabilities_impl(
 #if !defined(__ARM_NEON) && !defined(__ARM_NEON__)
     const getnative::CpuDispatchInfo cpu = getnative::cpu_dispatch_info();
 #endif
-#if defined(GETNATIVE_HAS_MEDIA) && defined(GETNATIVE_HAS_CUDA)
-    const bool nvdec_available =
-        getnative::media::backend_runtime_available(
-            getnative::media::DecoderOptions::Backend::cuda)
-        && getnative::cuda_backend_available();
+#if defined(GETNATIVE_HAS_MEDIA)
+    const bool nvdec_compiled = getnative::media::backend_compiled(
+        getnative::media::DecoderOptions::Backend::cuda);
+    const bool nvdec_runtime = getnative::media::backend_runtime_available(
+        getnative::media::DecoderOptions::Backend::cuda);
+#if defined(GETNATIVE_HAS_CUDA)
+    const bool nvdec_zero_copy =
+        nvdec_runtime && getnative::cuda_backend_available();
+#else
+    const bool nvdec_zero_copy = false;
+#endif
+    const bool vaapi_compiled = getnative::media::backend_compiled(
+        getnative::media::DecoderOptions::Backend::vaapi);
+    const bool vaapi_runtime = getnative::media::backend_runtime_available(
+        getnative::media::DecoderOptions::Backend::vaapi);
+    const auto vaapi_codecs = getnative::media::hardware_codecs(
+        getnative::media::DecoderOptions::Backend::vaapi);
+    const bool d3d11va_compiled = getnative::media::backend_compiled(
+        getnative::media::DecoderOptions::Backend::d3d11va);
+    const bool d3d11va_runtime = getnative::media::backend_runtime_available(
+        getnative::media::DecoderOptions::Backend::d3d11va);
+    const auto d3d11va_codecs = getnative::media::hardware_codecs(
+        getnative::media::DecoderOptions::Backend::d3d11va);
 #endif
 #if defined(GETNATIVE_HAS_MEDIA) && defined(GETNATIVE_HAS_VULKAN)
     bool vulkan_video_available = false;
@@ -152,18 +170,46 @@ void write_capabilities_impl(
     output << "true,\"media_verify_concurrency\":{\"min\":1,\"max\":16,\"default\":8,\"gpu_max\":8}},\"decode_backends\":["
               "{\"id\":\"software\",\"compiled\":true,\"runtime_device\":true,"
               "\"codecs\":[\"*\"],\"zero_copy\":false},";
-#if defined(GETNATIVE_HAS_CUDA)
-    output << "{\"id\":\"nvdec\",\"compiled\":true,\"runtime_device\":"
-           << (nvdec_available ? "true" : "false")
+    output << "{\"id\":\"nvdec\",\"compiled\":"
+           << (nvdec_compiled ? "true" : "false")
+           << ",\"runtime_device\":" << (nvdec_runtime ? "true" : "false")
            << ","
               "\"codecs\":[\"h264\",\"hevc\",\"av1\",\"vp9\",\"mpeg2video\",\"vc1\"],"
               "\"zero_copy\":"
-           << (nvdec_available ? "true" : "false")
+           << (nvdec_zero_copy ? "true" : "false")
            << "},";
-#else
-    output << "{\"id\":\"nvdec\",\"compiled\":false,\"runtime_device\":false,"
-              "\"codecs\":[],\"zero_copy\":false,\"reason\":\"not compiled\"},";
-#endif
+    output << "{\"id\":\"vaapi\",\"compiled\":"
+           << (vaapi_compiled ? "true" : "false")
+           << ",\"runtime_device\":" << (vaapi_runtime ? "true" : "false")
+           << ",\"codecs\":[";
+    for (std::size_t index = 0U; index < vaapi_codecs.size(); ++index) {
+        if (index != 0U) output << ',';
+        output << json_string(vaapi_codecs[index]);
+    }
+    output << "],\"zero_copy\":false";
+    if (!vaapi_runtime) {
+        output << ",\"reason\":"
+               << json_string(vaapi_compiled
+                                  ? "no VAAPI render device"
+                                  : "FFmpeg VAAPI was not compiled");
+    }
+    output << "},";
+    output << "{\"id\":\"d3d11va\",\"compiled\":"
+           << (d3d11va_compiled ? "true" : "false")
+           << ",\"runtime_device\":" << (d3d11va_runtime ? "true" : "false")
+           << ",\"codecs\":[";
+    for (std::size_t index = 0U; index < d3d11va_codecs.size(); ++index) {
+        if (index != 0U) output << ',';
+        output << json_string(d3d11va_codecs[index]);
+    }
+    output << "],\"zero_copy\":false";
+    if (!d3d11va_runtime) {
+        output << ",\"reason\":"
+               << json_string(d3d11va_compiled
+                                  ? "no D3D11 video device"
+                                  : "FFmpeg D3D11VA was not compiled");
+    }
+    output << "},";
 #if defined(GETNATIVE_HAS_VULKAN)
     output << "{\"id\":\"vulkan_video\",\"compiled\":true,\"runtime_device\":"
            << (vulkan_video_available ? "true" : "false")
@@ -211,6 +257,10 @@ void write_capabilities_impl(
               "{\"id\":\"software\",\"compiled\":false,\"runtime_device\":false,"
               "\"codecs\":[],\"zero_copy\":false,\"reason\":\"not compiled\"},"
               "{\"id\":\"nvdec\",\"compiled\":false,\"runtime_device\":false,"
+              "\"codecs\":[],\"zero_copy\":false,\"reason\":\"not compiled\"},"
+              "{\"id\":\"vaapi\",\"compiled\":false,\"runtime_device\":false,"
+              "\"codecs\":[],\"zero_copy\":false,\"reason\":\"not compiled\"},"
+              "{\"id\":\"d3d11va\",\"compiled\":false,\"runtime_device\":false,"
               "\"codecs\":[],\"zero_copy\":false,\"reason\":\"not compiled\"},"
               "{\"id\":\"vulkan_video\",\"compiled\":false,\"runtime_device\":false,"
               "\"codecs\":[],\"zero_copy\":false,\"reason\":\"not compiled\"},"

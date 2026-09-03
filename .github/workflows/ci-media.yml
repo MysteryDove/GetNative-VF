@@ -45,6 +45,7 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install -y --no-install-recommends
           build-essential ninja-build nasm patchelf pkg-config zlib1g-dev ffmpeg
+          libva-dev libdrm-dev
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.20.0
@@ -61,7 +62,7 @@ jobs:
       - name: Build pinned FFmpeg SDK
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         run: scripts/build-ffmpeg-linux.sh .deps/ffmpeg-linux-x64
-      - name: Verify FFmpeg NVDEC hwaccels
+      - name: Verify FFmpeg NVDEC and VAAPI hwaccels
         run: |
           set -euo pipefail
           info=.deps/ffmpeg-linux-x64/share/ffmpeg/BUILD_INFO.txt
@@ -69,6 +70,9 @@ jobs:
           grep -Eq '^CONFIG_NVDEC=yes$' "$info"
           grep -Eq '^CONFIG_HEVC_NVDEC_HWACCEL=yes$' "$info"
           grep -Eq '^CONFIG_H264_NVDEC_HWACCEL=yes$' "$info"
+          grep -Eq '^CONFIG_VAAPI=yes$' "$info"
+          grep -Eq '^CONFIG_HEVC_VAAPI_HWACCEL=yes$' "$info"
+          grep -Eq '^CONFIG_H264_VAAPI_HWACCEL=yes$' "$info"
           for library in libavformat.so.62 libavcodec.so.62 libavutil.so.60 libswscale.so.9; do
             path=".deps/ffmpeg-linux-x64/lib/$library"
             test "$(patchelf --print-rpath "$path")" = '$ORIGIN'
@@ -131,6 +135,23 @@ jobs:
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         shell: msys2 {0}
         run: scripts/build-ffmpeg-windows.sh .deps/ffmpeg-windows-x64
+      - name: Verify FFmpeg D3D11VA hwaccels
+        shell: pwsh
+        run: |
+          $info = ".deps/ffmpeg-windows-x64/share/ffmpeg/BUILD_INFO.txt"
+          if (-not (Test-Path $info -PathType Leaf)) {
+            throw "FFmpeg BUILD_INFO.txt is missing"
+          }
+          $text = (Get-Content $info -Raw) -replace "`r", ""
+          foreach ($flag in @(
+            "CONFIG_D3D11VA=yes",
+            "CONFIG_HEVC_D3D11VA_HWACCEL=yes",
+            "CONFIG_H264_D3D11VA_HWACCEL=yes"
+          )) {
+            if ($text -notmatch "(?m)^$([regex]::Escape($flag))$") {
+              throw "FFmpeg SDK is missing $flag"
+            }
+          }
       - name: Install test-only FFmpeg CLI
         run: choco install ffmpeg -y --no-progress
       - name: Build and test release engine
