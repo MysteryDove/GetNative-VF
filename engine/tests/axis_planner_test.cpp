@@ -1,10 +1,12 @@
 #include "axis_planner.hpp"
+#include "getnative/cpu_analysis.hpp"
 #include "getnative/joining_thread.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -651,6 +653,41 @@ void test_forward_half_pixel_ties_match_zimg_rounding() {
     }
 }
 
+void test_half_pixel_tie_does_not_spike_bilinear_roundtrip() {
+    // 840 = 1080 * 7/9. A 9-row period cache would replay row 4's taps onto
+    // later classes, but that row sits on a zimg half-pixel tie; 1 ulp can
+    // flip the window so cached weights land on the wrong indices and the
+    // descale/forward pair spikes. Replay must stay off on this lattice.
+    constexpr std::int32_t width = 64;
+    constexpr std::int32_t height = 1080;
+    std::vector<float> pixels(static_cast<std::size_t>(width)
+                              * static_cast<std::size_t>(height));
+    for (std::int32_t y = 0; y < height; ++y) {
+        for (std::int32_t x = 0; x < width; ++x) {
+            pixels[static_cast<std::size_t>(y) * static_cast<std::size_t>(width)
+                   + static_cast<std::size_t>(x)] = static_cast<float>(
+                0.25 + 0.5 * std::sin(0.031 * static_cast<double>(y))
+                    * std::cos(0.017 * static_cast<double>(x)));
+        }
+    }
+    const getnative::ConstImageView view{pixels.data(), width, height, width};
+    const getnative::MetricSpec metric{2, 2, 2, 2, 0.0F, 1U};
+    getnative::CpuWorkspace workspace;
+    const auto error_at = [&](std::int32_t native_height) {
+        const auto plan = getnative::build_axis_plan(
+            {height, native_height, static_cast<double>(native_height), 0.0,
+             getnative::Filter::bilinear(), getnative::BorderMode::mirror});
+        return getnative::analyze_axis_candidate_f32(
+            view, plan, getnative::AnalysisAxes::vertical, metric, workspace);
+    };
+    const double neighbor = std::max(error_at(839), error_at(841));
+    const double tied = error_at(840);
+    expect(std::isfinite(tied) && std::isfinite(neighbor),
+           "bilinear 7/9 tie roundtrip produced a non-finite error");
+    expect(tied <= 10.0 * std::max(neighbor, 1e-12),
+           "bilinear 7/9 tie height spiked relative to 839/841");
+}
+
 } // namespace
 
 int main() {
@@ -668,6 +705,7 @@ int main() {
         test_failure_stops_claiming_and_joins_started_builds();
         test_period_replay_repeats_interior_rows();
         test_forward_half_pixel_ties_match_zimg_rounding();
+        test_half_pixel_tie_does_not_spike_bilinear_roundtrip();
         std::cout << "axis planner tests passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception &error) {

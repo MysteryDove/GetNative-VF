@@ -84,6 +84,15 @@ constexpr bool direct_transpose = GETNATIVE_PLANNER_DIRECT_TRANSPOSE != 0;
                    : std::floor(x + 0.49999999999999994);
 }
 
+[[nodiscard]] bool round_half_up_is_tied(double x) noexcept {
+    if (!finite_binary64(x)) return false;
+    // This TU is built with -ffast-math, so infinities and NaN are off-limits.
+    const double scale = std::abs(x) + 1.0;
+    const double delta = scale * std::numeric_limits<double>::epsilon();
+    const double rounded = round_half_up(x);
+    return rounded != round_half_up(x + delta) || rounded != round_half_up(x - delta);
+}
+
 [[nodiscard]] constexpr double poly3(double x, double c0, double c1,
                                      double c2, double c3) noexcept {
     return c0 + x * (c1 + x * (c2 + x * c3));
@@ -412,6 +421,9 @@ struct DoubleCsrView {
 // only by the division-rounding jitter the per-row path itself exhibits
 // across periods (<=1 position ulp, far below the 2e-6 upstream-conformance
 // budget), and every comparison gate is self-consistent or tolerance-based.
+// Replay is skipped when any row's tap window sits on a zimg half-pixel
+// tie: 1 ulp can flip round_half_up and land cached weights on the wrong
+// indices (bilinear 1080→840 = 7/9 is the reproducing case).
 [[nodiscard]] std::int32_t position_lattice_period(
     std::int32_t source_size, double active_length) noexcept {
     if (!finite_binary64(active_length)
@@ -429,6 +441,23 @@ struct DoubleCsrView {
     return static_cast<std::int32_t>(period);
 }
 
+[[nodiscard]] bool lattice_has_half_pixel_tie(
+    std::int32_t source_size, double active_length, double shift,
+    double window_radius) noexcept {
+    if (source_size <= 0 || !finite_binary64(active_length) || active_length <= 0.0
+        || !finite_binary64(shift) || !finite_binary64(window_radius)) {
+        return false;
+    }
+    const double ratio = static_cast<double>(source_size) / active_length;
+    if (!finite_binary64(ratio) || ratio == 0.0) return false;
+    for (std::int32_t row = 0; row < source_size; ++row) {
+        const double position =
+            (static_cast<double>(row) + 0.5) / ratio + shift;
+        if (round_half_up_is_tied(position - window_radius)) return true;
+    }
+    return false;
+}
+
 // Per-period-class store of raw tap weights and totals for one builder.
 struct PeriodWeightCache {
     std::int32_t period = 0;
@@ -436,9 +465,14 @@ struct PeriodWeightCache {
     std::vector<double> raw;     // period x width, filled for row < period
     std::vector<double> totals;  // period
 
-    void enable(std::int32_t rows, double active_length, std::size_t taps) {
+    void enable(std::int32_t rows, double active_length, double shift,
+                double window_radius, std::size_t taps) {
         period = position_lattice_period(rows, active_length);
         if (period == 0) return;
+        if (lattice_has_half_pixel_tie(rows, active_length, shift, window_radius)) {
+            period = 0;
+            return;
+        }
         width = taps;
         raw.resize(static_cast<std::size_t>(period) * width);
         totals.resize(static_cast<std::size_t>(period));
@@ -476,7 +510,8 @@ void make_descale_matrix(DoubleCsrView result,
     std::vector<double> coalesced_weights(static_cast<std::size_t>(2 * support));
     std::vector<bool> coalesced_seen(static_cast<std::size_t>(2 * support));
     PeriodWeightCache period_cache;
-    period_cache.enable(rows, request.active_length,
+    period_cache.enable(rows, request.active_length, request.shift,
+                        static_cast<double>(support),
                         static_cast<std::size_t>(2 * support));
     for (std::int32_t i = 0; i < rows; ++i) {
         double position = 0.0;
@@ -683,7 +718,8 @@ void make_zimg_forward(DoubleCsrView result,
     std::vector<double> tap_weights(static_cast<std::size_t>(filter_size));
     std::vector<double> row_weights;
     PeriodWeightCache period_cache;
-    period_cache.enable(rows, request.active_length,
+    period_cache.enable(rows, request.active_length, request.shift,
+                        static_cast<double>(filter_size) / 2.0,
                         static_cast<std::size_t>(filter_size));
     for (std::int32_t row = 0; row < rows; ++row) {
         double position = 0.0;
