@@ -275,7 +275,7 @@ using MetalFrameConsumer = std::function<void(MetalFrame frame)>;
 [[nodiscard]] bool backend_compiled(DecoderOptions::Backend backend) noexcept;
 [[nodiscard]] bool backend_runtime_available(DecoderOptions::Backend backend) noexcept;
 [[nodiscard]] std::vector<std::string> hardware_codecs(DecoderOptions::Backend backend);
-/** Host-copy hwdec for Vulkan/CPU ingest: D3D11VA, NVDEC, then VAAPI. */
+/** Preferred host-copy hardware decoder: D3D11VA, NVDEC, then VAAPI. */
 [[nodiscard]] DecoderOptions::Backend preferred_host_hwdec() noexcept;
 [[nodiscard]] const char *decoder_backend_id(DecoderOptions::Backend backend) noexcept;
 

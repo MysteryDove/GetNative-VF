@@ -1366,11 +1366,21 @@ std::string runtime_version() {
 }
 
 [[nodiscard]] bool probe_hwdevice(AVHWDeviceType type) noexcept {
-    if (!ffmpeg_has_hwdevice(type)) return false;
+    static std::mutex mutex;
+    static std::unordered_map<int, bool> cache;
+    const std::scoped_lock lock(mutex);
+    const auto cached = cache.find(static_cast<int>(type));
+    if (cached != cache.end()) return cached->second;
+    if (!ffmpeg_has_hwdevice(type)) {
+        cache.emplace(static_cast<int>(type), false);
+        return false;
+    }
     AVBufferRef *ref = nullptr;
     const int err = av_hwdevice_ctx_create(&ref, type, nullptr, nullptr, 0);
     av_buffer_unref(&ref);
-    return err >= 0;
+    const bool ok = err >= 0;
+    cache.emplace(static_cast<int>(type), ok);
+    return ok;
 }
 
 bool backend_compiled(DecoderOptions::Backend backend) noexcept {

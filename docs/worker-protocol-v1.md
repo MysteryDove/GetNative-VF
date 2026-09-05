@@ -66,8 +66,9 @@ reported false by current engines; indexed media uses the commands in section
 When `verify_engine_decode=true`, optional `decode_backends` entries describe
 `software`, `nvdec`, `vaapi`, `d3d11va`, `vulkan_video`, and `videotoolbox`.
 Each entry contains `compiled`, `runtime_device`, `codecs`, and `zero_copy`,
-plus an optional `reason` when unavailable. Vulkan Check uses a host-copy
-hwdec (`vaapi` / `d3d11va` / `nvdec`) rather than `vulkan_video`. `codecs` is device/runtime capability, not a promise that every
+plus an optional `reason` when unavailable. Vulkan Check uses `vulkan_video`
+(or software fallback); it does not mix NVDEC, D3D11VA, or VAAPI into the
+Vulkan compute path. `codecs` is device/runtime capability, not a promise that every
 profile, level, bit depth, surface allocation, or source file will use hardware
 decode. Consumers must use result provenance as the record of what a job
 actually used.

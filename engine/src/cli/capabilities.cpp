@@ -16,10 +16,10 @@
 #endif
 
 #include <algorithm>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace getnative::cli {
 namespace {
@@ -62,30 +62,55 @@ void write_isa_set(std::ostream &output, const getnative::CpuIsaSet &set) {
 
 } // namespace
 
-void write_capabilities_impl(
-    std::ostream &output, bool analysis_available
-#if defined(GETNATIVE_HAS_CUDA)
-    , const getnative::CudaAnalysisEngine *resident_cuda,
-    std::string_view resident_cuda_error, bool use_resident_cuda
-#endif
-#if defined(GETNATIVE_HAS_VULKAN)
-    , const getnative::VulkanAnalysisEngine *resident_vulkan,
-    std::string_view resident_vulkan_error, bool use_resident_vulkan
-#endif
-) {
+void write_capabilities(std::ostream &output, bool analysis_available) {
     const char *available = analysis_available ? "true" : "false";
 #if !defined(__ARM_NEON) && !defined(__ARM_NEON__)
     const getnative::CpuDispatchInfo cpu = getnative::cpu_dispatch_info();
 #endif
+#if defined(GETNATIVE_HAS_CUDA)
+    const getnative::CudaRuntimeProbe cuda_probe = getnative::cuda_runtime_probe();
+    const getnative::CudaDeviceInfo *cuda_device = nullptr;
+    for (const auto &device : cuda_probe.devices) {
+        if (device.backend_compatible && device.ordinal == 0) {
+            cuda_device = &device;
+            break;
+        }
+    }
+    if (cuda_device == nullptr) {
+        for (const auto &device : cuda_probe.devices) {
+            if (device.backend_compatible) {
+                cuda_device = &device;
+                break;
+            }
+        }
+    }
+#endif
+#if defined(GETNATIVE_HAS_VULKAN)
+    const getnative::VulkanRuntimeProbe vulkan_probe = getnative::vulkan_runtime_probe();
+    const getnative::VulkanDeviceInfo *vulkan_device = nullptr;
+    {
+        const std::int32_t selected =
+            getnative::select_default_vulkan_device_index(vulkan_probe.devices);
+        for (const auto &device : vulkan_probe.devices) {
+            if (device.index == selected && device.backend_compatible) {
+                vulkan_device = &device;
+                break;
+            }
+        }
+    }
+#endif
 #if defined(GETNATIVE_HAS_MEDIA)
     const bool nvdec_compiled = getnative::media::backend_compiled(
         getnative::media::DecoderOptions::Backend::cuda);
+#if defined(GETNATIVE_HAS_CUDA)
+    const bool nvdec_zero_copy = nvdec_compiled && cuda_probe.device_available;
+    const bool nvdec_runtime = nvdec_zero_copy
+        ? true
+        : getnative::media::backend_runtime_available(
+            getnative::media::DecoderOptions::Backend::cuda);
+#else
     const bool nvdec_runtime = getnative::media::backend_runtime_available(
         getnative::media::DecoderOptions::Backend::cuda);
-#if defined(GETNATIVE_HAS_CUDA)
-    const bool nvdec_zero_copy =
-        nvdec_runtime && getnative::cuda_backend_available();
-#else
     const bool nvdec_zero_copy = false;
 #endif
     const bool vaapi_compiled = getnative::media::backend_compiled(
@@ -105,32 +130,20 @@ void write_capabilities_impl(
     bool vulkan_video_available = false;
     std::vector<std::string> vulkan_video_codecs;
     std::string vulkan_video_reason;
-    try {
-        std::optional<getnative::VulkanAnalysisEngine> temporary_vulkan_video;
-        const getnative::VulkanAnalysisEngine *vulkan_video = resident_vulkan;
-        if (use_resident_vulkan) {
-            if (vulkan_video == nullptr) {
-                throw std::runtime_error(
-                    resident_vulkan_error.empty()
-                        ? "no compatible Vulkan device is available"
-                        : std::string{resident_vulkan_error});
-            }
-        } else {
-            temporary_vulkan_video.emplace();
-            vulkan_video = &*temporary_vulkan_video;
-        }
-        const auto &device = vulkan_video->device_info();
-        vulkan_video_codecs = device.video_decode_codecs;
+    if (vulkan_device == nullptr) {
+        vulkan_video_reason = vulkan_probe.reason.empty()
+            ? "no compatible Vulkan device is available"
+            : vulkan_probe.reason;
+    } else {
+        vulkan_video_codecs = vulkan_device->video_decode_codecs;
         if (!getnative::media::backend_runtime_available(
                 getnative::media::DecoderOptions::Backend::vulkan_video)) {
             vulkan_video_reason = "FFmpeg Vulkan hardware decode is unavailable";
-        } else if (!device.video_decode_available) {
-            vulkan_video_reason = device.video_decode_reason;
+        } else if (!vulkan_device->video_decode_available) {
+            vulkan_video_reason = vulkan_device->video_decode_reason;
         } else {
             vulkan_video_available = true;
         }
-    } catch (const std::exception &error) {
-        vulkan_video_reason = error.what();
     }
 #endif
 #if defined(GETNATIVE_HAS_MEDIA) && defined(__APPLE__)
@@ -347,22 +360,13 @@ void write_capabilities_impl(
 #endif
 #if defined(GETNATIVE_HAS_CUDA)
     try {
-        std::optional<getnative::CudaAnalysisEngine> temporary_cuda;
-        const getnative::CudaAnalysisEngine *cuda = resident_cuda;
-        if (use_resident_cuda) {
-            if (cuda == nullptr) {
-                throw std::runtime_error(
-                    resident_cuda_error.empty()
-                        ? "no compatible CUDA device is available"
-                        : std::string{resident_cuda_error});
-            }
-        } else {
-            // CUDA ordinal 0 is authoritative after CUDA_VISIBLE_DEVICES has
-            // established runtime order. Do not guess among multiple devices.
-            temporary_cuda.emplace();
-            cuda = &*temporary_cuda;
+        if (cuda_device == nullptr) {
+            throw std::runtime_error(
+                cuda_probe.reason.empty()
+                    ? "no compatible CUDA device is available"
+                    : cuda_probe.reason);
         }
-        const auto &device = cuda->device_info();
+        const auto &device = *cuda_device;
         const std::int32_t minimum_cuda = getnative::cuda_minimum_compute_capability();
         output << ",{\"id\":\"cuda\",\"compiled\":true,\"device_available\":true,"
                   "\"analysis_command_available\":"
@@ -411,20 +415,13 @@ void write_capabilities_impl(
 #endif
 #if defined(GETNATIVE_HAS_VULKAN)
     try {
-        std::optional<getnative::VulkanAnalysisEngine> temporary_vulkan;
-        const getnative::VulkanAnalysisEngine *vulkan = resident_vulkan;
-        if (use_resident_vulkan) {
-            if (vulkan == nullptr) {
-                throw std::runtime_error(
-                    resident_vulkan_error.empty()
-                        ? "no compatible Vulkan device is available"
-                        : std::string{resident_vulkan_error});
-            }
-        } else {
-            temporary_vulkan.emplace();
-            vulkan = &*temporary_vulkan;
+        if (vulkan_device == nullptr) {
+            throw std::runtime_error(
+                vulkan_probe.reason.empty()
+                    ? "no compatible Vulkan device is available"
+                    : vulkan_probe.reason);
         }
-        const auto &device = vulkan->device_info();
+        const auto &device = *vulkan_device;
         output << ",{\"id\":\"vulkan\",\"compiled\":true,\"device_available\":true,"
                   "\"analysis_command_available\":"
                << available
@@ -488,43 +485,5 @@ void write_capabilities_impl(
     }
     output << "],\"runtime_dependencies\":[]}\n";
 }
-
-void write_capabilities(std::ostream &output, bool analysis_available) {
-    write_capabilities_impl(
-        output, analysis_available
-#if defined(GETNATIVE_HAS_CUDA)
-        , nullptr, {}, false
-#endif
-#if defined(GETNATIVE_HAS_VULKAN)
-        , nullptr, {}, false
-#endif
-    );
-}
-
-#if defined(GETNATIVE_HAS_CUDA) || defined(GETNATIVE_HAS_VULKAN)
-void write_capabilities(std::ostream &output, bool analysis_available,
-#if defined(GETNATIVE_HAS_CUDA)
-                        const getnative::CudaAnalysisEngine *resident_cuda,
-                        std::string_view resident_cuda_error
-#endif
-#if defined(GETNATIVE_HAS_VULKAN)
-#if defined(GETNATIVE_HAS_CUDA)
-                        ,
-#endif
-                        const getnative::VulkanAnalysisEngine *resident_vulkan,
-                        std::string_view resident_vulkan_error
-#endif
-                        ) {
-    write_capabilities_impl(
-        output, analysis_available
-#if defined(GETNATIVE_HAS_CUDA)
-        , resident_cuda, resident_cuda_error, true
-#endif
-#if defined(GETNATIVE_HAS_VULKAN)
-        , resident_vulkan, resident_vulkan_error, true
-#endif
-        );
-}
-#endif
 
 } // namespace getnative::cli

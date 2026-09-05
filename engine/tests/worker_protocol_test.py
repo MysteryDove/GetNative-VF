@@ -1240,6 +1240,9 @@ def main():
                         and decode_backends.get("nvdec", {}).get("runtime_device")
                         and decode_backends.get("nvdec", {}).get("zero_copy")):
                     accelerators.append(("cuda", "nvdec"))
+                if (vulkan_usable
+                        and decode_backends.get("vulkan_video", {}).get("runtime_device")):
+                    accelerators.append(("vulkan", "vulkan_video"))
 
                 late_scope = {
                     "selection": "all", "start_frame": 24, "end_frame": 29,
@@ -1330,30 +1333,6 @@ def main():
                           and accelerator_i_telemetry.get("effective_concurrency") == 4,
                           json.dumps({"terminal": accelerator_i_terminal,
                                       "warnings": accelerator_i_warnings})[:1000])
-
-                if vulkan_usable:
-                    worker.send(**verify_media_command(
-                        "vm-vulkan-copy", media_path, "vulkan"))
-                    vk_terminal, vk_results, vk_warnings = collect_verify(worker)
-                    vk_payload = vk_terminal.get("payload", {})
-                    vk_provenance = vk_payload.get("provenance", {})
-                    vk_decoder = vk_provenance.get("decoder")
-                    vk_close = (
-                        vk_results.keys() == cpu_results.keys()
-                        and all(abs(vk_results[seq] - cpu_results[seq]) <= 2e-6
-                                for seq in vk_results)
-                    )
-                    check("verify-media-vulkan-host-hwdec",
-                          vk_terminal["type"] == "result" and vk_close
-                          and not vk_warnings
-                          and vk_decoder in (
-                              "vaapi", "d3d11va", "nvdec", "software")
-                          and vk_provenance.get("actual_compute_backend")
-                              == "vulkan"
-                          and (vk_decoder == "software"
-                               or vk_provenance.get("zero_copy") is False),
-                          json.dumps({"provenance": vk_provenance,
-                                      "warnings": vk_warnings})[:1000])
 
                 hevc_accelerators = [
                     (backend, decoder)
