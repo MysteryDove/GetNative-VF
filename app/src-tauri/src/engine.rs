@@ -295,22 +295,29 @@ pub(crate) fn validate_capabilities(payload: &Value) -> Result<(), String> {
         return Err("getnative-engine returned an unsupported capability schema".to_owned());
     }
     if !capabilities.decode_backends.is_empty() {
-        let expected = if capabilities.decode_backends.len() == 3 {
-            ["software", "nvdec", "vulkan_video", ""]
-        } else {
-            ["software", "nvdec", "vulkan_video", "videotoolbox"]
-        };
-        if capabilities.decode_backends.len() < 3
-            || capabilities.decode_backends.len() > expected.len()
+        const EXPECTED: [&str; 6] = [
+            "software",
+            "nvdec",
+            "vaapi",
+            "d3d11va",
+            "vulkan_video",
+            "videotoolbox",
+        ];
+        if capabilities.decode_backends.len() != EXPECTED.len()
             || capabilities
                 .decode_backends
                 .iter()
-                .zip(expected)
+                .zip(EXPECTED)
                 .any(|(backend, id)| {
+                    let host_copy = backend.id == "vaapi" || backend.id == "d3d11va";
                     backend.id != id
                         || backend.runtime_device && !backend.compiled
                         || backend.zero_copy && !backend.runtime_device
-                        || backend.compiled && backend.id != "software" && backend.codecs.is_empty()
+                        || host_copy && backend.zero_copy
+                        || backend.compiled
+                            && backend.id != "software"
+                            && !host_copy
+                            && backend.codecs.is_empty()
                         || !backend.compiled && backend.reason.as_deref().is_none_or(str::is_empty)
                 })
         {
@@ -899,5 +906,46 @@ mod tests {
         let mut missing = valid_capabilities();
         missing["backends"].as_array_mut().unwrap().pop();
         assert!(validate_capabilities(&missing).is_err());
+    }
+
+    fn media_decode_capabilities() -> serde_json::Value {
+        let mut caps = valid_capabilities();
+        caps["features"] = json!({ "verify_engine_decode": true });
+        for command in [
+            "media_index_begin",
+            "media_frame_window",
+            "media_preview_begin",
+            "media_asset_batch_begin",
+        ] {
+            caps["commands"][command] = json!(true);
+        }
+        caps["media"] = json!({
+            "available": true,
+            "ffmpeg_abi": "62.62.60.9",
+            "index_version": 3,
+            "index_format": "lwi/vf.lwi"
+        });
+        caps["decode_backends"] = json!([
+            {"id": "software", "compiled": true, "runtime_device": true, "codecs": ["*"], "zero_copy": false},
+            {"id": "nvdec", "compiled": true, "runtime_device": true, "codecs": ["h264", "hevc"], "zero_copy": true},
+            {"id": "vaapi", "compiled": false, "runtime_device": false, "codecs": [], "zero_copy": false, "reason": "FFmpeg VAAPI was not compiled"},
+            {"id": "d3d11va", "compiled": true, "runtime_device": true, "codecs": ["h264", "hevc"], "zero_copy": false},
+            {"id": "vulkan_video", "compiled": true, "runtime_device": false, "codecs": ["h264"], "zero_copy": false, "reason": "unavailable"},
+            {"id": "videotoolbox", "compiled": false, "runtime_device": false, "codecs": [], "zero_copy": false, "reason": "not compiled", "surface_formats": ["420v", "420f", "x420", "xf20"]}
+        ]);
+        caps
+    }
+
+    #[test]
+    fn capability_schema_accepts_windows_host_copy_decode_backends() {
+        assert!(validate_capabilities(&media_decode_capabilities()).is_ok());
+    }
+
+    #[test]
+    fn capability_schema_rejects_legacy_decode_backend_lists() {
+        let mut caps = media_decode_capabilities();
+        caps["decode_backends"].as_array_mut().unwrap().remove(2);
+        caps["decode_backends"].as_array_mut().unwrap().remove(2);
+        assert!(validate_capabilities(&caps).is_err());
     }
 }
