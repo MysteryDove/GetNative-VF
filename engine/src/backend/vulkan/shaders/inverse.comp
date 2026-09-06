@@ -19,7 +19,8 @@ const uint HORIZONTAL_AXES = 0U;
 const uint VERTICAL_AXES = 1U;
 const uint BOTH_AXES = 2U;
 const uint CANDIDATE_WORDS = 29U;
-const uint MAXIMUM_BAND = 15U;
+layout(constant_id = 0) const uint SPECIALIZED_BAND = 0U;
+const uint MAXIMUM_BAND = SPECIALIZED_BAND == 0U ? 15U : SPECIALIZED_BAND;
 
 uint candidate_word(uint candidate, uint field) {
     return plan_data[candidate * CANDIDATE_WORDS + field];
@@ -43,14 +44,15 @@ void inverse_axis(uint candidate, bool vertical, bool source_input,
                   uint input_base, uint input_stride,
                   uint output_base, uint output_stride) {
     const uint size = axis_word(candidate, vertical, 1U);
-    const uint band = axis_word(candidate, vertical, 2U);
+    const uint band = SPECIALIZED_BAND == 0U
+        ? axis_word(candidate, vertical, 2U) : SPECIALIZED_BAND;
     const uint transpose_offsets = axis_word(candidate, vertical, 6U);
     const uint transpose_indices = axis_word(candidate, vertical, 7U);
     const uint transpose_weights = axis_word(candidate, vertical, 8U);
     const uint lower_ld = axis_word(candidate, vertical, 9U);
     const uint upper_l = axis_word(candidate, vertical, 10U);
     const uint inverse_diagonal = axis_word(candidate, vertical, 11U);
-    float recent[15];
+    float recent[MAXIMUM_BAND];
     for (uint distance = 0U; distance < MAXIMUM_BAND; ++distance) {
         recent[distance] = 0.0;
     }

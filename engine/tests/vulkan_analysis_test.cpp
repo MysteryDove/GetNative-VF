@@ -318,7 +318,63 @@ void test_conformance(const getnative::VulkanRuntimeProbe &probe) {
     }
 }
 
+void test_bandwidth_specialization(const getnative::VulkanRuntimeProbe &probe) {
+    getnative::VulkanAnalysisOptions options;
+    options.device_index = compatible_device(probe).index;
+    options.execution_slots = 1U;
+    getnative::VulkanAnalysisEngine engine(options);
+    const auto source = make_source(37, 29, 42);
+    const auto candidates = make_candidates(37, 29);
+    const getnative::MetricSpec metric{2, 3, 1, 2, 0.015F, 1U};
+    // Homogeneous axes select bandwidth-specialized pipelines; the mixed-axis
+    // conformance test also covers generic dispatch and reconstruction orders.
+    for (const auto &candidate : candidates) {
+        const std::vector single{candidate};
+        for (const std::uint32_t norm : {1U, 2U, 3U, 4U}) {
+            auto requested_metric = metric;
+            requested_metric.norm = norm;
+            compare_with_cpu(engine, source.view, single, requested_metric,
+                             "single-candidate bandwidth specialization");
+            const auto first = engine.analyze_axis_batch_f32(
+                source.view, single, requested_metric);
+            const auto second = engine.analyze_axis_batch_f32(
+                source.view, single, requested_metric);
+            expect(first.front().error == second.front().error,
+                   "repeated specialized result is bit-identical");
+        }
+    }
+}
+
 } // namespace
+
+void test_resident_plan_cache() {
+    getnative::VulkanAnalysisOptions options;
+    options.execution_slots = 1;
+    options.cache_plans = true;
+    getnative::VulkanAnalysisEngine engine{options};
+    const auto source = make_source(48, 32, 51);
+    auto candidates = make_candidates(48, 32);
+    const getnative::MetricSpec metric{0, 0, 0, 0, 0.015F, 1U};
+    const auto first = engine.analyze_axis_batch_f32(source.view, candidates, metric);
+    const auto uploaded = engine.runtime_telemetry().plan_upload_bytes;
+    candidates[0].id = "renamed";
+    const auto warm = engine.analyze_axis_batch_f32(source.view, candidates, metric,
+                                                  {}, getnative::GpuStageProfile::stages);
+    expect(engine.runtime_telemetry().plan_upload_bytes == uploaded,
+           "warm immutable plan must not be uploaded again");
+    for (std::size_t i = 0; i < first.size(); ++i)
+        expect(first[i].error == warm[i].error && warm[i].id == candidates[i].id,
+               "cache preserves exact values and current result IDs");
+    candidates[0].horizontal = make_plan(48, 25, 25.25, 0.375, getnative::Filter::lanczos(8));
+    const auto changed = engine.analyze_axis_batch_f32(source.view, candidates, metric);
+    expect(engine.runtime_telemetry().plan_upload_bytes > uploaded,
+           "different immutable plan invalidates cache");
+    options.cache_plans = false;
+    getnative::VulkanAnalysisEngine uncached{options};
+    const auto control = uncached.analyze_axis_batch_f32(source.view, candidates, metric);
+    for (std::size_t i = 0; i < control.size(); ++i)
+        expect(control[i].error == changed[i].error, "cache miss equals uncached evaluation");
+}
 
 int main() {
     try {
@@ -332,6 +388,8 @@ int main() {
             return 0;
         }
         test_conformance(probe);
+        test_resident_plan_cache();
+        test_bandwidth_specialization(probe);
         std::cout << "Vulkan analysis conformance passed on "
                   << compatible_device(probe).name << '\n';
         return 0;

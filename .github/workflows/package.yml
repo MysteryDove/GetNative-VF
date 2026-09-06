@@ -158,7 +158,7 @@ jobs:
         id: ffmpeg-cache
         with:
           path: .deps/ffmpeg-linux-x64
-          key: ffmpeg-${{ env.FFMPEG_VERSION }}-ubuntu-22.04-x64-${{ hashFiles('scripts/build-ffmpeg-linux.sh') }}
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-ubuntu-22.04-x64-${{ hashFiles('scripts/build-ffmpeg-linux.sh', 'scripts/patches/ffmpeg-*.patch') }}
       - name: Build pinned FFmpeg SDK
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         run: scripts/build-ffmpeg-linux.sh .deps/ffmpeg-linux-x64
@@ -683,7 +683,7 @@ jobs:
         id: ffmpeg-cache
         with:
           path: .deps/ffmpeg-windows-x64
-          key: ffmpeg-${{ env.FFMPEG_VERSION }}-windows-x64-msvc-hwaccel-${{ hashFiles('scripts/build-ffmpeg-windows.sh') }}
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-windows-x64-msvc-hwaccel-${{ hashFiles('scripts/build-ffmpeg-windows.sh', 'scripts/patches/ffmpeg-*.patch') }}
       - name: Check cached FFmpeg NVDEC, Vulkan, and D3D11VA hwaccels
         id: ffmpeg-hwaccel
         shell: pwsh

@@ -1,4 +1,7 @@
 #include "getnative/media_decode.hpp"
+#include "getnative/decode_ranges.hpp"
+#include "getnative/decode_restart.hpp"
+#include "getnative/joining_thread.hpp"
 #include "getnative/utf8_path.hpp"
 
 #ifndef NOMINMAX
@@ -34,6 +37,7 @@ extern "C" {
 #include <libavutil/dict.h>
 #include <libavutil/hash.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/imgutils.h>
 #if defined(__APPLE__)
 #include <CoreMedia/CoreMedia.h>
 #include <VideoToolbox/VideoToolbox.h>
@@ -124,9 +128,16 @@ using Clock = std::chrono::steady_clock;
     return std::string{buffer.data()};
 }
 
+class FfmpegError : public std::runtime_error {
+public:
+    FfmpegError(int value, std::string_view operation)
+        : std::runtime_error(std::string{operation} + ": " + ffmpeg_error(value)), code(value) {}
+    int code;
+};
+
 void check_ffmpeg(int error, std::string_view operation) {
     if (error < 0) {
-        throw std::runtime_error(std::string{operation} + ": " + ffmpeg_error(error));
+        throw FfmpegError(error, operation);
     }
 }
 
@@ -341,10 +352,59 @@ template <class Handle>
 }
 
 [[nodiscard]] AVPixelFormat select_vulkan_format(
-    AVCodecContext *, const AVPixelFormat *formats) {
+    AVCodecContext *codec, const AVPixelFormat *formats) {
     for (const AVPixelFormat *format = formats;
          *format != AV_PIX_FMT_NONE; ++format) {
-        if (*format == AV_PIX_FMT_VULKAN) return *format;
+        if (*format != AV_PIX_FMT_VULKAN) continue;
+        AVBufferRef *frames_ref = nullptr;
+        try {
+            check_ffmpeg(avcodec_get_hw_frames_parameters(
+                codec, codec->hw_device_ctx, *format, &frames_ref),
+                "avcodec_get_hw_frames_parameters(Vulkan)");
+            auto *frames = reinterpret_cast<AVHWFramesContext *>(frames_ref->data);
+            auto *vkframes = static_cast<AVVulkanFramesContext *>(frames->hwctx);
+            auto *device = static_cast<AVVulkanDeviceContext *>(frames->device_ctx->hwctx);
+            // Analysis samples the luma plane. FFmpeg's default STORAGE usage
+            // requires extended format support that video output need not have.
+            const VkImageUsageFlags usage = static_cast<VkImageUsageFlags>(vkframes->usage)
+                & ~static_cast<VkImageUsageFlags>(VK_IMAGE_USAGE_STORAGE_BIT);
+            vkframes->usage = static_cast<VkImageUsageFlagBits>(usage);
+            const auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceVideoFormatPropertiesKHR>(
+                vkGetInstanceProcAddr(device->inst, "vkGetPhysicalDeviceVideoFormatPropertiesKHR"));
+            if (!query) throw std::runtime_error("Vulkan video format query is unavailable");
+            VkPhysicalDeviceVideoFormatInfoKHR request{};
+            request.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_FORMAT_INFO_KHR;
+            request.pNext = vkframes->create_pnext;
+            request.imageUsage = usage;
+            std::uint32_t count = 0;
+            if (query(device->phys_dev, &request, &count, nullptr) != VK_SUCCESS || count == 0) {
+                throw std::runtime_error("Vulkan video output usage is unsupported");
+            }
+            std::vector<VkVideoFormatPropertiesKHR> properties(count);
+            for (auto &p : properties) p.sType = VK_STRUCTURE_TYPE_VIDEO_FORMAT_PROPERTIES_KHR;
+            if (query(device->phys_dev, &request, &count, properties.data()) != VK_SUCCESS) {
+                throw std::runtime_error("Vulkan video format query failed");
+            }
+            const auto supported = std::find_if(properties.begin(), properties.end(),
+                [&](const auto &p) {
+                    return p.format == vkframes->format[0]
+                        && p.imageType == VK_IMAGE_TYPE_2D && p.imageTiling == vkframes->tiling
+                        && (p.imageUsageFlags & usage) == usage
+                        && (p.imageCreateFlags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) != 0;
+                });
+            if (supported == properties.end()) {
+                throw std::runtime_error("Vulkan video format cannot expose a sampled luma plane");
+            }
+            vkframes->img_flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+            check_ffmpeg(av_hwframe_ctx_init(frames_ref), "av_hwframe_ctx_init(Vulkan)");
+            av_buffer_unref(&codec->hw_frames_ctx);
+            codec->hw_frames_ctx = frames_ref;
+            return *format;
+        } catch (const std::exception &error) {
+            av_buffer_unref(&frames_ref);
+            av_log(codec, AV_LOG_ERROR, "%s\n", error.what());
+            return AV_PIX_FMT_NONE;
+        }
     }
     return AV_PIX_FMT_NONE;
 }
@@ -394,14 +454,22 @@ struct VulkanDeviceOwner {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
         timeline.timelineSemaphore = source.native_timeline_semaphore
             ? VK_TRUE : VK_FALSE;
+        synchronization2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES;
+        synchronization2.synchronization2 = source.native_synchronization2 ? VK_TRUE : VK_FALSE;
+        ycbcr.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
+        ycbcr.samplerYcbcrConversion = source.native_sampler_ycbcr_conversion ? VK_TRUE : VK_FALSE;
+        timeline.pNext = &synchronization2;
+        synchronization2.pNext = &ycbcr;
     }
 
     std::vector<std::string> extensions;
     std::vector<const char *> extension_names;
     VkPhysicalDeviceTimelineSemaphoreFeatures timeline{};
+    VkPhysicalDeviceSynchronization2Features synchronization2{};
+    VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr{};
     void *queue_lock_opaque = nullptr;
-    void (*lock_queue)(void *) = nullptr;
-    void (*unlock_queue)(void *) = nullptr;
+    void (*lock_queue)(void *, std::uint32_t, std::uint32_t) = nullptr;
+    void (*unlock_queue)(void *, std::uint32_t, std::uint32_t) = nullptr;
 };
 
 void free_vulkan_device_owner(AVHWDeviceContext *context) {
@@ -409,19 +477,19 @@ void free_vulkan_device_owner(AVHWDeviceContext *context) {
     context->user_opaque = nullptr;
 }
 
-void lock_vulkan_queue(AVHWDeviceContext *context, std::uint32_t,
-                       std::uint32_t) {
+void lock_vulkan_queue(AVHWDeviceContext *context, std::uint32_t family,
+                       std::uint32_t index) {
     auto *owner = static_cast<VulkanDeviceOwner *>(context->user_opaque);
     if (owner != nullptr && owner->lock_queue != nullptr) {
-        owner->lock_queue(owner->queue_lock_opaque);
+        owner->lock_queue(owner->queue_lock_opaque, family, index);
     }
 }
 
-void unlock_vulkan_queue(AVHWDeviceContext *context, std::uint32_t,
-                         std::uint32_t) {
+void unlock_vulkan_queue(AVHWDeviceContext *context, std::uint32_t family,
+                         std::uint32_t index) {
     auto *owner = static_cast<VulkanDeviceOwner *>(context->user_opaque);
     if (owner != nullptr && owner->unlock_queue != nullptr) {
-        owner->unlock_queue(owner->queue_lock_opaque);
+        owner->unlock_queue(owner->queue_lock_opaque, family, index);
     }
 }
 
@@ -439,9 +507,10 @@ void configure_vulkan_decoder(AVCodecContext &codec, const AVCodec &decoder,
     if (VK_API_VERSION_MAJOR(options.native_instance_api_version) < 1U
         || (VK_API_VERSION_MAJOR(options.native_instance_api_version) == 1U
             && VK_API_VERSION_MINOR(options.native_instance_api_version) < 3U)
-        || !options.native_timeline_semaphore) {
+        || !options.native_timeline_semaphore || !options.native_synchronization2
+        || !options.native_sampler_ycbcr_conversion) {
         throw std::runtime_error(
-            "Vulkan Video decode requires Vulkan 1.3 and timeline semaphores");
+            "Vulkan Video decode requires Vulkan 1.3, timeline semaphores, synchronization2 and YCbCr conversion");
     }
     if (!decoder_supports_vulkan(decoder)) {
         throw std::runtime_error(
@@ -488,7 +557,7 @@ void configure_vulkan_decoder(AVCodecContext &codec, const AVCodec &decoder,
     if (options.native_decode_queue_family
         != options.native_compute_queue_family) {
         vulkan->qf[vulkan->nb_qf++] = AVVulkanDeviceQueueFamily{
-            static_cast<int>(options.native_decode_queue_family), 1,
+            static_cast<int>(options.native_decode_queue_family), static_cast<int>(options.native_decode_queue_count),
             static_cast<VkQueueFlagBits>(
                 VK_QUEUE_VIDEO_DECODE_BIT_KHR | VK_QUEUE_TRANSFER_BIT),
             static_cast<VkVideoCodecOperationFlagBitsKHR>(
@@ -517,7 +586,7 @@ void configure_vulkan_decoder(AVCodecContext &codec, const AVCodec &decoder,
     vulkan->nb_encode_queues = 0;
     vulkan->queue_family_decode_index =
         static_cast<int>(options.native_decode_queue_family);
-    vulkan->nb_decode_queues = 1;
+    vulkan->nb_decode_queues = static_cast<int>(options.native_decode_queue_count);
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
@@ -639,15 +708,36 @@ struct VulkanFrameLease {
         if (frame->hw_frames_ctx == nullptr || frame->data[0] == nullptr) {
             throw std::runtime_error("cloned Vulkan frame is incomplete");
         }
-        auto *frames = reinterpret_cast<AVHWFramesContext *>(
-            frame->hw_frames_ctx->data);
-        auto *vulkan_frame = reinterpret_cast<AVVkFrame *>(frame->data[0]);
-        lock = std::make_unique<VulkanFrameLock>(*frames, *vulkan_frame);
     }
 
     FramePtr frame;
-    std::unique_ptr<VulkanFrameLock> lock;
 };
+
+struct VulkanSubmissionLease {
+    VulkanSubmissionLease(std::shared_ptr<void> frame, AVHWFramesContext &frames, AVVkFrame &image)
+        : retained_frame(std::move(frame)), lock(frames, image) {}
+    std::shared_ptr<void> retained_frame;
+    VulkanFrameLock lock;
+};
+
+VulkanFrame acquire_vulkan_submission(const VulkanFrame &input) {
+    auto &frame = *static_cast<VulkanFrameLease *>(input.lease.get())->frame;
+    auto &frames = *reinterpret_cast<AVHWFramesContext *>(frame.hw_frames_ctx->data);
+    auto &image = *reinterpret_cast<AVVkFrame *>(frame.data[0]);
+    auto submission = std::make_shared<VulkanSubmissionLease>(input.lease, frames, image);
+    VulkanFrame output = input;
+    output.layout = static_cast<std::uint32_t>(image.layout[0]);
+    output.access = static_cast<std::uint32_t>(image.access[0]);
+    output.queue_family = image.queue_family[0];
+    output.semaphore = native_value(image.sem[0]);
+    output.semaphore_value = image.sem_value[0];
+    output.sync_opaque = &submission->lock;
+    output.mark_submitted = VulkanFrameLock::mark_submitted;
+    output.release_without_submit = VulkanFrameLock::release_without_submit;
+    output.acquire_for_submit = nullptr;
+    output.lease = std::move(submission);
+    return output;
+}
 #endif
 
 struct BuiltDecoder {
@@ -745,7 +835,6 @@ struct BuiltDecoder {
     return {std::move(format), std::move(built.codec), stream, built.decoder};
 }
 
-#if defined(__APPLE__)
 [[nodiscard]] OpenedDecoder open_demuxer(const std::string &path, std::uint32_t stream_index,
                                          const MediaIndex *index = nullptr) {
     AVFormatContext *raw_format = nullptr;
@@ -763,6 +852,7 @@ struct BuiltDecoder {
     return {std::move(format), {}, stream, nullptr};
 }
 
+#if defined(__APPLE__)
 [[nodiscard]] std::unique_ptr<VideotoolboxSession> make_videotoolbox_session(
     const AVStream &stream, const ExtraDataInfo *configuration,
     std::size_t max_inflight) {
@@ -3038,20 +3128,191 @@ void decode_selected_hardware_indexed(
     const auto start = Clock::now();
     const bool videotoolbox =
         options.backend == DecoderOptions::Backend::videotoolbox;
-    const std::vector<IndexedDecodeRun> runs =
-        plan_indexed_decode_runs(index, selected_frames);
+    std::mutex restart_mutex;
+    std::map<std::uint64_t, bool> closed_restarts;
+    std::optional<OpenedDecoder> restart_probe;
+    const auto closed_restart = [&](std::uint64_t anchor) {
+        if (anchor == 0) return true;
+        const std::scoped_lock lock(restart_mutex);
+        if (const auto found = closed_restarts.find(anchor); found != closed_restarts.end()) return found->second;
+        if (anchor >= index.frames.size() || (index.codec != "h264" && index.codec != "hevc")) return false;
+        if (stop.stop_requested()) throw std::runtime_error("cancelled");
+        if (!restart_probe) restart_probe.emplace(open_demuxer(path, index.stream_index, &index));
+        auto &probe = *restart_probe;
+        const auto &identity = index.frames[anchor];
+        bool safe = false;
+        if (seek_to_keyframe(*probe.format, index, identity, true)) {
+            PacketPtr packet{av_packet_alloc()};
+            if (!packet) throw std::bad_alloc();
+            for (std::size_t n = 0; n < 1024 && av_read_frame(probe.format.get(), packet.get()) >= 0; ++n) {
+                if (stop.stop_requested()) throw std::runtime_error("cancelled");
+                const bool matches = identity.file_position
+                    ? packet->pos == *identity.file_position
+                    : identity.pts && packet->pts == *identity.pts;
+                if (packet->stream_index == static_cast<int>(index.stream_index) && matches) {
+                    const auto *configuration = indexed_decoder_configuration(index, anchor);
+                    const auto *extra = configuration && !configuration->data.empty()
+                        ? configuration->data.data() : probe.stream->codecpar->extradata;
+                    const auto extra_size = configuration && !configuration->data.empty()
+                        ? configuration->data.size() : static_cast<std::size_t>(probe.stream->codecpar->extradata_size);
+                    unsigned length_bytes = 0;
+                    if (extra && extra_size && extra[0] == 1) {
+                        if (index.codec == "h264" && extra_size >= 5) length_bytes = (extra[4] & 3U) + 1U;
+                        if (index.codec == "hevc" && extra_size >= 22) length_bytes = (extra[21] & 3U) + 1U;
+                    }
+                    safe = packet_has_closed_restart(
+                        {packet->data, static_cast<std::size_t>(packet->size)},
+                        index.codec == "h264" ? RestartCodec::h264 : RestartCodec::hevc, length_bytes);
+                    break;
+                }
+                av_packet_unref(packet.get());
+            }
+        }
+        closed_restarts.emplace(anchor, safe);
+        return safe;
+    };
+    const auto safe_decode_anchor = [&](std::uint64_t anchor) {
+        while (!closed_restart(anchor)) {
+            const auto earlier = preceding_rap(index, anchor);
+            if (!earlier) return std::uint64_t{0};
+            if (index.frames[*earlier].extradata_index != index.frames[anchor].extradata_index) {
+                throw std::runtime_error("no independently decodable RAP after configuration change");
+            }
+            anchor = *earlier;
+        }
+        return anchor;
+    };
+    std::vector<std::size_t> safe_cuts;
+    for (std::size_t i = 1; i < selected_frames.size(); ++i) {
+        const auto anchor = selected_frames[i].keyframe_anchor;
+        if (anchor != selected_frames[i - 1].keyframe_anchor && anchor < index.frames.size()
+            && index.frames[anchor].rap && !selected_frames[i].leading_frame
+            && selected_frames[i].frame_index >= anchor) safe_cuts.push_back(i);
+    }
+    IndexedRangeScheduler scheduler{selected_frames.size(), safe_cuts};
+    const auto split_tail = [&](IndexedRangeScheduler::Lease lease, std::size_t preferred,
+                                std::size_t minimum_tail) {
+        const auto range = scheduler.range(lease);
+        if (!range) return false;
+        for (auto cut = std::lower_bound(safe_cuts.begin(), safe_cuts.end(), preferred);
+             cut != safe_cuts.end() && *cut < range->end && range->end - *cut >= minimum_tail; ++cut) {
+            const auto anchor = selected_frames[*cut].keyframe_anchor;
+            if (!closed_restart(anchor)) continue;
+            if (scheduler.split_tail(lease, *cut, minimum_tail, true)) {
+                if (telemetry) telemetry->decode_session_changes.push_back(
+                    "range_split:" + std::to_string(*cut) + ":rap:" + std::to_string(anchor));
+                return true;
+            }
+        }
+        return false;
+    };
+    std::vector<IndexedRangeScheduler::Assignment> assignments;
+    assignments.push_back(scheduler.claim().value());
+    std::stop_callback cancelled{stop, [&] { scheduler.cancel(); }};
+    if (options.maximum_decode_sessions != 1U && options.maximum_decode_sessions != 2U
+        && options.maximum_decode_sessions != 4U) {
+        throw std::invalid_argument("maximum_decode_sessions must be 1, 2 or 4");
+    }
+    // Fixed-tier integration probes retain the existing dense-scan baseline.
+    // Split only at an indexed RAP, and reuse the normal planner's leading
+    // picture / extradata handling within each independent decoder session.
+    const bool contiguous = selected_frames.back().frame_index
+        - selected_frames.front().frame_index + 1U == selected_frames.size();
+    if (!options.adaptive_decode && options.maximum_decode_sessions > 1U
+        && options.frame_concurrency >= options.maximum_decode_sessions && contiguous
+        && selected_frames.size() >= 1024U) {
+        while (assignments.size() < options.maximum_decode_sessions) {
+            auto largest = std::max_element(assignments.begin(), assignments.end(), [](const auto &a, const auto &b) {
+                return a.range.end - a.range.begin < b.range.end - b.range.begin;
+            });
+            if (!split_tail(largest->lease, largest->range.begin
+                + (largest->range.end - largest->range.begin) / 2U, 256U)) break;
+            largest->range = scheduler.range(largest->lease).value();
+            assignments.push_back(scheduler.claim().value());
+        }
+    }
     const IndexedIdentityLookup identity_lookup{index};
-    constexpr std::size_t worker_count = 1U;
+    const std::size_t initial_workers = assignments.size();
+    auto resources = options.decode_resources;
+    resources.analysis_concurrency = options.frame_concurrency;
+    resources.safe_partitions = safe_cuts.size() + 1;
+    if (!resources.session_bytes && index.width > 0 && index.height > 0
+        && index.width <= std::numeric_limits<int>::max() - 255
+        && index.height <= std::numeric_limits<int>::max() - 63) {
+        const auto format = av_get_pix_fmt(index.pixel_format.c_str());
+        const int width = (index.width + 255) & ~255;
+        const int height = (index.height + 63) & ~63;
+        if (format != AV_PIX_FMT_NONE && width >= index.width && height >= index.height) {
+            const int surface_bytes = av_image_get_buffer_size(format, width, height, 256);
+            if (surface_bytes > 0) {
+                // Reserve 16 reference pictures plus decoder/output queues and
+                // bitstream storage; the budget helper adds its 25% margin.
+                resources.session_bytes = static_cast<std::uint64_t>(surface_bytes)
+                    * (32U + options.frame_concurrency) + (16U << 20U);
+                resources.existing_session_bytes = resources.session_bytes;
+            }
+        }
+    }
+    const auto budget = decode_budget(resources);
+    const std::size_t worker_count = options.adaptive_decode && options.demand_snapshot
+        ? std::max(initial_workers, budget.maximum_sessions) : initial_workers;
+    assignments.resize(worker_count);
+    AdaptiveDecodeController controller{worker_count};
     std::vector<DecodeTelemetry> worker_telemetry(worker_count);
     std::vector<double> worker_consumer_ms(worker_count, 0.0);
+    std::array<std::atomic_bool, 4> worker_done{}, worker_ready{}, worker_creation_failed{};
+    std::array<std::atomic<double>, 4> initialization_ms{};
+    for (auto &done : worker_done) done.store(true);
+    std::mutex producer_clock_mutex;
+    auto producer_clock = Clock::now();
+    double producer_thread_ms = 0.0;
+    std::size_t running_producers = 0;
+    const auto producer_exposure = [&](int delta) {
+        const std::scoped_lock lock(producer_clock_mutex);
+        const auto now = Clock::now();
+        producer_thread_ms += std::chrono::duration<double, std::milli>(now - producer_clock).count()
+            * static_cast<double>(running_producers);
+        producer_clock = now;
+        if (delta > 0) ++running_producers;
+        if (delta < 0) --running_producers;
+        return producer_thread_ms;
+    };
     std::mutex failure_mutex;
     std::atomic_bool failed{false};
     std::exception_ptr failure;
 
     const auto decode_slice = [&](std::size_t worker_index) {
+        struct Done {
+            std::atomic_bool &flag;
+            const decltype(producer_exposure) &exposure;
+            ~Done() { exposure(-1); flag.store(true, std::memory_order_release); }
+        } done{worker_done[worker_index], producer_exposure};
+        bool initialized = false;
+        const auto initialization_start = Clock::now();
         try {
-            const std::size_t run_begin = worker_index * runs.size() / worker_count;
-            const std::size_t run_end = (worker_index + 1U) * runs.size() / worker_count;
+            const auto assignment = assignments[worker_index];
+            auto runs = plan_indexed_decode_runs(index, selected_frames.subspan(
+                assignment.range.begin, assignment.range.end - assignment.range.begin));
+            for (auto &run : runs) {
+                run.selected_begin += assignment.range.begin;
+                run.selected_end += assignment.range.begin;
+            }
+            if (options.backend == DecoderOptions::Backend::vulkan_video) {
+                std::vector<IndexedDecodeRun> safe_runs;
+                for (auto run : runs) {
+                    run.decode_anchor = safe_decode_anchor(run.decode_anchor);
+                    if (!safe_runs.empty() && safe_runs.back().decode_anchor == run.decode_anchor) {
+                        safe_runs.back().selected_end = run.selected_end;
+                        safe_runs.back().end_position = run.end_position;
+                        safe_runs.back().end_decode_index = run.end_decode_index;
+                    } else {
+                        safe_runs.push_back(run);
+                    }
+                }
+                runs = std::move(safe_runs);
+            }
+            const std::size_t run_begin = 0U;
+            const std::size_t run_end = runs.size();
             const ExtraDataInfo *initial_configuration = indexed_decoder_configuration(
                 index, runs[run_begin].decode_anchor);
 #if defined(__APPLE__)
@@ -3071,6 +3332,9 @@ void decode_selected_hardware_indexed(
 #endif
             PacketPtr packet{av_packet_alloc()};
             if (!packet) throw std::runtime_error("FFmpeg packet allocation failed");
+            initialized = true;
+            initialization_ms[worker_index].store(std::chrono::duration<double, std::milli>(
+                Clock::now() - initialization_start).count());
             std::optional<std::uint32_t> current_extradata_index =
                 runs[run_begin].decode_anchor < index.frames.size()
                     ? std::optional{index.frames[runs[run_begin].decode_anchor]
@@ -3079,6 +3343,7 @@ void decode_selected_hardware_indexed(
             DecodeTelemetry &local = worker_telemetry[worker_index];
             double &consumer_ms = worker_consumer_ms[worker_index];
             constexpr std::size_t maximum_decode_attempts = 3U;
+            bool assignment_finished = false;
 
             const auto configure_decoder = [&](std::uint64_t decode_anchor,
                                                bool force_flush) {
@@ -3088,7 +3353,7 @@ void decode_selected_hardware_indexed(
                         : std::nullopt;
                 if (current_extradata_index == required_extradata) {
 #if defined(__APPLE__)
-                    if (force_flush && vt) vt->flush();
+                    if (force_flush && vt) vt->flush(stop);
                     else
 #endif
                     if (force_flush && opened.codec) {
@@ -3115,18 +3380,21 @@ void decode_selected_hardware_indexed(
             };
 
             for (std::size_t run_index = run_begin; run_index < run_end; ++run_index) {
+                if (assignment_finished) break;
                 if (stop.stop_requested()) throw std::runtime_error("cancelled");
                 if (failed.load(std::memory_order_relaxed)) return;
                 const IndexedDecodeRun &run = runs[run_index];
                 std::uint64_t decode_anchor = run.decode_anchor;
+                std::vector<char> delivered_flags(run.selected_end - run.selected_begin, 0);
+                std::size_t delivered_count = 0U;
                 for (std::size_t attempt = 0U;; ++attempt) {
-                    // Every run starts at an indexed RAP. CUDA/Vulkan reset DPB
-                    // by feeding the next IDR; flushing would tear down the
-                    // hardware context for every selected I-picture. VideoToolbox
-                    // stalls on that pattern, so it flushes (recreates the
-                    // session) at each RAP. Retries always flush because they
-                    // start before the requested RAP.
-                    configure_decoder(decode_anchor, videotoolbox || attempt != 0U);
+                    // A run seeks independently and may restart at an open GOP.
+                    // Vulkan must discard the preceding run's DPB associations;
+                    // an indexed RAP is not necessarily an IDR reset.
+                    const bool vulkan_jump = run_index != run_begin
+                        && options.backend == DecoderOptions::Backend::vulkan_video;
+                    configure_decoder(decode_anchor,
+                                      videotoolbox || vulkan_jump || attempt != 0U);
                     std::uint64_t presentation_cursor = 0U;
                     if (decode_anchor < index.frames.size()
                         && seek_to_keyframe(*opened.format, index,
@@ -3140,8 +3408,6 @@ void decode_selected_hardware_indexed(
                                                  AVSEEK_FLAG_BACKWARD);
                     }
                     av_packet_unref(packet.get());
-                    std::vector<char> delivered_flags(
-                        run.selected_end - run.selected_begin, 0);
                     const std::uint64_t minimum_decode_index =
                         presentation_cursor < index.frames.size()
                             ? index.frames[presentation_cursor].decode_index : 0U;
@@ -3150,8 +3416,8 @@ void decode_selected_hardware_indexed(
                         selected_frames.subspan(
                             run.selected_begin, run.selected_end - run.selected_begin),
                         minimum_decode_index, run.end_decode_index};
-                    std::size_t delivered_count = 0U;
                     auto process = [&](AVFrame &source) {
+                        if (assignment_finished) return;
                         ++local.decoded_frames;
                         const IndexedFrameMatch matched = matcher.match(
                             source, delivered_flags, false, presentation_cursor);
@@ -3161,12 +3427,29 @@ void decode_selected_hardware_indexed(
                             ++presentation_cursor;
                         }
                         if (!matched.selected_target) return;
-                        delivered_flags[*matched.selected_target] = 1;
-                        ++delivered_count;
                         const std::size_t target =
                             run.selected_begin + *matched.selected_target;
+                        const auto reservation = scheduler.reserve(assignment.lease, target);
+                        if (reservation == IndexedRangeScheduler::Delivery::unavailable) {
+                            if (stop.stop_requested()) throw std::runtime_error("cancelled");
+                            // A newer session owns this tail. Delayed leading
+                            // output may still be needed by this owner.
+                            assignment_finished = scheduler.finished(assignment.lease);
+                            return;
+                        }
+                        if (reservation == IndexedRangeScheduler::Delivery::delivered) return;
                         const auto consumer_start = Clock::now();
-                        deliver(source, selected_frames[target], target);
+                        try {
+                            deliver(source, selected_frames[target], target);
+                        } catch (...) {
+                            scheduler.abandon_delivery(assignment.lease, target);
+                            throw;
+                        }
+                        scheduler.commit(assignment.lease, target);
+                        worker_ready[worker_index].store(true, std::memory_order_release);
+                        assignment_finished = scheduler.finished(assignment.lease);
+                        delivered_flags[*matched.selected_target] = 1;
+                        ++delivered_count;
                         consumer_ms += std::chrono::duration<double, std::milli>(
                             Clock::now() - consumer_start).count();
                         ++local.selected_frames;
@@ -3175,7 +3458,7 @@ void decode_selected_hardware_indexed(
                     if (vt) {
                         const auto pump = [&](bool block) {
                             VideotoolboxFrame output;
-                            while (delivered_count != delivered_flags.size()) {
+                            while (!assignment_finished && delivered_count != delivered_flags.size()) {
                                 const bool got = block ? vt->wait_pop(output, stop)
                                                        : vt->try_pop(output);
                                 block = false;
@@ -3194,7 +3477,7 @@ void decode_selected_hardware_indexed(
                                 process(probe);
                             }
                         };
-                        while (delivered_count != delivered_flags.size()
+                        while (!assignment_finished && delivered_count != delivered_flags.size()
                                && av_read_frame(opened.format.get(), packet.get()) >= 0) {
                             if (stop.stop_requested()) {
                                 av_packet_unref(packet.get());
@@ -3210,24 +3493,25 @@ void decode_selected_hardware_indexed(
                                     break;
                                 }
                                 while (!vt->can_submit()
+                                       && !assignment_finished
                                        && delivered_count != delivered_flags.size()) {
                                     pump(true);
                                 }
-                                if (delivered_count != delivered_flags.size()) {
+                                if (!assignment_finished && delivered_count != delivered_flags.size()) {
                                     vt->submit(
                                         packet->data, packet->size, packet->pts,
-                                        packet->dts, packet->duration);
+                                        packet->dts, packet->duration, stop);
                                     pump(false);
                                 }
                             }
                             av_packet_unref(packet.get());
                         }
-                        vt->finish();
+                        vt->finish(stop);
                         pump(true);
                     } else
 #endif
                     {
-                    while (delivered_count != delivered_flags.size()
+                    while (!assignment_finished && delivered_count != delivered_flags.size()
                            && av_read_frame(opened.format.get(), packet.get()) >= 0) {
                         if (stop.stop_requested()) {
                             av_packet_unref(packet.get());
@@ -3251,7 +3535,7 @@ void decode_selected_hardware_indexed(
                         }
                         av_packet_unref(packet.get());
                     }
-                    if (delivered_count != delivered_flags.size()) {
+                    if (!assignment_finished && delivered_count != delivered_flags.size()) {
                         send_packet_tolerant(
                             *opened.codec, nullptr, stop, &local,
                             std::string{"avcodec_send_packet("}
@@ -3260,14 +3544,10 @@ void decode_selected_hardware_indexed(
                         receive_frames(*opened.codec, stop, process);
                     }
                     }
-                    if (delivered_count == delivered_flags.size()) break;
-                    // A retry is only safe before this run emitted a surface;
-                    // otherwise the analysis pipeline would receive duplicates.
-                    if (delivered_count != 0U) {
-                        throw std::runtime_error(
-                            std::string{backend_name}
-                            + " decoder lost indexed frame identity after a completed prefix");
-                    }
+                    if (assignment_finished || delivered_count == delivered_flags.size()) break;
+                    // Preserve delivered_flags across attempts. Preroll may
+                    // revisit frames, but successfully enqueued identities are
+                    // never offered to the analysis consumer a second time.
                     const std::optional<std::uint64_t> earlier =
                         preceding_rap(index, decode_anchor);
                     if (attempt + 1U >= maximum_decode_attempts || !earlier) {
@@ -3279,23 +3559,160 @@ void decode_selected_hardware_indexed(
                     ++local.decode_retries;
                 }
             }
+            if (!scheduler.complete(assignment.lease)) {
+                throw std::runtime_error("indexed decoder did not complete its leased range");
+            }
         } catch (...) {
+            bool allocation_failure = false;
+            try { throw; }
+            catch (const FfmpegError &error) { allocation_failure = error.code == AVERROR(ENOMEM); }
+            catch (const std::bad_alloc &) { allocation_failure = true; }
+            catch (...) {}
+            if (options.adaptive_decode && worker_index != 0
+                && (!initialized || allocation_failure)) {
+                scheduler.release(assignments[worker_index].lease);
+                worker_creation_failed[worker_index].store(true);
+                return;
+            }
             const std::scoped_lock lock(failure_mutex);
             if (!failure) failure = std::current_exception();
             failed.store(true, std::memory_order_relaxed);
         }
     };
 
-    std::vector<std::thread> workers;
-    workers.reserve(worker_count);
-    for (std::size_t worker = 0U; worker < worker_count; ++worker) {
-        workers.emplace_back(decode_slice, worker);
+    std::vector<std::unique_ptr<JoiningThread>> workers(worker_count);
+    std::array<bool, 4> retiring{};
+    std::size_t peak_sessions = initial_workers;
+    const auto launch = [&](std::size_t slot) {
+        worker_done[slot].store(false);
+        worker_ready[slot].store(false);
+        worker_creation_failed[slot].store(false);
+        retiring[slot] = false;
+        producer_exposure(1);
+        try {
+            workers[slot] = std::make_unique<JoiningThread>(decode_slice, slot);
+        } catch (...) {
+            producer_exposure(-1);
+            worker_done[slot].store(true);
+            scheduler.release(assignments[slot].lease);
+            throw;
+        }
+    };
+    try {
+        for (std::size_t worker = 0U; worker < initial_workers; ++worker) {
+            launch(worker);
+        }
+    } catch (...) {
+        failed.store(true, std::memory_order_relaxed);
+        throw;
     }
-    for (std::thread &worker : workers) worker.join();
+    if (options.adaptive_decode && options.demand_snapshot) {
+        auto snapshot = options.demand_snapshot();
+        snapshot.producer_thread_ms = producer_exposure(0);
+        DecodeDemandSampler sampler{snapshot};
+        std::size_t ceiling = worker_count;
+        bool waiting_for_tier = false;
+        std::size_t previous_active = initial_workers;
+        while (!failed.load() && !stop.stop_requested()) {
+            std::size_t active = 0;
+            bool ready = true;
+            for (std::size_t i = 0; i < worker_count; ++i) {
+                if (workers[i] && worker_done[i].load(std::memory_order_acquire)) {
+                    workers[i]->join();
+                    workers[i].reset();
+                    if (worker_creation_failed[i].exchange(false)) {
+                        ceiling = std::max<std::size_t>(1, controller.sessions() / 2);
+                        controller.resource_limit(ceiling);
+                        if (telemetry) telemetry->decode_session_changes.emplace_back("session_creation_failed");
+                    }
+                }
+                if (workers[i]) { ++active; ready = ready && worker_ready[i].load(std::memory_order_acquire); }
+            }
+            if (!active && !scheduler.pending_ranges()) break;
+            if (waiting_for_tier && active == controller.sessions() && ready) {
+                controller.tier_ready();
+                waiting_for_tier = false;
+                snapshot = options.demand_snapshot();
+                snapshot.producer_thread_ms = producer_exposure(0);
+                sampler = DecodeDemandSampler{snapshot};
+            }
+            snapshot = options.demand_snapshot();
+            snapshot.producer_thread_ms = producer_exposure(0);
+            if (active != previous_active) {
+                // Never compare a window spanning a session-count transition.
+                sampler = DecodeDemandSampler{snapshot};
+            }
+            if (const auto window = sampler.sample(snapshot); window && active == controller.sessions()) {
+                double init = 0;
+                for (const auto &value : initialization_ms) init = std::max(init, value.load() / 1000.0);
+                const double remaining = window->throughput > 0
+                    ? static_cast<double>(selected_frames.size() - scheduler.delivered()) / window->throughput : 0;
+                const auto decision = controller.observe(*window, remaining, init);
+                if (decision.reason != DecodeChangeReason::none && telemetry) {
+                    telemetry->decode_session_changes.push_back(std::to_string(decision.sessions)
+                        + ":" + decode_change_reason(decision.reason));
+                }
+                if (decision.reason == DecodeChangeReason::starvation_probe
+                    || decision.reason == DecodeChangeReason::capacity_probe
+                    || decision.reason == DecodeChangeReason::probe_reverted) waiting_for_tier = true;
+            }
+            const auto desired = std::min(ceiling, controller.sessions());
+            if (active > desired) {
+                std::size_t excess = active - desired;
+                for (std::size_t i = worker_count; i-- > 0 && excess;) {
+                    if (!workers[i]) continue;
+                    if (!retiring[i]) {
+                        const auto range = scheduler.range(assignments[i].lease);
+                        if (range) retiring[i] = split_tail(assignments[i].lease, range->begin + 1, 1);
+                    }
+                    if (retiring[i]) --excess;
+                }
+            }
+            if (active < desired || !active) {
+                if (!scheduler.pending_ranges()) {
+                    auto ranges = scheduler.active_ranges();
+                    std::sort(ranges.begin(), ranges.end(), [](const auto &a, const auto &b) {
+                        return a.range.end - a.range.begin > b.range.end - b.range.begin;
+                    });
+                    for (const auto &range : ranges) {
+                        if (split_tail(range.lease, range.range.begin
+                            + (range.range.end - range.range.begin) / 2, 256)) break;
+                    }
+                    if (!scheduler.pending_ranges() && active) {
+                        ceiling = active;
+                        controller.resource_limit(ceiling);
+                        waiting_for_tier = false;
+                        if (telemetry) telemetry->decode_session_changes.emplace_back("no_safe_remaining_partition");
+                    }
+                }
+                for (std::size_t i = 0; i < worker_count && active < desired; ++i) {
+                    if (workers[i]) continue;
+                    const auto assignment = scheduler.claim();
+                    if (!assignment) break;
+                    assignments[i] = *assignment;
+                    try { launch(i); ++active; }
+                    catch (...) {
+                        ceiling = std::max<std::size_t>(1, active);
+                        controller.resource_limit(ceiling);
+                        if (!active) throw;
+                        break;
+                    }
+                }
+                peak_sessions = std::max(peak_sessions, active);
+            }
+            previous_active = active;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    for (auto &worker : workers) if (worker) worker->join();
     if (failure) std::rethrow_exception(failure);
 
     if (telemetry) {
-        telemetry->decode_sessions = worker_count;
+        telemetry->decode_sessions = peak_sessions;
+        telemetry->current_decode_sessions = 0;
+        telemetry->decode_extra_budget_bytes = budget.extra_bytes;
+        telemetry->decode_session_estimate_bytes = budget.session_bytes;
+        for (const auto &value : initialization_ms) telemetry->decode_session_initialization_ms += value.load();
         for (const DecodeTelemetry &local : worker_telemetry) {
             telemetry->decoded_frames += local.decoded_frames;
             telemetry->selected_frames += local.selected_frames;
@@ -3463,15 +3880,7 @@ void decode_selected_vulkan(const std::string &path,
         output.bit_depth = bit_depth;
         output.normalized_sample_bits = luma.normalized_bits;
         output.range = frame_range(source);
-        output.layout = static_cast<std::uint32_t>(leased_frame->layout[0]);
-        output.access = static_cast<std::uint32_t>(leased_frame->access[0]);
-        output.queue_family = leased_frame->queue_family[0];
-        output.semaphore = native_value(leased_frame->sem[0]);
-        output.semaphore_value = leased_frame->sem_value[0];
-        output.sync_opaque = lease->lock.get();
-        output.mark_submitted = VulkanFrameLock::mark_submitted;
-        output.release_without_submit =
-            VulkanFrameLock::release_without_submit;
+        output.acquire_for_submit = acquire_vulkan_submission;
         output.lease = std::move(lease);
         consumer(std::move(output));
         }, telemetry);

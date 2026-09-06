@@ -324,8 +324,15 @@ public:
     void run(Decoder &&decoder) {
         std::stop_callback cancelled{stop_, [this] { condition_.notify_all(); }};
         workers_.reserve(concurrency_);
-        for (std::size_t index = 0U; index < concurrency_; ++index) {
-            workers_.emplace_back([this] { worker_loop(); });
+        try {
+            for (std::size_t index = 0U; index < concurrency_; ++index) {
+                workers_.emplace_back([this] { worker_loop(); });
+            }
+        } catch (...) {
+            fail(std::current_exception());
+            for (auto &worker : workers_) if (worker.joinable()) worker.join();
+            workers_.clear();
+            throw;
         }
 
         std::exception_ptr decode_failure;
@@ -338,6 +345,7 @@ public:
             const std::scoped_lock lock(mutex_);
             decoding_done_ = true;
             if (stop_.stop_requested()) {
+                account_waits();
                 abort_ = true;
                 inflight_ -= queue_.size();
                 queue_.clear();
@@ -365,6 +373,14 @@ public:
     [[nodiscard]] double queue_wait_ms() const noexcept {
         return queue_wait_ms_.load(std::memory_order_relaxed);
     }
+    [[nodiscard]] media::DecodeDemandSnapshot demand_snapshot() const {
+        const std::scoped_lock lock(mutex_);
+        account_waits();
+        return {std::chrono::duration<double, std::milli>(
+                    last_accounted_ - started_).count(),
+                completed(), starvation_thread_ms_, capacity_thread_ms_,
+                0.0, queue_frame_ms_, concurrency_, inflight_};
+    }
 
 private:
     std::size_t concurrency_;
@@ -384,14 +400,33 @@ private:
     std::atomic<std::uint64_t> completed_{0U};
     std::atomic<std::size_t> max_inflight_{0U};
     std::atomic<double> queue_wait_ms_{0.0};
+    const std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
+    mutable std::chrono::steady_clock::time_point last_accounted_ = started_;
+    std::size_t starving_workers_ = 0, blocked_producers_ = 0;
+    mutable double starvation_thread_ms_ = 0.0, capacity_thread_ms_ = 0.0;
+    mutable double queue_frame_ms_ = 0.0;
+
+    // Integrate under mutex, including waits that span a sampling boundary.
+    void account_waits() const {
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - last_accounted_).count();
+        starvation_thread_ms_ += ms * static_cast<double>(starving_workers_);
+        capacity_thread_ms_ += ms * static_cast<double>(blocked_producers_);
+        queue_frame_ms_ += ms * static_cast<double>(queue_.size());
+        last_accounted_ = now;
+    }
 
     void push(Frame frame) {
         const auto wait_start = std::chrono::steady_clock::now();
         std::unique_lock lock(mutex_);
+        account_waits();
+        ++blocked_producers_;
         condition_.wait(lock, [&] {
             return abort_ || failure_ || stop_.stop_requested()
                 || inflight_ < concurrency_;
         });
+        account_waits();
+        --blocked_producers_;
         queue_wait_ms_.fetch_add(
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - wait_start).count(),
@@ -413,6 +448,7 @@ private:
         {
             const std::scoped_lock lock(mutex_);
             if (!failure_) failure_ = std::move(error);
+            account_waits();
             abort_ = true;
             inflight_ -= queue_.size();
             queue_.clear();
@@ -426,10 +462,14 @@ private:
             std::optional<Frame> frame;
             {
                 std::unique_lock lock(mutex_);
+                account_waits();
+                ++starving_workers_;
                 condition_.wait(lock, [&] {
                     return abort_ || stop_.stop_requested() || !queue_.empty()
                         || decoding_done_;
                 });
+                account_waits();
+                --starving_workers_;
                 if (abort_ || stop_.stop_requested()) return;
                 if (queue_.empty()) {
                     if (decoding_done_) return;
@@ -4335,6 +4375,19 @@ private:
         cuda_decoder_options.frame_concurrency = spec.concurrency;
         vulkan_decoder_options.frame_concurrency = spec.concurrency;
         metal_decoder_options.frame_concurrency = spec.concurrency;
+#if defined(GETNATIVE_TEST_ADAPTIVE_DECODE)
+        cuda_decoder_options.adaptive_decode = true;
+        vulkan_decoder_options.adaptive_decode = true;
+        metal_decoder_options.adaptive_decode = true;
+#endif
+#if defined(GETNATIVE_TEST_FIXED_DECODE_SESSIONS)
+        cuda_decoder_options.maximum_decode_sessions = GETNATIVE_TEST_FIXED_DECODE_SESSIONS;
+        vulkan_decoder_options.maximum_decode_sessions = GETNATIVE_TEST_FIXED_DECODE_SESSIONS;
+        metal_decoder_options.maximum_decode_sessions = GETNATIVE_TEST_FIXED_DECODE_SESSIONS;
+        cuda_decoder_options.adaptive_decode = false;
+        vulkan_decoder_options.adaptive_decode = false;
+        metal_decoder_options.adaptive_decode = false;
+#endif
         bool use_cuda_decode = false;
         bool use_vulkan_decode = false;
         bool use_metal_decode = false;
@@ -4384,20 +4437,23 @@ private:
                     native.compute_queue_family;
                 vulkan_decoder_options.native_decode_queue_family =
                     native.decode_queue_family;
+                vulkan_decoder_options.native_decode_queue_count = native.decode_queue_count;
                 vulkan_decoder_options.native_video_codec_operations =
                     native.video_codec_operations;
                 vulkan_decoder_options.native_instance_api_version =
                     native.instance_api_version;
                 vulkan_decoder_options.native_timeline_semaphore =
                     native.timeline_semaphore;
+                vulkan_decoder_options.native_synchronization2 = native.synchronization2;
+                vulkan_decoder_options.native_sampler_ycbcr_conversion = native.sampler_ycbcr_conversion;
                 vulkan_decoder_options.native_device_extensions =
                     native.enabled_device_extensions;
                 vulkan_decoder_options.native_queue_lock_opaque = &vulkan;
-                vulkan_decoder_options.lock_native_queue = [](void *opaque) {
-                    static_cast<VulkanAnalysisEngine *>(opaque)->lock_native_queue();
+                vulkan_decoder_options.lock_native_queue = [](void *opaque, std::uint32_t family, std::uint32_t queue_index) {
+                    static_cast<VulkanAnalysisEngine *>(opaque)->lock_native_queue(family, queue_index);
                 };
-                vulkan_decoder_options.unlock_native_queue = [](void *opaque) {
-                    static_cast<VulkanAnalysisEngine *>(opaque)->unlock_native_queue();
+                vulkan_decoder_options.unlock_native_queue = [](void *opaque, std::uint32_t family, std::uint32_t queue_index) {
+                    static_cast<VulkanAnalysisEngine *>(opaque)->unlock_native_queue(family, queue_index);
                 };
             }
         }
@@ -4609,22 +4665,25 @@ private:
         try {
 #if defined(GETNATIVE_HAS_METAL)
             if (spec.backend == BackendChoice::metal) {
-                resident_metal_engine().preflight_axis_batch(
+                metal_decoder_options.decode_resources.analysis_reserved_bytes = resident_metal_engine().preflight_axis_batch(
                     preflight_dimensions, candidates, spec.metric, spec.concurrency);
+                metal_decoder_options.decode_resources.available_bytes = resident_metal_engine().available_memory_bytes();
             }
 #endif
 #if defined(GETNATIVE_HAS_CUDA)
             if (spec.backend == BackendChoice::cuda) {
-                resident_cuda_engine().preflight_axis_batch(
+                cuda_decoder_options.decode_resources.analysis_reserved_bytes = resident_cuda_engine().preflight_axis_batch(
                     preflight_dimensions, candidates, spec.metric,
                     spec.concurrency);
+                cuda_decoder_options.decode_resources.available_bytes = resident_cuda_engine().available_memory_bytes();
             }
 #endif
 #if defined(GETNATIVE_HAS_VULKAN)
             if (spec.backend == BackendChoice::vulkan) {
-                resident_vulkan_engine().preflight_axis_batch(
+                vulkan_decoder_options.decode_resources.analysis_reserved_bytes = resident_vulkan_engine().preflight_axis_batch(
                     preflight_dimensions, candidates, spec.metric,
                     spec.concurrency);
+                vulkan_decoder_options.decode_resources.available_bytes = resident_vulkan_engine().available_memory_bytes();
             }
 #endif
         } catch (const std::exception &error) {
@@ -4681,6 +4740,14 @@ private:
         std::size_t max_inflight = 0U;
         std::size_t surface_lease_peak = 0U;
         double queue_wait_ms = 0.0;
+        double analysis_starvation_thread_ms = 0.0;
+        double producer_capacity_thread_ms = 0.0;
+        double analysis_queue_frame_ms = 0.0;
+        const auto record_demand = [&](const media::DecodeDemandSnapshot &snapshot) {
+            analysis_starvation_thread_ms += snapshot.starvation_thread_ms;
+            producer_capacity_thread_ms += snapshot.capacity_thread_ms;
+            analysis_queue_frame_ms += snapshot.queue_frame_ms;
+        };
         const auto append_result = [&](std::uint64_t seq,
                                        const media::FrameIdentity &identity,
                                        double error,
@@ -4836,8 +4903,10 @@ private:
                         },
                         [&] { job.stop_source.request_stop(); }};
                     pipeline.run([&](auto consume) {
+                        auto options = cuda_decoder_options;
+                        options.demand_snapshot = [&] { return pipeline.demand_snapshot(); };
                         media::decode_selected_cuda(
-                            input.path, index, selected, cuda_decoder_options,
+                            input.path, index, selected, options,
                             job.stop_source.get_token(), std::move(consume),
                             &decode_telemetry);
                     });
@@ -4845,6 +4914,7 @@ private:
                     surface_lease_peak = std::max(
                         surface_lease_peak, pipeline.max_inflight());
                     queue_wait_ms += pipeline.queue_wait_ms();
+                    record_demand(pipeline.demand_snapshot());
                     actual_decoder = "nvdec";
                     zero_copy = true;
                     decoded = true;
@@ -4869,7 +4939,9 @@ private:
                     vulkan_decoder_options.expected_bit_depth = index.bit_depth;
                     MediaVerifyPipeline<media::VulkanFrame> pipeline{
                         spec.concurrency, job.stop_source.get_token(),
-                        [&](const media::VulkanFrame &frame) {
+                        [&](const media::VulkanFrame &queued_frame) {
+                            const media::VulkanFrame frame = queued_frame.acquire_for_submit
+                                ? queued_frame.acquire_for_submit(queued_frame) : queued_frame;
                             if (frame.width != spec.width
                                 || frame.height != spec.height) {
                                 throw WorkerError(
@@ -4927,8 +4999,10 @@ private:
                         },
                         [&] { job.stop_source.request_stop(); }};
                     pipeline.run([&](auto consume) {
+                        auto options = vulkan_decoder_options;
+                        options.demand_snapshot = [&] { return pipeline.demand_snapshot(); };
                         media::decode_selected_vulkan(
-                            input.path, index, selected, vulkan_decoder_options,
+                            input.path, index, selected, options,
                             job.stop_source.get_token(), std::move(consume),
                             &decode_telemetry);
                     });
@@ -4936,6 +5010,7 @@ private:
                     surface_lease_peak = std::max(
                         surface_lease_peak, pipeline.max_inflight());
                     queue_wait_ms += pipeline.queue_wait_ms();
+                    record_demand(pipeline.demand_snapshot());
                     actual_decoder = "vulkan_video";
                     zero_copy = true;
                     decoded = true;
@@ -4997,8 +5072,10 @@ private:
                         },
                         [&] { job.stop_source.request_stop(); }};
                     pipeline.run([&](auto consume) {
+                        auto options = metal_decoder_options;
+                        options.demand_snapshot = [&] { return pipeline.demand_snapshot(); };
                         media::decode_selected_metal(
-                            input.path, index, selected, metal_decoder_options,
+                            input.path, index, selected, options,
                             job.stop_source.get_token(), std::move(consume),
                             &decode_telemetry);
                     });
@@ -5006,6 +5083,7 @@ private:
                     surface_lease_peak = std::max(
                         surface_lease_peak, pipeline.max_inflight());
                     queue_wait_ms += pipeline.queue_wait_ms();
+                    record_demand(pipeline.demand_snapshot());
                     actual_decoder = "videotoolbox";
                     zero_copy = true;
                     if (decode_telemetry.host_frame_bytes != 0U
@@ -5109,6 +5187,7 @@ private:
         std::size_t plan_upload_bytes = 0U;
         std::size_t result_readback_bytes = 0U;
         double device_convert_ms = 0.0;
+        std::array<double, 6> vulkan_stage_gpu_ms{};
         double upload_ms = 0.0;
         double readback_ms = 0.0;
         double execution_slot_wait_ms = 0.0;
@@ -5143,6 +5222,7 @@ private:
             result_readback_bytes = gpu.result_readback_bytes;
             device_convert_ms = gpu.source_conversion_ms;
             upload_ms = gpu.host_pack_ms;
+            vulkan_stage_gpu_ms = gpu.stage_gpu_ms;
             readback_ms = 0.0;
             execution_slot_wait_ms = gpu.execution_slot_wait_ms;
         }
@@ -5219,11 +5299,25 @@ private:
                         static_cast<std::int64_t>(decode_telemetry.decode_retries))},
                     {"decode_sessions", JsonValue::integer(
                         static_cast<std::int64_t>(decode_telemetry.decode_sessions))},
+                    {"decode_current_sessions", JsonValue::integer(static_cast<std::int64_t>(decode_telemetry.current_decode_sessions))},
+                    {"decode_extra_budget_bytes", JsonValue::integer(static_cast<std::int64_t>(decode_telemetry.decode_extra_budget_bytes))},
+                    {"decode_session_estimate_bytes", JsonValue::integer(static_cast<std::int64_t>(decode_telemetry.decode_session_estimate_bytes))},
+                    {"decode_session_initialization_ms", JsonValue::number(decode_telemetry.decode_session_initialization_ms)},
+                    {"decode_session_changes", [&] {
+                        std::vector<JsonValue> changes;
+                        for (const auto &change : decode_telemetry.decode_session_changes) changes.push_back(JsonValue::string(change));
+                        return JsonValue::array(std::move(changes));
+                    }()},
                     {"discarded_packets", JsonValue::integer(
                         static_cast<std::int64_t>(decode_telemetry.discarded_packets))},
                     {"convert_ms", JsonValue::number(
                         decode_telemetry.convert_ms + device_convert_ms)},
                     {"upload_ms", JsonValue::number(upload_ms)},
+                    {"vulkan_stage_gpu_ms", [&] {
+                        std::vector<JsonValue> values;
+                        for (double value : vulkan_stage_gpu_ms) values.push_back(JsonValue::number(value));
+                        return JsonValue::array(std::move(values));
+                    }()},
                     {"compute_ms", JsonValue::number(
                         std::max(
                             0.0,
@@ -5239,6 +5333,9 @@ private:
                     {"execution_slot_wait_ms", JsonValue::number(
                         execution_slot_wait_ms)},
                     {"queue_wait_ms", JsonValue::number(queue_wait_ms)},
+                    {"analysis_starvation_thread_ms", JsonValue::number(analysis_starvation_thread_ms)},
+                    {"producer_capacity_thread_ms", JsonValue::number(producer_capacity_thread_ms)},
+                    {"analysis_queue_frame_ms", JsonValue::number(analysis_queue_frame_ms)},
                     {"surface_lease_peak", JsonValue::integer(
                         static_cast<std::int64_t>(surface_lease_peak))},
                     {"host_frame_bytes", JsonValue::integer(

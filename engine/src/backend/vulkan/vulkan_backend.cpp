@@ -285,6 +285,8 @@ struct DeviceRecord {
     std::optional<std::uint32_t> decode_queue_family;
     VkVideoCodecOperationFlagsKHR video_codec_operations = 0U;
     bool timeline_semaphore = false;
+    bool synchronization2 = false;
+    bool sampler_ycbcr_conversion = false;
     std::vector<std::string> enabled_video_extensions;
 };
 
@@ -374,11 +376,21 @@ struct DeviceRecord {
         VkPhysicalDeviceTimelineSemaphoreFeatures timeline{};
         timeline.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+        VkPhysicalDeviceSynchronization2Features synchronization2{};
+        synchronization2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES;
+        VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr{};
+        ycbcr.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
+        timeline.pNext = &ycbcr;
+        if (record.properties.apiVersion >= VK_API_VERSION_1_3) {
+            ycbcr.pNext = &synchronization2;
+        }
         VkPhysicalDeviceFeatures2 features{};
         features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         features.pNext = &timeline;
         vkGetPhysicalDeviceFeatures2(record.physical, &features);
         record.timeline_semaphore = timeline.timelineSemaphore == VK_TRUE;
+        record.synchronization2 = synchronization2.synchronization2 == VK_TRUE;
+        record.sampler_ycbcr_conversion = ycbcr.samplerYcbcrConversion == VK_TRUE;
 
         const std::vector<VkExtensionProperties> extensions =
             device_extensions(record.physical);
@@ -454,6 +466,8 @@ struct DeviceRecord {
             info.video_decode_reason = "Vulkan Video requires Vulkan 1.3";
         } else if (!record.timeline_semaphore) {
             info.video_decode_reason = "timeline semaphores are unavailable";
+        } else if (!record.synchronization2 || !record.sampler_ycbcr_conversion) {
+            info.video_decode_reason = "synchronization2 or sampler YCbCr conversion is unavailable";
         } else if (!record.decode_queue_family.has_value()) {
             info.video_decode_reason = "no Vulkan Video decode queue family";
         } else if (record.video_codec_operations == 0U) {
@@ -544,6 +558,8 @@ public:
         video_codec_operations = selected->video_codec_operations;
         enabled_device_extensions = selected->enabled_video_extensions;
         timeline_semaphore = selected->timeline_semaphore;
+        synchronization2 = selected->synchronization2;
+        sampler_ycbcr_conversion = selected->sampler_ycbcr_conversion;
         std::uint32_t family_count = 0U;
         vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, nullptr);
         std::vector<VkQueueFamilyProperties> queue_properties(family_count);
@@ -554,16 +570,23 @@ public:
                 queue_properties[queue_family].timestampValidBits;
         }
 
-        constexpr float priority = 1.0F;
+        // FFmpeg is handed queue 0 only. Reserve additional queues for
+        // independent analysis slots, within the device's advertised limit.
+        const std::uint32_t compute_queue_count = std::min(
+            static_cast<std::uint32_t>(slot_count + 1U),
+            queue_properties[queue_family].queueCount);
+        const std::vector<float> priorities(compute_queue_count, 1.0F);
         std::vector<VkDeviceQueueCreateInfo> queue_infos;
         queue_infos.push_back(VkDeviceQueueCreateInfo{
             VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, nullptr, 0U,
-            queue_family, 1U, &priority});
+            queue_family, compute_queue_count, priorities.data()});
         if (decode_queue_family != queue_family
             && selected->decode_queue_family.has_value()) {
+            decode_queue_count = std::min<std::uint32_t>(2U, queue_properties[decode_queue_family].queueCount);
+            decode_priorities.assign(decode_queue_count, 1.0F);
             queue_infos.push_back(VkDeviceQueueCreateInfo{
                 VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, nullptr, 0U,
-                decode_queue_family, 1U, &priority});
+                decode_queue_family, decode_queue_count, decode_priorities.data()});
         }
         std::vector<const char *> extension_names;
         extension_names.reserve(enabled_device_extensions.size());
@@ -574,15 +597,27 @@ public:
         timeline.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
         timeline.timelineSemaphore = timeline_semaphore ? VK_TRUE : VK_FALSE;
+        VkPhysicalDeviceSynchronization2Features sync2{};
+        sync2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES;
+        sync2.synchronization2 = synchronization2 ? VK_TRUE : VK_FALSE;
+        VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr{};
+        ycbcr.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
+        ycbcr.samplerYcbcrConversion = sampler_ycbcr_conversion ? VK_TRUE : VK_FALSE;
+        timeline.pNext = &ycbcr;
+        if (synchronization2) ycbcr.pNext = &sync2;
         const VkDeviceCreateInfo device_info{
             VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             timeline_semaphore ? &timeline : nullptr, 0U,
             static_cast<std::uint32_t>(queue_infos.size()), queue_infos.data(),
             0U, nullptr, static_cast<std::uint32_t>(extension_names.size()),
             extension_names.data(), nullptr};
+        compute_queues.resize(compute_queue_count);
         check_vk(vkCreateDevice(physical, &device_info, nullptr, &device),
                  "vkCreateDevice");
         vkGetDeviceQueue(device, queue_family, 0U, &queue);
+        for (std::uint32_t index = 0; index < compute_queue_count; ++index) {
+            vkGetDeviceQueue(device, queue_family, index, &compute_queues[index]);
+        }
 
         try {
             std::array<VkDescriptorSetLayoutBinding, 5U> bindings{};
@@ -620,6 +655,11 @@ public:
             inverse_pipeline = create_pipeline(
                 vulkan_detail::embedded::getnative_vulkan_inverse_spv,
                 sizeof(vulkan_detail::embedded::getnative_vulkan_inverse_spv));
+            for (const std::uint32_t band : {1U, 3U, 5U, 7U}) {
+                specialized_inverse_pipelines[band] = create_pipeline(
+                    vulkan_detail::embedded::getnative_vulkan_inverse_spv,
+                    sizeof(vulkan_detail::embedded::getnative_vulkan_inverse_spv), band);
+            }
             forward_pipeline = create_pipeline(
                 vulkan_detail::embedded::getnative_vulkan_forward_spv,
                 sizeof(vulkan_detail::embedded::getnative_vulkan_forward_spv));
@@ -683,11 +723,13 @@ public:
     }
 
     void submit(VkCommandBuffer command, VkFence fence,
-                const VulkanLumaFrameView *source = nullptr) {
+                const VulkanLumaFrameView *source, std::size_t slot_index) {
         VkTimelineSemaphoreSubmitInfo timeline_info{};
         VkSemaphore semaphore = VK_NULL_HANDLE;
         std::uint64_t signal_value = 0U;
-        VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        // The decoded image's layout transition must also wait for video DPB
+        // reads; waiting only at the shader stage leaves that transition early.
+        VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
         if (source != nullptr) {
             semaphore = native_handle<VkSemaphore>(source->semaphore);
             if (source->semaphore_value
@@ -708,12 +750,30 @@ public:
             1U, &command,
             source != nullptr ? 1U : 0U,
             source != nullptr ? &semaphore : nullptr};
-        std::scoped_lock lock(queue_mutex);
-        check_vk(vkQueueSubmit(queue, 1U, &submit_info, fence), "vkQueueSubmit");
+        const std::size_t queue_index = compute_queues.size() > 1U
+            ? 1U + slot_index % (compute_queues.size() - 1U) : 0U;
+        // If the device has just one queue, share FFmpeg's external lock.
+        // Otherwise synchronize only callers using this particular queue.
+        std::scoped_lock lock(queue_index == 0U
+            ? queue_mutex : analysis_queue_mutexes[queue_index]);
+        check_vk(vkQueueSubmit(compute_queues[queue_index], 1U, &submit_info, fence),
+                 "vkQueueSubmit");
     }
 
-    void lock_queue() { queue_mutex.lock(); }
-    void unlock_queue() noexcept { queue_mutex.unlock(); }
+    std::mutex &native_queue_mutex(std::uint32_t family, std::uint32_t index) noexcept {
+        if (family == queue_family && index < compute_queues.size()) {
+            return index == 0U ? queue_mutex : analysis_queue_mutexes[index];
+        }
+        if (family == decode_queue_family && index < decode_queue_count) return decode_queue_mutexes[index];
+        // FFmpeg may only submit to family/index pairs advertised at creation.
+        std::terminate();
+    }
+    void lock_queue(std::uint32_t family, std::uint32_t index) {
+        native_queue_mutex(family, index).lock();
+    }
+    void unlock_queue(std::uint32_t family, std::uint32_t index) noexcept {
+        native_queue_mutex(family, index).unlock();
+    }
 
     InstanceHandle instance;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
@@ -721,9 +781,13 @@ public:
     VkQueue queue = VK_NULL_HANDLE;
     std::uint32_t queue_family = 0U;
     std::uint32_t decode_queue_family = 0U;
+    std::uint32_t decode_queue_count = 1U;
+    std::vector<float> decode_priorities;
     VkVideoCodecOperationFlagsKHR video_codec_operations = 0U;
     std::uint32_t instance_api_version = VK_API_VERSION_1_0;
     bool timeline_semaphore = false;
+    bool synchronization2 = false;
+    bool sampler_ycbcr_conversion = false;
     std::uint32_t timestamp_valid_bits = 0U;
     std::vector<std::string> enabled_device_extensions;
     VulkanDeviceInfo info;
@@ -734,6 +798,7 @@ public:
     VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
     VkPipeline transpose_pipeline = VK_NULL_HANDLE;
     VkPipeline inverse_pipeline = VK_NULL_HANDLE;
+    std::array<VkPipeline, 8U> specialized_inverse_pipelines{};
     VkPipeline forward_pipeline = VK_NULL_HANDLE;
     VkPipeline metric_pipeline = VK_NULL_HANDLE;
     VkPipeline luma_pipeline = VK_NULL_HANDLE;
@@ -741,9 +806,15 @@ public:
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     std::atomic<std::size_t> validation_errors{0U};
 
+    [[nodiscard]] VkPipeline inverse_for_band(std::uint32_t band) const {
+        return band < specialized_inverse_pipelines.size()
+                && specialized_inverse_pipelines[band] != VK_NULL_HANDLE
+            ? specialized_inverse_pipelines[band] : inverse_pipeline;
+    }
+
 private:
     [[nodiscard]] VkPipeline create_pipeline(
-        const std::uint32_t *code, std::size_t bytes) const {
+        const std::uint32_t *code, std::size_t bytes, std::uint32_t band = 0U) const {
         const VkShaderModuleCreateInfo module_info{
             VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0U,
             bytes, code};
@@ -751,9 +822,13 @@ private:
         check_vk(vkCreateShaderModule(device, &module_info, nullptr, &module),
                  "vkCreateShaderModule");
         try {
+            const VkSpecializationMapEntry band_entry{0U, 0U, sizeof(band)};
+            const VkSpecializationInfo specialization{
+                1U, &band_entry, sizeof(band), &band};
             const VkPipelineShaderStageCreateInfo stage{
                 VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0U,
-                VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
+                VK_SHADER_STAGE_COMPUTE_BIT, module, "main",
+                band != 0U ? &specialization : nullptr};
             const VkComputePipelineCreateInfo pipeline_info{
                 VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr, 0U,
                 stage, pipeline_layout, VK_NULL_HANDLE, -1};
@@ -791,6 +866,9 @@ private:
         if (inverse_pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(device, inverse_pipeline, nullptr);
         }
+        for (VkPipeline pipeline : specialized_inverse_pipelines) {
+            if (pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, pipeline, nullptr);
+        }
         if (transpose_pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(device, transpose_pipeline, nullptr);
         }
@@ -808,6 +886,9 @@ private:
     }
 
     std::mutex queue_mutex;
+    std::array<std::mutex, 2> decode_queue_mutexes;
+    std::vector<VkQueue> compute_queues;
+    std::array<std::mutex, 9U> analysis_queue_mutexes;
 };
 
 class Buffer {
@@ -953,9 +1034,12 @@ public:
     void create(VkDevice device, const VulkanLumaFrameView &source) {
         reset();
         device_ = device;
+        const VkImageViewUsageCreateInfo usage{
+            VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, nullptr,
+            VK_IMAGE_USAGE_SAMPLED_BIT};
         const VkImageViewCreateInfo view_info{
             VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            nullptr,
+            &usage,
             0U,
             native_handle<VkImage>(source.image),
             VK_IMAGE_VIEW_TYPE_2D,
@@ -996,16 +1080,22 @@ struct ExecutionSlot {
         try {
             const VkCommandBufferAllocateInfo command_info{
                 VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr,
-                command_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1U};
+                command_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 2U};
+            std::array<VkCommandBuffer, 2U> commands{};
             check_vk(vkAllocateCommandBuffers(
-                         context.device, &command_info, &command),
+                         context.device, &command_info, commands.data()),
                      "vkAllocateCommandBuffers");
+            command = commands[0];
+            analysis_command = commands[1];
             const VkFenceCreateInfo fence_info{
                 VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr,
                 VK_FENCE_CREATE_SIGNALED_BIT};
             check_vk(vkCreateFence(
                          context.device, &fence_info, nullptr, &fence),
                      "vkCreateFence");
+            check_vk(vkCreateFence(
+                         context.device, &fence_info, nullptr, &conversion_fence),
+                     "vkCreateFence(conversion)");
             if (context.timestamp_valid_bits != 0U) {
                 const VkQueryPoolCreateInfo query_info{
                     VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, nullptr, 0U,
@@ -1026,6 +1116,9 @@ struct ExecutionSlot {
                 vkDestroyQueryPool(
                     context.device, conversion_query_pool, nullptr);
             }
+            if (conversion_fence != VK_NULL_HANDLE) {
+                vkDestroyFence(context.device, conversion_fence, nullptr);
+            }
             if (fence != VK_NULL_HANDLE) vkDestroyFence(context.device, fence, nullptr);
             vkDestroyCommandPool(context.device, command_pool, nullptr);
             throw;
@@ -1033,9 +1126,14 @@ struct ExecutionSlot {
     }
 
     ~ExecutionSlot() {
+        if (stage_query_pool != VK_NULL_HANDLE)
+            vkDestroyQueryPool(context_->device, stage_query_pool, nullptr);
         if (conversion_query_pool != VK_NULL_HANDLE) {
             vkDestroyQueryPool(
                 context_->device, conversion_query_pool, nullptr);
+        }
+        if (conversion_fence != VK_NULL_HANDLE) {
+            vkDestroyFence(context_->device, conversion_fence, nullptr);
         }
         if (fence != VK_NULL_HANDLE) vkDestroyFence(context_->device, fence, nullptr);
         if (command_pool != VK_NULL_HANDLE) {
@@ -1046,9 +1144,13 @@ struct ExecutionSlot {
     Context *context_ = nullptr;
     VkCommandPool command_pool = VK_NULL_HANDLE;
     VkCommandBuffer command = VK_NULL_HANDLE;
+    VkCommandBuffer analysis_command = VK_NULL_HANDLE;
+    VkFence conversion_fence = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     VkQueryPool conversion_query_pool = VK_NULL_HANDLE;
+    VkQueryPool stage_query_pool = VK_NULL_HANDLE;
+    std::uint32_t stage_query_capacity = 0;
     Buffer host_plan;
     Buffer host_source;
     Buffer host_partials;
@@ -1159,11 +1261,30 @@ struct PackedBatch {
         bool has_horizontal = false;
         bool has_vertical = false;
         bool has_both = false;
+        std::uint32_t horizontal_band = 0U;
+        std::uint32_t vertical_band = 0U;
     };
     std::vector<std::uint32_t> plan_words;
     std::vector<Tile> tiles;
     std::size_t workspace_elements = 0U;
     bool has_horizontal = false;
+};
+
+struct ResidentBatch {
+    std::int32_t width = 0, height = 0;
+    std::vector<CandidateAnalysis> candidates;
+    PackedBatch packed;
+    bool uploaded = false;
+
+    bool matches(ConstImageView source, std::span<const CandidateAnalysis> next) const {
+        if (width != source.width || height != source.height || candidates.size() != next.size()) return false;
+        for (std::size_t i = 0; i < next.size(); ++i) {
+            if (candidates[i].horizontal != next[i].horizontal
+                || candidates[i].vertical != next[i].vertical
+                || candidates[i].axes != next[i].axes) return false;
+        }
+        return true;
+    }
 };
 
 [[nodiscard]] std::size_t packed_axis_word_count(const AxisPlan &plan) {
@@ -1299,6 +1420,17 @@ struct PackedBatch {
                     : static_cast<std::size_t>(source.width));
         }
         ++tile.candidate_count;
+        // Mixed-band axes retain the generic per-candidate shader.
+        if (candidate.axes != AnalysisAxes::vertical) {
+            const auto band = static_cast<std::uint32_t>(candidate.horizontal->half_bandwidth);
+            tile.horizontal_band = !tile.has_horizontal ? band
+                : (tile.horizontal_band == band ? band : 0U);
+        }
+        if (candidate.axes != AnalysisAxes::horizontal) {
+            const auto band = static_cast<std::uint32_t>(candidate.vertical->half_bandwidth);
+            tile.vertical_band = !tile.has_vertical ? band
+                : (tile.vertical_band == band ? band : 0U);
+        }
         tile.has_horizontal = tile.has_horizontal
             || candidate.axes != AnalysisAxes::vertical;
         tile.has_vertical = tile.has_vertical
@@ -1384,13 +1516,17 @@ struct VulkanAnalysisEngine::Impl {
         native_context_info.compute_queue = native_value(context->queue);
         native_context_info.compute_queue_family = context->queue_family;
         native_context_info.decode_queue_family = context->decode_queue_family;
+        native_context_info.decode_queue_count = context->decode_queue_count;
         native_context_info.video_codec_operations =
             context->video_codec_operations;
         native_context_info.instance_api_version = context->instance_api_version;
         native_context_info.timeline_semaphore = context->timeline_semaphore;
+        native_context_info.synchronization2 = context->synchronization2;
+        native_context_info.sampler_ycbcr_conversion = context->sampler_ycbcr_conversion;
         native_context_info.enabled_device_extensions =
             context->enabled_device_extensions;
         slots.reserve(options.execution_slots);
+        resident_batches.resize(options.execution_slots);
         for (std::size_t index = 0U; index < options.execution_slots; ++index) {
             slots.push_back(std::make_unique<ExecutionSlot>(*context));
         }
@@ -1458,6 +1594,8 @@ struct VulkanAnalysisEngine::Impl {
         telemetry.host_pack_ms += delta.host_pack_ms;
         telemetry.source_conversion_ms += delta.source_conversion_ms;
         telemetry.gpu_execution_ms += delta.gpu_execution_ms;
+        for (std::size_t i = 0; i < delta.stage_gpu_ms.size(); ++i)
+            telemetry.stage_gpu_ms[i] += delta.stage_gpu_ms[i];
         peak_workspace = std::max(peak_workspace, delta.peak_workspace_elements);
         peak_working_set = std::max(peak_working_set, delta.peak_working_set_bytes);
         telemetry.peak_workspace_elements = peak_workspace;
@@ -1468,6 +1606,7 @@ struct VulkanAnalysisEngine::Impl {
     VulkanNativeContextInfo native_context_info;
     std::unique_ptr<Context> context;
     std::vector<std::unique_ptr<ExecutionSlot>> slots;
+    std::vector<ResidentBatch> resident_batches;
     std::vector<bool> slot_busy;
     std::mutex slot_mutex;
     std::condition_variable slot_available;
@@ -1574,15 +1713,40 @@ const VulkanNativeContextInfo &VulkanAnalysisEngine::native_context() const noex
     return impl_->native_context_info;
 }
 
-void VulkanAnalysisEngine::lock_native_queue() {
-    impl_->context->lock_queue();
+std::optional<std::uint64_t> VulkanAnalysisEngine::available_memory_bytes() const noexcept {
+    try {
+        const auto &context = *impl_->context;
+        const auto extensions = device_extensions(context.physical);
+        if (!has_device_extension(extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) return std::nullopt;
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+        budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+        VkPhysicalDeviceMemoryProperties2 properties{};
+        properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+        properties.pNext = &budget;
+        vkGetPhysicalDeviceMemoryProperties2(context.physical, &properties);
+        std::optional<std::uint64_t> available;
+        for (std::uint32_t i = 0; i < properties.memoryProperties.memoryHeapCount; ++i) {
+            if (!(properties.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
+            if (!budget.heapBudget[i]) return std::nullopt;
+            const auto free = budget.heapBudget[i] > budget.heapUsage[i]
+                ? budget.heapBudget[i] - budget.heapUsage[i] : 0;
+            available = available ? std::min(*available, static_cast<std::uint64_t>(free)) : free;
+        }
+        return available;
+    } catch (...) {
+        return std::nullopt;
+    }
 }
 
-void VulkanAnalysisEngine::unlock_native_queue() noexcept {
-    impl_->context->unlock_queue();
+void VulkanAnalysisEngine::lock_native_queue(std::uint32_t family, std::uint32_t index) {
+    impl_->context->lock_queue(family, index);
 }
 
-void VulkanAnalysisEngine::preflight_axis_batch(
+void VulkanAnalysisEngine::unlock_native_queue(std::uint32_t family, std::uint32_t index) noexcept {
+    impl_->context->unlock_queue(family, index);
+}
+
+std::size_t VulkanAnalysisEngine::preflight_axis_batch(
     ConstImageView dimensions,
     std::span<const CandidateAnalysis> candidates,
     const MetricSpec &metric, std::size_t concurrency) const {
@@ -1591,7 +1755,7 @@ void VulkanAnalysisEngine::preflight_axis_batch(
         throw std::length_error(
             "Vulkan execution slots cannot satisfy the requested concurrency");
     }
-    if (candidates.empty()) return;
+    if (candidates.empty()) return 0;
 
     const PackedBatch packed = pack_batch(
         dimensions, candidates, impl_->effective_workspace_limit_elements);
@@ -1638,6 +1802,7 @@ void VulkanAnalysisEngine::preflight_axis_batch(
         throw std::length_error(
             "Vulkan device memory cannot satisfy the requested concurrency");
     }
+    return aggregate;
 }
 
 std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_f32(
@@ -1695,11 +1860,28 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
     delta.execution_slot_wait_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - wait_start).count();
     ExecutionSlot &slot = *impl_->slots[slot_index];
+    VkCommandBuffer command = slot.command;
     ScopeExit release_slot{[&] { impl_->release_slot(slot_index); }};
 
     const auto pack_start = std::chrono::steady_clock::now();
-    PackedBatch packed = pack_batch(
-        source, candidates, impl_->effective_workspace_limit_elements);
+    auto &resident = impl_->resident_batches[slot_index];
+    PackedBatch transient;
+    if (!impl_->options.cache_plans) {
+        transient = pack_batch(source, candidates, impl_->effective_workspace_limit_elements);
+    } else if (!resident.matches(source, candidates)) {
+        // Retain shared ownership of immutable plans so an allocator cannot
+        // reuse an old plan address and accidentally hit this cache.
+        ResidentBatch replacement;
+        replacement.packed = pack_batch(source, candidates, impl_->effective_workspace_limit_elements);
+        replacement.candidates.assign(candidates.begin(), candidates.end());
+        replacement.width = source.width;
+        replacement.height = source.height;
+        resident = std::move(replacement);
+    }
+    const PackedBatch &packed = impl_->options.cache_plans ? resident.packed : transient;
+    const bool upload_plan = !impl_->options.cache_plans || !resident.uploaded;
+    // Any exceptional exit must force a fresh copy on the next attempt.
+    resident.uploaded = false;
     delta.host_pack_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - pack_start).count();
     if (stop.stop_requested()) throw std::runtime_error("Vulkan analysis cancelled");
@@ -1775,7 +1957,7 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
         static_cast<VkDeviceSize>(storage_limit));
     delta.buffer_allocation_count = allocations;
 
-    std::memcpy(slot.host_plan.mapped(), packed.plan_words.data(), plan_bytes);
+    if (upload_plan) std::memcpy(slot.host_plan.mapped(), packed.plan_words.data(), plan_bytes);
     if (device_source == nullptr) {
         float *staged_source = static_cast<float *>(slot.host_source.mapped());
         for (std::int32_t row = 0; row < source.height; ++row) {
@@ -1787,9 +1969,21 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
         }
         slot.host_source.flush();
     }
-    slot.host_plan.flush();
+    if (upload_plan) slot.host_plan.flush();
 
     ImageViewHandle luma_view;
+    bool conversion_submitted = false;
+    bool analysis_completed = false;
+    std::chrono::steady_clock::time_point gpu_start;
+    // Drain the submitted conversion before destroying its ImageView/AVFrame
+    // if recording or submitting the remaining analysis throws.
+    ScopeExit drain_conversion{[&] {
+        if (conversion_submitted && !analysis_completed) {
+            (void)vkWaitForFences(
+                impl_->context->device, 1U, &slot.conversion_fence, VK_TRUE,
+                std::numeric_limits<std::uint64_t>::max());
+        }
+    }};
     if (device_source != nullptr) {
         luma_view.create(impl_->context->device, *device_source);
     }
@@ -1830,20 +2024,50 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
     const VkCommandBufferBeginInfo begin_info{
         VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr,
         VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
-    check_vk(vkBeginCommandBuffer(slot.command, &begin_info),
+    check_vk(vkBeginCommandBuffer(command, &begin_info),
              "vkBeginCommandBuffer");
     const bool instrument = profile == GpuStageProfile::stages;
+    const bool stage_timestamps = instrument && impl_->context->timestamp_valid_bits != 0;
+    std::vector<std::size_t> measured_stages;
+    if (stage_timestamps) {
+        const auto query_count = checked_u32(2U * (3U + packed.tiles.size() * 4U), "stage query count");
+        if (slot.stage_query_capacity < query_count) {
+            if (slot.stage_query_pool != VK_NULL_HANDLE)
+                vkDestroyQueryPool(impl_->context->device, slot.stage_query_pool, nullptr);
+            slot.stage_query_pool = VK_NULL_HANDLE;
+            slot.stage_query_capacity = 0;
+            const VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                nullptr, 0U, VK_QUERY_TYPE_TIMESTAMP, query_count, 0U};
+            check_vk(vkCreateQueryPool(impl_->context->device, &info, nullptr,
+                                      &slot.stage_query_pool), "vkCreateQueryPool(stages)");
+            slot.stage_query_capacity = query_count;
+        }
+        vkCmdResetQueryPool(command, slot.stage_query_pool, 0, query_count);
+    }
+    const auto stage_begin = [&](std::size_t stage) {
+        if (!stage_timestamps) return;
+        const auto query = static_cast<std::uint32_t>(measured_stages.size() * 2);
+        measured_stages.push_back(stage);
+        vkCmdWriteTimestamp(command, stage == 5 ? VK_PIPELINE_STAGE_TRANSFER_BIT
+                                              : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            slot.stage_query_pool, query);
+    };
+    const auto stage_end = [&] {
+        if (stage_timestamps) vkCmdWriteTimestamp(command,
+            measured_stages.back() == 5 ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            slot.stage_query_pool, static_cast<std::uint32_t>(measured_stages.size() * 2 - 1));
+    };
     if (instrument && device_source != nullptr
         && slot.conversion_query_pool != VK_NULL_HANDLE) {
-        vkCmdResetQueryPool(slot.command, slot.conversion_query_pool, 0U, 2U);
+        vkCmdResetQueryPool(command, slot.conversion_query_pool, 0U, 2U);
     }
     const VkBufferCopy plan_copy{0U, 0U, static_cast<VkDeviceSize>(plan_bytes)};
-    vkCmdCopyBuffer(slot.command, slot.host_plan.get(), slot.device_plan.get(),
-                    1U, &plan_copy);
+    if (upload_plan) vkCmdCopyBuffer(command, slot.host_plan.get(), slot.device_plan.get(),
+                                    1U, &plan_copy);
     if (device_source == nullptr) {
         const VkBufferCopy source_copy{
             0U, 0U, static_cast<VkDeviceSize>(source_bytes)};
-        vkCmdCopyBuffer(slot.command, slot.host_source.get(),
+        vkCmdCopyBuffer(command, slot.host_source.get(),
                         slot.device_source.get(), 1U, &source_copy);
     } else {
         const bool concurrent =
@@ -1862,20 +2086,21 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
             concurrent || same_family ? VK_QUEUE_FAMILY_IGNORED
                                       : impl_->context->queue_family,
             native_handle<VkImage>(device_source->image),
-            {static_cast<VkImageAspectFlags>(device_source->aspect_mask),
-             0U, 1U, 0U, 1U},
+            // AVVkFrame tracks layout per image, not per plane. Transition all
+            // planes even though the sampling view exposes only luma.
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U},
         };
         vkCmdPipelineBarrier(
-            slot.command,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            command,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0U, 0U, nullptr, 0U, nullptr, 1U, &image_barrier);
     }
     command_barrier(
-        slot.command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
     vkCmdBindDescriptorSets(
-        slot.command, VK_PIPELINE_BIND_POINT_COMPUTE,
+        command, VK_PIPELINE_BIND_POINT_COMPUTE,
         impl_->context->pipeline_layout, 0U, 1U, &slot.descriptor_set,
         0U, nullptr);
 
@@ -1898,7 +2123,7 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
     }
     const auto write_push = [&] {
         vkCmdPushConstants(
-            slot.command, impl_->context->pipeline_layout,
+            command, impl_->context->pipeline_layout,
             VK_SHADER_STAGE_COMPUTE_BIT, 0U,
             static_cast<std::uint32_t>(sizeof(push)), push.data());
     };
@@ -1906,118 +2131,34 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
     if (device_source != nullptr) {
         if (instrument && slot.conversion_query_pool != VK_NULL_HANDLE) {
             vkCmdWriteTimestamp(
-                slot.command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 slot.conversion_query_pool, 0U);
         }
-        vkCmdBindPipeline(slot.command, VK_PIPELINE_BIND_POINT_COMPUTE,
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE,
                           impl_->context->luma_pipeline);
         write_push();
+        stage_begin(0);
         vkCmdDispatch(
-            slot.command,
+            command,
             divide_up(static_cast<std::uint32_t>(source.width), 16U),
             divide_up(static_cast<std::uint32_t>(source.height), 16U), 1U);
+        stage_end();
         ++dispatches;
         command_barrier(
-            slot.command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_READ_BIT);
         if (instrument && slot.conversion_query_pool != VK_NULL_HANDLE) {
             vkCmdWriteTimestamp(
-                slot.command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 slot.conversion_query_pool, 1U);
         }
-    }
-    if (packed.has_horizontal) {
-        vkCmdBindPipeline(slot.command, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          impl_->context->transpose_pipeline);
-        write_push();
-        vkCmdDispatch(
-            slot.command,
-            divide_up(static_cast<std::uint32_t>(source.width), 32U),
-            divide_up(static_cast<std::uint32_t>(source.height), 32U), 1U);
-        ++dispatches;
-        command_barrier(
-            slot.command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_ACCESS_SHADER_READ_BIT);
-    }
-
-    for (const PackedBatch::Tile &tile : packed.tiles) {
-        push[3] = checked_u32(tile.first_candidate, "Vulkan tile offset");
-        push[4] = checked_u32(tile.candidate_count, "Vulkan tile size");
-        if (tile.has_horizontal) {
-            push[12] = 0U;
-            vkCmdBindPipeline(slot.command, VK_PIPELINE_BIND_POINT_COMPUTE,
-                              impl_->context->inverse_pipeline);
-            write_push();
-            vkCmdDispatch(
-                slot.command,
-                divide_up(static_cast<std::uint32_t>(source.height), 64U),
-                push[4], 1U);
-            ++dispatches;
-            command_barrier(
-                slot.command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        }
-        if (tile.has_vertical) {
-            push[12] = 1U;
-            vkCmdBindPipeline(slot.command, VK_PIPELINE_BIND_POINT_COMPUTE,
-                              impl_->context->inverse_pipeline);
-            write_push();
-            vkCmdDispatch(
-                slot.command,
-                divide_up(checked_u32(
-                    tile.maximum_vertical_vectors,
-                    "Vulkan vertical vector count"), 64U),
-                push[4], 1U);
-            ++dispatches;
-            command_barrier(
-                slot.command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        }
-        if (tile.has_both) {
-            vkCmdBindPipeline(slot.command, VK_PIPELINE_BIND_POINT_COMPUTE,
-                              impl_->context->forward_pipeline);
-            write_push();
-            vkCmdDispatch(
-                slot.command,
-                divide_up(checked_u32(
-                    tile.maximum_forward_elements,
-                    "Vulkan forward intermediate"), 256U),
-                push[4], 1U);
-            ++dispatches;
-            command_barrier(
-                slot.command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_ACCESS_SHADER_READ_BIT);
-        }
-        vkCmdBindPipeline(slot.command, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          impl_->context->metric_pipeline);
-        write_push();
-        vkCmdDispatch(slot.command, push[6], push[4], 1U);
-        ++dispatches;
-        command_barrier(
-            slot.command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-    }
-    command_barrier(
-        slot.command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_ACCESS_TRANSFER_READ_BIT);
-    const VkBufferCopy partial_copy{0U, 0U, static_cast<VkDeviceSize>(partial_bytes)};
-    vkCmdCopyBuffer(slot.command, slot.device_partials.get(), slot.host_partials.get(),
-                    1U, &partial_copy);
-    check_vk(vkEndCommandBuffer(slot.command), "vkEndCommandBuffer");
-
-    check_vk(vkResetFences(impl_->context->device, 1U, &slot.fence),
-             "vkResetFences");
-    const auto gpu_start = std::chrono::steady_clock::now();
-    impl_->context->submit(slot.command, slot.fence, device_source);
-    if (device_source != nullptr) {
+        check_vk(vkEndCommandBuffer(command), "vkEndCommandBuffer(conversion)");
+        check_vk(vkResetFences(impl_->context->device, 1U, &slot.conversion_fence),
+                 "vkResetFences(conversion)");
+        gpu_start = std::chrono::steady_clock::now();
+        impl_->context->submit(command, slot.conversion_fence, device_source, slot_index);
+        conversion_submitted = true;
         const std::uint32_t final_queue_family =
             device_source->queue_family == VK_QUEUE_FAMILY_IGNORED
             ? VK_QUEUE_FAMILY_IGNORED : impl_->context->queue_family;
@@ -2028,14 +2169,138 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
             final_queue_family,
             device_source->semaphore_value + 1U);
         frame_released = true;
+        command = slot.analysis_command;
+        check_vk(vkBeginCommandBuffer(command, &begin_info),
+                 "vkBeginCommandBuffer(analysis)");
+        vkCmdBindDescriptorSets(
+            command, VK_PIPELINE_BIND_POINT_COMPUTE,
+            impl_->context->pipeline_layout, 0U, 1U, &slot.descriptor_set,
+            0U, nullptr);
     }
+
+    if (packed.has_horizontal) {
+        stage_begin(1);
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          impl_->context->transpose_pipeline);
+        write_push();
+        vkCmdDispatch(
+            command,
+            divide_up(static_cast<std::uint32_t>(source.width), 32U),
+            divide_up(static_cast<std::uint32_t>(source.height), 32U), 1U);
+        stage_end();
+        ++dispatches;
+        command_barrier(
+            command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT);
+    }
+
+    for (const PackedBatch::Tile &tile : packed.tiles) {
+        push[3] = checked_u32(tile.first_candidate, "Vulkan tile offset");
+        push[4] = checked_u32(tile.candidate_count, "Vulkan tile size");
+        if (tile.has_horizontal) {
+            stage_begin(2);
+            push[12] = 0U;
+            vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              impl_->context->inverse_for_band(tile.horizontal_band));
+            write_push();
+            vkCmdDispatch(
+                command,
+                divide_up(static_cast<std::uint32_t>(source.height), 64U),
+                push[4], 1U);
+            stage_end();
+            ++dispatches;
+            command_barrier(
+                command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        }
+        if (tile.has_vertical) {
+            stage_begin(2);
+            push[12] = 1U;
+            vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              impl_->context->inverse_for_band(tile.vertical_band));
+            write_push();
+            vkCmdDispatch(
+                command,
+                divide_up(checked_u32(
+                    tile.maximum_vertical_vectors,
+                    "Vulkan vertical vector count"), 64U),
+                push[4], 1U);
+            stage_end();
+            ++dispatches;
+            command_barrier(
+                command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        }
+        if (tile.has_both) {
+            stage_begin(3);
+            vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              impl_->context->forward_pipeline);
+            write_push();
+            vkCmdDispatch(
+                command,
+                divide_up(checked_u32(
+                    tile.maximum_forward_elements,
+                    "Vulkan forward intermediate"), 256U),
+                push[4], 1U);
+            stage_end();
+            ++dispatches;
+            command_barrier(
+                command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_SHADER_READ_BIT);
+        }
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          impl_->context->metric_pipeline);
+        write_push();
+        stage_begin(4);
+        vkCmdDispatch(command, push[6], push[4], 1U);
+        stage_end();
+        ++dispatches;
+        command_barrier(
+            command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
+    command_barrier(
+        command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT);
+    const VkBufferCopy partial_copy{0U, 0U, static_cast<VkDeviceSize>(partial_bytes)};
+    stage_begin(5);
+    vkCmdCopyBuffer(command, slot.device_partials.get(), slot.host_partials.get(),
+                    1U, &partial_copy);
+    stage_end();
+    check_vk(vkEndCommandBuffer(command), "vkEndCommandBuffer");
+
+    check_vk(vkResetFences(impl_->context->device, 1U, &slot.fence),
+             "vkResetFences");
+    if (device_source == nullptr) gpu_start = std::chrono::steady_clock::now();
+    impl_->context->submit(command, slot.fence, nullptr, slot_index);
     check_vk(vkWaitForFences(
                  impl_->context->device, 1U, &slot.fence, VK_TRUE,
                  std::numeric_limits<std::uint64_t>::max()),
              "vkWaitForFences");
+    analysis_completed = true;
+    resident.uploaded = true;
     delta.gpu_execution_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - gpu_start).count();
     slot.host_partials.invalidate();
+    if (stage_timestamps) {
+        std::vector<std::uint64_t> ticks(measured_stages.size() * 2);
+        check_vk(vkGetQueryPoolResults(impl_->context->device, slot.stage_query_pool, 0,
+            static_cast<std::uint32_t>(ticks.size()), ticks.size() * sizeof(std::uint64_t),
+            ticks.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+            "vkGetQueryPoolResults(stages)");
+        const auto bits = impl_->context->timestamp_valid_bits;
+        const auto mask = bits >= 64 ? UINT64_MAX : (std::uint64_t{1} << bits) - 1;
+        for (std::size_t i = 0; i < measured_stages.size(); ++i)
+            delta.stage_gpu_ms[measured_stages[i]] += static_cast<double>((ticks[i * 2 + 1] - ticks[i * 2]) & mask)
+                * impl_->context->properties.limits.timestampPeriod / 1'000'000.0;
+    }
     if (instrument && device_source != nullptr
         && slot.conversion_query_pool != VK_NULL_HANDLE) {
         std::array<std::uint64_t, 2U> timestamps{};
@@ -2075,11 +2340,11 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
                                : std::pow(mean, 1.0 / static_cast<double>(metric.norm))});
     }
 
-    delta.command_buffer_submission_count = 1U;
+    delta.command_buffer_submission_count = device_source != nullptr ? 2U : 1U;
     delta.kernel_dispatch_count = dispatches;
     delta.analyzed_candidate_count = candidates.size();
     delta.tile_count = packed.tiles.size();
-    delta.plan_upload_bytes = plan_bytes;
+    delta.plan_upload_bytes = upload_plan ? plan_bytes : 0U;
     delta.source_upload_bytes = device_source == nullptr ? source_bytes : 0U;
     delta.source_conversion_bytes = device_source != nullptr ? source_bytes : 0U;
     delta.source_conversion_count = device_source != nullptr ? 1U : 0U;

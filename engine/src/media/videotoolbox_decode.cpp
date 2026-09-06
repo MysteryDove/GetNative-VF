@@ -217,11 +217,23 @@ struct VideotoolboxSession::Impl {
     std::size_t inflight = 0;
     bool failed = false;
     std::string error;
+    std::chrono::steady_clock::time_point last_progress = std::chrono::steady_clock::now();
+    static constexpr auto health_timeout = std::chrono::seconds(30);
+
+    void check_health() {
+        if (failed) throw std::runtime_error(error.empty() ? "VideoToolbox decode failed" : error);
+        if (inflight && std::chrono::steady_clock::now() - last_progress > health_timeout) {
+            failed = true;
+            error = "VideoToolbox decoder made no progress for 30 seconds";
+            throw std::runtime_error(error);
+        }
+    }
 
     static void callback(void *opaque, void *, OSStatus status, VTDecodeInfoFlags,
                          CVImageBufferRef image, CMTime pts, CMTime duration) {
         auto *self = static_cast<Impl *>(opaque);
         std::unique_lock lock(self->mutex);
+        self->last_progress = std::chrono::steady_clock::now();
         if (self->inflight > 0) --self->inflight;
         if (status != noErr) {
             self->failed = true;
@@ -456,7 +468,8 @@ bool VideotoolboxSession::can_submit() const {
 }
 
 void VideotoolboxSession::submit(const std::uint8_t *data, int size, std::int64_t pts,
-                                 std::int64_t dts, std::int64_t duration) {
+                                 std::int64_t dts, std::int64_t duration, std::stop_token stop) {
+    if (stop.stop_requested()) throw std::runtime_error("cancelled");
     if (data == nullptr || size <= 0) return;
     if (impl_->session == nullptr) {
         PendingPacket packet;
@@ -475,24 +488,28 @@ void VideotoolboxSession::submit(const std::uint8_t *data, int size, std::int64_
         impl_->pending.clear();
         for (const auto &item : queued) {
             submit_ready(item.data.data(), static_cast<int>(item.data.size()),
-                         item.pts, item.dts, item.duration);
+                         item.pts, item.dts, item.duration, stop);
         }
         return;
     }
-    submit_ready(data, size, pts, dts, duration);
+    submit_ready(data, size, pts, dts, duration, stop);
 }
 
 void VideotoolboxSession::submit_ready(const std::uint8_t *data, int size, std::int64_t pts,
-                                       std::int64_t dts, std::int64_t duration) {
+                                       std::int64_t dts, std::int64_t duration, std::stop_token stop) {
     {
         std::unique_lock lock(impl_->mutex);
-        impl_->ready.wait(lock, [&] {
-            return impl_->failed || impl_->inflight < impl_->max_inflight;
-        });
+        std::stop_callback cancelled{stop, [this] { impl_->ready.notify_all(); }};
+        while (impl_->inflight >= impl_->max_inflight && !stop.stop_requested()) {
+            impl_->check_health();
+            impl_->ready.wait_for(lock, std::chrono::milliseconds(50));
+        }
+        if (stop.stop_requested()) throw std::runtime_error("cancelled");
         if (impl_->failed) {
             throw std::runtime_error(impl_->error.empty() ? "VideoToolbox decode failed"
                                                           : impl_->error);
         }
+        if (!impl_->inflight) impl_->last_progress = std::chrono::steady_clock::now();
         ++impl_->inflight;
     }
 
@@ -559,6 +576,7 @@ void VideotoolboxSession::submit_ready(const std::uint8_t *data, int size, std::
 
 bool VideotoolboxSession::try_pop(VideotoolboxFrame &out) {
     std::lock_guard lock(impl_->mutex);
+    impl_->check_health();
     if (impl_->outputs.empty()) return false;
     out = std::move(impl_->outputs.front());
     impl_->outputs.pop_front();
@@ -567,8 +585,10 @@ bool VideotoolboxSession::try_pop(VideotoolboxFrame &out) {
 }
 
 bool VideotoolboxSession::wait_pop(VideotoolboxFrame &out, std::stop_token stop) {
+    std::stop_callback cancelled{stop, [this] { impl_->ready.notify_all(); }};
     std::unique_lock lock(impl_->mutex);
     while (!stop.stop_requested()) {
+        impl_->check_health();
         if (impl_->failed) {
             throw std::runtime_error(impl_->error.empty() ? "VideoToolbox decode failed"
                                                           : impl_->error);
@@ -585,18 +605,24 @@ bool VideotoolboxSession::wait_pop(VideotoolboxFrame &out, std::stop_token stop)
     return false;
 }
 
-void VideotoolboxSession::finish() {
+void VideotoolboxSession::finish(std::stop_token stop) {
     if (impl_->session != nullptr) {
-        (void)VTDecompressionSessionFinishDelayedFrames(impl_->session);
-        (void)VTDecompressionSessionWaitForAsynchronousFrames(impl_->session);
+        if (stop.stop_requested()) throw std::runtime_error("cancelled");
+        const auto status = VTDecompressionSessionFinishDelayedFrames(impl_->session);
+        if (status != noErr) throw std::runtime_error("VTDecompressionSessionFinishDelayedFrames failed");
+        std::stop_callback cancelled{stop, [this] { impl_->ready.notify_all(); }};
+        std::unique_lock lock(impl_->mutex);
+        while (impl_->inflight && !stop.stop_requested()) {
+            impl_->check_health();
+            impl_->ready.wait_for(lock, std::chrono::milliseconds(50));
+        }
+        if (stop.stop_requested()) throw std::runtime_error("cancelled");
+        impl_->check_health();
     }
 }
 
-void VideotoolboxSession::flush() {
-    if (impl_->session != nullptr) {
-        (void)VTDecompressionSessionFinishDelayedFrames(impl_->session);
-        (void)VTDecompressionSessionWaitForAsynchronousFrames(impl_->session);
-    }
+void VideotoolboxSession::flush(std::stop_token stop) {
+    finish(stop);
     std::lock_guard lock(impl_->mutex);
     impl_->outputs.clear();
     impl_->inflight = 0;

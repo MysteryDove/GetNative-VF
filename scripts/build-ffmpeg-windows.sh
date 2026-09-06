@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+padding_patch="${script_dir}/patches/ffmpeg-vulkan-bitstream-padding.patch"
+view_usage_patch="${script_dir}/patches/ffmpeg-vulkan-coincident-view-usage.patch"
+
 # A non-login MSYS2 shell launched from an MSVC developer environment can
 # inherit PATH without its own core tools.
 export PATH="/usr/bin:$PATH"
@@ -101,6 +105,10 @@ fetch_source "$url" "$archive" "$ffmpeg_sha256"
 fetch_source "$zlib_url" "$zlib_archive" "$zlib_sha256"
 
 tar --force-local -xf "${work_dir_windows}/${archive}" -C "$work_dir"
+for source_patch in "$padding_patch" "$view_usage_patch"; do
+  git -C "${work_dir_windows}/ffmpeg-${ffmpeg_version}" apply --check "$(cygpath -m "$source_patch")"
+  git -C "${work_dir_windows}/ffmpeg-${ffmpeg_version}" apply "$(cygpath -m "$source_patch")"
+done
 tar --force-local -xf "${work_dir_windows}/${zlib_archive}" -C "$work_dir"
 zlib_dir="${work_dir}/zlib-${zlib_version}"
 # FFmpeg's Windows config defines HAVE_UNISTD_H to 0. zconf.h tests only
@@ -409,8 +417,11 @@ done
 legal_dir="${sdk_dir}/share/ffmpeg"
 mkdir -p "${legal_dir}/source"
 cp "${work_dir}/${archive}" "${legal_dir}/source/${archive}"
+cp "$padding_patch" "$view_usage_patch" "${legal_dir}/source/"
 cp COPYING.LGPLv2.1 LICENSE.md "${legal_dir}/"
 cp ffbuild/config.mak "${legal_dir}/BUILD_INFO.txt"
+printf '\nGETNATIVE_VULKAN_BITSTREAM_PADDING=zero\n' >> "${legal_dir}/BUILD_INFO.txt"
+printf 'GETNATIVE_VULKAN_COINCIDENT_VIEW_USAGE=decode_dst_dpb\n' >> "${legal_dir}/BUILD_INFO.txt"
 
 require_config() {
   local name=$1

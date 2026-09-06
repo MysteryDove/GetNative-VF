@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -114,6 +115,7 @@ public:
     [[nodiscard]] std::size_t peak_workspace_elements() const noexcept;
     // Peak bytes across all explicitly allocated Metal buffers, including queued plan tiles.
     [[nodiscard]] std::size_t peak_working_set_bytes() const noexcept;
+    [[nodiscard]] std::optional<std::uint64_t> available_memory_bytes() const noexcept;
     [[nodiscard]] MetalRuntimeTelemetry runtime_telemetry() const;
     // Preserves immutable pipeline-creation telemetry and resets per-analysis counters.
     void reset_analysis_telemetry();
@@ -121,7 +123,7 @@ public:
     // analysis finishes before the buffers are released.
     void trim_working_buffers();
 
-    void preflight_axis_batch(
+    std::size_t preflight_axis_batch(
         ConstImageView dimensions,
         std::span<const CandidateAnalysis> candidates,
         const MetricSpec &metric, std::size_t concurrency) const;

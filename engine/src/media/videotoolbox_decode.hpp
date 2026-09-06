@@ -38,14 +38,14 @@ public:
     void set_timebase(int num, int den);
     [[nodiscard]] bool can_submit() const;
     void submit(const std::uint8_t *data, int size, std::int64_t pts,
-                std::int64_t dts, std::int64_t duration);
+                std::int64_t dts, std::int64_t duration, std::stop_token stop = {});
     // Non-blocking pop. Returns false when no completed frame is ready.
     bool try_pop(VideotoolboxFrame &out);
     // Wait until a frame is ready, the in-flight set drains, stop is requested,
     // or the decoder fails. Returns false when nothing remains.
     bool wait_pop(VideotoolboxFrame &out, std::stop_token stop);
-    void finish();
-    void flush();
+    void finish(std::stop_token stop = {});
+    void flush(std::stop_token stop = {});
     [[nodiscard]] std::size_t inflight() const;
     [[nodiscard]] bool failed() const;
     [[nodiscard]] std::string error() const;
@@ -54,7 +54,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     void submit_ready(const std::uint8_t *data, int size, std::int64_t pts,
-                      std::int64_t dts, std::int64_t duration);
+                      std::int64_t dts, std::int64_t duration, std::stop_token stop);
 };
 
 } // namespace getnative::media

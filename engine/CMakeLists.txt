@@ -864,11 +864,24 @@ if(TARGET getnative_media)
     getnative_enable_strict_fp(getnative_media)
 endif()
 
+option(GETNATIVE_TEST_ADAPTIVE_DECODE "Enable unvalidated internal adaptive decode integration testing" OFF)
+set(GETNATIVE_TEST_FIXED_DECODE_SESSIONS "0" CACHE STRING "Internal fixed decode tier: 0 disables override")
+if(NOT GETNATIVE_TEST_FIXED_DECODE_SESSIONS MATCHES "^(0|1|2|4)$")
+    message(FATAL_ERROR "GETNATIVE_TEST_FIXED_DECODE_SESSIONS must be 0, 1, 2 or 4")
+endif()
+set(GETNATIVE_CUDA_DUAL_TEST_ENGINE "" CACHE FILEPATH "Second internally fixed-tier engine for CUDA parity tests")
 add_executable(getnative-engine
     src/cli/capabilities.cpp
     src/cli/json.cpp
     src/cli/main.cpp
     src/cli/worker.cpp)
+if(GETNATIVE_TEST_ADAPTIVE_DECODE)
+    target_compile_definitions(getnative-engine PRIVATE GETNATIVE_TEST_ADAPTIVE_DECODE=1)
+endif()
+if(NOT GETNATIVE_TEST_FIXED_DECODE_SESSIONS STREQUAL "0")
+    target_compile_definitions(getnative-engine PRIVATE
+        GETNATIVE_TEST_FIXED_DECODE_SESSIONS=${GETNATIVE_TEST_FIXED_DECODE_SESSIONS})
+endif()
 if(NOT GETNATIVE_ENABLE_METAL)
     target_link_libraries(getnative-engine PRIVATE getnative_core)
 endif()
@@ -918,6 +931,19 @@ if(GETNATIVE_ENABLE_VULKAN)
 endif()
 
 if(BUILD_TESTING)
+    add_executable(getnative_decode_ranges_tests tests/decode_ranges_test.cpp)
+    target_include_directories(getnative_decode_ranges_tests PRIVATE include)
+    target_compile_features(getnative_decode_ranges_tests PRIVATE cxx_std_23)
+    target_link_libraries(getnative_decode_ranges_tests PRIVATE Threads::Threads)
+    getnative_enable_warnings(getnative_decode_ranges_tests)
+    add_test(NAME getnative_decode_ranges_tests COMMAND getnative_decode_ranges_tests)
+
+    add_executable(getnative_decode_control_tests tests/decode_control_test.cpp)
+    target_include_directories(getnative_decode_control_tests PRIVATE include)
+    target_compile_features(getnative_decode_control_tests PRIVATE cxx_std_23)
+    getnative_enable_warnings(getnative_decode_control_tests)
+    add_test(NAME getnative_decode_control_tests COMMAND getnative_decode_control_tests)
+
     add_executable(getnative_core_tests tests/core_test.cpp)
     target_link_libraries(getnative_core_tests PRIVATE getnative_core)
     target_compile_features(getnative_core_tests PRIVATE cxx_std_23)
@@ -1010,6 +1036,25 @@ if(BUILD_TESTING)
             RESOURCE_LOCK getnative_gpu
             RUN_SERIAL TRUE)
         if(TARGET getnative_media)
+            if(GETNATIVE_ENABLE_VULKAN)
+                add_test(NAME getnative_vulkan_decode_runs_tests
+                    COMMAND "${GETNATIVE_PYTHON3}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/vulkan_decode_runs_test.py"
+                        $<TARGET_FILE:getnative-engine>)
+                set_tests_properties(getnative_vulkan_decode_runs_tests PROPERTIES
+                    TIMEOUT 180 SKIP_RETURN_CODE 77 RESOURCE_LOCK getnative_gpu RUN_SERIAL TRUE)
+            endif()
+            if(GETNATIVE_ENABLE_CUDA)
+                add_test(NAME getnative_cuda_decode_sessions_tests
+                    COMMAND "${GETNATIVE_PYTHON3}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda_decode_sessions_test.py"
+                        $<TARGET_FILE:getnative-engine> "${GETNATIVE_CUDA_DUAL_TEST_ENGINE}")
+                set_tests_properties(getnative_cuda_decode_sessions_tests PROPERTIES
+                    TIMEOUT 180
+                    SKIP_RETURN_CODE 77
+                    RESOURCE_LOCK getnative_gpu
+                    RUN_SERIAL TRUE)
+            endif()
             add_test(NAME getnative_media_worker_tests
                 COMMAND "${GETNATIVE_PYTHON3}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/media_worker_test.py"

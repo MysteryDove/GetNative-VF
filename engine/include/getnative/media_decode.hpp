@@ -1,6 +1,7 @@
 #pragma once
 
 #include "getnative/stop_token.hpp"
+#include "getnative/decode_control.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -138,6 +139,11 @@ struct DecodeTelemetry {
     std::uint64_t host_frame_bytes = 0U;
     std::uint64_t conversion_bytes = 0U;
     std::size_t decode_sessions = 0U;
+    std::size_t current_decode_sessions = 0U;
+    std::uint64_t decode_extra_budget_bytes = 0U;
+    std::uint64_t decode_session_estimate_bytes = 0U;
+    double decode_session_initialization_ms = 0.0;
+    std::vector<std::string> decode_session_changes;
     double index_ms = 0.0;
     double decode_ms = 0.0;
     double convert_ms = 0.0;
@@ -207,8 +213,10 @@ struct VulkanFrame {
                            std::uint32_t access, std::uint32_t queue_family,
                            std::uint64_t semaphore_value) = nullptr;
     void (*release_without_submit)(void *opaque) = nullptr;
-    // Owns both the AVFrame reference and the frame lock represented by the
-    // callbacks above. The lock remains valid after the decode callback exits.
+    // Invoke on the consuming thread before reading mutable image state.
+    // The returned lease locks and unlocks the FFmpeg mutex on that thread.
+    VulkanFrame (*acquire_for_submit)(const VulkanFrame &frame) = nullptr;
+    // Queued frames own only an AVFrame reference, never a cross-thread mutex.
     std::shared_ptr<void> lease;
 };
 
@@ -245,13 +253,16 @@ struct DecoderOptions {
     std::uintptr_t native_queue = 0U;
     std::uint32_t native_compute_queue_family = 0U;
     std::uint32_t native_decode_queue_family = 0U;
+    std::uint32_t native_decode_queue_count = 1U;
     std::uint32_t native_video_codec_operations = 0U;
     std::uint32_t native_instance_api_version = 0U;
     bool native_timeline_semaphore = false;
+    bool native_synchronization2 = false;
+    bool native_sampler_ycbcr_conversion = false;
     std::vector<std::string> native_device_extensions;
     void *native_queue_lock_opaque = nullptr;
-    void (*lock_native_queue)(void *opaque) = nullptr;
-    void (*unlock_native_queue)(void *opaque) = nullptr;
+    void (*lock_native_queue)(void *opaque, std::uint32_t family, std::uint32_t index) = nullptr;
+    void (*unlock_native_queue)(void *opaque, std::uint32_t family, std::uint32_t index) = nullptr;
     std::int32_t expected_bit_depth = 0;
     bool output_rgb = false;
     // Pure preview sessions convert directly from the decoded pixel format to
@@ -262,6 +273,13 @@ struct DecoderOptions {
     bool output_luma = true;
     // Number of decoded frames the caller may retain concurrently.
     std::size_t frame_concurrency = 2U;
+    // Internal fixed-tier override for integration tests. Never a user setting.
+    std::size_t maximum_decode_sessions = 1U;
+    // Internal Verify feedback; absent for software decode and media preview.
+    std::function<DecodeDemandSnapshot()> demand_snapshot;
+    // Internal rollout gate. Enabled only by validated callers / integration tests.
+    bool adaptive_decode = false;
+    DecodeResources decode_resources;
 };
 
 using IndexProgress = std::function<void(std::uint64_t indexed_records)>;

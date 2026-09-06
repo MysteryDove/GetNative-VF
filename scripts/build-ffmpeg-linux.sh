@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+padding_patch="${script_dir}/patches/ffmpeg-vulkan-bitstream-padding.patch"
+view_usage_patch="${script_dir}/patches/ffmpeg-vulkan-coincident-view-usage.patch"
+
 ffmpeg_version="8.1.2"
 ffmpeg_sha256="464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
 archive="ffmpeg-${ffmpeg_version}.tar.xz"
@@ -31,6 +35,10 @@ if [[ "$actual_sha256" != "$ffmpeg_sha256" ]]; then
 fi
 
 tar -xf "${work_dir}/${archive}" -C "$work_dir"
+for source_patch in "$padding_patch" "$view_usage_patch"; do
+  git -C "${work_dir}/ffmpeg-${ffmpeg_version}" apply --check "$source_patch"
+  git -C "${work_dir}/ffmpeg-${ffmpeg_version}" apply "$source_patch"
+done
 
 # Hardware decode headers: nv-codec-headers (ffnvcodec) and the Vulkan SDK are
 # external inputs. Each hwaccel family is enabled only when its headers are
@@ -176,9 +184,12 @@ done
 legal_dir="${sdk_dir}/share/ffmpeg"
 mkdir -p "${legal_dir}/source"
 cp "${work_dir}/${archive}" "${legal_dir}/source/${archive}"
+cp "$padding_patch" "$view_usage_patch" "${legal_dir}/source/"
 cp COPYING.LGPLv2.1 LICENSE.md "${legal_dir}/"
 cp ffbuild/config.mak "${legal_dir}/BUILD_INFO.txt"
 printf '\nGETNATIVE_POST_INSTALL_RPATH=$ORIGIN\n' >> "${legal_dir}/BUILD_INFO.txt"
+printf 'GETNATIVE_VULKAN_BITSTREAM_PADDING=zero\n' >> "${legal_dir}/BUILD_INFO.txt"
+printf 'GETNATIVE_VULKAN_COINCIDENT_VIEW_USAGE=decode_dst_dpb\n' >> "${legal_dir}/BUILD_INFO.txt"
 
 require_config() {
   local name=$1

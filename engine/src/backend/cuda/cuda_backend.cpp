@@ -1588,11 +1588,22 @@ std::uintptr_t CudaAnalysisEngine::native_context() const noexcept {
     return reinterpret_cast<std::uintptr_t>(impl_->context);
 }
 
+std::optional<std::uint64_t> CudaAnalysisEngine::available_memory_bytes() const noexcept {
+    try {
+        bind_analysis_context(*impl_->api, impl_->context);
+        std::size_t available = 0, total = 0;
+        if (impl_->api->mem_get_info(&available, &total) != CUDA_SUCCESS || !total) return std::nullopt;
+        return available;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 std::uintptr_t CudaAnalysisEngine::native_decode_stream() const noexcept {
     return reinterpret_cast<std::uintptr_t>(impl_->decode_stream);
 }
 
-void CudaAnalysisEngine::preflight_axis_batch(
+std::size_t CudaAnalysisEngine::preflight_axis_batch(
     ConstImageView dimensions,
     std::span<const CandidateAnalysis> candidates,
     const MetricSpec &metric, std::size_t concurrency) const {
@@ -1601,7 +1612,7 @@ void CudaAnalysisEngine::preflight_axis_batch(
         throw std::length_error(
             "CUDA execution slots cannot satisfy the requested concurrency");
     }
-    if (candidates.empty()) return;
+    if (candidates.empty()) return 0;
 
     PackedBatch packed;
     packed.layout = PackedBatch::compute_layout(candidates);
@@ -1673,6 +1684,7 @@ void CudaAnalysisEngine::preflight_axis_batch(
         throw std::length_error(
             "CUDA device memory cannot satisfy the requested concurrency");
     }
+    return aggregate;
 }
 
 std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_f32(

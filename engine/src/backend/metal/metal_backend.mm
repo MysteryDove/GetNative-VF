@@ -6,6 +6,7 @@
 #import <Metal/Metal.h>
 #import <CoreVideo/CoreVideo.h>
 #import <IOSurface/IOSurface.h>
+#include <mach/mach.h>
 
 #include <algorithm>
 #include <array>
@@ -1168,6 +1169,25 @@ std::size_t MetalAnalysisEngine::peak_workspace_elements() const noexcept {
 std::size_t MetalAnalysisEngine::peak_working_set_bytes() const noexcept {
     return impl_->peak_working_set_bytes;
 }
+std::optional<std::uint64_t> MetalAnalysisEngine::available_memory_bytes() const noexcept {
+    @autoreleasepool {
+        const std::uint64_t recommended = impl_->device.recommendedMaxWorkingSetSize;
+        const std::uint64_t allocated = impl_->device.currentAllocatedSize;
+        if (!recommended || allocated >= recommended) return std::nullopt;
+        vm_statistics64_data_t stats{};
+        mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+        const mach_port_t host = mach_host_self();
+        const kern_return_t status = host_statistics64(host, HOST_VM_INFO64,
+            reinterpret_cast<host_info64_t>(&stats), &count);
+        vm_size_t page_size = 0;
+        const kern_return_t page_status = host_page_size(host, &page_size);
+        mach_port_deallocate(mach_task_self(), host);
+        if (status != KERN_SUCCESS || page_status != KERN_SUCCESS || !page_size) return std::nullopt;
+        // Exclude inactive/compressed pages rather than assuming they can be reclaimed.
+        const std::uint64_t free_bytes = static_cast<std::uint64_t>(stats.free_count) * page_size;
+        return std::min(recommended - allocated, free_bytes);
+    }
+}
 MetalRuntimeTelemetry MetalAnalysisEngine::runtime_telemetry() const {
     const std::scoped_lock lock(impl_->mutex);
     MetalRuntimeTelemetry result;
@@ -1244,7 +1264,7 @@ void MetalAnalysisEngine::trim_working_buffers() {
     impl_->clear_retained_working_buffers();
 }
 
-void MetalAnalysisEngine::preflight_axis_batch(
+std::size_t MetalAnalysisEngine::preflight_axis_batch(
     ConstImageView dimensions, std::span<const CandidateAnalysis> candidates,
     const MetricSpec &metric, std::size_t concurrency) const {
     if (dimensions.width <= 0 || dimensions.height <= 0
@@ -1257,7 +1277,7 @@ void MetalAnalysisEngine::preflight_axis_batch(
     if (metric.norm < metal_minimum_p_norm || metric.norm > metal_maximum_p_norm) {
         throw std::invalid_argument("Metal supports p-norm in 1..4");
     }
-    if (candidates.empty()) return;
+    if (candidates.empty()) return 0;
     const std::size_t elements = checked_product(
         static_cast<std::size_t>(dimensions.width),
         static_cast<std::size_t>(dimensions.height), "Metal preflight source");
@@ -1289,6 +1309,7 @@ void MetalAnalysisEngine::preflight_axis_batch(
                > impl_->options.retained_working_buffer_limit_bytes) {
         throw std::length_error("Metal device memory cannot satisfy requested concurrency");
     }
+    return checked_product(per_slot, concurrency, "Metal concurrent working set");
 }
 
 std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_f32(

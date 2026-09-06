@@ -432,20 +432,57 @@ inclusive. `fingerprint` may be empty, but when present must match the engine's
 `media_fingerprint_error`. A resolution change or a mismatch with locked
 `geometry` is a content error, not a capability fallback.
 
-`concurrency` is optional, defaults to 2, and must be an integer in `1..8`.
+`concurrency` is optional, defaults to 8, and must be an integer in `1..16`.
+GPU jobs clamp it to the 8 execution slots and emit `concurrency_clamped`.
 It is the maximum number of selected frames simultaneously queued or being
 analyzed inside one media job. It does not change frame selection, does not
 schedule multiple Sources concurrently, and is independent of the legacy
 streamed verify `worker_count`. The `accepted` event echoes `concurrency`.
 
 Decode and analysis use one bounded pipeline for all three selection modes.
-Completed frames may arrive internally out of order, but progress batches and
-the final `payload.frames` are emitted in selected-frame `seq` order. CUDA
-surfaces and Vulkan frame locks remain leased until their analysis completes.
+Progress batches report completion order; the final `payload.frames` is sorted
+by selected-frame `seq`. Decoded frame leases remain alive through analysis.
+Vulkan signals the decoder semaphore after luma conversion, so decode need not
+wait for subsequent analysis of the separate F32 buffer.
+Queued Vulkan leases retain the frame without holding its mutex. The analysis
+thread locks the frame and reads current layout/semaphore state immediately
+before submitting conversion, then unlocks on that same thread. The shared
+device exposes up to two supported decode queues, with separate locks for each
+actual family/index; queue count is not an estimate of physical decoder count.
 Before selected-frame decode starts, CUDA/Vulkan validate execution slots,
 workspace, storage-buffer limits, and aggregate device-memory requirements.
-Failure returns `media_concurrency_unavailable`; it never lowers concurrency or
+Failure returns `media_concurrency_unavailable`; it never lowers effective concurrency or
 tries another compute backend.
+
+Release builds currently default to one decode session while adaptive decoding
+is undergoing platform validation. There is no user-facing session-count setting.
+The unpublished `GETNATIVE_CUDA_DECODE_SESSIONS` environment switch has been
+removed and is ignored. Internal integration builds can exercise fixed or
+adaptive tiers without protocol or GUI changes. `telemetry.decode_sessions`
+reports peak simultaneously active sessions, not cumulative session creations.
+
+Hardware Verify additionally reports optional cumulative
+`analysis_starvation_thread_ms`, `producer_capacity_thread_ms`, and
+`analysis_queue_frame_ms` counters. The first two sum wait time over threads;
+the last integrates the number of frames waiting in the analysis queue. They
+must not be added to job wall time. These counters prepare internal adaptive
+decode scheduling; their presence does not indicate that automatic session
+selection is enabled. Optional `decode_extra_budget_bytes`,
+`decode_session_estimate_bytes`, `decode_session_initialization_ms`,
+`decode_current_sessions` (zero after draining), and `decode_session_changes`
+describe internal scheduling. Changes use `tier:reason` strings; consumers must
+ignore unknown reasons and optional fields. Internal diagnostics may also include
+`range_split:selected_ordinal:rap:source_frame` entries to identify safe handoff
+boundaries; these are not additional tier changes.
+
+With internal GPU stage profiling enabled, `vulkan_stage_gpu_ms` contains six
+summed GPU timestamp intervals in this order: luma conversion, transpose,
+inverse, forward, metric, result copy. Unsupported timestamps or disabled
+profiling produce zeros. Intervals may overlap across analysis slots and include
+GPU scheduling contention; their sum is not job wall time. `compute_ms` remains
+summed analysis-call wall time, and Vulkan `upload_ms` is host plan/source packing
+time, not a GPU transfer measurement. Do not compare those fields directly with
+CUDA kernel/transfer event timings.
 
 The command selects compute first. Explicit `cuda` and `vulkan` must initialize
 that compute backend or fail with `unsupported`; decoder capability never

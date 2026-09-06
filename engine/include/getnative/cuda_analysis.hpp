@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -204,11 +205,12 @@ public:
     [[nodiscard]] CudaRuntimeTelemetry runtime_telemetry() const;
     void reset_analysis_telemetry();
     [[nodiscard]] std::uintptr_t native_context() const noexcept;
+    [[nodiscard]] std::optional<std::uint64_t> available_memory_bytes() const noexcept;
     [[nodiscard]] std::uintptr_t native_decode_stream() const noexcept;
 
     // Validates the complete per-frame device working set for a media task
     // before decoding starts. This does not submit work or acquire a slot.
-    void preflight_axis_batch(
+    std::size_t preflight_axis_batch(
         ConstImageView dimensions,
         std::span<const CandidateAnalysis> candidates,
         const MetricSpec &metric, std::size_t concurrency) const;

@@ -1,0 +1,10 @@
+diff --git a/libavcodec/vulkan_decode.c b/libavcodec/vulkan_decode.c
+--- a/libavcodec/vulkan_decode.c
++++ b/libavcodec/vulkan_decode.c
+@@ -234,5 +234,5 @@
+                                 hwfc->format[0],
+                                 VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR |
+-                                (!is_current ? VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR : 0));
++                                (!alloc_dpb ? VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR : 0));
+         if (err < 0)
+             return err;

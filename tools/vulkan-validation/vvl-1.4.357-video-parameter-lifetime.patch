@@ -1,0 +1,148 @@
+diff --git a/layers/chassis/dispatch_object.h b/layers/chassis/dispatch_object.h
+index cef5e4b..449ae4d 100644
+--- a/layers/chassis/dispatch_object.h
++++ b/layers/chassis/dispatch_object.h
+@@ -23,6 +23,7 @@
+ 
+ #pragma once
+ #include <atomic>
++#include <mutex>
+ #include <vector>
+ 
+ #include <vulkan/vulkan.h>
+@@ -324,6 +325,28 @@ class DispatchDevice : public HandleWrapper {
+ 
+     bool IsSecondary(VkCommandBuffer cb) const;
+ 
++    // Blackwell video decode can read recording parameters at submission time.
++    // Keep the unwrapped deep copy until the recording is reset or destroyed.
++    struct VideoDecodeRecording {
++        VkCommandPool pool = VK_NULL_HANDLE;
++        std::vector<std::unique_ptr<vku::safe_VkVideoDecodeInfoKHR>> parameters;
++    };
++    std::mutex video_decode_mutex;
++    vvl::unordered_map<VkCommandBuffer, VideoDecodeRecording> video_decode_recordings;
++    void ClearVideoDecodeRecording(VkCommandBuffer command_buffer) {
++        std::lock_guard<std::mutex> lock(video_decode_mutex);
++        auto found = video_decode_recordings.find(command_buffer);
++        if (found != video_decode_recordings.end()) found->second.parameters.clear();
++    }
++    void ClearVideoDecodePool(VkCommandPool pool, bool destroy) {
++        std::lock_guard<std::mutex> lock(video_decode_mutex);
++        for (auto it = video_decode_recordings.begin(); it != video_decode_recordings.end();) {
++            if (it->second.pool != pool) { ++it; continue; }
++            if (destroy) it = video_decode_recordings.erase(it);
++            else { it->second.parameters.clear(); ++it; }
++        }
++    }
++
+     Settings& settings;
+     DispatchInstance* dispatch_instance;
+ 
+diff --git a/layers/chassis/dispatch_object_manual.cpp b/layers/chassis/dispatch_object_manual.cpp
+index 163a526..c622eb8 100644
+--- a/layers/chassis/dispatch_object_manual.cpp
++++ b/layers/chassis/dispatch_object_manual.cpp
+@@ -1893,6 +1893,12 @@ VkResult DispatchDevice::AllocateCommandBuffers(VkDevice device, const VkCommand
+     }
+     VkResult result = device_dispatch_table.AllocateCommandBuffers(device, (const VkCommandBufferAllocateInfo*)&local_pAllocateInfo,
+                                                                    pCommandBuffers);
++    if (result == VK_SUCCESS && pAllocateInfo) {
++        std::lock_guard<std::mutex> lock(video_decode_mutex);
++        for (uint32_t i = 0; i < pAllocateInfo->commandBufferCount; ++i) {
++            video_decode_recordings[pCommandBuffers[i]].pool = pAllocateInfo->commandPool;
++        }
++    }
+     if ((result == VK_SUCCESS) && pAllocateInfo && (pAllocateInfo->level == VK_COMMAND_BUFFER_LEVEL_SECONDARY)) {
+         auto lock = WriteLockGuard(secondary_cb_map_mutex);
+         for (uint32_t cb_index = 0; cb_index < pAllocateInfo->commandBufferCount; cb_index++) {
+@@ -1908,6 +1914,11 @@ void DispatchDevice::FreeCommandBuffers(VkDevice device, VkCommandPool commandPo
+     commandPool = Unwrap(commandPool);
+     device_dispatch_table.FreeCommandBuffers(device, commandPool, commandBufferCount, pCommandBuffers);
+ 
++    {
++        std::lock_guard<std::mutex> lock(video_decode_mutex);
++        for (uint32_t i = 0; i < commandBufferCount; ++i) video_decode_recordings.erase(pCommandBuffers[i]);
++    }
++
+     auto lock = WriteLockGuard(secondary_cb_map_mutex);
+     for (uint32_t cb_index = 0; cb_index < commandBufferCount; cb_index++) {
+         secondary_cb_map.erase(pCommandBuffers[cb_index]);
+@@ -1917,8 +1928,10 @@ void DispatchDevice::FreeCommandBuffers(VkDevice device, VkCommandPool commandPo
+ void DispatchDevice::DestroyCommandPool(VkDevice device, VkCommandPool commandPool, const VkAllocationCallbacks* pAllocator) {
+     if (!wrap_handles) return device_dispatch_table.DestroyCommandPool(device, commandPool, pAllocator);
+ 
++    const VkCommandPool wrapped_pool = commandPool;
+     commandPool = Erase(commandPool);
+     device_dispatch_table.DestroyCommandPool(device, commandPool, pAllocator);
++    ClearVideoDecodePool(wrapped_pool, true);
+ 
+     auto lock = WriteLockGuard(secondary_cb_map_mutex);
+     for (auto item = secondary_cb_map.begin(); item != secondary_cb_map.end();) {
+@@ -1936,7 +1949,11 @@ bool DispatchDevice::IsSecondary(VkCommandBuffer commandBuffer) const {
+ }
+ 
+ VkResult DispatchDevice::BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo* pBeginInfo) {
+-    if (!wrap_handles || !IsSecondary(commandBuffer)) return device_dispatch_table.BeginCommandBuffer(commandBuffer, pBeginInfo);
++    if (!wrap_handles || !IsSecondary(commandBuffer)) {
++        const VkResult result = device_dispatch_table.BeginCommandBuffer(commandBuffer, pBeginInfo);
++        if (result == VK_SUCCESS) ClearVideoDecodeRecording(commandBuffer);
++        return result;
++    }
+     vku::safe_VkCommandBufferBeginInfo local_pBeginInfo;
+     if (pBeginInfo) {
+         local_pBeginInfo.initialize(pBeginInfo);
+@@ -1950,6 +1967,7 @@ VkResult DispatchDevice::BeginCommandBuffer(VkCommandBuffer commandBuffer, const
+         }
+     }
+     VkResult result = device_dispatch_table.BeginCommandBuffer(commandBuffer, (const VkCommandBufferBeginInfo*)&local_pBeginInfo);
++    if (result == VK_SUCCESS) ClearVideoDecodeRecording(commandBuffer);
+     return result;
+ }
+ 
+diff --git a/layers/vulkan/generated/dispatch_object.cpp b/layers/vulkan/generated/dispatch_object.cpp
+index 095ebd5..fb5898d 100644
+--- a/layers/vulkan/generated/dispatch_object.cpp
++++ b/layers/vulkan/generated/dispatch_object.cpp
+@@ -1241,10 +1241,12 @@ VkResult DispatchDevice::CreateCommandPool(VkDevice device, const VkCommandPoolC
+ 
+ VkResult DispatchDevice::ResetCommandPool(VkDevice device, VkCommandPool commandPool, VkCommandPoolResetFlags flags) {
+     if (!wrap_handles) return device_dispatch_table.ResetCommandPool(device, commandPool, flags);
++    const VkCommandPool wrapped_pool = commandPool;
+     {
+         commandPool = Unwrap(commandPool);
+     }
+     VkResult result = device_dispatch_table.ResetCommandPool(device, commandPool, flags);
++    if (result == VK_SUCCESS) ClearVideoDecodePool(wrapped_pool, false);
+ 
+     return result;
+ }
+@@ -1257,6 +1259,7 @@ VkResult DispatchDevice::EndCommandBuffer(VkCommandBuffer commandBuffer) {
+ 
+ VkResult DispatchDevice::ResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFlags flags) {
+     VkResult result = device_dispatch_table.ResetCommandBuffer(commandBuffer, flags);
++    if (result == VK_SUCCESS) ClearVideoDecodeRecording(commandBuffer);
+ 
+     return result;
+ }
+@@ -3767,7 +3770,8 @@ void DispatchDevice::CmdControlVideoCodingKHR(VkCommandBuffer commandBuffer,
+ 
+ void DispatchDevice::CmdDecodeVideoKHR(VkCommandBuffer commandBuffer, const VkVideoDecodeInfoKHR* pDecodeInfo) {
+     if (!wrap_handles) return device_dispatch_table.CmdDecodeVideoKHR(commandBuffer, pDecodeInfo);
+-    vku::safe_VkVideoDecodeInfoKHR var_local_pDecodeInfo;
++    auto retained = std::make_unique<vku::safe_VkVideoDecodeInfoKHR>();
++    auto &var_local_pDecodeInfo = *retained;
+     vku::safe_VkVideoDecodeInfoKHR* local_pDecodeInfo = nullptr;
+     {
+         if (pDecodeInfo) {
+@@ -3801,6 +3805,10 @@ void DispatchDevice::CmdDecodeVideoKHR(VkCommandBuffer commandBuffer, const VkVi
+             UnwrapPnextChainHandles(local_pDecodeInfo->pNext);
+         }
+     }
++    {
++        std::lock_guard<std::mutex> lock(video_decode_mutex);
++        video_decode_recordings.at(commandBuffer).parameters.push_back(std::move(retained));
++    }
+     device_dispatch_table.CmdDecodeVideoKHR(commandBuffer, (const VkVideoDecodeInfoKHR*)local_pDecodeInfo);
+ }
+ 

@@ -4,8 +4,10 @@
 #include "getnative/stop_token.hpp"
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -82,6 +84,9 @@ struct VulkanRuntimeTelemetry {
     double host_pack_ms = 0.0;
     double source_conversion_ms = 0.0;
     double gpu_execution_ms = 0.0;
+    // GPU timestamp intervals in stages mode: luma, transpose, inverse,
+    // forward, metric, result copy. Not summed worker wall time.
+    std::array<double, 6> stage_gpu_ms{};
 };
 
 struct VulkanNativeContextInfo {
@@ -91,16 +96,21 @@ struct VulkanNativeContextInfo {
     std::uintptr_t compute_queue = 0U;
     std::uint32_t compute_queue_family = 0U;
     std::uint32_t decode_queue_family = 0U;
+    std::uint32_t decode_queue_count = 1U;
     std::uint32_t video_codec_operations = 0U;
     std::uint32_t instance_api_version = 0U;
     bool timeline_semaphore = false;
+    bool synchronization2 = false;
+    bool sampler_ycbcr_conversion = false;
     std::vector<std::string> enabled_device_extensions;
 };
 
 // The caller retains the decoded image and its timeline semaphore until this
 // synchronous analysis call returns. mark_submitted updates FFmpeg's AVVkFrame
 // synchronization state and releases its frame lock immediately after queue
-// submission; release_without_submit is the exception-path counterpart.
+// submission; release_without_submit is the exception-path counterpart. The
+// image semaphore is signaled after luma conversion (the last image read),
+// allowing decode to reuse its DPB while analysis continues on the F32 buffer.
 struct VulkanLumaFrameView {
     std::uintptr_t image = 0U;
     std::uint32_t image_format = 0U;
@@ -130,6 +140,7 @@ struct VulkanAnalysisOptions {
     std::uint32_t metric_groups_per_candidate = 128U;
     bool enable_validation = false;
     bool force_non_coherent = false;
+    bool cache_plans = false;
 };
 
 [[nodiscard]] VulkanRuntimeProbe vulkan_runtime_probe() noexcept;
@@ -155,15 +166,16 @@ public:
     [[nodiscard]] const VulkanAnalysisOptions &options() const noexcept;
     [[nodiscard]] std::size_t peak_workspace_elements() const noexcept;
     [[nodiscard]] std::size_t peak_working_set_bytes() const noexcept;
+    [[nodiscard]] std::optional<std::uint64_t> available_memory_bytes() const noexcept;
     [[nodiscard]] VulkanRuntimeTelemetry runtime_telemetry() const;
     void reset_analysis_telemetry();
     [[nodiscard]] const VulkanNativeContextInfo &native_context() const noexcept;
-    void lock_native_queue();
-    void unlock_native_queue() noexcept;
+    void lock_native_queue(std::uint32_t family, std::uint32_t index);
+    void unlock_native_queue(std::uint32_t family, std::uint32_t index) noexcept;
 
     // Validates storage-buffer and aggregate device-memory requirements for
     // a media task before decoding starts. No command buffer is submitted.
-    void preflight_axis_batch(
+    std::size_t preflight_axis_batch(
         ConstImageView dimensions,
         std::span<const CandidateAnalysis> candidates,
         const MetricSpec &metric, std::size_t concurrency) const;

@@ -1,0 +1,20 @@
+diff --git a/libavcodec/vulkan_decode.c b/libavcodec/vulkan_decode.c
+--- a/libavcodec/vulkan_decode.c
++++ b/libavcodec/vulkan_decode.c
+@@ -516,10 +516,15 @@
+     sd_buf = (FFVkBuffer *)vp->slices_buf->data;
+ 
++    /* The aligned range is visible to the decoder. Recycled buffer contents
++     * beyond the last slice must not become additional bitstream data. */
++    memset((uint8_t *)sd_buf->mapped_mem + vp->slices_size, 0,
++           data_size - vp->slices_size);
++
+     /* Flush if needed */
+     if (!(sd_buf->flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+         VkMappedMemoryRange flush_buf = {
+             .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+             .memory = sd_buf->mem,
+             .offset = 0,
+-            .size = FFALIGN(vp->slices_size,
++            .size = FFALIGN(data_size,
+                             ctx->s.props.properties.limits.nonCoherentAtomSize),
