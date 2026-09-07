@@ -453,7 +453,7 @@ the valley distance is zero, peak arena workspace is 168.750 MiB, and all
 explicit Metal buffers total 252.230 MiB at peak. The recorded benchmark is a
 p=1 workload; p=2..4 and media input remain outside this Metal-host proof.
 
-CUDA has a separate real-device gate on an RTX 5080. The p1..4 correctness,
-resource, and throughput evidence is recorded in
-`docs/performance/cuda-pnorm-1-4-20260810.md`; it does not derive any CUDA claim
-from the Metal host above.
+CUDA requires separate real-device correctness, resource, and throughput
+validation. The historical media Verify measurements and their limits are
+recorded in [CUDA Verify](performance/cuda-verify-rtx5080.md); they do not derive
+any CUDA claim from the Metal host above.

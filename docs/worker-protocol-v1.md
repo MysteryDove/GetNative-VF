@@ -458,19 +458,25 @@ workspace, storage-buffer limits, and aggregate device-memory requirements.
 Failure returns `media_concurrency_unavailable`; it never lowers effective concurrency or
 tries another compute backend.
 
-Release builds currently default to one decode session while adaptive decoding
-is undergoing platform validation. There is no user-facing session-count setting.
+Release builds enable adaptive hardware decoding for CUDA, Vulkan Video, and
+VideoToolbox Verify by default. Jobs start with one session and may probe two or
+four according to measured demand, safe indexed partitions, and memory budget;
+short or analysis-bound jobs may remain at one. There is no user-facing
+session-count setting. Software decoding and preview remain single-session.
+Builders can disable adaptation with `GETNATIVE_ENABLE_ADAPTIVE_DECODE=OFF`;
+this replaces the former `GETNATIVE_TEST_ADAPTIVE_DECODE` test-only option.
 The unpublished `GETNATIVE_CUDA_DECODE_SESSIONS` environment switch has been
-removed and is ignored. Internal integration builds can exercise fixed or
-adaptive tiers without protocol or GUI changes. `telemetry.decode_sessions`
+removed and is ignored. Internal integration builds can set
+`GETNATIVE_TEST_FIXED_DECODE_SESSIONS` to 1, 2, or 4 to override adaptation
+without protocol or GUI changes. `telemetry.decode_sessions`
 reports peak simultaneously active sessions, not cumulative session creations.
 
 Hardware Verify additionally reports optional cumulative
 `analysis_starvation_thread_ms`, `producer_capacity_thread_ms`, and
 `analysis_queue_frame_ms` counters. The first two sum wait time over threads;
 the last integrates the number of frames waiting in the analysis queue. They
-must not be added to job wall time. These counters prepare internal adaptive
-decode scheduling; their presence does not indicate that automatic session
+must not be added to job wall time. These counters feed adaptive
+decode scheduling; their presence alone does not indicate that automatic session
 selection is enabled. Optional `decode_extra_budget_bytes`,
 `decode_session_estimate_bytes`, `decode_session_initialization_ms`,
 `decode_current_sessions` (zero after draining), and `decode_session_changes`

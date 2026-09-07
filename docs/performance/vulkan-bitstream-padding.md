@@ -26,9 +26,10 @@ the project build option alone cannot repair a separately loaded runtime.
 
 ## Evidence
 
-The isolated root is `/home/owen/tmp/gnvf-tune-20260905` on the Linux host.
+The following labels identify historical experiments; raw files are not
+distributed with this repository.
 
-- `adaptive-evidence/paired-vulkan-tail-34072`: formal comparison stopped on
+- `paired-vulkan-tail-34072`: formal comparison stopped on
   exact parity failure. Do not use its partial timing as an accepted result.
 - `vulkan-seek-18303.json`, `vulkan-seek-serial.json`, `vulkan-seek-vvl.json`:
   the same ten error-value differences recur without adaptive concurrency.
@@ -54,7 +55,7 @@ median was 42211.916329 ms (807.165440 fps), a 0.143692% elapsed-time increase.
 Automatic tested two sessions then reverted to one in every measured job.
 Elapsed-time spreads were 0.0310% fixed and 0.0505% automatic. Whole-card sampled
 memory peaks including warmup were 855 MiB and 947 MiB respectively.
-`paired-vulkan-padding-34072/summary.json` records engine and resolved FFmpeg
+The historical run `paired-vulkan-padding-34072` records engine and resolved FFmpeg
 library SHA-256 hashes. This comparison supersedes the failed unpatched parity
 run; it does not waive other platform or mode gates.
 

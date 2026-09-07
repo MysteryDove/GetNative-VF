@@ -46,11 +46,13 @@ compile_commands.json
 *.gputrace
 *.spindump
 
-# OMX plans are reviewable project artifacts; runtime/session state is local.
-/.omx/*
-!/.omx/plans/
-!/.omx/plans/*.md
-/.codex/
+# Local assistant state and generated review captures.
+.omx/
+.omc/
+.codex/
+.grok/
+.claude/
+/output_*.png
 
 # Local configuration and credentials.
 .env

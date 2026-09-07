@@ -1,4 +1,9 @@
-# CUDA Verify / 双路 NVDEC — RTX 5080, 2026-09-05
+# CUDA Verify / 固定双路 NVDEC 历史测量 — RTX 5080, 2026-09-05
+
+此页保留早期固定单/双路实现的测量，不是当前自动会话控制器的性能结论。
+当时的环境变量开关已删除；当前默认自适应行为、构建选项及后续测量见
+[自适应解码进展](adaptive-decode-progress.md) 和
+[Worker 协议](../worker-protocol-v1.md)。
 
 在同一最终二进制中，显式启用双路 NVDEC 后，5001 帧双轴 Bilinear Verify 从 **851.24 提升到 1462.22 fps（1.72×）**；整集 34072 帧从 **40.27 秒缩短至 23.04 秒（1.75×）**。完整逐帧结果保持一致，仍为 NVDEC → CUDA、zero-copy，无软件回退。
 
@@ -16,15 +21,10 @@ RTX 5080 有两组 NVDEC；NVIDIA 说明单 decoding session 不能利用多组 
 
 这些是不同计时边界的诊断对照，不应混称为 GPU 核时间。驻留帧 microbenchmark 含每次 luma→F32、分析、结果回读与同步，只用于判断计算供给能力，不是整片吞吐。
 
-## 实现与开关
+## 历史实现
 
-启动应用或 worker 前设置：
-
-```sh
-export GETNATIVE_CUDA_DECODE_SESSIONS=2
-```
-
-默认未设置或设为 `1` 时维持单路；非法值返回 `bad_request`。这是一项显式启用的实验能力，暂未改变 GUI 默认行为。
+当时通过环境变量显式启用双路，默认单路。该机制已由共享调度器和
+自动会话控制器替代，旧环境变量不再生效。
 
 双路只在以下条件满足时启用：
 
@@ -62,26 +62,31 @@ Recipe：`h_plus_w`，Bilinear，候选 1536×864，p=1，四边 crop=5，thresh
 ## 验证
 
 - 5001 帧及整集 34072 帧：单/双路 seq、frame_index、PTS、timestamp、error 完全一致，无缺帧和重复。
-- 新增 `getnative_cuda_decode_sessions_tests`：2400 帧 open-GOP H.264，覆盖完整区间、跨 GOP 起止、稀疏选择、短任务、分析并发=1、取消后复用和非法开关值。
+- 当时新增 `getnative_cuda_decode_sessions_tests`：2400 帧 open-GOP H.264，覆盖完整区间、跨 GOP 起止、稀疏选择、短任务、分析并发=1、取消后复用和非法开关值；当前测试改为比较两个固定会话配置的引擎。
 - 1200 帧 1080p HEVC Main10 open-GOP、p4：实际双路运行，结果与单路一致；该合成片仅作正确性覆盖。
 - 新增测试及 media worker、media index、Vulkan analysis 共四项相关测试通过；没有覆盖或回退上一轮 Vulkan 修改。
 - 既有 CUDA telemetry 默认关闭与旧测试断言不一致的问题未在本轮扩大处理；不把此次相关测试通过描述为全套 CTest 全绿。
-- 未验证 Windows 包、其他 GPU、多视频同时运行或机械硬盘上的收益，所以默认仍为单路。
+- 当时未验证 Windows 包、其他 GPU、多视频同时运行或机械硬盘上的收益；这些历史结果不能代替相应平台验收。
 
-## 复现与证据
+## 当前固定会话对照方式
+
+分别构建 `GETNATIVE_TEST_FIXED_DECODE_SESSIONS=1` 与 `=2` 的引擎，再以
+相同媒体、配方和参数运行以下命令，将引擎路径与输出文件分别替换。
+该构建覆盖优先于自适应选项。它测量的是当前固定配置，不能重现上表旧二进制
+的全部实现细节，也不能用来代替默认自动配置的验证。
 
 ```sh
-GETNATIVE_CUDA_DECODE_SESSIONS=2 \
 python3 engine/bench/media_verify_benchmark.py \
   /path/to/getnative-engine /path/to/00001.m2ts \
   --backend cuda --frames 5001 --repeats 3 --output /path/to/dual.json
 ```
 
-将开关改为 `1` 得到同二进制对照；整集使用 `--frames 34072 --repeats 1`。报告会保存实际环境开关、请求、provenance、telemetry 和每帧结果。
+整集使用 `--frames 34072 --repeats 1`。报告保存引擎路径、请求、provenance、
+telemetry 和每帧结果；应检查 `decode_sessions` 确认实际会话数。
 
-开发机证据：`/home/owen/tmp/gnvf-tune-20260905/cuda-evidence/`。本机在当前任务产物的 `rtx5080/cuda-evidence/` 保留副本。
+## 历史证据摘要
 
 - 媒体 SHA-256：`72938cf98d3bc333b93ae1bc73faeb4d0b2a3399d835376c057e111d855130b5`
 - 整集排序并 canonical JSON 编码的帧结果 SHA-256：`d07f2fe7cf4f45ede926e896d6ebe78d65b9350df0aa7dc8125f381a75aab994`
 
-`comparison.json`、各实验 JSON/日志、驻留分析/纯解码探针、整集显存采样和源码/二进制校验值随证据保存；大型原始结果没有加入仓库。
+大型原始结果未加入仓库；以上为历史测量摘要。

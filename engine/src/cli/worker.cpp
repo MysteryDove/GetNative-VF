@@ -4399,7 +4399,7 @@ private:
         cuda_decoder_options.frame_concurrency = spec.concurrency;
         vulkan_decoder_options.frame_concurrency = spec.concurrency;
         metal_decoder_options.frame_concurrency = spec.concurrency;
-#if defined(GETNATIVE_TEST_ADAPTIVE_DECODE)
+#if defined(GETNATIVE_ENABLE_ADAPTIVE_DECODE)
         cuda_decoder_options.adaptive_decode = true;
         vulkan_decoder_options.adaptive_decode = true;
         metal_decoder_options.adaptive_decode = true;

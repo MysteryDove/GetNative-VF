@@ -12,9 +12,7 @@ It does not establish that every Verify selection/input passes validation.
 The overlay and reproducible isolated build helper are in
 `tools/vulkan-validation/`. VVL is pinned to SDK 1.4.357.0 commit
 `f4874eee15c78d7bdb2b7e60659d539f14741500`. No system driver or SDK installation
-was overwritten. The tested installation is:
-
-`/home/owen/tmp/gnvf-tune-20260905/vvl-lifetime-install`
+was overwritten; the tested layer used an isolated installation prefix.
 
 ## Causal Evidence
 
@@ -97,12 +95,7 @@ plan remain unverified/unimplemented as recorded separately.
 
 ## Evidence
 
-Remote evidence: `/home/owen/tmp/gnvf-tune-20260905/adaptive-evidence/lifetime-fix/`.
-The sibling `video-call-trace.log` and `video-lifetime.log` contain the debugger
-experiments. Local copies live under:
-
-`/Users/owen/.codex/visualizations/2026/09/05/01a07130-01a1-7ba1-83b2-866f145ce127/rtx5080/adaptive-evidence/`
-
-The `canary/` directory intentionally contains errors. `verified/` contains
-both archived failing open-GOP logs and explicitly named successful reuse output;
-use the per-run context rather than interpreting the entire directory as passed.
+Raw debugger and validation logs are not distributed with this repository.
+Canary runs intentionally contain errors; archived open-GOP failures and
+successful reuse runs are separate evidence. Interpret each result using its
+stated configuration rather than treating the entire experiment as passed.

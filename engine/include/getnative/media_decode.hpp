@@ -277,7 +277,8 @@ struct DecoderOptions {
     std::size_t maximum_decode_sessions = 1U;
     // Internal Verify feedback; absent for software decode and media preview.
     std::function<DecodeDemandSnapshot()> demand_snapshot;
-    // Internal rollout gate. Enabled only by validated callers / integration tests.
+    // Hardware Verify enables this by default and supplies demand feedback.
+    // Other callers retain single-session decoding.
     bool adaptive_decode = false;
     DecodeResources decode_resources;
 };

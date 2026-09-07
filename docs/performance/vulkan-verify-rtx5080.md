@@ -9,12 +9,12 @@
 ## 负载与计时
 
 - 基线源码：`0fec15f`，最终为本轮未提交修改。
-- GPU：RTX 5080，驱动 595.84；Linux 开发机。
-- 原始 `00001.m2ts`，1920×1080 H.264 8-bit；完整文件从本机复制，双方 SHA-256 一致。
+- GPU：RTX 5080，驱动 595.84；Linux。
+- 原始 `00001.m2ts`，1920×1080 H.264 8-bit；对照使用 SHA-256 一致的完整输入。
 - 范围 #0–#5000，共 5001 帧；`h_plus_w`，候选高 864（宽 1536），Bilinear，p=1，四边 crop=5，threshold=0.015，并发=8。
 - 每个进程先运行一次相同 job 预热，再测三次；表中为 `frames_completed / job_total_ms` 的中位数，含热索引检查和规划。不是 GUI progress 平均值，也不是 GPU 核时间。
 - 所有 A/B 使用同一媒体、驱动和实际加载的系统 FFmpeg 8.0.1-3ubuntu2 动态库。CMake 指向现有 FFmpeg SDK 的头文件/链接输入，但运行时 `ldd` 显示加载 `/usr/lib/x86_64-linux-gnu/libav*.so`；这不是打包产物验证。
-- 初期 CUDA-only 本机构建目标为 SM120，最终恢复仓库默认 SM75/86/89/120 及 PTX75/120；Vulkan 编译选项保持相同。CUDA 数字作为同负载参考。
+- 初期 CUDA-only 实验构建目标为 SM120，最终恢复仓库默认 SM75/86/89/120 及 PTX75/120；Vulkan 编译选项保持相同。CUDA 数字作为同负载参考。
 
 ## 分阶段结果
 
@@ -66,8 +66,6 @@ python3 engine/bench/media_verify_benchmark.py \
 
 结果文件保存请求、运行时 provenance、完整逐帧结果和 telemetry，脚本拒绝缺帧、重复帧及硬解回退。性能测量不启用 validation/profiling。
 
-开发机上的隔离实验目录：`/home/owen/tmp/gnvf-tune-20260905`。原有 `/home/owen/dev/vf/GetNative-VF` 保持在 `be30fcd`，未覆盖其源码。
-
 证据摘要：
 
 - 媒体 SHA-256：`72938cf98d3bc333b93ae1bc73faeb4d0b2a3399d835376c057e111d855130b5`
@@ -75,4 +73,4 @@ python3 engine/bench/media_verify_benchmark.py \
 - 最终 binary SHA-256：`8d19123619226eea39964204cdeee2cb868b5212e43a428d19564d755ffe808f`
 - 5001 帧排序、JSON canonical 编码结果 SHA-256：`767af0230ef667f08fce387f902f22ae34ab2299df7eaac56844075729f788fe`
 
-本机完整证据存于本任务产物目录的 `rtx5080/evidence/`，包含各版本请求/结果、比较脚本、构建与测试日志、运行库清单和 validation 错误记录；未把大型 JSON 或视频提交到仓库。
+大型原始结果及视频未加入仓库；以上保留测量摘要、输入/二进制哈希和验证边界。

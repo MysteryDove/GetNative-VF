@@ -17,17 +17,15 @@ Host:
 
 ## Vulkan Scan
 
-The Vulkan scan used the current uncommitted Vulkan worktree based on
-`d64af6c`. The relevant local sources were copied unchanged to
-`/tmp/getnative-vf/src` and built in
-`/tmp/getnative-vf/build-vulkan-dynamic` with `GETNATIVE_ENABLE_VULKAN=ON`.
+The Vulkan scan used the then-uncommitted Vulkan worktree based on
+`d64af6c`, built in isolation with `GETNATIVE_ENABLE_VULKAN=ON`.
 Shaders were built with shaderc/SPIR-V Tools v2026.3 and embedded in the
 executable.
 
 Command:
 
 ```sh
-/tmp/getnative-vf/build-vulkan-dynamic/getnative_vulkan_kernel_benchmark \
+build/vulkan/getnative_vulkan_kernel_benchmark \
   --scan --assert
 ```
 
@@ -63,8 +61,8 @@ Executable SHA-256:
 
 ## CUDA Scan
 
-The CUDA scan used the clean remote GetNative-VF CUDA baseline at `9f3a425`,
-copied to `/tmp/getnative-cuda-scan.x0FF0H/src`. It was built with CUDA 13.3 as
+The CUDA scan used the clean GetNative-VF CUDA baseline at `9f3a425`,
+built in isolation with CUDA 13.3 as
 the staged generic C++ implementation. The fatbin contains native
 `sm_75`, `sm_86`, `sm_89`, and `sm_120` code plus `compute_75` and
 `compute_120` PTX.
@@ -72,8 +70,8 @@ the staged generic C++ implementation. The fatbin contains native
 Configure and build:
 
 ```sh
-cmake -S /tmp/getnative-cuda-scan.x0FF0H/src/engine \
-  -B /tmp/getnative-cuda-scan.x0FF0H/build -G Ninja \
+cmake -S engine \
+  -B build/cuda -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTING=ON \
   -DGETNATIVE_ENABLE_CUDA=ON \
@@ -82,7 +80,7 @@ cmake -S /tmp/getnative-cuda-scan.x0FF0H/src/engine \
   -DGETNATIVE_ENABLE_MEDIA=OFF \
   -DGETNATIVE_CUDA_ROOT=/usr/local/cuda-13.3
 
-cmake --build /tmp/getnative-cuda-scan.x0FF0H/build \
+cmake --build build/cuda \
   --target getnative_cuda_throughput_benchmark \
            getnative_cuda_baseline_tests -j 16
 ```
@@ -90,7 +88,7 @@ cmake --build /tmp/getnative-cuda-scan.x0FF0H/build \
 Benchmark command, repeated with `N=64`, `256`, and `1000`:
 
 ```sh
-/tmp/getnative-cuda-scan.x0FF0H/build/getnative_cuda_throughput_benchmark \
+build/cuda/getnative_cuda_throughput_benchmark \
   --width 1920 --height 1080 \
   --native-width 1280 --native-height 850 \
   --axes vertical --candidates N --warmups 3 --samples 7

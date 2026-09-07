@@ -7,13 +7,10 @@
 - Primary product surfaces: Project Hub, Project Workspace, Media Inspector, Samples, Analysis Workbench, Whole-video Verification, Results, Settings and Diagnostics
 - Evidence reviewed:
   - `docs/architecture.md`
-  - `.omx/plans/standalone-getnative.md`
   - `README.md`
   - `app/src/App.tsx`
   - `app/src/App.css`
   - `upstream/muvsfunc/muvsfunc.py`
-  - Local training sources `总监培训2026_20260725.html` and `总监培训2026_20260726.html` (research inputs; not distributed)
-  - Local training scripts `test_getnative.vpy`, `test_getfnative.vpy`, `test_getfnative_v2.vpy`, `test_selectkernel.vpy`, and `check_descale.vpy` (research inputs; not distributed)
 - Design assumption: Project is the top-level workspace. A quick one-off analysis is an untitled temporary Project that can be saved later.
 - Confirmed product decisions:
   - First launch opens Project Hub.
@@ -846,7 +843,7 @@ Rules:
   - Replace the geometry Preview command with workflow-specific Run Height Search, Run Kernel Search, and Start Verification commands.
   - Replace synthetic curves and valleys with immutable Run data.
   - Expand the current jobs bar into the persistent Global Job Tray.
-  - Use `docs/gui-development-spec.md` as the staged implementation handoff; when it conflicts with this file, `DESIGN.md` wins.
+  - Keep the implementation aligned with this design and the command contracts in `docs/worker-protocol-v1.md`.
 
 ## Open questions
 

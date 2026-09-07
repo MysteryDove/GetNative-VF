@@ -1,49 +1,45 @@
-# GetNative VF 0.2.3 — changes since v0.2.2
+Check now uses adaptive hardware decoding by default across CUDA, Vulkan Video, and VideoToolbox. This update also adds per-candidate Blur controls and improves measured-result handoff, video navigation, and verification history.
 
-This update improves Check correctness and Vulkan video execution, adds per-candidate blur controls, and fixes result handoff, timeline navigation, and historical recipe preservation. Metal/VideoToolbox support, Vulkan compute, the keep-alive shell, and the Media/sample layout were already present in v0.2.2.
+## New Features
 
-## Analysis and result correctness
+- Adaptive hardware decoding — Check starts with one decode session and can probe two or four according to workload, available memory, and safe video partitions. Short or analysis-bound jobs may stay at one; no manual session-count setting is required.
+- Blur candidate controls — build Algorithm Test candidates with per-filter Blur values, including Bicubic B/C grids.
+- Check metric inheritance — use metrics from Resolution Test or a local Check override without changing the saved Recipe. Fusion uses the metrics recorded by each Run.
+- Higher Check concurrency — the frame-concurrency range is now 1–16, with a default of 8. GPU execution is capped at 8 in both the interface and engine.
 
-- Add Blur to the Algorithm Test candidate builder, including Bicubic B/C grids.
-- Preserve non-default blur in engine result echoes and use candidate ids for result selection. Applying a measured candidate now preserves the actual filter. Older results recover omitted parameters through their original candidate ids and input snapshots.
-- Reject kernel lists above the engine's 4096-entry limit before constructing an oversized Cartesian grid; batch deduplication avoids repeatedly copying the growing list.
-- Fix successful candidate additions incorrectly reporting a duplicate.
-- Skip planner period-cache replay on half-pixel ties to preserve reference phase and border behavior.
+## Bug Fixes
 
-## Check workflow and UI
+- Preserve the measured filter, including non-default Blur, when applying a candidate. Older results recover omitted parameters from their original input snapshots.
+- Preserve historical verification Recipes when the active Recipe is edited or deleted, so completed Runs and Fusion keep their original inputs.
+- Restore live Check curves on macOS WebKit and keep running-result coverage up to date.
+- Show relative video time and seek correctly in files with non-zero timestamp origins.
+- Fix successful candidate additions reporting a duplicate, and reject oversized kernel grids before exceeding the engine's 4096-candidate limit.
+- Preserve reference phase and border behavior when planner cache replay encounters half-pixel ties.
+- Fix Vulkan frame-lock ownership, shared-device features, image/view usage, and synchronization between decoding and analysis.
+- Improve Fusion legends, visibility controls, and frame navigation; avoid plot extent failures on large result sets.
 
-- Check can inherit MetricSpec from Resolution Test or use a local override without editing the Recipe. Execution and Fusion use the effective metrics recorded by each Run.
-- Store independent Recipe snapshots for verification. Editing or deleting the active Recipe preserves historical inputs and Fusion eligibility, including legacy metadata captured before modification.
-- Raise the Check frame-concurrency range to 1..16 with a default of 8; GPU execution is capped at 8 in the UI and engine.
-- Restore live Check curves on macOS WebKit by calling browser timers with the correct receiver. Running result cards update their live coverage.
-- Display relative video time and translate time-based seeks correctly for files with non-zero PTS origins. Raw PTS remains available in the result data.
-- Improve Fusion legends, visibility controls, and frame navigation; compatibility checks avoid building a per-frame union unnecessarily.
-- Avoid spread-argument limits in plot extent calculations for large result sets.
+## Performance
 
-## Vulkan decoding and packaging
+- Separate Vulkan compute and decode queues where supported, release decode surfaces after conversion, and specialize small inverse bandwidths.
+- Share decode-demand sampling, memory budgeting, and session adjustment across the three hardware Check paths.
+- In a controlled Linux RTX 5080 test on a 34,072-frame H.264 video, automatic Vulkan decoding measured 1161.6 fps versus 807.2 fps with one fixed session, with exact frame-record parity. This is a configuration-specific comparison, not a general speedup over v0.2.2. See [the experiment record](https://github.com/MysteryDove/GetNative-VF/blob/v0.2.3/docs/performance/vulkan-optimization-experiments.md).
+- Avoid constructing resident GPU analysis engines just to report capabilities.
 
-- Vulkan Check selects Vulkan Video when usable and otherwise falls back to software decode. Hardware capabilities listed in Diagnostics are distinguished from each job's actual decoder and zero-copy provenance.
-- Separate supported compute/decode queues, release decode surfaces after conversion, and fix frame-lock ownership across decoder and analysis threads.
-- Correct shared Vulkan device features, image/view usage, layout barriers, and semaphore dependencies; specialize small inverse bandwidths.
-- Apply and record FFmpeg Vulkan bitstream-padding and coincident-view-usage fixes in SDK builds. Update Linux/Windows media SDK and CI capability checks, including VAAPI/D3D11VA entries.
-- Probe capabilities without unnecessarily constructing resident analysis engines.
+## Packaging
 
-## Experimental adaptive decoding
+- Apply FFmpeg Vulkan bitstream-padding and image-view-usage fixes in the Linux and Windows SDK builds, with patch changes included in cache keys.
+- Verify VAAPI capability entries on Linux and D3D11VA entries on Windows alongside NVDEC and Vulkan Video.
+- Continue shipping Windows x64 portable ZIP, Linux x64 `.deb` / AppImage, and macOS arm64 `.app.zip` packages.
+- Remove unused starter assets and refresh developer documentation.
 
-A shared indexed-range scheduler, demand sampler, memory budget, and 1→2→4 session controller are available behind internal test configuration. **Adaptive decoding remains disabled in release defaults.** Vulkan plan caching also remains off by default; shader experiments without measurable gains were reverted.
+## Notes
 
-Historical Linux RTX 5080 validation on a 34,072-frame H.264 workload measured 807.2 fps fixed-single versus 1161.6 fps automatic, with exact frame-record parity. This compares two configurations of the repaired experimental build; it is not a general v0.2.2-to-0.2.3 performance guarantee. See [the retained experiment record](performance/vulkan-optimization-experiments.md).
-
-Full Vulkan core/sync validation used an isolated patched Validation Layer with a positive canary. This does not establish that stock/upstream VVL is fixed. Persistent adjacent chunk scheduling, additional failure injection, profile-specific DPB estimates, Windows runtime acceptance, and default enablement remain open.
-
-## Validation and compatibility
-
-- Local frontend: 180 tests passed; production build and locale-key checks passed.
-- Local engine: CTest 20/20 passed with the documented FFmpeg runtime environment. Rust: 53 passed, 3 fixture-dependent tests ignored.
-- Actual macOS GUI: 34,072/34,072 frames completed without failures using a blur=1.1 Recipe; relative 10-second navigation selected frame 240 correctly, and live curves updated during execution.
-- Nine supplied PNGs: before/after CPU and Metal height-scan results were unchanged for each backend; all updated kernel echoes preserved blur. This does not claim CPU/Metal bitwise equality to each other.
-- Project schema remains version 2. Worker protocol additions preserve absolute timestamp semantics by default; the GUI explicitly requests relative time.
-- The latest GUI/protocol fixes have not been runtime-tested on Linux or Windows. Existing bundle-size warnings remain.
+- Existing project files remain on schema version 2. Worker timestamp additions preserve absolute-time behavior by default; the GUI requests relative time explicitly.
+- Vulkan Check uses Vulkan Video when available and falls back to software decoding otherwise. Software decoding and preview remain single-session.
+- Builders can disable adaptive decoding with `GETNATIVE_ENABLE_ADAPTIVE_DECODE=OFF`. Internal Vulkan plan caching remains off by default.
+- Adaptive multi-session runtime coverage is still configuration-specific; Windows runtime acceptance remains open. Clean Vulkan validation results used an isolated patched Validation Layer and do not establish an upstream fix.
+- The macOS app is unsigned and not notarized; see the Gatekeeper instructions below.
+- Linux AppImage needs host WebKitGTK 4.1. On Ubuntu, the `.deb` installs this dependency through apt.
 
 ## macOS: unsigned app (Gatekeeper / xattr)
 

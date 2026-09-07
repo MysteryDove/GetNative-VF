@@ -1,7 +1,22 @@
 # Adaptive decode implementation checkpoint
 
-Status: incomplete, not enabled. This document records the implementation and
-evidence from 2026-09-05; it is not a release acceptance report.
+Current default (2026-09-07): adaptive hardware Verify decoding is enabled via
+`GETNATIVE_ENABLE_ADAPTIVE_DECODE=ON` for CUDA, Vulkan Video, and VideoToolbox.
+The former test-only option has been replaced; builders can explicitly use
+`GETNATIVE_ENABLE_ADAPTIVE_DECODE=OFF` for single-session decoding, and the
+internal fixed-tier override still takes precedence. This default change does
+not close the remaining implementation or platform-validation gaps below.
+
+Default-build validation on Apple M4 Max: all 20 CTest cases passed; the supplied
+`00001.m2ts` completed 34,072 frames in each of two VideoToolbox/Metal runs with
+zero failures or retries, zero-copy provenance, and identical frame records.
+Both runs retained one session. This verifies the default build on macOS, not
+multi-session expansion or a performance gain. Configuration checks also
+covered explicit disablement and the fixed-tier override.
+
+The following sections record the implementation and evidence from 2026-09-05
+and 2026-09-06, when release defaults were disabled. They are historical
+checkpoints, not a release acceptance report.
 
 2026-09-06 follow-up: the validation crash now has a tested, bounded local VVL
 workaround with handle wrapping still enabled. Stock VVL remains affected.
@@ -36,8 +51,8 @@ defaults remain disabled, and Windows testing is explicitly deferred by the user
 
 The first formal Vulkan 5001-frame three-pair test regressed by 3.6843%:
 6147.561147 ms fixed one versus 6374.054562 ms automatic. The probe finished the
-job without completing its three stable windows. This is a failed gate, retained
-in `adaptive-evidence/paired-vulkan-5001/summary.json` on the Linux test host.
+job without completing its three stable windows. This is a failed gate, recorded
+under the historical run label `paired-vulkan-5001`.
 
 Probe admission now accounts for prospective doubled throughput: remaining
 work, expressed in current-tier seconds, must cover initialization plus six
@@ -49,7 +64,7 @@ The corrected Vulkan 5001-frame interleaved three-pair run passed exact frame
 parity, with 6144.004088 ms fixed-one median and 6149.885536 ms automatic median
 (+0.0957%). Automatic stayed at one session in all three runs. Full-card sampled
 memory peaks, including warmup, were 794 MiB fixed and 791 MiB automatic.
-Evidence: `adaptive-evidence/paired-vulkan-tail-5001/summary.json`.
+Historical run label: `paired-vulkan-tail-5001`.
 
 The earlier CUDA 5001-frame automatic result (23.2% less elapsed time) used the
 previous admission policy and is not evidence for the corrected binary.
@@ -63,7 +78,7 @@ parity: fixed-one median 40262.048441 ms (846.255998 fps), automatic median
 elapsed-time spread was 3.20145%; all measured runs peaked at four sessions,
 with one reverting the four-session probe and two retaining it. Full-card
 sampled peaks including warmup were 1063 MiB fixed and 1495 MiB automatic.
-Evidence: `adaptive-evidence/paired-cuda-tail-34072/summary.json`. This comparison
+Historical run label: `paired-cuda-tail-34072`. This comparison
 does not establish the separate 95%-of-fixed-dual gate.
 
 The current local build also passed all 20 CTest cases with the documented
@@ -102,14 +117,13 @@ estimates. These prevent claiming the complete plan is delivered.
 
 Local macOS build: `cmake --build build/engine -j 8`.
 
-Local CTest: 19/19 passed with
-`DYLD_LIBRARY_PATH=/Users/owen/Documents/GetNative-VF/build/engine`.
+Local CTest: 19/19 passed with the build's FFmpeg runtime directory in
+`DYLD_LIBRARY_PATH`.
 Without that environment, the worker protocol test's portable-executable copy
 cannot load the adjacent FFmpeg dylibs because it copies only the executable.
 The controller was also rebuilt and rerun after the last budget/rollback edits.
 
-Linux RTX 5080: isolated source/build at
-`/home/owen/tmp/gnvf-tune-20260905`; persistent SSH socket `/tmp/gnvf-ssh-%C`.
+Linux RTX 5080: source and build were isolated from the regular checkout.
 Controller, existing CUDA fixed dual-session integration, media worker and Vulkan
 analysis tests passed (4/4). This is not adaptive scheduler coverage.
 
@@ -139,10 +153,8 @@ After the barrier fixes, the H.264 5001-frame and HEVC 128-frame diagnostic runs
 had zero validation messages. Disabling wrapping is diagnostic only and does not
 satisfy the full-validation acceptance requirement.
 
-Evidence copies are under:
-`/Users/owen/.codex/visualizations/2026/09/05/01a07130-01a1-7ba1-83b2-866f145ce127/rtx5080/adaptive-evidence/`.
-The remote directory of the same name also retains the isolated validation-layer
-package; no system package or GPU driver was changed.
+Raw experiment records are not distributed with this repository. The validation
+layer was installed separately; no system package or GPU driver was changed.
 
 ## Earlier checkpoint remaining work (superseded above)
 

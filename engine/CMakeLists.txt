@@ -864,7 +864,7 @@ if(TARGET getnative_media)
     getnative_enable_strict_fp(getnative_media)
 endif()
 
-option(GETNATIVE_TEST_ADAPTIVE_DECODE "Enable unvalidated internal adaptive decode integration testing" OFF)
+option(GETNATIVE_ENABLE_ADAPTIVE_DECODE "Enable adaptive hardware decode sessions for media Verify" ON)
 set(GETNATIVE_TEST_FIXED_DECODE_SESSIONS "0" CACHE STRING "Internal fixed decode tier: 0 disables override")
 if(NOT GETNATIVE_TEST_FIXED_DECODE_SESSIONS MATCHES "^(0|1|2|4)$")
     message(FATAL_ERROR "GETNATIVE_TEST_FIXED_DECODE_SESSIONS must be 0, 1, 2 or 4")
@@ -875,8 +875,8 @@ add_executable(getnative-engine
     src/cli/json.cpp
     src/cli/main.cpp
     src/cli/worker.cpp)
-if(GETNATIVE_TEST_ADAPTIVE_DECODE)
-    target_compile_definitions(getnative-engine PRIVATE GETNATIVE_TEST_ADAPTIVE_DECODE=1)
+if(GETNATIVE_ENABLE_ADAPTIVE_DECODE)
+    target_compile_definitions(getnative-engine PRIVATE GETNATIVE_ENABLE_ADAPTIVE_DECODE=1)
 endif()
 if(NOT GETNATIVE_TEST_FIXED_DECODE_SESSIONS STREQUAL "0")
     target_compile_definitions(getnative-engine PRIVATE

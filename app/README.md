@@ -17,15 +17,15 @@ those typed commands.
 - Existing `engine_capabilities` and `engine_geometry` live under Diagnostics.
 - Locales: Simplified Chinese (`zh-CN`, first-launch default) and English
   (`en`). Language is an application preference, not Project state.
-- Project storage uses a versioned schema-1 manifest behind a neutral storage
+- Project storage uses a versioned schema-2 manifest behind a neutral storage
   boundary (file vs future bundle is not baked into page components).
 - Media accepts mixed still/video imports, native drag and drop, real probing,
   still preview, and silent exact-frame browsing when the media sidecar is
   available.
 - Samples preserve Source, stream, frame number, PTS, timebase, timestamp,
   include state, order, and tags in the Project manifest.
-- Analysis controls remain capability-gated while the engine reports
-  `commands.analyze=false`; no synthetic curves or Runs are created.
+- Analysis controls follow the engine's reported capabilities; completed Runs
+  retain the measured results and their input snapshots.
 
 ## Development
 

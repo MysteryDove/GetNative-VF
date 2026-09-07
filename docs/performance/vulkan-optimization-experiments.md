@@ -1,6 +1,9 @@
 # Vulkan Verify experiments — Linux RTX 5080
 
-2026-09-06 continuation. Release adaptive defaults remain gated. All new GPU
+2026-09-06 continuation, recorded while release adaptive defaults were gated.
+Adaptive hardware Verify became default-on on 2026-09-07; see the
+[current default and remaining gaps](adaptive-decode-progress.md).
+All new GPU
 experiments use the isolated test host and the pinned FFmpeg 8.1.2 SDK with the
 bitstream-padding and coincident-view-usage patches. Diagnostic FFmpeg snapshot
 experiments below are explicitly separate from that SDK.
@@ -77,11 +80,11 @@ that is not a substitute for Linux Vulkan execution.
 
 ## Evidence and remaining acceptance
 
-Remote root: `/home/owen/tmp/gnvf-tune-20260905/adaptive-evidence/`.
-The `paired-vulkan-plan-cache-5001`, `paired-vulkan-unroll-5001`,
+Historical runs `paired-vulkan-plan-cache-5001`, `paired-vulkan-unroll-5001`,
 `paired-vulkan-tiled-5001`, `paired-vulkan-queues-5001` and
-`paired-vulkan-queueonly-5001` directories contain binary/library hashes,
-per-job records and summaries. `matrix-vulkan-lock-{1,2,3}.json` and
+`paired-vulkan-queueonly-5001` recorded binary/library hashes,
+per-job records and summaries. Raw files are not distributed with this repository.
+`matrix-vulkan-lock-{1,2,3}.json` and
 `matrix-vulkan-lock-validation.json` record the completed correctness matrices.
 
 Final same-source automatic/single long-job timing, full-job validation,
@@ -101,22 +104,22 @@ Automatic elapsed time is 0.694920165 of fixed single (-30.508%), equivalent to
 probed four, and reverted to two; `decode_sessions=4` records the peak, not the
 retained tier. The total includes probing, initialization and tail/restart costs.
 The memory column is sampled whole-card usage including warmup, not per-job
-allocated bytes. See `paired-vulkan-final-34072/summary.json` for binary and
-resolved runtime-library hashes. This comparison supersedes the earlier
+allocated bytes. The historical run `paired-vulkan-final-34072` recorded binary
+and resolved runtime-library hashes. This comparison supersedes the earlier
 fixed-dual queue-only screening for the final delivery's end-to-end claim.
 
 The final 5001-frame three-pair short-job gate also passed: fixed-single median
 6130.767539 ms (815.721681 fps), automatic median 6131.712163 ms (815.596014 fps),
 only 0.01541% more elapsed time. Automatic retained one session because the
 remaining-work admission guard cannot fund a complete expansion trial. All
-records matched exactly. Evidence: `paired-vulkan-final-5001/summary.json`.
+records matched exactly. Historical run label: `paired-vulkan-final-5001`.
 
 Full core/sync validation of the final automatic binary completed two 34072-frame
 jobs, each exactly matching the fixed-single results, with zero log messages.
 The same isolated patched VVL retains handle wrapping; the canary immediately
 before this run again emitted one intentional core and one synchronization
-error. The normal job's log is separate. Evidence:
-`vulkan-final-full-validation.json` and `optimization-validation/validation.log`.
+error. Full-job results and validation logs were recorded separately from the
+canary's intentional errors.
 This does not claim the stock VVL parameter-lifetime crash is fixed upstream.
 
 The final 5001-frame validation run also completed twice with exact parity.
@@ -145,4 +148,5 @@ The formal throughput table above was measured with profiling disabled.
 
 Windows remains deferred by the user. The larger adaptive plan still requires
 persistent adjacent range scheduling and additional failure injection before
-complete delivery or platform-default enablement can be claimed.
+complete delivery can be claimed. Default enablement does not establish Windows
+runtime acceptance.
