@@ -1,6 +1,7 @@
 import type { AxisMode, MathMode, MetricSpec } from "../engine/protocol";
 import { validateMetricSpec } from "../engine/shapeGuards";
 import { storedVerifyCoverage, storedVerifyFrames } from "../engine/verifyResults";
+import { verificationRecipe } from "./verificationRecipe";
 import type {
   ProjectState,
   Recipe,
@@ -50,12 +51,6 @@ function metricDifference(left: MetricSpec, right: MetricSpec): string | null {
   return null;
 }
 
-function recipeForRun(run: Run, state: ProjectState): Recipe | null {
-  const request = requestOf(run);
-  const id = typeof request?.recipeId === "string" ? request.recipeId : null;
-  return id ? state.recipesById[id] ?? null : null;
-}
-
 export type FusionEligibility = { ok: true } | { ok: false; reason: string };
 
 export function fusionEligibility(
@@ -79,12 +74,10 @@ export function fusionEligibility(
   if (request.sourceFingerprint !== source.fingerprint) return { ok: false, reason: "source_fingerprint_mismatch" };
   const streamIndex = request.scanScope && record(request.scanScope)?.streamIndex;
   if (!Number.isInteger(streamIndex) || (streamIndex as number) < 0) return { ok: false, reason: "stream_missing" };
-  const recipe = recipeForRun(run, state);
+  const recipe = verificationRecipe(run, state);
   if (!recipe || !recipe.metric || !recipe.kernel || !recipe.geometry) return { ok: false, reason: "recipe_snapshot_missing" };
   if (!Number.isInteger(request.recipeRevision) || request.recipeRevision !== recipe.revision) return { ok: false, reason: "recipe_revision_mismatch" };
   if (!validMetric(request.metric)) return { ok: false, reason: "metric_mismatch" };
-  const metricReason = metricDifference(request.metric, recipe.metric);
-  if (metricReason) return { ok: false, reason: metricReason };
   if (request.axisMode !== recipe.axisMode) return { ok: false, reason: "axis_mode_mismatch" };
   if (request.profileId !== (recipe.profileId ?? "")) return { ok: false, reason: "profile_mismatch" };
   if (request.mathMode !== (recipe.mathMode ?? "raw")) return { ok: false, reason: "math_mode_mismatch" };
@@ -132,7 +125,7 @@ function runMetadata(run: Run, state: ProjectState): {
   scope: unknown;
 } | null {
   const request = requestOf(run);
-  const recipe = recipeForRun(run, state);
+  const recipe = verificationRecipe(run, state);
   const scope = record(request?.scanScope);
   if (!request || !recipe || !validMetric(request.metric) || !scope) return null;
   if (typeof request.recipeId !== "string" || !Number.isInteger(request.recipeRevision) || !Number.isInteger(scope.streamIndex)) return null;

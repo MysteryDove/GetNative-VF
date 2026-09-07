@@ -1083,7 +1083,9 @@ function VerifyRunReview({
     );
   }, [frames, threshold, topN]);
 
-  const coverage = verifyCoverageDisplay(run);
+  const displayRun = !stored && frames.length > 0
+    ? { ...run, status: "running", completed: frames.length } : run;
+  const coverage = verifyCoverageDisplay(displayRun);
   const concurrency = verifyRunConcurrency(run);
 
   return (
@@ -1098,7 +1100,7 @@ function VerifyRunReview({
         <span className="verify-run-label">{verificationRunLabel(run, state, t)}</span>
         <span className="analyze-table-count">{filtered.length}</span>
         <span className="help-copy">
-          {run.status}
+          {displayRun.status}
           {" · "}
           {t("verify.col.coverage")} {coverage.text}
           {coverage.badge
@@ -1134,7 +1136,7 @@ function VerifyRunReview({
               <div className="result-table-row" role="row" key={frame.seq}>
                 <span role="cell">#{frame.frameIndex}</span>
                 <span role="cell">
-                  {frame.timestampSeconds != null ? `${frame.timestampSeconds.toFixed(3)}s` : "—"}
+                  {frame.timelineSeconds != null ? `${frame.timelineSeconds.toFixed(3)}s` : "—"}
                 </span>
                 <span role="cell">{frame.error != null ? frame.error.toPrecision(6) : "—"}</span>
                 <span role="cell">

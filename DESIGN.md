@@ -400,9 +400,9 @@ Logic:
 - Preview Scan supports Legacy I-picture Only and Every N Frames. Preview results always display an Incomplete Coverage badge and the exact scanned/eligible frame counts.
 - Custom scope accepts frame or timestamp in/out values, resolves them to exact frame boundaries, and records both representations.
 - Selecting multiple Sources creates one VerificationRun per Source inside one RunGroup. No video is concatenated with another video for execution or result identity.
-- Start Verification snapshots the current `active_recipe_id` into the new VerificationRun.
+- Start Verification stores the full current Recipe in `inputSnapshot.recipeSnapshot`, alongside the effective request. Both snapshots are independent of subsequent Recipe edits or deletion. Before editing or deleting a Recipe, legacy runs retain its metadata and their recorded request parameters in the same snapshot form.
 - Switching the Project's active Recipe after a run starts never changes that running or completed run.
-- Pixel Exclusion Threshold comes from the Recipe and cannot be edited here. Frame Review rules operate on stored frame metrics and may be changed after completion without recomputation.
+- Check can inherit MetricSpec from Resolution Test or use a local override without rewriting the Recipe. Fusion compares the effective metrics recorded by the input Runs; an override need not equal the original Recipe metric. Frame Review rules operate on stored frame metrics and may be changed after completion without recomputation.
 - Absolute review thresholds and Top N filters are supported. Top Percent remains a product decision, and relative deviation is withheld until its baseline formula is explicitly defined.
 - Raw per-frame metrics are retained. Log view applies display epsilon only at render time.
 - High-error credits, text, or scene changes are not silently discarded. Users may tag or exclude ranges while preserving the original result.

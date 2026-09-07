@@ -557,6 +557,7 @@ Filter parse_filter(const JsonValue &kernel) {
 // carries b and c, lanczos always carries taps.
 JsonValue filter_to_json(const Filter &filter) {
     std::vector<std::pair<std::string, JsonValue>> members;
+    if (filter.blur != 1.0) members.emplace_back("blur", JsonValue::number(filter.blur));
     switch (filter.type) {
     case KernelType::bilinear:
         members.emplace_back("id", JsonValue::string("bilinear"));
@@ -1356,6 +1357,7 @@ struct MediaJob {
     std::string target = "frame";
     std::optional<std::uint64_t> frame_index;
     std::optional<double> timestamp_seconds;
+    std::string timestamp_reference = "absolute";
     std::uint32_t window_radius = 12U;
     std::int32_t maximum_dimension = 1280;
     std::int32_t expected_width = 0;
@@ -2117,6 +2119,10 @@ public:
         }
         if (kind == MediaJobKind::frame_window || kind == MediaJobKind::preview) {
             job->target = optional_string(command, "target").value_or("frame");
+            job->timestamp_reference = optional_string(command, "timestamp_reference").value_or("absolute");
+            if (job->timestamp_reference != "absolute" && job->timestamp_reference != "relative") {
+                throw WorkerError("bad_request", "timestamp_reference must be absolute or relative");
+            }
             if (const JsonValue *frame = command.find("frame_index");
                 frame != nullptr && !frame->is_null()) {
                 const std::int64_t value = require_int64(command, "frame_index");
@@ -2909,7 +2915,15 @@ private:
     }
 
 #if defined(GETNATIVE_HAS_MEDIA)
-    static JsonValue frame_identity_json(const media::FrameIdentity &frame) {
+    static std::optional<double> media_time_origin(const media::MediaIndex &index) {
+        for (const auto &frame : index.frames) {
+            if (frame.timestamp_seconds) return frame.timestamp_seconds;
+        }
+        return std::nullopt;
+    }
+
+    static JsonValue frame_identity_json(const media::FrameIdentity &frame,
+                                        std::optional<double> time_origin) {
         return JsonValue::object({
             {"frame_index", JsonValue::integer(static_cast<std::int64_t>(frame.frame_index))},
             {"pts", frame.pts ? JsonValue::integer(*frame.pts) : JsonValue{}},
@@ -2917,6 +2931,8 @@ private:
                 ? JsonValue::integer(*frame.best_effort_timestamp) : JsonValue{}},
             {"timestamp_seconds", frame.timestamp_seconds
                 ? JsonValue::number(*frame.timestamp_seconds) : JsonValue{}},
+            {"timeline_seconds", frame.timestamp_seconds && time_origin
+                ? JsonValue::number(*frame.timestamp_seconds - *time_origin) : JsonValue{}},
             {"key_frame", JsonValue::boolean(frame.key_frame)},
             {"picture_type", frame.picture_type
                 ? JsonValue::string(*frame.picture_type) : JsonValue{}},
@@ -2935,9 +2951,15 @@ private:
             }
             const media::FrameIdentity *best = nullptr;
             double best_distance = std::numeric_limits<double>::infinity();
+            double target_seconds = *job.timestamp_seconds;
+            if (job.timestamp_reference == "relative") {
+                const auto origin = media_time_origin(index);
+                if (!origin) throw WorkerError("media_index_error", "indexed frames do not contain usable timestamps");
+                target_seconds += *origin;
+            }
             for (const auto &frame : index.frames) {
                 if (!frame.timestamp_seconds) continue;
-                const double distance = std::abs(*frame.timestamp_seconds - *job.timestamp_seconds);
+                const double distance = std::abs(*frame.timestamp_seconds - target_seconds);
                 if (distance < best_distance) {
                     best = &frame;
                     best_distance = distance;
@@ -3047,17 +3069,19 @@ private:
         std::vector<media::FrameIdentity> frames =
             media::frame_window(index, target, radius);
         std::vector<JsonValue> values;
+        const auto time_origin = media_time_origin(index);
         values.reserve(frames.size());
-        for (const auto &frame : frames) values.push_back(frame_identity_json(frame));
+        for (const auto &frame : frames) values.push_back(frame_identity_json(frame, time_origin));
         JsonValue previous;
         JsonValue next;
         for (const auto &frame : index.frames) {
             if (!frame.key_frame) continue;
-            if (frame.frame_index < target) previous = frame_identity_json(frame);
-            if (frame.frame_index > target && next.is_null()) next = frame_identity_json(frame);
+            if (frame.frame_index < target) previous = frame_identity_json(frame, time_origin);
+            if (frame.frame_index > target && next.is_null()) next = frame_identity_json(frame, time_origin);
         }
         return JsonValue::object({
-            {"selected", frame_identity_json(index.frames[target])},
+            {"selected", frame_identity_json(index.frames[target], time_origin)},
+            {"time_origin_seconds", time_origin ? JsonValue::number(*time_origin) : JsonValue{}},
             {"frames", JsonValue::array(std::move(values))},
             {"total_frames", JsonValue::integer(
                 static_cast<std::int64_t>(index.frames.size()))},
@@ -4748,6 +4772,7 @@ private:
             producer_capacity_thread_ms += snapshot.capacity_thread_ms;
             analysis_queue_frame_ms += snapshot.queue_frame_ms;
         };
+        const auto time_origin = media_time_origin(index);
         const auto append_result = [&](std::uint64_t seq,
                                        const media::FrameIdentity &identity,
                                        double error,
@@ -4760,6 +4785,8 @@ private:
                     ? JsonValue::integer(*identity.pts) : JsonValue{}},
                 {"timestamp_seconds", identity.timestamp_seconds
                     ? JsonValue::number(*identity.timestamp_seconds) : JsonValue{}},
+                {"timeline_seconds", identity.timestamp_seconds && time_origin
+                    ? JsonValue::number(*identity.timestamp_seconds - *time_origin) : JsonValue{}},
                 {"error", JsonValue::number(error)},
             });
             final_frames.push_back(result);

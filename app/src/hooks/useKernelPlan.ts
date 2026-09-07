@@ -11,6 +11,7 @@ import {
 import {
   buildKernelResultRows,
   compareKernelResultRows,
+  kernelResultKey,
   planKernelRunGroup,
 } from "../engine/kernelRunGroup";
 import { metricCompatibilityKey } from "../engine/runGroupPlan";
@@ -54,7 +55,7 @@ export function useKernelPlan({
   inheritedMetric: MetricSpec;
   /** Samples excluded from the kernel test (default: every included sample). */
   excludedSampleIds: Set<string>;
-  /** Selected result row (`${runId}-${kernelLabel}`), mirrored for row highlighting. */
+  /** Selected result row (run id + candidate id), mirrored for row highlighting. */
   selectedResultKey: string | null;
   /** Result table sample switch: null = all samples. */
   sampleFilter: string | null;
@@ -218,7 +219,7 @@ export function useKernelPlan({
   const kernelTableRows = useMemo(
     () =>
       [...resultRows.rows].sort(compareKernelResultRows).map((row) => {
-        const key = `${row.runId}-${row.kernelLabel}`;
+        const key = kernelResultKey(row);
         return {
           key,
           metric: row.metric,

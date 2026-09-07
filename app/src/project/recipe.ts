@@ -8,6 +8,7 @@ import type {
 import { validateMetricSpec } from "../engine/shapeGuards";
 import { MUF_PROFILE_ID, profileFor } from "../engine/profiles";
 import type { ProjectState, Recipe } from "./types";
+import { preserveVerificationRecipes } from "./verificationRecipe";
 
 /**
  * Recipe domain operations. All functions are pure ProjectState transforms so
@@ -99,7 +100,7 @@ export function updateRecipe(
   };
   return {
     ok: true,
-    state: { ...state, recipesById: { ...state.recipesById, [recipeId]: next } },
+    state: { ...preserveVerificationRecipes(state, recipeId), recipesById: { ...state.recipesById, [recipeId]: next } },
     recipe: next,
   };
 }
@@ -164,7 +165,7 @@ export function removeRecipeInState(
   }
   const recipesById = { ...state.recipesById };
   delete recipesById[recipeId];
-  return { ok: true, state: { ...state, recipesById } };
+  return { ok: true, state: { ...preserveVerificationRecipes(state, recipeId), recipesById } };
 }
 
 /** Remove a Recipe; if it is current, point `active_recipe_id` at another. */
@@ -186,7 +187,7 @@ export function deleteRecipeInState(
   return {
     ok: true,
     state: {
-      ...state,
+      ...preserveVerificationRecipes(state, recipeId),
       recipesById,
       project: { ...state.project, activeRecipeId },
     },

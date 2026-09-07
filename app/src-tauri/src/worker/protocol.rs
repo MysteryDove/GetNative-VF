@@ -277,10 +277,8 @@ pub(crate) fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), Str
         let Some(kernels) = kernels else {
             return Err("bad_request: kernel mode requires a non-empty kernels list".to_owned());
         };
-        if kernels.len() > MAX_CANDIDATES {
-            return Err(format!(
-                "bad_request: kernels must contain 1..={MAX_CANDIDATES} entries"
-            ));
+        if kernels.len() > 4096 {
+            return Err("bad_request: kernels must contain 1..=4096 entries".to_owned());
         }
         for kernel in kernels {
             validate_kernel_command(kernel)?;

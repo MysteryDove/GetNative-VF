@@ -2,6 +2,7 @@ import type { Translator } from "../i18n";
 import type { ProjectState, Run } from "../project/types";
 import type { VerifyFrameEntry } from "./executeVerify";
 import type { ScanScope, VerifyCoverage } from "./protocol";
+import { verificationRecipe } from "../project/verificationRecipe";
 
 type RecordValue = Record<string, unknown>;
 
@@ -19,6 +20,8 @@ function nonNegativeInteger(value: unknown): number | null {
 export function storedVerifyFrames(run: Run): VerifyFrameEntry[] | null {
   const frames = record(run.result)?.frames;
   if (!Array.isArray(frames)) return null;
+  const first = frames.find((item) => record(item)?.frameIndex === 0);
+  const origin = record(first)?.timestampSeconds;
   const rows: VerifyFrameEntry[] = [];
   for (const item of frames) {
     const row = record(item);
@@ -30,6 +33,9 @@ export function storedVerifyFrames(run: Run): VerifyFrameEntry[] | null {
       timestampSeconds: typeof row.timestampSeconds === "number"
         ? row.timestampSeconds
         : null,
+      timelineSeconds: typeof row.timelineSeconds === "number" ? row.timelineSeconds
+        : typeof origin === "number" && typeof row.timestampSeconds === "number"
+          ? row.timestampSeconds - origin : null,
       error: typeof row.error === "number" ? row.error : null,
     });
   }
@@ -111,7 +117,7 @@ export function verificationRunLabel(
       ? snapshot.recipeId
       : null;
   const recipeLabel = recipeId
-    ? state.recipesById[recipeId]?.name ?? recipeId
+    ? verificationRecipe(run, state)?.name ?? state.recipesById[recipeId]?.name ?? recipeId
     : t("verify.unknownRecipe");
   return `${sourceLabel} · ${verifyScopeLabel(t, verifyRunScope(run))} · ${recipeLabel}`;
 }

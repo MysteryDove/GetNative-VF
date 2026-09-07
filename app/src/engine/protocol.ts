@@ -193,6 +193,7 @@ export type VerifyFrameResult = {
   frameIndex?: number;
   pts?: number | null;
   timestampSeconds?: number | null;
+  timelineSeconds?: number | null;
 };
 
 /** Exact media verification coverage, available after presentation-order indexing. */

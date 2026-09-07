@@ -607,6 +607,7 @@
   "analyze.k.scanList.add": "Add",
   "analyze.k.scanList.addGrid": "Add Bicubic grid",
   "analyze.k.scanList.gridRanges": "Grid range",
+  "analyze.k.scanList.limit": "Kernel scans support at most 4096 candidates. Reduce the grid or remove candidates.",
   "analyze.k.scanList.duplicate": "Already in the scan list; not added.",
   "analyze.k.scanList.gridAdded": "Added {added}; skipped {skipped} duplicate(s).",
   "analyze.k.scanList.invalidParams": "Invalid parameters; nothing added.",

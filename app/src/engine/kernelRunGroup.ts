@@ -164,13 +164,14 @@ export function planKernelRunGroup(input: {
 }
 
 export type KernelResultEntry = {
+  candidateId: string;
   kernelId: string;
   parameters: Record<string, unknown>;
   metric: number;
 };
 
 /** Extract per-kernel metrics only from real engine-shaped results; never invent values. */
-export function extractKernelResultRows(result: unknown): KernelResultEntry[] | null {
+export function extractKernelResultRows(result: unknown, inputKernels: KernelRef[] = []): KernelResultEntry[] | null {
   if (!result || typeof result !== "object") return null;
   const record = result as Record<string, unknown>;
   // Worker protocol v1.1 kernel payload: {candidates: [{id: "<index>", error,
@@ -178,7 +179,7 @@ export function extractKernelResultRows(result: unknown): KernelResultEntry[] | 
   const rows = record.candidates ?? record.rows ?? record.results ?? record.metrics;
   if (!Array.isArray(rows)) return null;
   const extracted: KernelResultEntry[] = [];
-  for (const item of rows) {
+  for (const [index, item] of rows.entries()) {
     if (!item || typeof item !== "object") continue;
     const row = item as Record<string, unknown>;
     const kernel = row.kernel as Record<string, unknown> | undefined;
@@ -188,11 +189,19 @@ export function extractKernelResultRows(result: unknown): KernelResultEntry[] | 
     const metric = typeof rawMetric === "number" ? rawMetric : Number(rawMetric);
     if (!Number.isFinite(metric)) continue;
     const { id: _echoId, ...echoParams } = kernel ?? {};
+    const candidateId = typeof row.id === "string" || typeof row.id === "number"
+      ? String(row.id) : `row-${index}`;
+    const inputIndex = /^\d+$/.test(candidateId) ? Number(candidateId) : -1;
+    const inputKernel = inputKernels[inputIndex];
+    // Older engines omitted blur from the echo. Recover only via the stable
+    // candidate id and a matching input kernel, never via a display label.
+    const inputParams = inputKernel?.id === kernelId ? inputKernel.parameters : {};
     extracted.push({
+      candidateId,
       kernelId,
       parameters:
         kernel != null
-          ? echoParams
+          ? { ...inputParams, ...echoParams }
           : ((row.parameters ?? {}) as Record<string, unknown>),
       metric,
     });
@@ -201,6 +210,7 @@ export function extractKernelResultRows(result: unknown): KernelResultEntry[] | 
 }
 
 export type KernelResultRow = {
+  candidateId: string;
   runId: string;
   sampleId: string;
   kernelId: string;
@@ -209,6 +219,10 @@ export type KernelResultRow = {
   metric: number;
   sampleLabel: string;
 };
+
+export function kernelResultKey(row: Pick<KernelResultRow, "runId" | "candidateId">): string {
+  return `${row.runId}::${row.candidateId}`;
+}
 
 const KERNEL_SORT_ORDER = new Map(
   ["bilinear", "bicubic", "lanczos", "spline16", "spline36", "spline64"]
@@ -273,17 +287,19 @@ export function buildKernelResultRows(
   for (const run of runs) {
     const snapshot = run.inputSnapshot as {
       metric?: MetricSpec;
+      kernels?: KernelRef[];
     } | null;
     if (snapshot?.metric && metricCompatibilityKey(snapshot.metric) !== activeMetricKey) {
       incompatibleCount += 1;
       continue;
     }
-    const extracted = extractKernelResultRows(run.result);
+    const extracted = extractKernelResultRows(run.result, Array.isArray(snapshot?.kernels) ? snapshot.kernels : []);
     if (!extracted) continue;
     const sample = run.sampleId ? state.samplesById[run.sampleId] : null;
     for (const row of extracted) {
       const params = Object.entries(row.parameters);
       rows.push({
+        candidateId: row.candidateId,
         runId: run.id,
         sampleId: run.sampleId ?? "",
         kernelId: row.kernelId,

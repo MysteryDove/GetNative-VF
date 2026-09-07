@@ -3,6 +3,7 @@ import {
   defaultVerifyDraft,
   extractVerifyFrames,
   planVerifyRunGroup,
+  materializeVerifyRunGroup,
   reconcileReadyVideoSourceIds,
   resolveScanScope,
   validVerifyConcurrency,
@@ -282,4 +283,18 @@ describe("extractVerifyFrames", () => {
     expect(extractVerifyFrames({ frames: "nope" })).toBeNull();
     expect(extractVerifyFrames({ frames: [{ frame: "x", metric: 1 }] })).toBeNull();
   });
+});
+
+it("snapshots the recipe and measured parameters before later edits", () => {
+  const recipe = structuredClone(completeRecipe);
+  const source: Source = { id: "video", kind: "video", path: "/video.mkv", state: "ready", width: 1920, height: 1080, videoStreams: [], selectedStreamIndex: 0 };
+  const planned = planVerifyRunGroup({ draft: { ...defaultVerifyDraft(), sourceIds: [source.id] }, recipe, sourcesById: { video: source } });
+  if (!planned.ok) throw new Error(planned.reason);
+  recipe.kernel!.parameters.blur = 2;
+  const { runs } = materializeVerifyRunGroup({ plan: planned.plan });
+  const snapshot = runs[0].inputSnapshot as { recipeSnapshot: Recipe; request: { kernel: { parameters: Record<string, unknown> } } };
+  expect(snapshot.recipeSnapshot.kernel!.parameters.blur).toBeUndefined();
+  expect(snapshot.request.kernel.parameters.blur).toBeUndefined();
+  planned.plan.members[0].request.kernel.parameters.blur = 3;
+  expect(snapshot.request.kernel.parameters.blur).toBeUndefined();
 });

@@ -10,6 +10,8 @@ import {
 } from "./kernelDraft";
 import {
   compareKernelResultRows,
+  extractKernelResultRows,
+  kernelResultKey,
   materializeKernelRunGroup,
   planKernelRunGroup,
   type KernelResultRow,
@@ -255,9 +257,9 @@ describe("extractKernelResultRows (worker v1.1 payload)", () => {
     };
     const rows = extractKernelResultRows(payload);
     expect(rows).toEqual([
-      { kernelId: "bilinear", parameters: {}, metric: 5.1 },
-      { kernelId: "bicubic", parameters: { b: 0, c: 0.5 }, metric: 0.4 },
-      { kernelId: "bicubic", parameters: { b: 0, c: 1 }, metric: 0.4 },
+      { candidateId: "0", kernelId: "bilinear", parameters: {}, metric: 5.1 },
+      { candidateId: "1", kernelId: "bicubic", parameters: { b: 0, c: 0.5 }, metric: 0.4 },
+      { candidateId: "2", kernelId: "bicubic", parameters: { b: 0, c: 1 }, metric: 0.4 },
     ]);
     expect(extractKernelResultRows(null)).toBeNull();
     expect(extractKernelResultRows({ candidates: "bogus" })).toBeNull();
@@ -270,6 +272,7 @@ describe("compareKernelResultRows", () => {
       kernelId: string,
       parameters: KernelResultRow["parameters"],
     ): KernelResultRow => ({
+      candidateId: "0",
       runId: "run-1",
       sampleId: "sample-1",
       kernelId,
@@ -293,6 +296,21 @@ describe("compareKernelResultRows", () => {
       ["lanczos", { taps: 2 }],
     ]);
   });
+});
+
+it("recovers old blur echoes by candidate id and keeps result selection unambiguous", () => {
+  const rows = extractKernelResultRows({ candidates: [
+    { id: "1", kernel: { id: "spline16" }, error: 0.1 },
+    { id: "0", kernel: { id: "spline16" }, error: 0.2 },
+    { id: "9", kernel: { id: "spline16" }, error: 0.3 },
+  ] }, [
+    { id: "spline16", parameters: {} },
+    { id: "spline16", parameters: { blur: 1.1 } },
+  ])!;
+  expect(rows[0].parameters).toEqual({ blur: 1.1 });
+  expect(rows[1].parameters).toEqual({});
+  expect(rows[2].parameters).toEqual({});
+  expect(new Set(rows.map((row) => kernelResultKey({ runId: "run", candidateId: row.candidateId }))).size).toBe(3);
 });
 
 // Hoisted import helper keeps the appended block self-contained.

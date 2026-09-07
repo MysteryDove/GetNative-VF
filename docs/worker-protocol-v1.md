@@ -211,7 +211,11 @@ Field rules:
 Result payload: `mode: "kernel"`, `candidate` echo, and one entry per
 kernel **in request order**: `{"id": "<index>", "error": …, "kernel":
 {…echo with defaults filled…}}`. The `id` is the decimal index into the
-request's `kernels` list, so duplicated specs stay unambiguous. Plans
+request's `kernels` list, so duplicated specs stay unambiguous. Non-default
+`blur` is included in the echo for every kernel family. Clients must keep the
+candidate id as result identity instead of using a display label. Older echoes
+that omitted blur can recover it from that id in the original input snapshot.
+Plans
 share the session cache and store with height mode (same PlanKey space —
 a kernel-mode entry already scanned as a height candidate is a hit).
 Cancel/progress semantics are identical to height mode (partial payload
@@ -551,7 +555,16 @@ atomically and cancelled builds leave no valid temporary index.
 
 `media_frame_window` resolves `target` (`frame`, `timestamp`,
 `previous_keyframe`, or `next_keyframe`) and returns presentation-order frame
-identities. `media_preview_begin` returns one cached PNG asset. The engine seeks
+identities. Timestamp requests accept `timestamp_reference: "absolute" | "relative"`.
+The default remains absolute PTS seconds for existing clients; relative requests
+measure seconds from the stream's first usable indexed timestamp. The GUI uses
+relative requests. Raw `pts` and `timestamp_seconds` remain unchanged. Frame-window
+identities and media Verify frame results additionally expose `timeline_seconds`
+for display, and frame windows expose `time_origin_seconds`. Missing timestamps
+produce null display times; frame numbers remain authoritative. Old bounded runs
+without a known origin must not guess relative times from their first selected frame.
+
+`media_preview_begin` returns one cached PNG asset. The engine seeks
 with `avformat_seek_file`, flushes the codec, and decodes from the indexed
 keyframe anchor; only streams without usable timestamps may decode from the
 beginning.

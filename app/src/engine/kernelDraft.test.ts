@@ -3,6 +3,8 @@ import {
   addBicubicGridToScanList,
   addBlurParameters,
   addKernelToScanList,
+  addKernelsToScanList,
+  MAX_KERNEL_CANDIDATES,
   bicubicRefFromDraft,
   clearScanList,
   defaultKernelDraft,
@@ -28,6 +30,31 @@ const metric: MetricSpec = {
 function draft() {
   return defaultKernelDraft(metric, "muf-d278cd3", "raw", "auto");
 }
+
+it("rejects an oversized Cartesian grid before materializing kernel entries", () => {
+  const input = { ...draft(), bStep: "0.015", cStep: "0.015" };
+  expect(addBicubicGridToScanList(input)).toEqual({ ok: false, reason: "kernel_list_too_large" });
+  expect(input.scanList).toHaveLength(6);
+});
+
+it("batches deduplication and applies the cap to the final list without partial additions", () => {
+  const input = { ...draft(), scanList: [] };
+  const kernels = Array.from({ length: MAX_KERNEL_CANDIDATES }, (_, b) => ({ id: "bicubic", parameters: { b, c: 0.5 } }));
+  const filled = addKernelsToScanList(input, kernels);
+  expect(filled.ok).toBe(true);
+  if (!filled.ok) return;
+  expect(filled.added).toBe(MAX_KERNEL_CANDIDATES);
+  expect(addKernelsToScanList(filled.draft, [kernels[0]])).toMatchObject({ ok: true, added: 0, skipped: 1 });
+  expect(addKernelsToScanList(filled.draft, [{ id: "bilinear", parameters: {} }])).toEqual({ ok: false, reason: "kernel_list_too_large" });
+  expect(input.scanList).toHaveLength(0);
+  expect(filled.draft.scanList).toHaveLength(MAX_KERNEL_CANDIDATES);
+});
+
+it("reports a newly added blur candidate synchronously with its resulting draft", () => {
+  const result = addKernelsToScanList(draft(), [{ id: "spline16", parameters: { blur: 1.1 } }]);
+  expect(result).toMatchObject({ ok: true, added: 1, skipped: 0 });
+  if (result.ok) expect(result.draft.scanList).toHaveLength(7);
+});
 
 describe("kernel scan list", () => {
   it("seeds the six preset families and honors the base override", () => {

@@ -1,62 +1,49 @@
-macOS is now a first-class release: Metal analysis, VideoToolbox decode, and an Apple Silicon app bundle. Windows and Linux packages also pick up a Vulkan compute backend. The desktop app folds sample picking into Media, keeps project pages alive across navigation, and lets Check run more frames in flight.
+# GetNative VF 0.2.3 — changes since v0.2.2
 
-## New Features
-- macOS Metal analysis — the engine can run scans and verification on Apple Silicon GPUs, with blur-aware planning on that path.
-- VideoToolbox decode — macOS packages decode video in-process through VideoToolbox instead of relying on an external FFmpeg binary. Metal verify uses a persistent async VTDecompressionSession (zero-copy via IOSurface) instead of per-frame FFmpeg waits or RAP-split multi-session decode.
-- Adaptive Metal whole-video verify — verification on Metal adjusts itself instead of using a one-size-fits-all schedule.
-- macOS arm64 app — GitHub Releases now include an unsigned `GetNative VF_<version>_arm64.app.zip`.
-- Vulkan compute backend — Windows and Linux packages can analyze on Vulkan when a device is available, alongside CUDA and CPU.
-- Blur-aware planning — blur is part of the plan key and fixtures, so blurred recipes reproduce instead of silently mismatching.
-- Media owns samples — the separate Samples page is gone. Add stills and video frames, include/exclude, and remove sources (with their frames) on Media.
-- Keep-alive project shell — Overview, Media, Resolution Test, Algorithm Test, Check, Results, and Settings stay mounted. Switching pages is a short fade; plot zoom, recipe drafts, and the last media preview survive the round trip.
-- Collapsible navigation — the sidebar collapses to icons and the page content resizes with it (180ms). Labels fade with the column instead of popping off.
-- Resolution Test results — the table defaults to sort by error, keeps the top 20, and scrolls in place next to the plot.
-- Algorithm Test kernel picker — kernels add as a family grid of chips, with Blur on the add form; a scan result can be set as the recipe kernel without a separate apply-from-list step.
-- Check MetricSpec — inherits Resolution Test by default and can be unlinked for the scan without rewriting the Recipe.
-- Check frame concurrency — default 8; CPU maximum 16, GPU (CUDA/Vulkan/Metal/auto-GPU) maximum 8.
-- Custom menus and motion — native `<select>` / spinner widgets are replaced with in-app menus and the same short motion on buttons, dropdowns, and the nav collapse (avoids the Linux WebKit pointer-grab issue on more controls).
-- Analysis chrome — tighter parameter blocks, recipe picker / apply-to-current-recipe dialog, result history, and a brand mark on the project chrome.
+This update improves Check correctness and Vulkan video execution, adds per-candidate blur controls, and fixes result handoff, timeline navigation, and historical recipe preservation. Metal/VideoToolbox support, Vulkan compute, the keep-alive shell, and the Media/sample layout were already present in v0.2.2.
 
-## Bug Fixes
-- Rank a perfect single-point descale (error 0) over a nearby shallower multi-kernel valley.
-- Preserve zimg half-pixel forward phases so geometry matches the reference.
-- Keep Metal verify progress updates from breaking the CPU fallback path.
-- Scope plot decimation and marker budget to the zoom window so dense curves stay readable.
-- Make blur validation and planner `filter.cpp` safe under fast-math.
-- Accept Vulkan `p_norm` 1..4 in the worker protocol.
-- Restore engine builds on older Apple standard libraries, Xcode 16 stop tokens, and non-jthread toolchains.
-- Allow Vulkan builds against distro headers that omit AV1 video symbols.
-- Link CoreFoundation for native VideoToolbox decode.
-- Replace WebKitGTK native number spinners and range sliders so Linux text fields do not grab the pointer.
-- Let Quick Analysis replace the untitled recovery slot instead of failing with a project-mismatch error.
-- Vulkan Check decodes with FFmpeg Vulkan Video on the same device as Vulkan compute, or falls back to software; it does not mix NVDEC, D3D11VA, or VAAPI.
-- Clamp GPU Check concurrency to 8 (analysis slot limit) instead of erroring when the UI asked for more.
-- Color Check fusion curves from the plot palette, with a legend checkbox, and avoid crashing full-video fusion plots (extent loops + numeric frame picker).
-- Keep media preview frames when leaving the Media page; returning no longer re-decodes from scratch.
-- Swallow a Tauri file-drop unlisten rejection when leaving Media (harmless console `listeners[eventId].handlerId` error).
-- Stop the result-table scrollbar from hitching against scroll anchoring while virtualizing.
-- Show the duplicate-sample notice only after Add, and clear it when the kernel family or parameters change.
-- Drop the extra divider on the Apply to Current Recipe dialog.
+## Analysis and result correctness
 
-## Performance
-- Batch inverse rows through NEON on AArch64.
-- Port Metal register lag windows and a packed plan arena from the DSMVC work.
-- Gate GPU stage timers behind `GETNATIVE_GPU_STAGE_PROFILE` (off by default) and bind the CUDA analysis context once per thread.
-- Pages you have already opened keep their plot layers; collapsing the nav does not relayout hidden Check/Analyze curves, and plot canvases wait until the width tween settles before reallocating.
+- Add Blur to the Algorithm Test candidate builder, including Bicubic B/C grids.
+- Preserve non-default blur in engine result echoes and use candidate ids for result selection. Applying a measured candidate now preserves the actual filter. Older results recover omitted parameters through their original candidate ids and input snapshots.
+- Reject kernel lists above the engine's 4096-entry limit before constructing an oversized Cartesian grid; batch deduplication avoids repeatedly copying the growing list.
+- Fix successful candidate additions incorrectly reporting a duplicate.
+- Skip planner period-cache replay on half-pixel ties to preserve reference phase and border behavior.
 
-## Packaging
-- Pin the macOS FFmpeg SDK flow (VideoToolbox-enabled, self-contained dylibs).
-- Enable NVDEC and Vulkan Video in the Linux packaged FFmpeg SDK, matching Windows hwaccel, and allow intra-FFmpeg `$ORIGIN` NEEDED entries in the SDK closure.
-- Fix Windows packaged FFmpeg shipping without NVDEC/Vulkan Video (MSYS2 path checks never saw the SDK headers, so CUDA verify fell back to software decode). Fail CI if the Windows SDK omits hevc_nvdec/hevc_vulkan.
-- Ship Linux `.deb` / AppImage and Windows portable ZIP with CUDA + Vulkan. The AppImage is a thin package: GTK, WebKitGTK, GLib, and Wayland come from the host so GNOME/KDE input methods and AT-SPI match the session. FFmpeg and the pinned Vulkan loader stay in the image. AppImage uses system patchelf and pinned linuxdeploy tools.
-- Windows packages use the prebuilt Vulkan SDK instead of a source-built loader.
+## Check workflow and UI
 
-## Notes
-- The macOS build is not notarized. Gatekeeper may require a right-click → Open the first time, or clear quarantine with `xattr` (see below).
-- Linux AppImage needs host WebKitGTK 4.1. Prefer the `.deb` on Ubuntu (apt installs WebKitGTK for you).
-- The interface language is English for this release (the language control is kept, disabled, for compatibility).
-- Compatibility profile is muvsfunc getnative (`muf-d278cd3`) only. Other profile ids in older manifests are coerced to that contract.
-- Existing 0.2.1 project files still open. Sample lists now live on Media; Check concurrency in new runs is 1–16 on CPU and 1–8 on GPU.
+- Check can inherit MetricSpec from Resolution Test or use a local override without editing the Recipe. Execution and Fusion use the effective metrics recorded by each Run.
+- Store independent Recipe snapshots for verification. Editing or deleting the active Recipe preserves historical inputs and Fusion eligibility, including legacy metadata captured before modification.
+- Raise the Check frame-concurrency range to 1..16 with a default of 8; GPU execution is capped at 8 in the UI and engine.
+- Restore live Check curves on macOS WebKit by calling browser timers with the correct receiver. Running result cards update their live coverage.
+- Display relative video time and translate time-based seeks correctly for files with non-zero PTS origins. Raw PTS remains available in the result data.
+- Improve Fusion legends, visibility controls, and frame navigation; compatibility checks avoid building a per-frame union unnecessarily.
+- Avoid spread-argument limits in plot extent calculations for large result sets.
+
+## Vulkan decoding and packaging
+
+- Vulkan Check selects Vulkan Video when usable and otherwise falls back to software decode. Hardware capabilities listed in Diagnostics are distinguished from each job's actual decoder and zero-copy provenance.
+- Separate supported compute/decode queues, release decode surfaces after conversion, and fix frame-lock ownership across decoder and analysis threads.
+- Correct shared Vulkan device features, image/view usage, layout barriers, and semaphore dependencies; specialize small inverse bandwidths.
+- Apply and record FFmpeg Vulkan bitstream-padding and coincident-view-usage fixes in SDK builds. Update Linux/Windows media SDK and CI capability checks, including VAAPI/D3D11VA entries.
+- Probe capabilities without unnecessarily constructing resident analysis engines.
+
+## Experimental adaptive decoding
+
+A shared indexed-range scheduler, demand sampler, memory budget, and 1→2→4 session controller are available behind internal test configuration. **Adaptive decoding remains disabled in release defaults.** Vulkan plan caching also remains off by default; shader experiments without measurable gains were reverted.
+
+Historical Linux RTX 5080 validation on a 34,072-frame H.264 workload measured 807.2 fps fixed-single versus 1161.6 fps automatic, with exact frame-record parity. This compares two configurations of the repaired experimental build; it is not a general v0.2.2-to-0.2.3 performance guarantee. See [the retained experiment record](performance/vulkan-optimization-experiments.md).
+
+Full Vulkan core/sync validation used an isolated patched Validation Layer with a positive canary. This does not establish that stock/upstream VVL is fixed. Persistent adjacent chunk scheduling, additional failure injection, profile-specific DPB estimates, Windows runtime acceptance, and default enablement remain open.
+
+## Validation and compatibility
+
+- Local frontend: 180 tests passed; production build and locale-key checks passed.
+- Local engine: CTest 20/20 passed with the documented FFmpeg runtime environment. Rust: 53 passed, 3 fixture-dependent tests ignored.
+- Actual macOS GUI: 34,072/34,072 frames completed without failures using a blur=1.1 Recipe; relative 10-second navigation selected frame 240 correctly, and live curves updated during execution.
+- Nine supplied PNGs: before/after CPU and Metal height-scan results were unchanged for each backend; all updated kernel echoes preserved blur. This does not claim CPU/Metal bitwise equality to each other.
+- Project schema remains version 2. Worker protocol additions preserve absolute timestamp semantics by default; the GUI explicitly requests relative time.
+- The latest GUI/protocol fixes have not been runtime-tested on Linux or Windows. Existing bundle-size warnings remain.
 
 ## macOS: unsigned app (Gatekeeper / xattr)
 

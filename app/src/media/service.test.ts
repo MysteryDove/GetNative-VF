@@ -7,6 +7,7 @@ const invokeMock = vi.fn<(command: string, args?: unknown) => Promise<unknown>>(
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (command: string, args?: unknown) => invokeMock(command, args),
+  convertFileSrc: (path: string) => `asset:${path}`,
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -25,7 +26,7 @@ vi.mock("@tauri-apps/api/event", () => ({
   },
 }));
 
-import { exportFrameAssetBatch, requestFrameWindow } from "./service";
+import { exportFrameAssetBatch, requestFrameWindow, requestMediaPreview } from "./service";
 
 function emit(name: string, payload: Record<string, unknown>): void {
   for (const handler of handlers.get(name) ?? []) {
@@ -38,6 +39,20 @@ function listenerCount(name: string): number {
 }
 
 describe("engine media service", () => {
+  it("sends relative preview time explicitly while preserving the engine timeline fields", async () => {
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "engine_worker_media_begin") {
+        const request = (args as { request: Record<string, unknown> }).request;
+        expect(request).toMatchObject({ target: "timestamp", timestamp_seconds: 10, timestamp_reference: "relative" });
+        emit("engine-worker-event", { type: "result", request_id: request.request_id, payload: {
+          asset: { path: "/frame.png" }, decoder: "software",
+          window: { selected: { frame_index: 240, timestamp_seconds: 4210, timeline_seconds: 10 }, time_origin_seconds: 4200 },
+        } });
+      }
+    });
+    const task = requestMediaPreview({ path: "/offset.m2ts", streamIndex: 0, target: "timestamp", timestampSeconds: 10, timestampReference: "relative" });
+    await expect(task.promise).resolves.toMatchObject({ window: { selected: { timestamp_seconds: 4210, timeline_seconds: 10 } } });
+  });
   beforeEach(() => {
     handlers.clear();
     order.length = 0;

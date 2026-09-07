@@ -9,6 +9,12 @@ import type {
 import { buildCandidateGrid } from "./candidateGrid";
 import { invalidKernelBlur, kernelSignature } from "./heightDraft";
 
+export const MAX_KERNEL_CANDIDATES = 4096;
+
+export type AddKernelsResult =
+  | { ok: true; draft: KernelDraft; added: number; skipped: number }
+  | { ok: false; reason: string };
+
 /**
  * Kernel Analysis (算法测试) draft: one fixed geometry per Sample source shape,
  * plus a user-built scan list of kernel candidates. Geometry is never edited
@@ -177,11 +183,31 @@ export function addKernelToScanList(
   draft: KernelDraft,
   kernel: KernelRef,
 ): { draft: KernelDraft; added: boolean } {
-  const candidate = normalizeKernelRef(kernel);
-  const signature = kernelSignature(candidate);
+  const result = addKernelsToScanList(draft, [kernel]);
+  return result.ok ? { draft: result.draft, added: result.added > 0 } : { draft, added: false };
+}
+
+/** Build one bounded batch without repeatedly copying the accumulated list. */
+export function addKernelsToScanList(draft: KernelDraft, kernels: KernelRef[]): AddKernelsResult {
   const seen = new Set(draft.scanList.map((entry) => kernelSignature(normalizeKernelRef(entry))));
-  if (seen.has(signature)) return { draft, added: false };
-  return { draft: { ...draft, scanList: [...draft.scanList, candidate] }, added: true };
+  const added: KernelRef[] = [];
+  let skipped = 0;
+  for (const kernel of kernels) {
+    const candidate = normalizeKernelRef(kernel);
+    const signature = kernelSignature(candidate);
+    if (seen.has(signature)) { skipped += 1; continue; }
+    if (draft.scanList.length + added.length >= MAX_KERNEL_CANDIDATES) {
+      return { ok: false, reason: "kernel_list_too_large" };
+    }
+    seen.add(signature);
+    added.push(candidate);
+  }
+  return {
+    ok: true,
+    draft: added.length ? { ...draft, scanList: [...draft.scanList, ...added] } : draft,
+    added: added.length,
+    skipped,
+  };
 }
 
 /**
@@ -201,6 +227,9 @@ export function addBicubicGridToScanList(
     endpointRule: "inclusive",
   });
   if (!bGrid.ok) return bGrid;
+  if (bGrid.grid.candidates.length > MAX_KERNEL_CANDIDATES) {
+    return { ok: false, reason: "kernel_list_too_large" };
+  }
   const cGrid = buildCandidateGrid({
     axis: "c",
     start: draft.cStart,
@@ -209,25 +238,23 @@ export function addBicubicGridToScanList(
     endpointRule: "inclusive",
   });
   if (!cGrid.ok) return cGrid;
+  if (bGrid.grid.candidates.length * cGrid.grid.candidates.length > MAX_KERNEL_CANDIDATES) {
+    return { ok: false, reason: "kernel_list_too_large" };
+  }
 
   const blur = addBlurParameters(draft);
   if (!blur.ok) return { ok: false, reason: "invalid_blur" };
 
-  let current = draft;
-  let added = 0;
-  let skipped = 0;
+  const kernels: KernelRef[] = [];
   for (const b of bGrid.grid.candidates) {
     for (const c of cGrid.grid.candidates) {
-      const result = addKernelToScanList(current, {
+      kernels.push({
         id: "bicubic",
         parameters: { b, c, ...blur.parameters },
       });
-      current = result.draft;
-      if (result.added) added += 1;
-      else skipped += 1;
     }
   }
-  return { ok: true, draft: current, added, skipped };
+  return addKernelsToScanList(draft, kernels);
 }
 
 export function removeKernelFromScanList(draft: KernelDraft, index: number): KernelDraft {
@@ -251,6 +278,7 @@ export function resolveKernelCandidates(
     (kernel) => reported.size === 0 || reported.has(kernel.id),
   );
   if (candidates.length === 0) return { ok: false, reason: "no_kernels" };
+  if (candidates.length > MAX_KERNEL_CANDIDATES) return { ok: false, reason: "kernel_list_too_large" };
   return { ok: true, candidates };
 }
 

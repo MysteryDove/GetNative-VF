@@ -63,6 +63,7 @@ export function reconcileReadyVideoSourceIds(
 }
 
 export type VerifyRunGroupPlan = {
+  recipeSnapshot: Recipe;
   groupType: "multi_source_verification" | "single_verification";
   label: string;
   memberCount: number;
@@ -149,9 +150,10 @@ export function planVerifyRunGroup(input: {
   const readiness = recipeReadiness(input.recipe);
   if (!readiness.ok) return { ok: false, reason: "recipe_incomplete" };
   // recipeReadiness guarantees geometry/kernel/metric are present.
-  const recipeGeometry = input.recipe.geometry!;
-  const recipeKernel = input.recipe.kernel!;
-  const recipeMetric = input.draft.metric ?? input.recipe.metric!;
+  const recipeSnapshot = structuredClone(input.recipe);
+  const recipeGeometry = recipeSnapshot.geometry!;
+  const recipeKernel = recipeSnapshot.kernel!;
+  const recipeMetric = structuredClone(input.draft.metric ?? recipeSnapshot.metric!);
   const selected = input.draft.sourceIds
     .map((id) => input.sourcesById[id])
     .filter((source): source is Source => Boolean(source));
@@ -209,6 +211,7 @@ export function planVerifyRunGroup(input: {
   return {
     ok: true,
     plan: {
+      recipeSnapshot,
       groupType: selected.length > 1 ? "multi_source_verification" : "single_verification",
       label:
         input.draft.scopeKind === "full" ? "Full Video Check" : "Preview Scan",
@@ -244,8 +247,9 @@ export function materializeVerifyRunGroup(input: {
     createdAt: nowIso,
     updatedAt: nowIso,
     inputSnapshot: {
+      recipeSnapshot: structuredClone(input.plan.recipeSnapshot),
       planKey: member.planKey,
-      request: member.request,
+      request: structuredClone(member.request),
       scanScope: member.scanScope,
       concurrency: member.request.concurrency,
     },

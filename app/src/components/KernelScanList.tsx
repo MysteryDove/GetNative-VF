@@ -6,7 +6,7 @@ import type { KernelRef } from "../engine/protocol";
 import { kernelDisplayName } from "../engine/displayNames";
 import {
   addBicubicGridToScanList,
-  addKernelToScanList,
+  addKernelsToScanList,
   bicubicRefFromDraft,
   lanczosRefsFromDraft,
   lanczosTapsRange,
@@ -150,17 +150,13 @@ export function KernelScanListBuilder({
       setAddNotice(t("analyze.k.scanList.invalidParams"));
       return;
     }
-    let addedAny = false;
-    onDraftChange((current) => {
-      let next = current;
-      for (const ref of attached) {
-        const result = addKernelToScanList(next, ref);
-        next = result.draft;
-        addedAny = addedAny || result.added;
-      }
-      return next;
-    });
-    setAddNotice(addedAny ? "" : t("analyze.k.scanList.duplicate"));
+    const result = addKernelsToScanList(draft, attached);
+    if (!result.ok) {
+      setAddNotice(t("analyze.k.scanList.limit"));
+      return;
+    }
+    onDraftChange(() => result.draft);
+    setAddNotice(result.added ? "" : t("analyze.k.scanList.duplicate"));
   }
 
   function handleAddFamily() {
@@ -189,7 +185,9 @@ export function KernelScanListBuilder({
     const result = addBicubicGridToScanList(draft);
     if (!result.ok) {
       setAddNotice(
-        result.reason === "invalid_blur"
+        result.reason === "kernel_list_too_large"
+          ? t("analyze.k.scanList.limit")
+          : result.reason === "invalid_blur"
           ? t("analyze.blurInvalid")
           : t("analyze.k.scanList.invalidParams"),
       );

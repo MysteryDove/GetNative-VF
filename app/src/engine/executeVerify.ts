@@ -11,6 +11,7 @@ export type VerifyFrameEntry = {
   frameIndex: number;
   pts?: number | null;
   timestampSeconds?: number | null;
+  timelineSeconds?: number | null;
   error: number | null;
 };
 
@@ -41,7 +42,7 @@ export async function startVerifyRunGroup(input: {
   deps?: Partial<VerifyOrchestratorDeps>;
 }): Promise<StartVerifyResult> {
   const deps = { ...defaultDeps(), ...input.deps };
-  const { recipe } = input;
+  const recipe = input.plan.recipeSnapshot;
   if (!recipe.geometry || !recipe.kernel || !recipe.metric) {
     return { ok: false, reason: "recipe_incomplete" };
   }
@@ -65,7 +66,7 @@ export async function startVerifyRunGroup(input: {
       const source = input.state.sourcesById[member.sourceId];
       if (!source?.width || !source.height) throw new Error("verify_source_dims_missing");
       await runEngineMediaVerifyMember(
-        member, projectRun.id, recipe, runGroup.id,
+        member, projectRun.id, runGroup.id,
         source.width, source.height, input, deps,
       );
       submitted += 1;
@@ -106,7 +107,6 @@ type TerminalEvent = Extract<WorkerEvent, { type: "result" | "cancelled" | "erro
 async function runEngineMediaVerifyMember(
   member: Member,
   projectRunId: string,
-  recipe: Recipe,
   runGroupId: string,
   width: number,
   height: number,
@@ -151,6 +151,7 @@ async function runEngineMediaVerifyMember(
           frameIndex: entry.frameIndex ?? entry.seq,
           pts: entry.pts ?? null,
           timestampSeconds: entry.timestampSeconds ?? null,
+          timelineSeconds: entry.timelineSeconds ?? null,
           error: entry.error,
         }));
         framesSeen += batch.length;
@@ -181,7 +182,7 @@ async function runEngineMediaVerifyMember(
       startFrame: member.scanScope.startFrame ?? null,
       endFrame: member.scanScope.endFrame ?? null,
       axisMode: member.request.axisMode,
-      kernel: kernelParamsForWire(recipe.kernel!),
+      kernel: kernelParamsForWire(member.request.kernel),
       candidate: String(geometryCandidate(member.request.geometry, member.request.axisMode)),
       geometry: geometryToWire(member.request.geometry),
       metric: {

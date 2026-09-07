@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { Translator } from "../i18n";
 import {
   compareKernelResultRows,
+  kernelResultKey,
   type KernelResultRow,
 } from "../engine/kernelRunGroup";
 import {
@@ -298,7 +299,7 @@ export function KernelMetricPlot({
                 {visibleCategories.map((category, index) => {
                   const point = series.byCategory.get(kernelCategoryKey(category));
                   if (!point) return null;
-                  const key = `${point.runId}-${point.kernelLabel}`;
+                  const key = kernelResultKey(point);
                   const selected = selectedKey === key;
                   return (
                     <circle

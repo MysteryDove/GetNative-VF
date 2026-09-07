@@ -1513,6 +1513,21 @@ def main():
         check("kernel-cross-mode-cache", height_l3["payload"]["telemetry"]["plan_cache_hits"] == 1,
               json.dumps(height_l3["payload"]["telemetry"]))
 
+        # The echo must reconstruct the actual measured filter, including blur.
+        blur_result = run_analyze(worker, {
+            "protocol_version": 1, "type": "analyze", "request_id": "kernel-blur",
+            "mode": "kernel", "backend": "cpu",
+            "frame_asset": {"path": frame, "format": "f32le", "width": 320, "height": 240},
+            "axis_mode": "h_only", "candidate": "200",
+            "kernels": [{"id": "spline16"}, {"id": "spline16", "blur": 1.1}],
+            "metric": {"p_norm": 1}})
+        blur_rows = blur_result["payload"]["candidates"]
+        check("kernel-blur-echo", blur_rows[1]["kernel"] == {"id": "spline16", "blur": 1.1}
+              and blur_rows[0]["kernel"] == {"id": "spline16"})
+        replay = run_analyze(worker, analyze_command(
+            "kernel-blur-replay", frame, ["200"], kernel=blur_rows[1]["kernel"]))
+        check("kernel-blur-round-trip", replay["payload"]["candidates"][0]["error"] == blur_rows[1]["error"])
+
         # Duplicate kernel specs get distinct index ids but one shared plan.
         dup_result = run_analyze(worker, {
             "protocol_version": 1, "type": "analyze", "request_id": "k3",

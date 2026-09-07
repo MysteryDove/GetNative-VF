@@ -15,8 +15,10 @@ export class VerifyLiveFrameBuffer {
 
   constructor(
     private readonly onInvalidate: () => void,
-    private readonly schedule: (callback: () => void, delayMs: number) => TimerHandle = setTimeout,
-    private readonly cancel: (handle: TimerHandle) => void = clearTimeout,
+    private readonly schedule: (callback: () => void, delayMs: number) => TimerHandle =
+      (callback, delayMs) => globalThis.setTimeout(callback, delayMs),
+    private readonly cancel: (handle: TimerHandle) => void =
+      (handle) => globalThis.clearTimeout(handle),
   ) {}
 
   append(runId: string, entries: VerifyFrameEntry[]): void {

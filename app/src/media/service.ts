@@ -44,11 +44,13 @@ export type FrameIdentity = {
   pts: number | null;
   best_effort_timestamp: number | null;
   timestamp_seconds: number | null;
+  timeline_seconds?: number | null;
   key_frame: boolean;
   picture_type: string | null;
 };
 
 export type MediaFrameWindow = {
+  time_origin_seconds?: number | null;
   selected: FrameIdentity;
   frames: FrameIdentity[];
   total_frames: number;
@@ -271,6 +273,7 @@ export function requestMediaPreview(request: {
   target?: FrameWindowTarget;
   frameIndex?: number | null;
   timestampSeconds?: number | null;
+  timestampReference?: "absolute" | "relative";
   exact?: boolean;
   maxDimension?: number;
   windowRadius?: number;
@@ -294,6 +297,7 @@ export function requestMediaPreview(request: {
     target: target.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`),
     frame_index: request.frameIndex ?? null,
     timestamp_seconds: request.timestampSeconds ?? null,
+    timestamp_reference: request.timestampReference ?? "absolute",
     maximum_dimension: request.maxDimension ?? 1600,
     window_radius: request.windowRadius ?? 0,
   });

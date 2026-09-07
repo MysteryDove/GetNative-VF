@@ -607,6 +607,7 @@
   "analyze.k.scanList.add": "添加",
   "analyze.k.scanList.addGrid": "添加 Bicubic 网格",
   "analyze.k.scanList.gridRanges": "网格范围",
+  "analyze.k.scanList.limit": "算法扫描最多支持 4096 个候选。请缩小网格或移除候选。",
   "analyze.k.scanList.duplicate": "已在清单中，未重复添加。",
   "analyze.k.scanList.gridAdded": "已添加 {added} 项，跳过 {skipped} 项重复。",
   "analyze.k.scanList.invalidParams": "参数无效，未添加。",

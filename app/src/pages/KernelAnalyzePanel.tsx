@@ -14,6 +14,7 @@ import { startKernelRunGroup, type ExecutionBridge } from "../engine/executeRunG
 import { applyPayloadToCurrentRecipe } from "../project/recipeApply";
 import { useRunGroupSubmit } from "../hooks/useRunGroupSubmit";
 import { useKernelPlan } from "../hooks/useKernelPlan";
+import { kernelResultKey } from "../engine/kernelRunGroup";
 import type { ProjectState } from "../project/types";
 import { BlockedState } from "../components/BlockedState";
 import { KernelScanList, KernelScanListBuilder } from "../components/KernelScanList";
@@ -74,7 +75,7 @@ export function KernelAnalyzePanel({
   const [excludedSampleIds, setExcludedSampleIds] = useState<Set<string>>(new Set());
   /** Result table sample switch: null = all samples. */
   const [sampleFilter, setSampleFilter] = useState<string | null>(null);
-  /** Selected result row (`${runId}-${kernelLabel}`); its kernel can be applied. */
+  /** Selected result row (run id + candidate id); its kernel can be applied. */
   const [selectedResultKey, setSelectedResultKey] = useState<string | null>(null);
 
   function toggleSampleExcluded(sampleId: string) {
@@ -147,7 +148,7 @@ export function KernelAnalyzePanel({
   /** Result-row handoff: the measured kernel becomes the current Recipe's kernel. */
   function applySelectedResultKernel() {
     const row = resultRows.rows.find(
-      (item) => `${item.runId}-${item.kernelLabel}` === selectedResultKey,
+      (item) => kernelResultKey(item) === selectedResultKey,
     );
     if (!row) return;
     applyKernelRefToCurrentRecipe(

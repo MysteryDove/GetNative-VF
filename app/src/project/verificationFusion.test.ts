@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { buildVerificationFusion, fusionEligibility } from "./verificationFusion";
 import { buildVerificationFusionCsv, buildVerificationFusionJson } from "./export";
 import type { ProjectState } from "./types";
+import { deleteRecipeInState, updateRecipe } from "./recipe";
+import { openedToProjectState, projectStateToManifest } from "./normalize";
 
 const metric = {
   cropLeft: 0,
@@ -87,6 +89,35 @@ function state(): ProjectState {
 }
 
 describe("verification fusion", () => {
+  it("compares effective run metrics, including identical overrides", () => {
+    const project = state();
+    for (const run of Object.values(project.runsById)) {
+      const input = run.inputSnapshot as { request: { metric: typeof metric } };
+      input.request.metric = { ...metric, pixelExclusionThreshold: 0.02 };
+    }
+    expect(buildVerificationFusion({ state: project, sourceId: "src", runIds: ["a", "b"] }).ok).toBe(true);
+    (project.runsById.b.inputSnapshot as { request: { metric: typeof metric } }).request.metric.pNorm = 2;
+    expect(buildVerificationFusion({ state: project, sourceId: "src", runIds: ["a", "b"] })).toEqual({ ok: false, reason: "pnorm_mismatch" });
+  });
+
+  it("keeps historical fusion recipes after edits, deletion, and persistence", () => {
+    const project = state();
+    const edited = updateRecipe(project, "r1", { name: "Changed", kernel: { id: "other", parameters: {} } });
+    if (!edited.ok) throw new Error("setup");
+    const deleted = deleteRecipeInState(edited.state, "r1");
+    if (!deleted.ok) throw new Error("setup");
+    const restored = openedToProjectState({
+      manifest: projectStateToManifest(deleted.state), storage_path: "/tmp/test.getnative.json",
+      missing_source_ids: [], read_only: false, schema_status: "supported",
+    });
+    const result = buildVerificationFusion({ state: restored, sourceId: "src", runIds: ["a", "b"] });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const input = result.fusion.inputs.find((entry) => entry.recipeId === "r1")!;
+      expect(input.recipeName).toBe("r1");
+      expect(input.recipeSnapshot).toMatchObject({ kernel: { id: "k" } });
+    }
+  });
   it("unions sparse frames and keeps all candidates", () => {
     const result = buildVerificationFusion({ state: state(), sourceId: "src", runIds: ["a", "b"], id: "f" });
     expect(result.ok).toBe(true);

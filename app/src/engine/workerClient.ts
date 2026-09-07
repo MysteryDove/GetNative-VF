@@ -165,6 +165,7 @@ type WireEvent = {
     frame_index?: number;
     pts?: number | null;
     timestamp_seconds?: number | null;
+    timeline_seconds?: number | null;
   }>;
 };
 
@@ -571,6 +572,7 @@ export class EngineWorkerClient {
                   frameIndex: entry.frame_index,
                   pts: entry.pts,
                   timestampSeconds: entry.timestamp_seconds,
+                  timelineSeconds: entry.timeline_seconds,
                 }))
             : undefined,
         });

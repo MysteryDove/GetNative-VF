@@ -7,6 +7,7 @@ import {
   verificationRunLabel,
   verifyCoverageDisplay,
   worstVerifyFrameInRange,
+  storedVerifyFrames,
 } from "./verifyResults";
 
 const t = createTranslator("en");
@@ -32,6 +33,17 @@ function makeRun(overrides: Partial<Run> = {}): Run {
 }
 
 describe("verification result presentation", () => {
+  it("preserves absolute PTS while recovering relative time only from a known origin", () => {
+    const legacy = makeRun({ result: { frames: [
+      { frameIndex: 240, timestampSeconds: 4210, error: 0.1 },
+      { frameIndex: 0, timestampSeconds: 4200, error: 0.2 },
+    ] } });
+    expect(storedVerifyFrames(legacy)?.[0]).toMatchObject({ timestampSeconds: 4210, timelineSeconds: 10 });
+    const bounded = makeRun({ result: { frames: [{ frameIndex: 240, timestampSeconds: 4210, error: 0.1 }] } });
+    expect(storedVerifyFrames(bounded)?.[0].timelineSeconds).toBeNull();
+    const modern = makeRun({ result: { frames: [{ frameIndex: 240, timestampSeconds: 4210, timelineSeconds: 10, error: 0.1 }] } });
+    expect(storedVerifyFrames(modern)?.[0].timelineSeconds).toBe(10);
+  });
   it("distinguishes same-source runs by range and nested request recipe", () => {
     const state = emptyProjectState({ id: "project-1" });
     state.sourcesById["source-1"] = {

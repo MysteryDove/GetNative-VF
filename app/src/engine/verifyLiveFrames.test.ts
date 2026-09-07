@@ -1,9 +1,25 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { VERIFY_LIVE_FLUSH_MS, VerifyLiveFrameBuffer } from "./verifyLiveFrames";
 
-afterEach(() => vi.useRealTimers());
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("VerifyLiveFrameBuffer", () => {
+  it("calls browser timers with the global receiver required by WebKit", () => {
+    vi.useFakeTimers();
+    const schedule = globalThis.setTimeout;
+    const cancel = globalThis.clearTimeout;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(function (this: unknown, callback, delay) {
+      expect(this).toBe(globalThis);
+      return schedule(callback, delay);
+    });
+    vi.spyOn(globalThis, "clearTimeout").mockImplementation(function (this: unknown, handle) {
+      expect(this).toBe(globalThis);
+      return cancel(handle);
+    });
+    const buffer = new VerifyLiveFrameBuffer(vi.fn());
+    buffer.append("run", [{ seq: 0, frameIndex: 0, error: 1 }]);
+    buffer.dispose();
+  });
   it("retains batches as chunks and invalidates at most once per 200ms window", () => {
     vi.useFakeTimers();
     const invalidate = vi.fn();

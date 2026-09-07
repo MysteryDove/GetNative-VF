@@ -179,6 +179,7 @@ export function useMediaPreview({
           target,
           frameIndex,
           timestampSeconds,
+          timestampReference: "relative",
           maxDimension: 1600,
           windowRadius: 12,
         });
@@ -191,7 +192,7 @@ export function useMediaPreview({
         setFrameWindowState({ sourceKey: sourceStreamKey(source), window });
         setFrameInput(String(window.selected.frame_index));
         setScrubFrame(window.selected.frame_index);
-        setTimeInput((window.selected.timestamp_seconds ?? 0).toFixed(3));
+        setTimeInput((window.selected.timeline_seconds ?? 0).toFixed(3));
         swapPreviewUrl(url);
         setPreviewDecoder(decoder);
         setError("");

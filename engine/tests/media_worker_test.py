@@ -166,6 +166,25 @@ def main():
         assert window["selected"]["frame_index"] == 119
         assert window["previous_keyframe"]["frame_index"] >= 96
 
+        # Non-zero container timestamps must not shift the user's timeline.
+        shifted = root / "offset.mkv"
+        subprocess.run([ffmpeg, "-v", "error", "-i", str(media), "-c", "copy",
+                        "-output_ts_offset", "4200", str(shifted)], check=True)
+        first, _ = begin(worker, "offset-first", "media_frame_window", shifted, cache,
+                         stream_index=0, target="frame", frame_index=0, window_radius=0)
+        origin = first["selected"]["timestamp_seconds"]
+        assert origin >= 4199
+        assert first["selected"]["timeline_seconds"] == 0
+        relative, _ = begin(worker, "offset-relative", "media_frame_window", shifted, cache,
+                            stream_index=0, target="timestamp", timestamp_seconds=1,
+                            timestamp_reference="relative", window_radius=0)
+        absolute, _ = begin(worker, "offset-absolute", "media_frame_window", shifted, cache,
+                            stream_index=0, target="timestamp", timestamp_seconds=origin + 1,
+                            window_radius=0)
+        assert relative["selected"]["frame_index"] == absolute["selected"]["frame_index"] == 24
+        assert abs(relative["selected"]["timeline_seconds"] - 1) < 0.002
+        assert relative["selected"]["pts"] == absolute["selected"]["pts"]
+
         # Keyframe stepping from a frame that is itself a keyframe must move
         # (regression: inclusive bounds resolved the step back to the current
         # frame, so the "next/previous keyframe" actions appeared dead).
