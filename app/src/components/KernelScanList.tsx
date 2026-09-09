@@ -247,6 +247,7 @@ export function KernelScanListBuilder({
                 <span>b</span>
                 <input
                   value={draft.bicubicB}
+                  inputMode="decimal"
                   onChange={(event) => patch({ bicubicB: event.target.value })}
                 />
               </label>
@@ -254,6 +255,7 @@ export function KernelScanListBuilder({
                 <span>c</span>
                 <input
                   value={draft.bicubicC}
+                  inputMode="decimal"
                   onChange={(event) => patch({ bicubicC: event.target.value })}
                 />
               </label>
@@ -277,6 +279,7 @@ export function KernelScanListBuilder({
                       <span>{label}</span>
                       <input
                         value={draft[key]}
+                        inputMode="decimal"
                         onChange={(event) => patch({ [key]: event.target.value })}
                       />
                     </label>

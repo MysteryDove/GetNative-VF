@@ -174,6 +174,7 @@ export function HeightParamsPanel({
             <span>{t("analyze.refineSelected")}</span>
             <input
               value={draft.refineSelected}
+              inputMode="decimal"
               onChange={(event) => onPatch({ refineSelected: event.target.value })}
             />
           </label>
@@ -181,6 +182,7 @@ export function HeightParamsPanel({
             <span>{t("analyze.refineHalfSpan")}</span>
             <input
               value={draft.refineHalfSpan}
+              inputMode="decimal"
               onChange={(event) => onPatch({ refineHalfSpan: event.target.value })}
             />
           </label>

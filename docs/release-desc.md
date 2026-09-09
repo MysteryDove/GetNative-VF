@@ -11,6 +11,7 @@ Check now uses adaptive hardware decoding by default across CUDA, Vulkan Video, 
 
 ## Bug Fixes
 
+- Preserve decimal input while editing Pixel exclusion, including values such as `0.001`, and provide decimal keyboards for refinement and Bicubic scan parameters.
 - Preserve the measured filter, including non-default Blur, when applying a candidate. Older results recover omitted parameters from their original input snapshots.
 - Preserve historical verification Recipes when the active Recipe is edited or deleted, so completed Runs and Fusion keep their original inputs.
 - Restore live Check curves on macOS WebKit and keep running-result coverage up to date.

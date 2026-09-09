@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { ChevronRight } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { MetricSpec } from "../engine/protocol";
@@ -68,6 +68,13 @@ export function MetricEditor({
   onChange: (metric: MetricSpec) => void;
   disabled?: boolean;
 }) {
+  // Keep intermediate text such as "0." while still publishing valid numbers.
+  // Matching the numeric value also lets external metric changes replace the draft.
+  const [pixelExclusionDraft, setPixelExclusionDraft] = useState<{
+    text: string;
+    value: number;
+  } | null>(null);
+
   return (
     <div className="metric-grid">
         {(
@@ -94,11 +101,18 @@ export function MetricEditor({
           <span title={t("analyze.pixelExclusion")}>{t("analyze.pixelExclusion")}</span>
           <input
             inputMode="decimal"
-            value={metric.pixelExclusionThreshold}
+            value={pixelExclusionDraft?.value === metric.pixelExclusionThreshold
+              ? pixelExclusionDraft.text
+              : metric.pixelExclusionThreshold}
             disabled={disabled}
-            onChange={(event) =>
-              onChange({ ...metric, pixelExclusionThreshold: Number(event.target.value) })
-            }
+            onChange={(event) => {
+              const text = event.target.value;
+              const value = Number(text);
+              const valid = text.trim() !== "" && Number.isFinite(value);
+              setPixelExclusionDraft({ text, value: valid ? value : metric.pixelExclusionThreshold });
+              if (valid) onChange({ ...metric, pixelExclusionThreshold: value });
+            }}
+            onBlur={() => setPixelExclusionDraft(null)}
           />
         </label>
         <label className="block">
