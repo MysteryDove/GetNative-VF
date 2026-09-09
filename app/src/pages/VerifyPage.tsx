@@ -178,9 +178,10 @@ export function VerifyPage({
       draft: { ...draft, metric: scanMetric },
       recipe,
       sourcesById: state.sourcesById,
+      capabilities,
     });
     return result.ok ? result.plan : null;
-  }, [draft, recipe, scanMetric, state.sourcesById]);
+  }, [draft, recipe, scanMetric, state.sourcesById, capabilities]);
 
   const runs = useMemo(
     () => verificationRuns(state).filter((run) => !historySourceId || run.sourceId === historySourceId),
@@ -434,14 +435,16 @@ export function VerifyPage({
                 min: String(concurrencyMin),
                 max: String(concurrencyMax),
               })
+          : !pNormSupported
+            ? t("analyze.pNormUnsupported", { backend: resolvedVerifyBackend })
           : !plan
             ? t("verify.blocked.invalidPlan")
             : null;
 
-  const canStart = analyzeAvailable && plan !== null && !submitting;
+  const canStart = startBlockedReason === null && plan !== null && !submitting;
 
   function startRun() {
-    if (!plan || !recipe) return;
+    if (!canStart || !plan || !recipe) return;
     setNotice("");
     void submitRunGroup(
       () =>

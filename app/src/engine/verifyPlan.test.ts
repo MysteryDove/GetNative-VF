@@ -128,6 +128,43 @@ describe("resolveScanScope", () => {
 });
 
 describe("planVerifyRunGroup", () => {
+  it.each(["cuda", "vulkan", "metal"] as const)(
+    "rejects inherited p=6 before creating a %s verification plan",
+    (backend) => {
+      const result = planVerifyRunGroup({
+        draft: { ...defaultVerifyDraft(backend), sourceIds: [video.id] },
+        recipe: { ...completeRecipe, metric: { ...completeRecipe.metric!, pNorm: 6 } },
+        sourcesById: { [video.id]: video },
+      });
+      expect(result).toEqual({ ok: false, reason: "backend_p_norm_unsupported" });
+    },
+  );
+
+  it.each(["auto", "cpu"] as const)("preserves p=6 for %s", (backend) => {
+    const result = planVerifyRunGroup({
+      draft: { ...defaultVerifyDraft(backend), sourceIds: [video.id] },
+      recipe: { ...completeRecipe, metric: { ...completeRecipe.metric!, pNorm: 6 } },
+      sourcesById: { [video.id]: video },
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.plan.members[0].request.metric.pNorm).toBe(6);
+  });
+
+  it("validates the Check metric override instead of the saved Recipe metric", () => {
+    const draft = { ...defaultVerifyDraft("cuda"), sourceIds: [video.id] };
+    const sourcesById = { [video.id]: video };
+    expect(planVerifyRunGroup({
+      draft: { ...draft, metric: { ...completeRecipe.metric!, pNorm: 6 } },
+      recipe: completeRecipe,
+      sourcesById,
+    })).toEqual({ ok: false, reason: "backend_p_norm_unsupported" });
+    expect(planVerifyRunGroup({
+      draft: { ...draft, metric: { ...completeRecipe.metric!, pNorm: 4 } },
+      recipe: { ...completeRecipe, metric: { ...completeRecipe.metric!, pNorm: 6 } },
+      sourcesById,
+    }).ok).toBe(true);
+  });
+
   it("creates one member VerificationRun per source with the recipe snapshot", () => {
     const draft = { ...defaultVerifyDraft(), scopeKind: "full" as const, sourceIds: ["src_1"] };
     const result = planVerifyRunGroup({

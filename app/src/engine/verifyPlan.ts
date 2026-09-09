@@ -4,6 +4,8 @@ import { recipeReadiness } from "../project/recipe";
 import type { ProjectState, Recipe, Run, RunGroup, Source } from "../project/types";
 import { geometryForSource } from "./geometry";
 import { metricCompatibilityKey } from "./runGroupPlan";
+import { validateBackendPNorm } from "./backendSelection";
+import type { EngineEnvelope } from "./types";
 
 /**
  * Whole-video Verification (全视频检查) setup. One member VerificationRun per
@@ -144,6 +146,7 @@ export function planVerifyRunGroup(input: {
   draft: VerifyDraft;
   recipe: Recipe;
   sourcesById: Record<string, Source>;
+  capabilities?: EngineEnvelope | null;
   nowMs?: number;
   requestIdPrefix?: string;
 }): { ok: true; plan: VerifyRunGroupPlan } | { ok: false; reason: string } {
@@ -154,6 +157,13 @@ export function planVerifyRunGroup(input: {
   const recipeGeometry = recipeSnapshot.geometry!;
   const recipeKernel = recipeSnapshot.kernel!;
   const recipeMetric = structuredClone(input.draft.metric ?? recipeSnapshot.metric!);
+  const backendMetric = validateBackendPNorm(
+    input.capabilities ?? null,
+    input.draft.backendPreference,
+    recipeMetric.pNorm,
+    recipeSnapshot.axisMode,
+  );
+  if (!backendMetric.ok) return backendMetric;
   const selected = input.draft.sourceIds
     .map((id) => input.sourcesById[id])
     .filter((source): source is Source => Boolean(source));
