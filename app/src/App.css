@@ -5196,6 +5196,7 @@ input {
 
 .plot-legend {
   display: flex;
+  flex-shrink: 0;
   flex-wrap: wrap;
   gap: 4px 12px;
   max-height: 56px;

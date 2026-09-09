@@ -699,8 +699,8 @@ export function VerifyPage({
               ) : null}
             </div>
           ) : null}
-          {runs.length > 1 || selectedFusion ? (
-            <div className="plot-legend">
+          {runs.length > 0 || selectedFusion ? (
+            <div className="plot-legend" role="group" aria-label={t("analyze.seriesVisible")}>
               {runs.map((run) => (
                 <label key={run.id} className="plot-legend-item">
                   <input

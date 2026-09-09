@@ -13,6 +13,7 @@ Check now uses adaptive hardware decoding by default across CUDA, Vulkan Video, 
 
 - Preserve decimal input while editing Pixel exclusion, including values such as `0.001`, and provide decimal keyboards for refinement and Bicubic scan parameters.
 - Block Check before submission when the selected GPU backend does not support the effective p-norm, including inherited metrics. Auto continues to use CPU for p-norm values above 4.
+- Keep curve visibility controls accessible when Check history grows, and allow hiding a single curve without deleting its result.
 - Preserve the measured filter, including non-default Blur, when applying a candidate. Older results recover omitted parameters from their original input snapshots.
 - Preserve historical verification Recipes when the active Recipe is edited or deleted, so completed Runs and Fusion keep their original inputs.
 - Restore live Check curves on macOS WebKit and keep running-result coverage up to date.
