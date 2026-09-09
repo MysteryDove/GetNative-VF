@@ -4,6 +4,7 @@ Check now uses adaptive hardware decoding by default across CUDA, Vulkan Video, 
 
 ## New Features
 
+- Clear all Results in one action with confirmation, including reviews and saved Fusion results. Videos, samples, and recipes are preserved; clearing is disabled while tasks are queued or running.
 - Adaptive hardware decoding — Check starts with one decode session and can probe two or four according to workload, available memory, and safe video partitions. Short or analysis-bound jobs may stay at one; no manual session-count setting is required.
 - Blur candidate controls — build Algorithm Test candidates with per-filter Blur values, including Bicubic B/C grids.
 - Check metric inheritance — use metrics from Resolution Test or a local Check override without changing the saved Recipe. Fusion uses the metrics recorded by each Run.

@@ -78,6 +78,17 @@ function runGroupActive(state: ProjectState, group: RunGroup): boolean {
   return group.memberRunIds.some((id) => ACTIVE_STATUSES.has(state.runsById[id]?.status ?? ""));
 }
 
+export function clearAllResultsFromState(state: ProjectState): ProjectState {
+  if (Object.values(state.runsById).some((run) => ACTIVE_STATUSES.has(run.status))) return state;
+  return {
+    ...state,
+    runsById: {},
+    runGroupsById: {},
+    verificationReviewsByRunId: {},
+    verificationFusionsById: {},
+  };
+}
+
 export function removeRunGroupFromState(state: ProjectState, groupId: string): ProjectState {
   const group = state.runGroupsById[groupId];
   if (!group || runGroupActive(state, group)) return state;
@@ -159,8 +170,12 @@ export function ResultsPage({
   const [sourceFilter, setSourceFilter] = useState("all");
   const [notice, setNotice] = useState("");
   const [pendingDelete, setPendingDelete] = useState<
-    { kind: "group"; id: string } | { kind: "run"; id: string } | null
+    { kind: "group"; id: string } | { kind: "run"; id: string } | { kind: "all" } | null
   >(null);
+  const hasActiveRuns = Object.values(state.runsById).some((run) => ACTIVE_STATUSES.has(run.status));
+  const hasResults = [state.runsById, state.runGroupsById,
+    state.verificationReviewsByRunId, state.verificationFusionsById]
+    .some((records) => Object.keys(records).length > 0);
 
   const groups = useMemo(
     () =>
@@ -284,7 +299,15 @@ export function ResultsPage({
 
   function confirmDelete() {
     if (!pendingDelete) return;
-    if (pendingDelete.kind === "group") {
+    if (pendingDelete.kind === "all") {
+      if (hasActiveRuns) return;
+      onProjectChange(clearAllResultsFromState);
+      setSelectedRuns(new Set());
+      setExpandedGroups(new Set());
+      setRunGroupFilter("all");
+      setSourceFilter("all");
+      setNotice("");
+    } else if (pendingDelete.kind === "group") {
       const group = state.runGroupsById[pendingDelete.id];
       if (!group || runGroupActive(state, group)) {
         setPendingDelete(null);
@@ -375,6 +398,16 @@ export function ResultsPage({
       <div className="page-header">
         <h2>{t("results.title")}</h2>
         <div className="top-actions">
+          <button
+            className="secondary-button danger-button"
+            type="button"
+            disabled={!hasResults || hasActiveRuns}
+            title={hasActiveRuns ? t("results.clearAllActiveHint") : t("results.clearAll")}
+            onClick={() => setPendingDelete({ kind: "all" })}
+          >
+            <Trash2 size={15} />
+            {t("results.clearAll")}
+          </button>
           <button
             className="secondary-button"
             type="button"
@@ -525,7 +558,7 @@ export function ResultsPage({
       {pendingDelete ? (
         <Modal
           onClose={() => setPendingDelete(null)}
-          title={t(pendingDelete.kind === "group" ? "results.deleteGroup" : "results.deleteRun")}
+          title={t(pendingDelete.kind === "all" ? "results.clearAll" : pendingDelete.kind === "group" ? "results.deleteGroup" : "results.deleteRun")}
           closeLabel={t("common.close")}
           actions={
             <>
@@ -537,15 +570,18 @@ export function ResultsPage({
               >
                 {t("common.cancel")}
               </button>
-              <button className="secondary-button danger-button" type="button" onClick={confirmDelete}>
+              <button className="secondary-button danger-button" type="button" onClick={confirmDelete}
+                disabled={pendingDelete.kind === "all" && hasActiveRuns}>
                 <Trash2 size={14} />
-                {t(pendingDelete.kind === "group" ? "results.deleteGroup" : "results.deleteRun")}
+                {t(pendingDelete.kind === "all" ? "results.clearAll" : pendingDelete.kind === "group" ? "results.deleteGroup" : "results.deleteRun")}
               </button>
             </>
           }
         >
           <p className="confirm-dialog-copy">
-            {pendingDelete.kind === "group"
+            {pendingDelete.kind === "all"
+              ? t("results.clearAllConfirm", { count: String(Object.keys(state.runsById).length) })
+              : pendingDelete.kind === "group"
               ? t("results.deleteGroupConfirm", {
                   label: state.runGroupsById[pendingDelete.id]?.label
                     || state.runGroupsById[pendingDelete.id]?.groupType

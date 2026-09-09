@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { ProjectState, Run, RunGroup } from "../project/types";
 import { emptyProjectState } from "../project/normalize";
 import {
+  clearAllResultsFromState,
   nextHistoryFilters,
   removeRunFromState,
   removeRunGroupFromState,
@@ -127,6 +128,28 @@ function deletionState(): ProjectState {
 }
 
 describe("Results deletion state", () => {
+  it("clears all result records without modifying sources, samples, recipes, or the input", () => {
+    const state = deletionState();
+    state.verificationFusionsById = { fusion: { id: "fusion" } } as unknown as ProjectState["verificationFusionsById"];
+    const next = clearAllResultsFromState(state);
+    expect(next.runsById).toEqual({});
+    expect(next.runGroupsById).toEqual({});
+    expect(next.verificationReviewsByRunId).toEqual({});
+    expect(next.verificationFusionsById).toEqual({});
+    expect(next.sourcesById).toBe(state.sourcesById);
+    expect(next.samplesById).toBe(state.samplesById);
+    expect(next.recipesById).toBe(state.recipesById);
+    expect(next.project).toBe(state.project);
+    expect(Object.keys(state.runsById)).toHaveLength(3);
+    expect(state.verificationFusionsById.fusion).toBeDefined();
+  });
+
+  it.each(["queued", "running"] as const)("refuses bulk deletion if a task is %s", (status) => {
+    const state = deletionState();
+    state.runsById.unrelated = { ...state.runsById.unrelated, status };
+    expect(clearAllResultsFromState(state)).toBe(state);
+  });
+
   it("removes a RunGroup, its member Runs, and their reviews without mutating the input", () => {
     const state = deletionState();
     const next = removeRunGroupFromState(state, "group");
