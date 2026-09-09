@@ -1,3 +1,5 @@
+This release restricts production builds to their bundled engine and provides versioned Windows packages for direct download from Release assets.
+
 Check now uses adaptive hardware decoding by default across CUDA, Vulkan Video, and VideoToolbox. This update also adds per-candidate Blur controls and improves measured-result handoff, video navigation, and verification history.
 
 ## New Features
@@ -26,6 +28,10 @@ Check now uses adaptive hardware decoding by default across CUDA, Vulkan Video, 
 - Avoid constructing resident GPU analysis engines just to report capabilities.
 
 ## Packaging
+
+- Release builds only run the engine in the application resource directory. Environment overrides and working-directory engine discovery remain available in debug builds only.
+- Download `getnative-vf-0.2.4-windows-x64-portable.zip` directly from this release's Assets, together with `SHA256SUMS-windows-x64.txt`. The Actions artifact is also versioned, but adds an outer ZIP wrapper.
+- The Windows package job now tests engine resolution in the release profile before uploading packages.
 
 - Apply FFmpeg Vulkan bitstream-padding and image-view-usage fixes in the Linux and Windows SDK builds, with patch changes included in cache keys.
 - Verify VAAPI capability entries on Linux and D3D11VA entries on Windows alongside NVDEC and Vulkan Video.

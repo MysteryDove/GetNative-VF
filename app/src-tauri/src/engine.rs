@@ -168,15 +168,39 @@ struct EngineCapabilities {
 }
 
 fn engine_candidates(app: &AppHandle) -> Vec<PathBuf> {
+    let resource_dir = app.path().resource_dir().ok();
+    #[cfg(debug_assertions)]
+    {
+        let engine_override = env::var_os("GETNATIVE_ENGINE_PATH").map(PathBuf::from);
+        let current_dir = env::current_dir().ok();
+        engine_candidate_paths(
+            resource_dir.as_deref(),
+            engine_override.as_deref(),
+            current_dir.as_deref(),
+        )
+    }
+    #[cfg(not(debug_assertions))]
+    engine_candidate_paths(resource_dir.as_deref(), None, None)
+}
+
+fn engine_candidate_paths(
+    resource_dir: Option<&Path>,
+    _development_override: Option<&Path>,
+    _development_current_dir: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let engine_name = format!("getnative-engine{}", env::consts::EXE_SUFFIX);
-    if let Some(path) = env::var_os("GETNATIVE_ENGINE_PATH") {
-        paths.push(PathBuf::from(path));
+    #[cfg(debug_assertions)]
+    if let Some(path) = _development_override {
+        paths.push(path.to_path_buf());
     }
-    if let Ok(resource_dir) = app.path().resource_dir() {
+    // Packaged builds must fail if their bundled engine is missing. Never
+    // substitute an executable selected by the environment or working directory.
+    if let Some(resource_dir) = resource_dir {
         paths.push(resource_dir.join("bin").join(&engine_name));
     }
-    if let Ok(current_dir) = env::current_dir() {
+    #[cfg(debug_assertions)]
+    if let Some(current_dir) = _development_current_dir {
         for build_root in [
             current_dir.join("../build/engine"),
             current_dir.join("../build/engine-debug"),
@@ -689,10 +713,64 @@ fn geometry_args(request: GeometryRequest) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_geometry_integer, checked_geometry_number, geometry_args, validate_capabilities,
-        GeometryRequest,
+        checked_geometry_integer, checked_geometry_number, engine_candidate_paths, geometry_args,
+        validate_capabilities, GeometryRequest,
     };
     use serde_json::json;
+    use std::path::Path;
+
+    #[test]
+    fn engine_resolution_uses_bundled_resource_directory() {
+        let resources = Path::new("package-resources");
+        let engine_name = format!("getnative-engine{}", std::env::consts::EXE_SUFFIX);
+        assert_eq!(
+            engine_candidate_paths(Some(resources), None, None),
+            vec![resources.join("bin").join(engine_name)]
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn engine_resolution_release_ignores_external_candidates() {
+        let resources = Path::new("package-resources");
+        assert_eq!(
+            engine_candidate_paths(
+                Some(resources),
+                Some(Path::new("external-engine")),
+                Some(Path::new("external-workspace")),
+            ),
+            engine_candidate_paths(Some(resources), None, None)
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn engine_resolution_release_fails_closed_without_resources() {
+        assert!(engine_candidate_paths(
+            None,
+            Some(Path::new("external-engine")),
+            Some(Path::new("external-workspace")),
+        )
+        .is_empty());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn engine_resolution_development_preserves_override_and_build_paths() {
+        let resources = Path::new("package-resources");
+        let external = Path::new("external-engine");
+        let workspace = Path::new("workspace");
+        let engine_name = format!("getnative-engine{}", std::env::consts::EXE_SUFFIX);
+        let paths = engine_candidate_paths(Some(resources), Some(external), Some(workspace));
+        assert_eq!(paths[0], external);
+        assert_eq!(paths[1], resources.join("bin").join(&engine_name));
+        assert!(paths.contains(&workspace.join("build/engine").join(&engine_name)));
+        assert!(paths.contains(
+            &workspace
+                .join("build/engine-debug/Debug")
+                .join(&engine_name)
+        ));
+    }
 
     fn valid_capabilities() -> serde_json::Value {
         json!({

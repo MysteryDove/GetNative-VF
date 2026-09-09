@@ -158,7 +158,7 @@ void write_capabilities(std::ostream &output, bool analysis_available) {
     constexpr bool metal_zero_copy_available = false;
 #endif
 #endif
-    output << "{\"schema_version\":2,\"engine\":\"getnative-engine\",\"version\":\"0.2.3\","
+    output << "{\"schema_version\":2,\"engine\":\"getnative-engine\",\"version\":\"0.2.4\","
               "\"commands\":{\"capabilities\":true,\"geometry\":true,\"analyze\":"
            << available;
 #if defined(GETNATIVE_HAS_MEDIA)

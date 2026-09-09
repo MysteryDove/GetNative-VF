@@ -13,11 +13,17 @@ or configure.
 Grab the latest package from
 [Releases](https://github.com/MysteryDove/GetNative-VF/releases):
 
-- **Windows** — portable ZIP; unzip and run `getnative-gui.exe`. Includes CUDA
+- **Windows** — download the versioned `*-portable.zip` directly from the
+  release's **Assets**, unzip and run `getnative-gui.exe`. Includes CUDA
   and Vulkan acceleration out of the box.
 - **Linux** — `.deb` and AppImage from GitHub Releases.
 - **macOS (Apple Silicon)** — unsigned `.app.zip` from GitHub Releases. Not
   notarized; Gatekeeper may require a right-click Open the first time.
+
+Download the matching `SHA256SUMS-*.txt` asset to check package integrity.
+GitHub Actions artifacts have an additional ZIP wrapper; use the individual
+Release assets for distribution. Draft release downloads are only accessible
+to repository maintainers until the release is published.
 
 ## Features
 

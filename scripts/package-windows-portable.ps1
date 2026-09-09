@@ -131,7 +131,7 @@ $version = (Get-Content (Join-Path $appDirectory "src-tauri\tauri.conf.json") -R
 $portableName = "GetNative VF_${version}_x64-portable"
 $artifactRoot = Join-Path $repository "artifacts\windows-x64"
 $portableRoot = Join-Path $artifactRoot $portableName
-$archive = Join-Path $artifactRoot "$portableName.zip"
+$archive = Join-Path $artifactRoot "getnative-vf-${version}-windows-x64-portable.zip"
 
 Remove-Item -LiteralPath $portableRoot -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue

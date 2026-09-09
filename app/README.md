@@ -61,7 +61,11 @@ npm install
 npm run tauri dev
 ```
 
-Set `GETNATIVE_ENGINE_PATH` to use another engine binary.
+Debug builds support `GETNATIVE_ENGINE_PATH` and local engine build directories.
+Release builds only use the engine in the application's resource directory
+(`bin/getnative-engine.exe` beside the Windows GUI). They ignore the environment
+override and working-directory build paths, and fail if the bundled engine is
+missing. Use a debug GUI when testing a custom engine.
 
 Useful checks:
 
@@ -70,6 +74,7 @@ npm run build
 npm run test:locale
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 cargo test --manifest-path src-tauri/Cargo.toml
+cargo test --release --manifest-path src-tauri/Cargo.toml engine_resolution_
 ```
 
 `npm run test:locale` checks `zh-CN` / `en` resource-key parity via
