@@ -44,7 +44,7 @@ to repository maintainers until the release is published.
   available backend automatically and always tells you which one is active.
 - **Projects and recipes** — save your sources, lock in an analysis recipe,
   and reproduce any result later with full provenance.
-- **Bilingual UI** — English and 简体中文.
+- **Bilingual UI** — English
 
 ## Why it exists
 
