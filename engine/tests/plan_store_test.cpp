@@ -147,6 +147,44 @@ void test_serialize_rejects_garbage() {
     check(threw_on_truncation && threw_on_corruption, "serialize-rejects-garbage");
 }
 
+// A cache file is untrusted input: forward taps are used as array positions,
+// so offsets and indices that leave the native axis must be refused.
+void test_serialize_rejects_out_of_range_forward_taps() {
+    const auto request = make_request(1080, 810.0, getnative::Filter::bicubic(0.0, 0.5),
+                                      getnative::BorderMode::mirror);
+    const getnative::AxisPlan plan = getnative::build_axis_plan(request);
+    const auto rejects = [&](const getnative::AxisPlan &tampered) {
+        const std::vector<std::byte> cooked =
+            getnative::detail::serialize_plan_cooked(tampered, request);
+        try {
+            [[maybe_unused]] const getnative::AxisPlan discarded =
+                getnative::detail::deserialize_plan_cooked(cooked);
+        } catch (const getnative::detail::PlanStoreError &) {
+            return true;
+        }
+        return false;
+    };
+    const auto width = static_cast<std::size_t>(plan.forward_width);
+
+    getnative::AxisPlan shifted_run = plan; // still contiguous, but past the axis end
+    for (std::size_t tap = 0; tap < width; ++tap) {
+        shifted_run.forward_indices[5U * width + tap] =
+            plan.destination_size + static_cast<std::int32_t>(tap);
+    }
+    getnative::AxisPlan negative_run = plan;
+    for (std::size_t tap = 0; tap < width; ++tap) {
+        negative_run.forward_indices[5U * width + tap] = -4 + static_cast<std::int32_t>(tap);
+    }
+    getnative::AxisPlan scattered = plan; // raw encoding, one stray tap
+    scattered.forward_indices[5U * width + 1U] = 1 << 30;
+    getnative::AxisPlan bad_offset = plan; // interior offset no longer row * width
+    bad_offset.forward_offsets[7] += 1U;
+
+    check(!rejects(plan) && rejects(shifted_run) && rejects(negative_run)
+              && rejects(scattered) && rejects(bad_offset),
+          "serialize-rejects-out-of-range-forward-taps");
+}
+
 struct ScratchDir {
     ScratchDir() {
         path = std::filesystem::temp_directory_path()
@@ -356,6 +394,7 @@ void test_single_flight() {
 int main() {
     test_serialize_roundtrip();
     test_serialize_rejects_garbage();
+    test_serialize_rejects_out_of_range_forward_taps();
     test_pack_roundtrip();
     test_pack_roundtrip_in_unicode_directory();
     test_pack_gating();

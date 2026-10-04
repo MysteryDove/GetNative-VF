@@ -1,13 +1,19 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { EngineEnvelope } from "../engine/types";
 import {
   applyPreset,
+  convertScanRange,
+  scanAxisKind,
+  type ScanAxisKind,
+  type ScanRange,
   defaultHeightDraft,
   estimateHeightWork,
   fixedKernelsForDraft,
   resolveBackendPreference,
   resolveHeightGrid,
+  scansFractionalCandidates,
   selectableBackends,
+  withFractionalBase,
   type HeightDraft,
 } from "../engine/heightDraft";
 import type { MetricSpec, SearchPreset } from "../engine/protocol";
@@ -84,8 +90,45 @@ export function useHeightDraft({
 
   const plan: HeightRunGroupPlan | null = planResult?.ok ? planResult.plan : null;
 
+  // Start/stop are px of the scanned axis, so each axis keeps its own range:
+  // switching H ↔ W restores what was last entered there, or the aspect-ratio
+  // equivalent of the other axis's range the first time.
+  const rangesByAxis = useRef<Partial<Record<ScanAxisKind, ScanRange>>>({});
+  const firstSource = includedSamples
+    .map((sample) => sourcesById[sample.sourceId])
+    .find((source) => source?.width && source?.height);
+  const widthPerHeight =
+    firstSource?.width && firstSource.height ? firstSource.width / firstSource.height : null;
+  const widthPerHeightRef = useRef(widthPerHeight);
+  widthPerHeightRef.current = widthPerHeight;
+
   const patch = useCallback((partial: Partial<HeightDraft>) => {
-    setDraft((current) => ({ ...current, ...partial }));
+    setDraft((current) => {
+      let next = { ...current, ...partial };
+      const fromAxis = scanAxisKind(current.axisMode);
+      const toAxis = scanAxisKind(next.axisMode);
+      if (fromAxis !== toAxis) {
+        rangesByAxis.current[fromAxis] = {
+          start: current.start,
+          stop: current.stop,
+          refineSelected: current.refineSelected,
+        };
+        const ratio = widthPerHeightRef.current;
+        const restored = rangesByAxis.current[toAxis]
+          ?? (ratio
+            ? convertScanRange(
+                rangesByAxis.current[fromAxis] as ScanRange,
+                toAxis === "width" ? ratio : 1 / ratio,
+              )
+            : null);
+        if (restored) next = { ...next, ...restored };
+      }
+      // Only the transition into a decimal scan picks the even base; later
+      // explicit integer choices stay the user's (and are flagged inline).
+      return !scansFractionalCandidates(current) && scansFractionalCandidates(next)
+        ? withFractionalBase(next)
+        : next;
+    });
   }, []);
 
   const setPreset = useCallback((preset: SearchPreset) => {

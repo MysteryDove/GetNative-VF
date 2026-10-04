@@ -12,6 +12,7 @@ import type {
 } from "./protocol";
 import { buildCandidateGrid, workEstimate } from "./candidateGrid";
 import { MUF_PROFILE_ID, profileFor } from "./profiles";
+import { hasFractionalPart, parseNumberInput } from "./numberInput";
 
 export const CUDA_MAXIMUM_P_NORM = 4;
 
@@ -93,33 +94,99 @@ export function heightDraftForProfile(
 
 export function applyPreset(draft: HeightDraft, preset: SearchPreset): HeightDraft {
   if (preset === "integer_coarse") {
+    // Broad scan keeps whatever range/step the user already entered; only an
+    // empty field falls back to the profile-independent defaults.
     return {
       ...draft,
       preset,
-      start: "500",
-      stop: "1000",
+      start: draft.start.trim() || "500",
+      stop: draft.stop.trim() || "1000",
       endpointRule: "inclusive",
-      step: "1",
+      step: draft.step.trim() || "1",
     };
   }
   if (preset === "fractional_refine") {
-    return {
+    return withFractionalBase({
       ...draft,
       preset,
-      step: "0.1",
+      step: hasFractionalPart(draft.step) ? draft.step : "0.1",
       endpointRule: "inclusive",
       refineHalfSpan: draft.refineHalfSpan || "1.0",
       refineSelected: draft.refineSelected || "720",
-    };
+    });
   }
   return { ...draft, preset: "custom" };
 }
 
+type FractionalBaseFields = Pick<
+  HeightDraft,
+  | "preset"
+  | "axisMode"
+  | "start"
+  | "stop"
+  | "step"
+  | "refineSelected"
+  | "refineHalfSpan"
+  | "baseHeight"
+  | "baseWidth"
+  | "baseHeightMode"
+  | "baseWidthMode"
+>;
+
+/** True when the scan produces (or is meant to produce) non-integer candidates. */
+export function scansFractionalCandidates(
+  draft: Pick<FractionalBaseFields, "preset" | "start" | "stop" | "step" | "refineSelected" | "refineHalfSpan">,
+): boolean {
+  if (draft.preset === "fractional_refine") return true;
+  return [draft.start, draft.stop, draft.step].some(hasFractionalPart);
+}
+
+/**
+ * Entering a decimal scan with an integer (null) base would collapse adjacent
+ * candidates, so the scanned axis moves to an even base — the getnative
+ * convention — unless the user already chose a parity or an explicit base.
+ */
+export function withFractionalBase<T extends FractionalBaseFields>(draft: T): T {
+  const axis = missingFractionalBaseAxis(draft);
+  if (axis === "height") return { ...draft, baseHeightMode: "even" };
+  if (axis === "width") return { ...draft, baseWidthMode: "even" };
+  return draft;
+}
+
+/** Which source dimension the scan range (start/stop/selected) is measured in. */
+export type ScanAxisKind = "height" | "width";
+
+export function scanAxisKind(axisMode: AxisMode): ScanAxisKind {
+  return axisMode === "w_only" ? "width" : "height";
+}
+
+/** The axis-specific part of the draft: these numbers mean px of one axis. */
+export type ScanRange = Pick<HeightDraft, "start" | "stop" | "refineSelected">;
+
+/**
+ * Translate a range to the other axis by the source aspect ratio
+ * (500–1000 high on 16:9 → 889–1778 wide), so switching the scan axis lands
+ * on the equivalent range instead of reusing height numbers as widths.
+ * `ratio` is target/source size; unparsable fields pass through unchanged.
+ */
+export function convertScanRange(range: ScanRange, ratio: number): ScanRange {
+  const convert = (text: string) => {
+    const value = Number(text);
+    if (!text.trim() || !Number.isFinite(value) || !(ratio > 0)) return text;
+    return String(Math.round(value * ratio));
+  };
+  return {
+    start: convert(range.start),
+    stop: convert(range.stop),
+    refineSelected: convert(range.refineSelected),
+  };
+}
+
 /** The scanned axis must have an explicit base for decimal candidates to stay fractional. */
 export function missingFractionalBaseAxis(
-  draft: Pick<HeightDraft, "preset" | "axisMode" | "baseHeight" | "baseWidth" | "baseHeightMode" | "baseWidthMode">,
+  draft: FractionalBaseFields,
 ): "height" | "width" | null {
-  if (draft.preset !== "fractional_refine") return null;
+  if (!scansFractionalCandidates(draft)) return null;
   if (draft.axisMode === "w_only") {
     return draft.baseWidthMode !== "integer" || draft.baseWidth.trim() ? null : "width";
   }
@@ -163,13 +230,39 @@ export function kernelSignature(kernel: KernelRef): string {
   return `${kernel.id}:${JSON.stringify(kernel.parameters)}`;
 }
 
+/** Numeric kernel parameters the user types as text (decimals or `p/q`). */
+const NUMERIC_KERNEL_PARAMETERS = ["b", "c", "blur"] as const;
+
+/** Names of typed kernel parameters that do not parse as numbers. */
+export function invalidKernelParameterNames(
+  parameters: Record<string, string | number | boolean> | undefined,
+): string[] {
+  if (!parameters) return [];
+  return NUMERIC_KERNEL_PARAMETERS.filter(
+    (name) => parameters[name] !== undefined && parseNumberInput(parameters[name]) === null,
+  );
+}
+
+/** Resolve typed parameter text ("1/3", "0.5") into the numbers the engine takes. */
+export function resolveKernelParameters(
+  parameters: Record<string, string | number | boolean>,
+): Record<string, string | number | boolean> {
+  const resolved = { ...parameters };
+  for (const name of NUMERIC_KERNEL_PARAMETERS) {
+    if (resolved[name] === undefined) continue;
+    const value = parseNumberInput(resolved[name]);
+    if (value !== null) resolved[name] = value;
+  }
+  return resolved;
+}
+
 export function fixedKernelsForDraft(
   draft: HeightDraft,
   capabilities: EngineEnvelope | null,
 ): KernelRef[] {
   const primary: KernelRef = {
     id: draft.kernelId,
-    parameters: { ...draft.kernelParameters },
+    parameters: resolveKernelParameters(draft.kernelParameters),
   };
   const seen = new Set<string>([kernelSignature(primary)]);
   const extras: KernelRef[] = [];
@@ -181,8 +274,8 @@ export function fixedKernelsForDraft(
       (candidate) => candidate.id === kernel.id,
     );
     const parameters = { ...(known?.parameters ?? {}), ...kernel.parameters };
-    if (parameters.blur === undefined && draft.kernelParameters.blur !== undefined) {
-      parameters.blur = draft.kernelParameters.blur;
+    if (parameters.blur === undefined && primary.parameters.blur !== undefined) {
+      parameters.blur = primary.parameters.blur;
     }
     extras.push({
       id: kernel.id,
@@ -192,12 +285,15 @@ export function fixedKernelsForDraft(
   return [primary, ...extras];
 }
 
+/** Mirrors the engine's `maximum_filter_blur`: plan size grows with blur. */
+export const MAXIMUM_KERNEL_BLUR = 16;
+
 export function invalidKernelBlur(
   parameters: Record<string, string | number | boolean> | undefined,
 ): boolean {
   if (parameters === undefined || parameters.blur === undefined) return false;
-  const blur = Number(parameters.blur);
-  return !Number.isFinite(blur) || blur <= 0;
+  const blur = parseNumberInput(parameters.blur);
+  return blur === null || blur <= 0 || blur > MAXIMUM_KERNEL_BLUR;
 }
 
 export function estimateHeightWork(

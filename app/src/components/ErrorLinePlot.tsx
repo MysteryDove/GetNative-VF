@@ -175,7 +175,7 @@ export function ErrorLinePlot({
   selectedX?: string | null;
   /** Point keys of detected local valleys, drawn as hollow ring markers. */
   valleyKeys?: ReadonlySet<string> | null;
-  onSelect?: (x: string) => void;
+  onSelect?: (x: string, runId?: string) => void;
   resetLabel?: string;
   onZoomRangeChange?: (range: { xMin: number; xMax: number } | null) => void;
 }) {
@@ -508,7 +508,7 @@ export function ErrorLinePlot({
                     stroke={isSelected || isBest ? undefined : isValley ? color : "none"}
                     strokeWidth={isBest || isSelected || isValley ? 1.6 : 0}
                     className={`error-plot-marker${isSelected ? " is-selected" : isBest ? " is-best" : ""}`}
-                    onClick={() => onSelect?.(point.x)}
+                    onClick={() => onSelect?.(point.x, point.runId)}
                   >
                     <title>{`${point.label ? `${point.label} · ` : ""}${point.x}: ${point.metric.toExponential(3)}`}</title>
                   </circle>

@@ -63,6 +63,8 @@ type ProjectPageHostProps = {
   analyzeSubroute: "height" | "kernel";
   openDiagnostics: () => void;
   openMedia: () => void;
+  openKernelTest: () => void;
+  openVerify: () => void;
 };
 
 /** Isolated from nav collapse so toggling the sidebar does not re-render keep-alive pages. */
@@ -89,6 +91,8 @@ const ProjectPageHost = memo(function ProjectPageHost({
   analyzeSubroute,
   openDiagnostics,
   openMedia,
+  openKernelTest,
+  openVerify,
 }: ProjectPageHostProps) {
   const [visited, setVisited] = useState<ReadonlySet<ProjectRoute>>(() => new Set([route]));
   useEffect(() => {
@@ -128,6 +132,8 @@ const ProjectPageHost = memo(function ProjectPageHost({
           subroute={analyzeSubroute}
           onOpenDiagnostics={openDiagnostics}
           onOpenMedia={openMedia}
+          onOpenKernelTest={openKernelTest}
+          onOpenVerify={openVerify}
           onProjectChange={onProjectChange}
           executionBridge={executionBridge}
         />
@@ -241,6 +247,8 @@ export function ProjectShell({
   const openSettings = useCallback(() => onNavigate("settings"), [onNavigate]);
   const openDiagnostics = useCallback(() => onNavigate("diagnostics"), [onNavigate]);
   const openMedia = useCallback(() => onNavigate("media"), [onNavigate]);
+  const openKernelTest = useCallback(() => navigateAnalyze("kernel"), [navigateAnalyze]);
+  const openVerify = useCallback(() => onNavigate("verify"), [onNavigate]);
   const counts = {
     sources: countById(state.sourcesById),
     samples: countById(state.samplesById),
@@ -326,6 +334,8 @@ export function ProjectShell({
               analyzeSubroute={analyzeSubroute}
               openDiagnostics={openDiagnostics}
               openMedia={openMedia}
+              openKernelTest={openKernelTest}
+              openVerify={openVerify}
             />
           </div>
 
@@ -337,10 +347,20 @@ export function ProjectShell({
               <ul className="jobs-tray-list">
                 {jobGroups.map((group) => (
                   <li key={group.id}>
-                    <span className={`job-phase ${group.phase}`}>{t(`jobs.phase.${group.phase}`)}</span>
+                    <span
+                      className={`job-phase ${group.phase}`}
+                      title={group.errorMessage ?? undefined}
+                    >
+                      {t(`jobs.phase.${group.phase}`)}
+                    </span>
                     <span className="job-label">
                       {state.runGroupsById[group.id]?.label ?? group.id}
                     </span>
+                    {group.errorMessage ? (
+                      <span className="job-error" title={group.errorMessage}>
+                        {group.errorMessage}
+                      </span>
+                    ) : null}
                     {group.backend ? (
                       <span
                         className="job-backend"

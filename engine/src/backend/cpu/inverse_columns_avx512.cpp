@@ -85,7 +85,7 @@ double absolute_difference_norm1_avx512_f32(
                 _mm512_sub_ps(_mm512_loadu_ps(source + x),
                               _mm512_loadu_ps(reconstruction + x)))));
         const __m512 filtered = _mm512_maskz_mov_ps(
-            _mm512_cmp_ps_mask(difference, threshold_values, _CMP_GT_OQ), difference);
+            _mm512_cmp_ps_mask(difference, threshold_values, _CMP_NLE_UQ), difference);
         sum = add_norm1_lanes(_mm512_castps512_ps128(filtered), sum);
         sum = add_norm1_lanes(_mm512_extractf32x4_ps(filtered, 1), sum);
         sum = add_norm1_lanes(_mm512_extractf32x4_ps(filtered, 2), sum);
@@ -137,7 +137,7 @@ double vertical_reconstruction_norm1_avx512_f32(
             sign, _mm512_castps_si512(
                 _mm512_sub_ps(_mm512_loadu_ps(source + x), reconstructed))));
         const __m512 filtered = _mm512_maskz_mov_ps(
-            _mm512_cmp_ps_mask(difference, threshold_values, _CMP_GT_OQ), difference);
+            _mm512_cmp_ps_mask(difference, threshold_values, _CMP_NLE_UQ), difference);
         sum = add_norm1_lanes(_mm512_castps512_ps128(filtered), sum);
         sum = add_norm1_lanes(_mm512_extractf32x4_ps(filtered, 1), sum);
         sum = add_norm1_lanes(_mm512_extractf32x4_ps(filtered, 2), sum);

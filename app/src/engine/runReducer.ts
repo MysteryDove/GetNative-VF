@@ -402,6 +402,8 @@ export type RunGroupProgress = {
   device?: string;
   activeJobIds: string[];
   cancelRequested: boolean;
+  /** First member failure (message, else code) so a failed job explains itself. */
+  errorMessage: string | null;
   updatedAtMs: number;
 };
 
@@ -445,6 +447,9 @@ export function runGroupProgress(state: ExecutionState, limit = 4): RunGroupProg
       (sum, job) => sum + (job.rateElapsedMs as number),
       0,
     );
+    const failedJob = jobs.find(
+      (job) => job.phase === "failed" && (job.errorMessage || job.errorCode),
+    );
     const backends = new Set(jobs.map((job) => job.backend).filter(Boolean));
     const devices = new Set(jobs.map((job) => job.device).filter(Boolean));
     progress.push({
@@ -461,6 +466,7 @@ export function runGroupProgress(state: ExecutionState, limit = 4): RunGroupProg
         .filter((job) => job.phase === "queued" || job.phase === "running")
         .map((job) => job.id),
       cancelRequested: jobs.every((job) => job.cancelRequested || (job.phase !== "queued" && job.phase !== "running")),
+      errorMessage: failedJob ? failedJob.errorMessage || failedJob.errorCode || null : null,
       updatedAtMs,
     });
   }

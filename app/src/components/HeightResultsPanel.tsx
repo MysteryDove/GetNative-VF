@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { ArrowRight, ChevronDown, ChevronRight } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { ProjectState } from "../project/types";
 import type { estimateHeightWork, resolveHeightGrid } from "../engine/heightDraft";
-import { kernelMetaLabel, type SeriesTable } from "../engine/runGroupPlan";
+import { heightRunConfig, kernelMetaLabel, type SeriesTable } from "../engine/runGroupPlan";
+import { padDecimals } from "../engine/numberInput";
 import { toggleSetValue } from "../utils/collections";
 import { BlockedState } from "./BlockedState";
 import {
@@ -19,11 +20,12 @@ import {
 import { detectValleys, type ValleySeries } from "../engine/valleyDetect";
 import { sourceFilterLabel } from "../project/sourceLabel";
 
-const HEIGHT_TABLE_LIMIT = 20;
+/** A picked candidate plus the Run that measured it (null for grid previews). */
+export type HeightSelection = { height: string; runId: string | null };
 
-/** Display a measured height with up to two decimals, trimming zeros. */
-function formatHeight(value: number): string {
-  return Number(value.toFixed(2)).toString();
+/** Plot/valley keys are `${runId}-${height}`; recover the engine's exact candidate string. */
+function candidateFromKey(key: string | undefined, runId: string, fallback: number): string {
+  return key?.startsWith(`${runId}-`) ? key.slice(runId.length + 1) : String(fallback);
 }
 
 /** Heights come from mixed sources (grid draft, engine rows); compare numerically. */
@@ -77,6 +79,7 @@ export function HeightResultsPanel({
   onOpenDiagnostics,
   onOpenApplyDialog,
   onRefineAroundSelection,
+  nextStep,
 }: {
   t: Translator;
   state: ProjectState;
@@ -95,10 +98,13 @@ export function HeightResultsPanel({
   excludedResultsAvailable: boolean;
   onToggleExcludedResults: (value: boolean) => void;
   onOpenDiagnostics: () => void;
-  onOpenApplyDialog: (selected?: string) => void;
+  onOpenApplyDialog: (selected?: HeightSelection) => void;
   onRefineAroundSelection: (height: string) => void;
+  /** Workflow handoff shown beside the apply notice once geometry is applied. */
+  nextStep?: { label: string; onClick: () => void } | null;
 }) {
-  const [selectedHeight, setSelectedHeight] = useState<string | null>(null);
+  const [selection, setSelection] = useState<HeightSelection | null>(null);
+  const selectedHeight = selection?.height ?? null;
   const selectedHeightAxis = useRef<typeof axisMode>(axisMode);
   const [logDisplay, setLogDisplay] = useState(true);
   // Zoom window reported by the plot; also scopes the valley search (scope D).
@@ -113,37 +119,33 @@ export function HeightResultsPanel({
   useEffect(() => {
     // A selected candidate is axis-specific. Keeping a W-only selection when
     // switching to H/H+W would reinterpret that width as a height on Apply.
-    setSelectedHeight(null);
+    setSelection(null);
     selectedHeightAxis.current = axisMode;
     setZoomRange(null);
   }, [axisMode]);
 
-  function selectHeight(value: string | null) {
+  function selectHeight(value: string | null, runId: string | null = null) {
     selectedHeightAxis.current = axisMode;
-    setSelectedHeight(value);
+    setSelection(value == null ? null : { height: value, runId });
   }
 
   function toggleRunVisibility(runId: string) {
     setHiddenRunIds((current) => toggleSetValue(current, runId));
   }
 
-  // One plot series per run (sample × kernel variant), each with a stable color.
-  const allRunSeries = useMemo(
-    () =>
-      seriesRows.seriesMeta.map((meta, index) => ({
-        ...meta,
-        color: plotSeriesColor(index),
-        label: `${meta.sampleLabel} · ${kernelMetaLabel(t, meta)}`,
-      })),
-    [seriesRows, t],
-  );
+  const runGroupValue = (runId: string) => {
+    const run = state.runsById[runId];
+    return run?.runGroupId ? run.runGroupId : `run:${runId}`;
+  };
+  // Each Run command gets a number plus the settings it was measured with, so
+  // a curve can always be traced back to its kernel parameters/step/base.
   const runFilterOptions = useMemo(() => {
-    const values = new Set<string>();
-    for (const series of allRunSeries) {
-      const run = state.runsById[series.runId];
-      const value = run?.runGroupId ? run.runGroupId : `run:${series.runId}`;
-      values.add(value);
+    const members = new Map<string, string[]>();
+    for (const meta of seriesRows.seriesMeta) {
+      const value = runGroupValue(meta.runId);
+      members.set(value, [...(members.get(value) ?? []), meta.runId]);
     }
+    const values = new Set(members.keys());
     const ordered = [...values].sort((a, b) => {
       const aTime = a.startsWith("run:")
         ? state.runsById[a.slice(4)]?.createdAt
@@ -153,11 +155,60 @@ export function HeightResultsPanel({
         : state.runGroupsById[b]?.createdAt;
       return (aTime ?? "").localeCompare(bTime ?? "") || a.localeCompare(b);
     });
-    return ordered.map((value, index) => ({
-      value,
-      label: t("results.runOption", { number: String(index + 1) }),
-    }));
-  }, [allRunSeries, state.runGroupsById, state.runsById, t]);
+    return ordered.map((value, index) => {
+      const runIds = members.get(value) ?? [];
+      const firstRun = state.runsById[runIds[0]];
+      const config = firstRun
+        ? heightRunConfig(firstRun, value.startsWith("run:") ? null : state.runGroupsById[value])
+        : null;
+      const kernels = new Set(
+        seriesRows.seriesMeta
+          .filter((meta) => runIds.includes(meta.runId))
+          .map((meta) => kernelMetaLabel(t, meta)),
+      );
+      const name = t("results.runOption", { number: String(index + 1) });
+      const summary = config?.step
+        ? [
+            kernels.size === 1
+              ? [...kernels][0]
+              : t("results.runKernelCount", { count: String(kernels.size) }),
+            t("results.runScanSummary", {
+              start: config.start ?? "",
+              stop: config.stop ?? "",
+              step: config.step,
+              base: t(
+                `analyze.baseMode.${axisMode === "w_only" ? config.baseWidthMode : config.baseHeightMode}`,
+              ),
+            }),
+          ].join(" · ")
+        : "";
+      return { value, name, summary, label: summary ? `${name} · ${summary}` : name };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seriesRows, state.runGroupsById, state.runsById, axisMode, t]);
+  const runNameByValue = useMemo(
+    () => new Map(runFilterOptions.map((option) => [option.value, option.name])),
+    [runFilterOptions],
+  );
+  // One plot series per run (sample × kernel variant), each with a stable color.
+  const allRunSeries = useMemo(
+    () =>
+      seriesRows.seriesMeta.map((meta, index) => {
+        const runName = runNameByValue.get(runGroupValue(meta.runId));
+        return {
+          ...meta,
+          color: plotSeriesColor(index),
+          runName: runName ?? "",
+          label: [
+            meta.sampleLabel,
+            kernelMetaLabel(t, meta),
+            runFilterOptions.length > 1 ? runName : null,
+          ].filter(Boolean).join(" · "),
+        };
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [seriesRows, runNameByValue, runFilterOptions.length, t],
+  );
   const sourceFilterOptions = useMemo(() => {
     const values: string[] = [];
     for (const series of allRunSeries) {
@@ -190,6 +241,13 @@ export function HeightResultsPanel({
     () => new Map(allRunSeries.map((series) => [series.runId, series.label])),
     [allRunSeries],
   );
+  const decimalsByRun = useMemo(
+    () => new Map(seriesRows.seriesMeta.map((meta) => [meta.runId, meta.decimals])),
+    [seriesRows],
+  );
+  /** Candidate text at the precision of the scan that measured it ("843.70"). */
+  const displayHeight = (runId: string | null, raw: string) =>
+    padDecimals(raw, runId ? decimalsByRun.get(runId) ?? 0 : 0);
   const runKernelById = useMemo(
     () =>
       new Map(
@@ -241,14 +299,24 @@ export function HeightResultsPanel({
     if (!best) return null;
     return {
       bestKey: best.key ?? null,
-      bestHeight: formatHeight(best.x),
+      // The engine's own candidate string: never re-rounded for display.
+      bestHeight: candidateFromKey(best.key, best.runId, best.x),
+      bestRunId: best.runId,
       bestMetric: best.metric,
       bestKernel: runKernelById.get(best.runId) ?? "",
       perfectCount: scoped.filter(
         (point) => point.metric <= PERFECTLY_DESCALE_THRESHOLD,
       ).length,
       totalCount: scoped.length,
-      candidates: detection.candidates.slice(0, 3),
+      candidates: detection.candidates.slice(0, 3).map((candidate) => ({
+        height: candidateFromKey(
+          candidate.deepest.key,
+          candidate.deepest.runId,
+          candidate.height,
+        ),
+        runId: candidate.deepest.runId,
+        runCount: candidate.runCount,
+      })),
       valleyKeys: new Set(
         detection.candidates
           .slice(0, 3)
@@ -285,11 +353,19 @@ export function HeightResultsPanel({
       filteredRows.map((row) => ({
         key: `${row.runId}-${row.height}`,
         metric: row.metric,
-        cells: [row.height, row.sampleLabel, row.kernelId, row.runId.slice(0, 10)],
-        selected: sameHeight(selectedHeight, row.height),
-        onSelect: () => selectHeight(row.height),
+        cells: [
+          displayHeight(row.runId, row.height),
+          row.sampleLabel,
+          runKernelById.get(row.runId) ?? row.kernelId,
+          runNameByValue.get(runGroupValue(row.runId)) ?? row.runId.slice(0, 10),
+        ],
+        selected:
+          sameHeight(selectedHeight, row.height) &&
+          (selection?.runId == null || selection.runId === row.runId),
+        onSelect: () => selectHeight(row.height, row.runId),
       })),
-    [filteredRows, selectedHeight],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filteredRows, selection, decimalsByRun, runKernelById, runNameByValue],
   );
 
   const isTableCollapsed = tableCollapsed ?? tableRows.length > 0;
@@ -320,13 +396,19 @@ export function HeightResultsPanel({
           type="button"
           disabled={applyBusy || !hasIncludedSamples}
           onClick={() => onOpenApplyDialog(
-            selectedHeightAxis.current === axisMode ? selectedHeight ?? undefined : undefined,
+            selectedHeightAxis.current === axisMode ? selection ?? undefined : undefined,
           )}
         >
           {t("analyze.applyToRecipe")}
         </button>
         {applyNotice || submitNotice ? (
           <span className="help-copy">{applyNotice || submitNotice}</span>
+        ) : null}
+        {nextStep && applyNotice ? (
+          <button className="primary-button next-step-button" type="button" onClick={nextStep.onClick}>
+            {nextStep.label}
+            <ArrowRight size={14} />
+          </button>
         ) : null}
         {excludedResultsAvailable ? (
           <label className="series-visibility analyze-excluded-toggle">
@@ -368,9 +450,13 @@ export function HeightResultsPanel({
                   role="radio"
                   aria-checked={runGroupFilter === option.value}
                   className={runGroupFilter === option.value ? "active" : ""}
+                  title={option.label}
                   onClick={() => setRunGroupFilter(option.value)}
                 >
-                  {option.label}
+                  {option.name}
+                  {option.summary ? (
+                    <small className="run-filter-summary">{option.summary}</small>
+                  ) : null}
                 </button>
               ))}
             </div>
@@ -435,7 +521,7 @@ export function HeightResultsPanel({
               bestKey={plotAids?.bestKey}
               selectedX={selectedHeight}
               valleyKeys={plotAids?.valleyKeys}
-              onSelect={selectHeight}
+              onSelect={(x, runId) => selectHeight(x, runId ?? null)}
               resetLabel={t("plot.resetZoom")}
               onZoomRangeChange={setZoomRange}
             />
@@ -444,12 +530,12 @@ export function HeightResultsPanel({
                 <button
                   type="button"
                   className={`plot-verdict ${plotAids.bestMetric <= PERFECTLY_DESCALE_THRESHOLD ? "perfect" : ""}`}
-                  onClick={() => selectHeight(plotAids.bestHeight)}
+                  onClick={() => selectHeight(plotAids.bestHeight, plotAids.bestRunId)}
                   title={t("analyze.verdictSelect")}
                 >
                   <span className="plot-verdict-cell plot-verdict-hero">
                     <span className="plot-verdict-label">{t("analyze.verdict.height")}</span>
-                    <strong>{plotAids.bestHeight}</strong>
+                    <strong>{displayHeight(plotAids.bestRunId, plotAids.bestHeight)}</strong>
                   </span>
                   <span className="plot-verdict-cell">
                     <span className="plot-verdict-label">{t("analyze.verdict.kernel")}</span>
@@ -483,13 +569,13 @@ export function HeightResultsPanel({
                       <button
                         type="button"
                         key={candidate.height}
-                        className={`candidate-chip ${sameHeight(selectedHeight, formatHeight(candidate.height)) ? "selected" : ""}`}
-                        onClick={() => selectHeight(formatHeight(candidate.height))}
+                        className={`candidate-chip ${sameHeight(selectedHeight, candidate.height) ? "selected" : ""}`}
+                        onClick={() => selectHeight(candidate.height, candidate.runId)}
                         title={t("analyze.verdict.consensus", {
                           count: String(candidate.runCount),
                         })}
                       >
-                        {formatHeight(candidate.height)}
+                        {displayHeight(candidate.runId, candidate.height)}
                         {candidate.runCount > 1 ? ` ×${candidate.runCount}` : ""}
                       </button>
                     ))}
@@ -509,9 +595,13 @@ export function HeightResultsPanel({
                 : `${t("analyze.blockedBody")} ${t("analyze.geometryHint")}`
             }
             action={
-              <button className="secondary-button" type="button" onClick={onOpenDiagnostics}>
-                {t("nav.diagnostics")}
-              </button>
+              // Diagnostics only helps when the engine is unavailable; with a
+              // working engine the next step is the Run button in Parameters.
+              analyzeAvailable ? undefined : (
+                <button className="secondary-button" type="button" onClick={onOpenDiagnostics}>
+                  {t("nav.diagnostics")}
+                </button>
+              )
             }
           />
         )}
@@ -530,11 +620,7 @@ export function HeightResultsPanel({
             <ChevronDown size={14} />
           )}
           <span>{t("analyze.resultsTable")}</span>
-          <span className="analyze-table-count">
-            {tableRows.length > HEIGHT_TABLE_LIMIT
-              ? `${HEIGHT_TABLE_LIMIT} / ${tableRows.length}`
-              : tableRows.length}
-          </span>
+          <span className="analyze-table-count">{tableRows.length}</span>
         </button>
         {!isTableCollapsed ? (
           <>
@@ -571,10 +657,9 @@ export function HeightResultsPanel({
                   t("analyze.col.run"),
                 ]}
                 metricColumnIndex={1}
-                columnTemplate="72px 96px minmax(80px, 1fr) 88px 72px"
+                columnTemplate="80px 96px minmax(80px, 1fr) minmax(120px, 1.4fr) 64px"
                 rows={tableRows}
                 defaultMetricSort="asc"
-                limit={HEIGHT_TABLE_LIMIT}
               />
             ) : (
               <div>

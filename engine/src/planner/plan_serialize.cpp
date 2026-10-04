@@ -229,15 +229,26 @@ AxisPlan deserialize_plan_cooked(
             plan.forward_offsets[row] = reader.u32();
         }
     }
-    if (plan.forward_offsets.back() != src * forward_width) {
-        throw PlanStoreError("cooked forward offsets do not span the forward matrix");
+    // The forward passes index weights and taps through these offsets, so
+    // every row must sit exactly at row * forward_width, not just the last.
+    for (std::size_t row = 0; row <= src; ++row) {
+        if (plan.forward_offsets[row] != row * forward_width) {
+            throw PlanStoreError("cooked forward offsets do not span the forward matrix");
+        }
     }
+    if (dst < forward_width) {
+        throw PlanStoreError("cooked forward width exceeds the destination axis");
+    }
+    const auto maximum_left = static_cast<std::int32_t>(dst - forward_width);
 
     const bool indices_runs = reader.u8() != 0;
     plan.forward_indices.resize(src * forward_width);
     if (indices_runs) {
         for (std::size_t row = 0; row < src; ++row) {
             const std::int32_t left = reader.i32();
+            if (left < 0 || left > maximum_left) {
+                throw PlanStoreError("cooked forward index is out of range");
+            }
             for (std::size_t tap = 0; tap < forward_width; ++tap) {
                 plan.forward_indices[row * forward_width + tap] =
                     left + static_cast<std::int32_t>(tap);
@@ -245,6 +256,19 @@ AxisPlan deserialize_plan_cooked(
         }
     } else {
         reader.raw_into(plan.forward_indices, src * forward_width);
+        // Forward taps address the native axis as one contiguous run per row.
+        for (std::size_t row = 0; row < src; ++row) {
+            const std::int32_t left = plan.forward_indices[row * forward_width];
+            if (left < 0 || left > maximum_left) {
+                throw PlanStoreError("cooked forward index is out of range");
+            }
+            for (std::size_t tap = 1; tap < forward_width; ++tap) {
+                if (plan.forward_indices[row * forward_width + tap]
+                    != left + static_cast<std::int32_t>(tap)) {
+                    throw PlanStoreError("cooked forward indices are not contiguous");
+                }
+            }
+        }
     }
     reader.raw_into(plan.forward_weights, src * forward_width);
 

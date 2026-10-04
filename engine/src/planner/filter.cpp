@@ -49,6 +49,9 @@ std::int32_t Filter::effective_support() const {
     if (!(scaled_support <= static_cast<double>(maximum_support))) {
         throw std::length_error("effective filter support is too large");
     }
+    if (blur > maximum_filter_blur) {
+        throw std::invalid_argument("blur must not exceed 16");
+    }
     const double effective = std::ceil(scaled_support);
     if (!(effective >= 1.0)
         || !(effective <= static_cast<double>(maximum_support))) {

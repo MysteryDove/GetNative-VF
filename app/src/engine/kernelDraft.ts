@@ -8,6 +8,12 @@ import type {
 } from "./protocol";
 import { buildCandidateGrid } from "./candidateGrid";
 import { invalidKernelBlur, kernelSignature } from "./heightDraft";
+import {
+  isFractionInput,
+  parseNumberInput,
+  parseRational,
+  rationalToNumber,
+} from "./numberInput";
 
 export const MAX_KERNEL_CANDIDATES = 4096;
 
@@ -100,13 +106,6 @@ export function defaultKernelDraft(
   };
 }
 
-function parseNonNegativeDecimal(value: string): number | null {
-  const trimmed = value.trim();
-  if (!/^\d+(\.\d+)?$/.test(trimmed)) return null;
-  const n = Number(trimmed);
-  return Number.isFinite(n) && n >= 0 ? n : null;
-}
-
 /**
  * Add-form blur contribution. Default 1 is omitted so chips and signatures
  * stay identical to kernels that never set blur. Invalid values refuse add.
@@ -116,7 +115,7 @@ export function addBlurParameters(
 ): { ok: true; parameters: { blur?: number } } | { ok: false } {
   const raw = draft.addBlur ?? "1";
   if (invalidKernelBlur({ blur: raw })) return { ok: false };
-  const blur = Number(raw);
+  const blur = parseNumberInput(raw) as number;
   return { ok: true, parameters: blur === 1 ? {} : { blur } };
 }
 
@@ -149,8 +148,9 @@ export function normalizeKernelRef(kernel: KernelRef): KernelRef {
 
 /** Single Bicubic (b, c) from the add form; null when either input is invalid. */
 export function bicubicRefFromDraft(draft: KernelDraft): KernelRef | null {
-  const b = parseNonNegativeDecimal(draft.bicubicB);
-  const c = parseNonNegativeDecimal(draft.bicubicC);
+  // Decimals or fractions ("1/3"); negative values are valid Bicubic params.
+  const b = parseNumberInput(draft.bicubicB);
+  const c = parseNumberInput(draft.bicubicC);
   if (b === null || c === null) return null;
   return { id: "bicubic", parameters: { b, c } };
 }
@@ -211,6 +211,41 @@ export function addKernelsToScanList(draft: KernelDraft, kernels: KernelRef[]): 
 }
 
 /**
+ * One sweep axis of the Bicubic grid. Plain decimals keep the exact
+ * fixed-point sequence; any `p/q` input (e.g. step 1/3) switches the axis to
+ * exact rational stepping so 0, 1/3, 2/3, 1 lands on the endpoints.
+ */
+export function resolveParameterSequence(input: {
+  axis: string;
+  start: string;
+  stop: string;
+  step: string;
+}): { ok: true; values: Array<string | number> } | { ok: false; reason: string } {
+  if (![input.start, input.stop, input.step].some(isFractionInput)) {
+    const grid = buildCandidateGrid({ ...input, endpointRule: "inclusive" });
+    return grid.ok ? { ok: true, values: grid.grid.candidates } : grid;
+  }
+  const start = parseRational(input.start);
+  const stop = parseRational(input.stop);
+  const step = parseRational(input.step);
+  if (!start || !stop || !step) return { ok: false, reason: "grid_not_decimal" };
+  if (step.numerator <= 0n) return { ok: false, reason: "grid_step_zero" };
+  const denominator = start.denominator * stop.denominator * step.denominator;
+  const startUnits = start.numerator * stop.denominator * step.denominator;
+  const stopUnits = stop.numerator * start.denominator * step.denominator;
+  const stepUnits = step.numerator * start.denominator * stop.denominator;
+  if (stopUnits < startUnits) return { ok: false, reason: "grid_stop_before_start" };
+  const values: number[] = [];
+  for (let units = startUnits; units <= stopUnits; units += stepUnits) {
+    if (values.length >= MAX_KERNEL_CANDIDATES) {
+      return { ok: false, reason: "kernel_list_too_large" };
+    }
+    values.push(rationalToNumber({ numerator: units, denominator }));
+  }
+  return { ok: true, values };
+}
+
+/**
  * One-click Bicubic (b, c) sweep: b-outer, c-inner, appended to the scan list
  * with per-entry duplicate skipping.
  */
@@ -219,26 +254,24 @@ export function addBicubicGridToScanList(
 ):
   | { ok: true; draft: KernelDraft; added: number; skipped: number }
   | { ok: false; reason: string } {
-  const bGrid = buildCandidateGrid({
+  const bGrid = resolveParameterSequence({
     axis: "b",
     start: draft.bStart,
     stop: draft.bStop,
     step: draft.bStep,
-    endpointRule: "inclusive",
   });
   if (!bGrid.ok) return bGrid;
-  if (bGrid.grid.candidates.length > MAX_KERNEL_CANDIDATES) {
+  if (bGrid.values.length > MAX_KERNEL_CANDIDATES) {
     return { ok: false, reason: "kernel_list_too_large" };
   }
-  const cGrid = buildCandidateGrid({
+  const cGrid = resolveParameterSequence({
     axis: "c",
     start: draft.cStart,
     stop: draft.cStop,
     step: draft.cStep,
-    endpointRule: "inclusive",
   });
   if (!cGrid.ok) return cGrid;
-  if (bGrid.grid.candidates.length * cGrid.grid.candidates.length > MAX_KERNEL_CANDIDATES) {
+  if (bGrid.values.length * cGrid.values.length > MAX_KERNEL_CANDIDATES) {
     return { ok: false, reason: "kernel_list_too_large" };
   }
 
@@ -246,8 +279,8 @@ export function addBicubicGridToScanList(
   if (!blur.ok) return { ok: false, reason: "invalid_blur" };
 
   const kernels: KernelRef[] = [];
-  for (const b of bGrid.grid.candidates) {
-    for (const c of cGrid.grid.candidates) {
+  for (const b of bGrid.values) {
+    for (const c of cGrid.values) {
       kernels.push({
         id: "bicubic",
         parameters: { b, c, ...blur.parameters },

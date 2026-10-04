@@ -221,6 +221,55 @@ initialState.runsById["verify-preview"] = {
   total: 1_609,
 };
 
+/**
+ * Fractional-scan repro: two 0.1 px Resolution Tests on an even base that
+ * differ only in Bicubic parameters. Legends, the Runs filter and the result
+ * table must tell them apart, and Apply must carry the even base over.
+ */
+function fractionalHeightRun(id: string, groupId: string, b: number, c: number, depth: number) {
+  initialState.runGroupsById[groupId] = {
+    id: groupId,
+    memberRunIds: [id],
+    groupType: "single_height",
+    label: "Resolution Test",
+    createdAt: `2026-08-18T00:0${depth}:00Z`,
+    intentSnapshot: { baseHeightMode: "even", baseWidthMode: "integer" },
+  };
+  initialState.runsById[id] = {
+    id,
+    runType: "height",
+    status: "completed",
+    runGroupId: groupId,
+    sampleId: "sample-1",
+    sourceId: "source-1",
+    createdAt: `2026-08-18T00:0${depth}:00Z`,
+    updatedAt: `2026-08-18T00:0${depth}:30Z`,
+    inputSnapshot: {
+      metric,
+      kernel: { id: "bicubic", parameters: { b, c } },
+      heightGrid: { start: "840", stop: "848", step: "0.1" },
+      profileId: "muf-d278cd3",
+      request: { axisMode: "h_plus_w", baseHeight: "848", baseWidth: null },
+    },
+    result: {
+      candidates: Array.from({ length: 81 }, (_, index) => {
+        const height = 840 + index / 10;
+        const distance = Math.abs(height - 843.7);
+        return {
+          id: String(Number(height.toFixed(1))),
+          error: distance < 0.05 ? 1.05e-8 * depth : 2e-4 * depth + distance * 1e-5,
+        };
+      }),
+    },
+    errorCode: null,
+    errorMessage: null,
+    completed: 81,
+    total: 81,
+  };
+}
+fractionalHeightRun("run-frac-a", "group-frac-a", 1 / 3, 1 / 3, 4);
+fractionalHeightRun("run-frac-b", "group-frac-b", 0, 0.5, 5);
+
 const capabilities: EngineEnvelope = {
   path: "fixture-engine",
   payload: {

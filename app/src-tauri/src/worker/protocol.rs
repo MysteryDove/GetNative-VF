@@ -100,12 +100,18 @@ pub struct WorkerAnalyzeRequest {
     pub geometry: Option<GeometryCommand>,
 }
 
+/// Mirrors the engine's `maximum_filter_blur`: plan size grows with blur.
+const MAXIMUM_KERNEL_BLUR: f64 = 16.0;
+
 fn validate_kernel_command(kernel: &KernelCommand) -> Result<(), String> {
     if kernel
         .blur
         .is_some_and(|blur| !blur.is_finite() || blur <= 0.0)
     {
         return Err("bad_request: blur must be finite and greater than zero".to_owned());
+    }
+    if kernel.blur.is_some_and(|blur| blur > MAXIMUM_KERNEL_BLUR) {
+        return Err("bad_request: blur must not exceed 16".to_owned());
     }
     match kernel.id.as_str() {
         "bilinear" | "spline16" | "spline36" | "spline64" => {}
@@ -797,6 +803,10 @@ mod tests {
         let command = analyze_command(&request).unwrap();
         assert_eq!(command["kernel"]["blur"], json!(1.25));
 
+        request.kernel.as_mut().unwrap().blur = Some(16.0);
+        assert!(validate_analyze(&request).is_ok());
+        request.kernel.as_mut().unwrap().blur = Some(16.5);
+        assert!(validate_analyze(&request).is_err());
         request.kernel.as_mut().unwrap().blur = Some(0.0);
         assert!(validate_analyze(&request).is_err());
         request.kernel.as_mut().unwrap().blur = Some(f64::NAN);

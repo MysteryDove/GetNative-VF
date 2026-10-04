@@ -1,5 +1,5 @@
 import type { EngineEnvelope } from "./types";
-import type { AxisMode, CandidateGridSpec, KernelRef, MetricSpec } from "./protocol";
+import type { AxisMode, BaseMode, CandidateGridSpec, KernelRef, MetricSpec } from "./protocol";
 import {
   fixedKernelsForDraft,
   missingFractionalBaseAxis,
@@ -11,7 +11,8 @@ import { validateHeightShape } from "./shapeGuards";
 import type { HeightAnalyzeRequest } from "./protocol";
 import type { ProjectState, Run, RunGroup } from "../project/types";
 import type { Translator } from "../i18n";
-import { kernelDisplayName } from "./displayNames";
+import { kernelRefLabel } from "./displayNames";
+import { decimalPlaces } from "./numberInput";
 import { baseForMode } from "./geometry";
 
 export type HeightRunGroupType =
@@ -379,7 +380,7 @@ export type SeriesTableRow = {
   metric: number;
   sampleLabel: string;
   kernelId: string;
-  /** Kernel identity including parameter variant, e.g. "lanczos@3". */
+  /** Kernel identity including every parameter (id + parameters signature). */
   kernelKey: string;
 };
 
@@ -389,8 +390,10 @@ export type SeriesMeta = {
   sampleId: string;
   sampleLabel: string;
   kernelId: string;
-  kernelTaps: number | null;
+  kernelParameters: KernelRef["parameters"];
   kernelKey: string;
+  /** Decimal places of the scan grid; candidates display padded to this. */
+  decimals: number;
 };
 
 export type SeriesTable = {
@@ -398,6 +401,70 @@ export type SeriesTable = {
   incompatibleCount: number;
   seriesMeta: SeriesMeta[];
 };
+
+type HeightRunSnapshot = {
+  metric?: MetricSpec;
+  kernel?: { id: string; parameters?: KernelRef["parameters"] };
+  heightGrid?: Pick<CandidateGridSpec, "start" | "stop" | "step">;
+  profileId?: string;
+  request?: {
+    axisMode?: AxisMode;
+    baseHeight?: string | null;
+    baseWidth?: string | null;
+  };
+};
+
+/** The settings one height Run was actually measured with. */
+export type HeightRunConfig = {
+  axisMode: AxisMode | null;
+  kernel: KernelRef | null;
+  metric: MetricSpec | null;
+  profileId: string | null;
+  start: string | null;
+  stop: string | null;
+  step: string | null;
+  decimals: number;
+  baseHeightMode: BaseMode;
+  baseWidthMode: BaseMode;
+};
+
+function baseModeFromValue(value: string | null | undefined): BaseMode {
+  const base = Number(value);
+  if (value == null || !Number.isInteger(base) || base <= 0) return "integer";
+  return base % 2 === 0 ? "even" : "odd";
+}
+
+/**
+ * Read back a height Run's frozen inputs. Base modes come from the RunGroup
+ * intent when present; older records fall back to the parity of the resolved
+ * base the request carried.
+ */
+export function heightRunConfig(
+  run: Pick<Run, "inputSnapshot">,
+  group?: Pick<RunGroup, "intentSnapshot"> | null,
+): HeightRunConfig {
+  const snapshot = (run.inputSnapshot ?? null) as HeightRunSnapshot | null;
+  const intent = (group?.intentSnapshot ?? null) as
+    | { baseHeightMode?: BaseMode; baseWidthMode?: BaseMode }
+    | null;
+  const grid = snapshot?.heightGrid;
+  return {
+    axisMode: snapshot?.request?.axisMode ?? null,
+    kernel: snapshot?.kernel?.id
+      ? { id: snapshot.kernel.id, parameters: { ...(snapshot.kernel.parameters ?? {}) } }
+      : null,
+    metric: snapshot?.metric ?? null,
+    profileId: snapshot?.profileId ?? null,
+    start: grid?.start ?? null,
+    stop: grid?.stop ?? null,
+    step: grid?.step ?? null,
+    decimals: grid
+      ? Math.max(decimalPlaces(grid.start), decimalPlaces(grid.stop), decimalPlaces(grid.step))
+      : 0,
+    baseHeightMode: intent?.baseHeightMode ?? baseModeFromValue(snapshot?.request?.baseHeight),
+    baseWidthMode: intent?.baseWidthMode ?? baseModeFromValue(snapshot?.request?.baseWidth),
+  };
+}
 
 export function buildSeriesTable(
   runs: Run[],
@@ -411,22 +478,12 @@ export function buildSeriesTable(
   let incompatibleCount = 0;
   for (const run of runs) {
     if (run.sampleId && hiddenSampleIds.has(run.sampleId)) continue;
-    const snapshot = run.inputSnapshot as
-      | {
-          metric?: { cropLeft: number; cropRight: number; cropTop: number; cropBottom: number; pixelExclusionThreshold: number; pNorm: number };
-          kernel?: { id: string; parameters?: Record<string, string | number | boolean> };
-          request?: { axisMode?: AxisMode };
-        }
-      | null;
-    if (
-      activeAxisMode &&
-      snapshot?.request?.axisMode &&
-      snapshot.request.axisMode !== activeAxisMode
-    ) {
+    const config = heightRunConfig(run);
+    if (activeAxisMode && config.axisMode && config.axisMode !== activeAxisMode) {
       continue;
     }
-    if (snapshot?.metric) {
-      if (metricCompatibilityKey(snapshot.metric) !== activeMetricKey) {
+    if (config.metric) {
+      if (metricCompatibilityKey(config.metric) !== activeMetricKey) {
         incompatibleCount += 1;
         continue;
       }
@@ -434,18 +491,18 @@ export function buildSeriesTable(
     const series = extractHeightSeries(run.result);
     if (!series) continue;
     const sample = run.sampleId ? state.samplesById[run.sampleId] : null;
-    const kernelId = snapshot?.kernel?.id ?? "—";
-    const rawTaps = Number(snapshot?.kernel?.parameters?.taps);
-    const kernelTaps = Number.isFinite(rawTaps) ? rawTaps : null;
-    const kernelKey = kernelTaps != null ? `${kernelId}@${kernelTaps}` : kernelId;
+    const kernelId = config.kernel?.id ?? "—";
+    const kernelParameters = config.kernel?.parameters ?? {};
+    const kernelKey = `${kernelId}:${JSON.stringify(kernelParameters)}`;
     const sampleLabel = sample?.label ?? run.sampleId ?? "—";
     seriesMeta.push({
       runId: run.id,
       sampleId: run.sampleId ?? "",
       sampleLabel,
       kernelId,
-      kernelTaps,
+      kernelParameters,
       kernelKey,
+      decimals: config.decimals,
     });
     for (const point of series) {
       rows.push({
@@ -463,8 +520,7 @@ export function buildSeriesTable(
 
 export function kernelMetaLabel(
   t: Translator,
-  meta: { kernelId: string; kernelTaps: number | null },
+  meta: { kernelId: string; kernelParameters?: KernelRef["parameters"] },
 ): string {
-  const name = kernelDisplayName(t, meta.kernelId);
-  return meta.kernelTaps != null ? `${name} ${meta.kernelTaps}` : name;
+  return kernelRefLabel(t, { id: meta.kernelId, parameters: meta.kernelParameters });
 }

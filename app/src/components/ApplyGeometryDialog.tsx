@@ -11,6 +11,8 @@ export type ApplyGeometryValues = {
   baseWidth: number | null;
   baseHeightMode?: BaseMode;
   baseWidthMode?: BaseMode;
+  /** True when the measuring Run's kernel should become the Recipe kernel. */
+  applyKernel?: boolean;
 };
 
 function parseField(text: string): number | null | "invalid" {
@@ -32,6 +34,10 @@ export function ApplyGeometryDialog({
   sourceHeight,
   initialSrcWidth,
   initialSrcHeight,
+  initialBaseHeightMode = "integer",
+  initialBaseWidthMode = "integer",
+  kernelLabel,
+  fromRun = false,
   onCancel,
   onConfirm,
 }: {
@@ -42,6 +48,13 @@ export function ApplyGeometryDialog({
   sourceHeight: number;
   initialSrcWidth?: number | null;
   initialSrcHeight?: number | null;
+  /** Base modes of the scan that measured the selection; carried over as-is. */
+  initialBaseHeightMode?: BaseMode;
+  initialBaseWidthMode?: BaseMode;
+  /** Kernel of the measuring Run; offered as the Recipe kernel when set. */
+  kernelLabel?: string | null;
+  /** True when the selection is tied to a Run whose settings prefill the dialog. */
+  fromRun?: boolean;
   onCancel: () => void;
   onConfirm: (values: ApplyGeometryValues) => void;
 }) {
@@ -50,8 +63,9 @@ export function ApplyGeometryDialog({
     (axisMode === "h_plus_w" ? sourceWidth * initialHeight / sourceHeight : sourceWidth);
   const [heightText, setHeightText] = useState(String(initialHeight));
   const [widthText, setWidthText] = useState(String(initialWidth));
-  const [heightMode, setHeightMode] = useState<BaseMode>("integer");
-  const [widthMode, setWidthMode] = useState<BaseMode>("integer");
+  const [heightMode, setHeightMode] = useState<BaseMode>(initialBaseHeightMode);
+  const [widthMode, setWidthMode] = useState<BaseMode>(initialBaseWidthMode);
+  const [applyKernel, setApplyKernel] = useState(true);
   const [error, setError] = useState("");
 
   const parsedHeight = parseField(heightText);
@@ -95,6 +109,7 @@ export function ApplyGeometryDialog({
       baseWidth: effectiveWidth == null ? null : baseForMode(effectiveWidth, widthMode),
       baseHeightMode: heightMode,
       baseWidthMode: widthMode,
+      applyKernel: Boolean(kernelLabel) && applyKernel,
     });
   }
 
@@ -144,7 +159,10 @@ export function ApplyGeometryDialog({
         </>
       }
     >
-      <p className="help-copy">{t("analyze.applyDialog.hint")}</p>
+      <p className="help-copy">
+        {t("analyze.applyDialog.hint")}
+        {fromRun ? ` ${t("analyze.applyDialog.fromRun")}` : ""}
+      </p>
       {field("height")}
       {field("width")}
       {preview ? (
@@ -154,6 +172,16 @@ export function ApplyGeometryDialog({
           <div className="dense-row"><strong>{t("analyze.baseWidth")}</strong><span>{preview.baseWidth ?? "null"}</span></div>
           <div className="dense-row"><strong>{t("analyze.baseHeight")}</strong><span>{preview.baseHeight ?? "null"}</span></div>
         </div>
+      ) : null}
+      {kernelLabel ? (
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={applyKernel}
+            onChange={(event) => setApplyKernel(event.target.checked)}
+          />
+          <span>{t("analyze.applyDialog.kernel", { kernel: kernelLabel })}</span>
+        </label>
       ) : null}
       {error ? <p className="help-copy warning-copy">{error}</p> : null}
     </Modal>

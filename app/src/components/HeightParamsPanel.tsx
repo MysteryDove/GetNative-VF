@@ -1,12 +1,15 @@
+import { useState } from "react";
 import { SlidersHorizontal } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
 import { kernelDisplayName } from "../engine/displayNames";
 import {
   invalidKernelBlur,
+  invalidKernelParameterNames,
   kernelSignature,
   missingFractionalBaseAxis,
   type HeightDraft,
+  type estimateHeightWork,
 } from "../engine/heightDraft";
 import type { BaseMode, KernelRef, SearchPreset } from "../engine/protocol";
 import { backendOptionLabel } from "../engine/backendSelection";
@@ -15,6 +18,56 @@ import { MenuSelect } from "./MenuSelect";
 import { RunLaunchButton } from "./RunLaunchButton";
 
 const LANCZOS_COMPARE_TAPS = [3, 4] as const;
+
+/** Step sizes that cover the usual getnative scans; anything else is "custom". */
+const COMMON_STEPS = ["1", "0.5", "0.1", "0.05", "0.01"] as const;
+const CUSTOM_STEP = "custom";
+
+/** Step as a pull-down of common px values with a free-form fallback. */
+function StepField({
+  t,
+  value,
+  onChange,
+}: {
+  t: Translator;
+  value: string;
+  onChange: (step: string) => void;
+}) {
+  const isCommon = (COMMON_STEPS as readonly string[]).includes(value.trim());
+  const [custom, setCustom] = useState(!isCommon);
+  const showInput = custom || !isCommon;
+  return (
+    <label className="block">
+      <span>{t("analyze.step")}</span>
+      <select
+        aria-label={t("analyze.step")}
+        value={showInput ? CUSTOM_STEP : value.trim()}
+        onChange={(event) => {
+          if (event.target.value === CUSTOM_STEP) {
+            setCustom(true);
+            return;
+          }
+          setCustom(false);
+          onChange(event.target.value);
+        }}
+      >
+        {COMMON_STEPS.map((step) => (
+          <option key={step} value={step}>{`${step} ${t("common.px")}`}</option>
+        ))}
+        <option value={CUSTOM_STEP}>{t("analyze.stepCustom")}</option>
+      </select>
+      {showInput ? (
+        // text + inputMode: WebKitGTK number spinners freeze the Linux UI
+        <input
+          inputMode="decimal"
+          aria-label={t("analyze.step")}
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+        />
+      ) : null}
+    </label>
+  );
+}
 
 function compareKernelTaps(kernelId: string): Array<number | null> {
   return kernelId === "lanczos" ? [...LANCZOS_COMPARE_TAPS] : [null];
@@ -43,6 +96,7 @@ export function HeightParamsPanel({
   onPatch,
   onSetPreset,
   onRun,
+  work,
   metricSpecOpen,
   onMetricSpecOpenChange,
 }: {
@@ -58,11 +112,14 @@ export function HeightParamsPanel({
   onPatch: (partial: Partial<HeightDraft>) => void;
   onSetPreset: (preset: SearchPreset) => void;
   onRun: () => void;
+  work: ReturnType<typeof estimateHeightWork>;
   metricSpecOpen: boolean;
   onMetricSpecOpenChange: (open: boolean) => void;
 }) {
   const kernelOptions = capabilities?.payload.kernels ?? [];
   const missingBaseAxis = missingFractionalBaseAxis(draft);
+  const invalidParameters = invalidKernelParameterNames(draft.kernelParameters);
+  const scansWidth = draft.axisMode === "w_only";
   const baseModes: BaseMode[] = ["integer", "odd", "even"];
   const baseModeField = (axis: "height" | "width") => axis === "height" ? "baseHeightMode" : "baseWidthMode";
   const baseValueField = (axis: "height" | "width") => axis === "height" ? "baseHeight" : "baseWidth";
@@ -168,10 +225,13 @@ export function HeightParamsPanel({
         </div>
       </div>
 
+      <span className="block-label">
+        {t(scansWidth ? "analyze.rangeWidth" : "analyze.rangeHeight")}
+      </span>
       {draft.preset === "fractional_refine" ? (
         <div className="range-grid">
           <label className="block">
-            <span>{t("analyze.refineSelected")}</span>
+            <span>{t(scansWidth ? "analyze.refineSelectedWidth" : "analyze.refineSelected")}</span>
             <input
               value={draft.refineSelected}
               inputMode="decimal"
@@ -186,15 +246,7 @@ export function HeightParamsPanel({
               onChange={(event) => onPatch({ refineHalfSpan: event.target.value })}
             />
           </label>
-          <label className="block">
-            <span>{t("analyze.step")}</span>
-            {/* text + inputMode: WebKitGTK number spinners freeze the Linux UI */}
-            <input
-              inputMode="decimal"
-              value={draft.step}
-              onChange={(event) => onPatch({ step: event.target.value })}
-            />
-          </label>
+          <StepField t={t} value={draft.step} onChange={(step) => onPatch({ step })} />
         </div>
       ) : (
         <div className="range-grid">
@@ -202,6 +254,7 @@ export function HeightParamsPanel({
             <span>{t("analyze.start")}</span>
             <input
               value={draft.start}
+              inputMode="decimal"
               onChange={(event) => onPatch({ start: event.target.value })}
             />
           </label>
@@ -209,17 +262,11 @@ export function HeightParamsPanel({
             <span>{t("analyze.stop")}</span>
             <input
               value={draft.stop}
+              inputMode="decimal"
               onChange={(event) => onPatch({ stop: event.target.value })}
             />
           </label>
-          <label className="block">
-            <span>{t("analyze.step")}</span>
-            <input
-              inputMode="decimal"
-              value={draft.step}
-              onChange={(event) => onPatch({ step: event.target.value })}
-            />
-          </label>
+          <StepField t={t} value={draft.step} onChange={(step) => onPatch({ step })} />
         </div>
       )}
 
@@ -289,6 +336,8 @@ export function HeightParamsPanel({
               <span>{`Bicubic ${parameter}`}</span>
               <input
                 inputMode="decimal"
+                title={t("analyze.fractionHint")}
+                aria-invalid={invalidParameters.includes(parameter) || undefined}
                 value={String(draft.kernelParameters[parameter] ?? (parameter === "b" ? 0 : 0.5))}
                 onChange={(event) =>
                   onPatch({
@@ -319,7 +368,11 @@ export function HeightParamsPanel({
       ) : (
         blurField
       )}
-      {invalidKernelBlur(draft.kernelParameters) ? (
+      {invalidParameters.length ? (
+        <p className="help-copy warning-copy" role="alert">
+          {t("analyze.kernelParamInvalid", { name: invalidParameters.join(", ") })}
+        </p>
+      ) : invalidKernelBlur(draft.kernelParameters) ? (
         <p className="help-copy warning-copy" role="alert">
           {t("analyze.blurInvalid")}
         </p>
@@ -431,6 +484,11 @@ export function HeightParamsPanel({
         submitting={submitting}
         label={t("analyze.runHeight")}
         blockedReason={runBlockedReason}
+        summary={
+          work.ok
+            ? `${t("analyze.candidateCount", { count: String(work.candidateCount) })} · ${t("analyze.workEstimate", { count: String(work.estimate) })}`
+            : null
+        }
         onClick={onRun}
       />
     </aside>

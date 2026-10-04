@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Eye, EyeOff } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
 import { resolveGeometrySnapshot } from "../engine/geometryResolve";
@@ -21,8 +22,10 @@ import { KernelAnalyzePanel } from "./KernelAnalyzePanel";
 import { defaultKernelDraft, type KernelDraft } from "../engine/kernelDraft";
 import {
   buildSeriesTable,
+  heightRunConfig,
   metricCompatibilityKey,
 } from "../engine/runGroupPlan";
+import { kernelRefLabel } from "../engine/displayNames";
 import type { ProjectState } from "../project/types";
 import { EmptyInlineAction } from "../components/EmptyInlineAction";
 import { RecipePicker } from "../components/RecipePicker";
@@ -30,16 +33,18 @@ import {
   ApplyGeometryDialog,
   type ApplyGeometryValues,
 } from "../components/ApplyGeometryDialog";
-import { plotSeriesColor } from "../components/ErrorLinePlot";
 import { RecipeSummaryStrip } from "../components/RecipeSummaryStrip";
 import { HeightParamsPanel } from "../components/HeightParamsPanel";
 import { analyzeViewState } from "../project/analyzeView";
-import { HeightResultsPanel } from "../components/HeightResultsPanel";
-import { Modal } from "../components/Modal";
+import { HeightResultsPanel, type HeightSelection } from "../components/HeightResultsPanel";
 import { toggleSetValue } from "../utils/collections";
 import { srcFromScanSelection } from "../engine/geometry";
-import { invalidKernelBlur, missingFractionalBaseAxis } from "../engine/heightDraft";
-import type { MetricSpec, SearchPreset } from "../engine/protocol";
+import {
+  invalidKernelBlur,
+  invalidKernelParameterNames,
+  missingFractionalBaseAxis,
+} from "../engine/heightDraft";
+import type { MetricSpec } from "../engine/protocol";
 
 export function AnalyzePage({
   t,
@@ -51,6 +56,8 @@ export function AnalyzePage({
   onInitialSampleSelectionConsumed,
   onOpenDiagnostics,
   onOpenMedia,
+  onOpenKernelTest,
+  onOpenVerify,
   onProjectChange,
   executionBridge,
 }: {
@@ -64,23 +71,31 @@ export function AnalyzePage({
   onInitialSampleSelectionConsumed?: () => void;
   onOpenDiagnostics: () => void;
   onOpenMedia: () => void;
+  /** Workflow handoffs offered right after a successful apply. */
+  onOpenKernelTest: () => void;
+  onOpenVerify: () => void;
   onProjectChange: (updater: (state: ProjectState) => ProjectState) => void;
   executionBridge: ExecutionBridge;
 }) {
-  const [hiddenSampleIds, setHiddenSampleIds] = useState<Set<string>>(() => {
-    if (!initialSampleIds?.length) return new Set();
+  const unselectedInitialSampleIds = () => {
+    if (!initialSampleIds?.length) return new Set<string>();
     const selected = new Set(initialSampleIds);
     return new Set(
       selectIncludedSamples(state)
         .filter((sample) => !selected.has(sample.id))
         .map((sample) => sample.id),
     );
-  });
+  };
+  /** Samples left out of the next Resolution Test (their stored curves stay). */
+  const [excludedSampleIds, setExcludedSampleIds] = useState<Set<string>>(unselectedInitialSampleIds);
+  /** Samples whose curves are hidden; display only, never changes what runs. */
+  const [hiddenSampleIds, setHiddenSampleIds] = useState<Set<string>>(unselectedInitialSampleIds);
   const [applyBusy, setApplyBusy] = useState(false);
   const [applyNotice, setApplyNotice] = useState("");
   const [applyDialogOpen, setApplyDialogOpen] = useState(false);
-  const [applySelection, setApplySelection] = useState<string | null>(null);
-  const [fractionalWarningAxis, setFractionalWarningAxis] = useState<"height" | "width" | null>(null);
+  const [applySelection, setApplySelection] = useState<HeightSelection | null>(null);
+  /** True once geometry was applied: offers the handoff to the Algorithm Test. */
+  const [applyDone, setApplyDone] = useState(false);
   const [showExcludedResults, setShowExcludedResults] = useState(false);
   const { submitting, notice: submitNotice, submit: submitRunGroup } = useRunGroupSubmit();
   // Kernel draft is lifted here so the hand-built scan list survives subroute
@@ -106,9 +121,9 @@ export function AnalyzePage({
   );
   const analysisSamples = useMemo(
     () => selectedAnalysisSamples(includedSamples, initialSampleIds).filter(
-      (sample) => !hiddenSampleIds.has(sample.id),
+      (sample) => !excludedSampleIds.has(sample.id),
     ),
-    [hiddenSampleIds, includedSamples, initialSampleIds],
+    [excludedSampleIds, includedSamples, initialSampleIds],
   );
 
   const hiddenResultSampleIds = useMemo(() => {
@@ -122,13 +137,11 @@ export function AnalyzePage({
   useEffect(() => {
     if (initialSampleIds == null) return;
     const selected = new Set(initialSampleIds);
-    setHiddenSampleIds(
-      new Set(
-        includedSamples
-          .filter((sample) => !selected.has(sample.id))
-          .map((sample) => sample.id),
-      ),
-    );
+    const unselected = includedSamples
+      .filter((sample) => !selected.has(sample.id))
+      .map((sample) => sample.id);
+    setExcludedSampleIds(new Set(unselected));
+    setHiddenSampleIds(new Set(unselected));
     onInitialSampleSelectionConsumed?.();
   }, [includedSamples, initialSampleIds, onInitialSampleSelectionConsumed]);
 
@@ -222,6 +235,7 @@ export function AnalyzePage({
       : t("analyze.plotTitle");
 
   const missingBaseAxis = missingFractionalBaseAxis(draft);
+  const invalidKernelParameters = invalidKernelParameterNames(draft.kernelParameters);
   const hasExcludedSamples = Object.values(state.samplesById).some((sample) => !sample.included);
 
   const runBlockedReason = !analyzeAvailable
@@ -232,6 +246,8 @@ export function AnalyzePage({
         ? t("analyze.fractionalBaseRequired", {
             base: t(missingBaseAxis === "width" ? "analyze.baseWidth" : "analyze.baseHeight"),
           })
+      : invalidKernelParameters.length
+        ? t("analyze.kernelParamInvalid", { name: invalidKernelParameters.join(", ") })
       : invalidKernelBlur(draft.kernelParameters)
         ? t("analyze.blurInvalid")
       : !work.ok || !plan
@@ -239,17 +255,8 @@ export function AnalyzePage({
         : null;
 
   const canRun = analyzeAvailable && plan !== null && !submitting
+    && invalidKernelParameters.length === 0
     && !invalidKernelBlur(draft.kernelParameters);
-
-  function handleSetPreset(preset: SearchPreset) {
-    setPreset(preset);
-    if (preset !== "fractional_refine") {
-      setFractionalWarningAxis(null);
-      return;
-    }
-    const axis = missingFractionalBaseAxis({ ...draft, preset });
-    if (axis) setFractionalWarningAxis(axis);
-  }
 
   function startRun() {
     if (!plan) return;
@@ -267,7 +274,9 @@ export function AnalyzePage({
         submitted: (result) =>
           t("analyze.runSubmitted", {
             submitted: String(result.submitted),
-            failedNote: result.failed > 0 ? `, ${result.failed} failed` : "",
+            failedNote: result.failed > 0
+              ? t("analyze.runFailedNote", { count: String(result.failed) })
+              : "",
           }),
         failed: (detail) => t("analyze.submitFailed", { detail }),
       },
@@ -277,6 +286,21 @@ export function AnalyzePage({
   function toggleSampleVisibility(sampleId: string) {
     setHiddenSampleIds((current) => toggleSetValue(current, sampleId));
   }
+
+  function toggleSampleExcluded(sampleId: string) {
+    setExcludedSampleIds((current) => toggleSetValue(current, sampleId));
+  }
+
+  /**
+   * Settings of the Run that measured the selection. Apply carries these over
+   * instead of the live parameter draft, which may have changed since.
+   */
+  const applyRunConfig = useMemo(() => {
+    const run = applySelection?.runId ? state.runsById[applySelection.runId] : null;
+    if (!run) return null;
+    return heightRunConfig(run, run.runGroupId ? state.runGroupsById[run.runGroupId] : null);
+  }, [applySelection, state.runGroupsById, state.runsById]);
+  const applyAxisMode = applyRunConfig?.axisMode ?? draft.axisMode;
 
   /** First included Sample's source dimensions; required to resolve geometry. */
   const applySourceDims = useMemo(() => {
@@ -327,8 +351,9 @@ export function AnalyzePage({
     unknownSize: t("recipe.unknownSize"),
   };
 
-  function openApplyDialog(selected?: string) {
+  function openApplyDialog(selected?: HeightSelection) {
     setApplyNotice("");
+    setApplyDone(false);
     if (!applySourceDims) {
       setApplyNotice(t("recipe.applyNoDims"));
       return;
@@ -353,8 +378,9 @@ export function AnalyzePage({
         setApplyNotice(t("recipe.applyNoDims"));
         return;
       }
-      const selectedNumber = applySelection == null ? null : Number(applySelection);
-      const axis = draft.axisMode;
+      const selectedNumber = applySelection == null ? null : Number(applySelection.height);
+      const axis = applyAxisMode;
+      const profileId = applyRunConfig?.profileId ?? draft.profileId;
       const selectedGeometry = selectedNumber != null
         ? srcFromScanSelection({
             axisMode: axis,
@@ -370,7 +396,7 @@ export function AnalyzePage({
         return;
       }
       const geometry = await resolveGeometrySnapshot({
-        profileId: draft.profileId,
+        profileId,
         sourceWidth: dims.width,
         sourceHeight: dims.height,
         axisMode: axis,
@@ -383,10 +409,13 @@ export function AnalyzePage({
         state,
         {
           geometry,
-          metric: { ...draft.metric },
-          axisMode: draft.axisMode,
-          profileId: draft.profileId,
+          metric: { ...(applyRunConfig?.metric ?? draft.metric) },
+          axisMode: axis,
+          profileId,
           mathMode: draft.mathMode,
+          ...(values.applyKernel && applyRunConfig?.kernel
+            ? { kernel: applyRunConfig.kernel }
+            : {}),
         },
         applyLabels,
       );
@@ -397,6 +426,7 @@ export function AnalyzePage({
       const next = result.state;
       onProjectChange(() => next);
       setApplyNotice(t("recipe.applied", { name: result.recipe.name }));
+      setApplyDone(true);
       setApplyDialogOpen(false);
     } catch (error) {
       setApplyNotice(String(error));
@@ -451,6 +481,7 @@ export function AnalyzePage({
             onInheritMetricChange={setKernelInheritMetric}
             inheritedMetric={draft.metric}
             onOpenDiagnostics={onOpenDiagnostics}
+            onOpenVerify={onOpenVerify}
             onProjectChange={onProjectChange}
             executionBridge={executionBridge}
             metricSpecOpen={analyzeViewState(state).metricSpecOpen}
@@ -481,24 +512,35 @@ export function AnalyzePage({
                       </div>
                       <ul className="sample-tree-frames">
                         {group.items.map((sample) => {
-                          const index = includedSamples.indexOf(sample);
                           const hidden = hiddenSampleIds.has(sample.id);
+                          const excluded = excludedSampleIds.has(sample.id);
                           return (
-                            <li key={sample.id} className={hidden ? "hidden-series" : ""}>
-                              <span className="swatch" style={{ background: plotSeriesColor(index) }} />
-                              <div>
+                            <li
+                              key={sample.id}
+                              className={`height-sample-row${excluded ? " hidden-series" : ""}`}
+                            >
+                              <label className="kernel-sample-option" title={t("analyze.includeInRun")}>
+                                <input
+                                  type="checkbox"
+                                  className="sample-check"
+                                  checked={!excluded}
+                                  aria-label={t("analyze.includeInRun")}
+                                  onChange={() => toggleSampleExcluded(sample.id)}
+                                />
                                 <strong>
                                   {sample.frameIndex != null ? `#${sample.frameIndex}` : (sample.label || sample.id)}
                                 </strong>
-                                <label className="series-visibility">
-                                  <input
-                                    type="checkbox"
-                                    checked={!hidden}
-                                    onChange={() => toggleSampleVisibility(sample.id)}
-                                  />
-                                  <span>{t("analyze.seriesVisible")}</span>
-                                </label>
-                              </div>
+                              </label>
+                              <button
+                                type="button"
+                                className={`sample-eye${hidden ? " is-off" : ""}`}
+                                aria-pressed={!hidden}
+                                aria-label={t(hidden ? "analyze.showSeries" : "analyze.hideSeries")}
+                                title={t(hidden ? "analyze.showSeries" : "analyze.hideSeries")}
+                                onClick={() => toggleSampleVisibility(sample.id)}
+                              >
+                                {hidden ? <EyeOff size={14} /> : <Eye size={14} />}
+                              </button>
                             </li>
                           );
                         })}
@@ -529,6 +571,11 @@ export function AnalyzePage({
             onToggleExcludedResults={setShowExcludedResults}
             onOpenDiagnostics={onOpenDiagnostics}
             onOpenApplyDialog={openApplyDialog}
+            nextStep={
+              applyDone
+                ? { label: t("analyze.nextStep.kernel"), onClick: onOpenKernelTest }
+                : null
+            }
             onRefineAroundSelection={refineAroundHeight}
           />
 
@@ -543,7 +590,8 @@ export function AnalyzePage({
             submitting={submitting}
             runBlockedReason={runBlockedReason}
             onPatch={handleDraftPatch}
-            onSetPreset={handleSetPreset}
+            onSetPreset={setPreset}
+            work={work}
             onRun={startRun}
             metricSpecOpen={analyzeViewState(state).metricSpecOpen}
             onMetricSpecOpenChange={(open) => persistAnalyzeView({ metricSpecOpen: open })}
@@ -555,44 +603,22 @@ export function AnalyzePage({
         <ApplyGeometryDialog
           t={t}
           busy={applyBusy}
-          axisMode={draft.axisMode}
+          axisMode={applyAxisMode}
           sourceWidth={applySourceDims.width}
           sourceHeight={applySourceDims.height}
           initialSrcHeight={
-            applySelection != null && draft.axisMode !== "w_only" ? Number(applySelection) : null
+            applySelection != null && applyAxisMode !== "w_only" ? Number(applySelection.height) : null
           }
           initialSrcWidth={
-            applySelection != null && draft.axisMode === "w_only" ? Number(applySelection) : null
+            applySelection != null && applyAxisMode === "w_only" ? Number(applySelection.height) : null
           }
+          initialBaseHeightMode={applyRunConfig?.baseHeightMode ?? draft.baseHeightMode}
+          initialBaseWidthMode={applyRunConfig?.baseWidthMode ?? draft.baseWidthMode}
+          kernelLabel={applyRunConfig?.kernel ? kernelRefLabel(t, applyRunConfig.kernel) : null}
+          fromRun={applyRunConfig !== null}
           onCancel={() => setApplyDialogOpen(false)}
           onConfirm={handleApplyGeometry}
         />
-      ) : null}
-      {fractionalWarningAxis ? (
-        <Modal
-          onClose={() => setFractionalWarningAxis(null)}
-          title={t("analyze.fractionalBaseWarning.title")}
-          closeLabel={t("common.close")}
-          actions={
-            <button
-              className="primary-button"
-              type="button"
-              onClick={() => setFractionalWarningAxis(null)}
-            >
-              {t("analyze.fractionalBaseWarning.action")}
-            </button>
-          }
-        >
-          <p>
-            {t("analyze.fractionalBaseWarning.body", {
-              base: t(
-                fractionalWarningAxis === "width"
-                  ? "analyze.baseWidth"
-                  : "analyze.baseHeight",
-              ),
-            })}
-          </p>
-        </Modal>
       ) : null}
     </div>
   );

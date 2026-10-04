@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Check, SlidersHorizontal } from "lucide-react";
+import { ArrowRight, Check, SlidersHorizontal } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
 import type {
@@ -42,6 +42,7 @@ export function KernelAnalyzePanel({
   onInheritMetricChange,
   inheritedMetric,
   onOpenDiagnostics,
+  onOpenVerify,
   onProjectChange,
   executionBridge,
   metricSpecOpen,
@@ -63,6 +64,8 @@ export function KernelAnalyzePanel({
   onInheritMetricChange: (value: boolean) => void;
   inheritedMetric: MetricSpec;
   onOpenDiagnostics: () => void;
+  /** Handoff to Check, offered once a kernel was set on the Recipe. */
+  onOpenVerify: () => void;
   onProjectChange: (updater: (state: ProjectState) => ProjectState) => void;
   executionBridge: ExecutionBridge;
   metricSpecOpen: boolean;
@@ -70,6 +73,7 @@ export function KernelAnalyzePanel({
   onPersistMetric: (metric: MetricSpec) => void;
 }) {
   const [applyNotice, setApplyNotice] = useState("");
+  const [kernelApplied, setKernelApplied] = useState(false);
   const { submitting, notice: submitNotice, submit: submitRunGroup } = useRunGroupSubmit();
   /** Samples excluded from the kernel test (default: every included sample). */
   const [excludedSampleIds, setExcludedSampleIds] = useState<Set<string>>(new Set());
@@ -142,6 +146,7 @@ export function KernelAnalyzePanel({
     const next = result.state;
     onProjectChange(() => next);
     setApplyNotice(t("recipe.applied", { name: result.recipe.name }));
+    setKernelApplied(true);
     return result.recipe;
   }
 
@@ -182,6 +187,7 @@ export function KernelAnalyzePanel({
   function startRun() {
     if (!plan) return;
     setApplyNotice("");
+    setKernelApplied(false);
     void submitRunGroup(
       () =>
         startKernelRunGroup({
@@ -195,7 +201,9 @@ export function KernelAnalyzePanel({
         submitted: (result) =>
           t("analyze.runSubmitted", {
             submitted: String(result.submitted),
-            failedNote: result.failed > 0 ? `, ${result.failed} failed` : "",
+            failedNote: result.failed > 0
+              ? t("analyze.runFailedNote", { count: String(result.failed) })
+              : "",
           }),
         failed: (detail) => t("analyze.submitFailed", { detail }),
       },
@@ -281,7 +289,7 @@ export function KernelAnalyzePanel({
         />
 
         <div className="analyze-table-host">
-          <div className="analyze-table-toolbar">
+          <div className="analyze-table-toolbar is-sticky">
             <h3>{t("analyze.resultsTable")}</h3>
             {excludedResultsAvailable ? (
               <label className="series-visibility analyze-excluded-toggle">
@@ -306,6 +314,12 @@ export function KernelAnalyzePanel({
                 <Check size={14} strokeWidth={2.4} />
                 {t("analyze.k.setRecipeKernel")}
               </button>
+              {kernelApplied && applyNotice ? (
+                <button className="primary-button next-step-button" type="button" onClick={onOpenVerify}>
+                  {t("analyze.nextStep.verify")}
+                  <ArrowRight size={14} />
+                </button>
+              ) : null}
             </div>
           </div>
           {resultSamples.length > 1 ? (

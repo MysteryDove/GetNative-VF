@@ -521,6 +521,9 @@ Filter parse_filter(const JsonValue &kernel) {
         if (!std::isfinite(blur) || blur <= 0.0) {
             throw WorkerError("bad_request", "blur must be finite and greater than zero");
         }
+        if (blur > maximum_filter_blur) {
+            throw WorkerError("bad_request", "blur must not exceed 16");
+        }
     }
     if (id == "bilinear") return Filter::bilinear(blur);
     if (id == "spline16") return Filter::spline16(blur);

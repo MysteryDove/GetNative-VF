@@ -11,8 +11,11 @@ import {
 } from "../engine/kernelPlotDensity";
 import { useElementSize } from "../hooks/useElementSize";
 import { plotSeriesColor } from "./ErrorLinePlot";
+import { formatParameterValue } from "../engine/numberInput";
 
-const MAX_CATEGORIES = 120;
+// Density compresses to 4px per kernel and scrolls beyond that; the cap only
+// bounds SVG node count for very large grids.
+const MAX_CATEGORIES = 1024;
 const PLOT_HEIGHT = 300;
 
 function kernelCategoryKey(row: KernelResultRow): string {
@@ -26,7 +29,7 @@ function kernelCategoryKey(row: KernelResultRow): string {
 function kernelTickLines(row: KernelResultRow): string[] {
   const parameters = Object.entries(row.parameters)
     .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }))
-    .map(([key, value]) => `${key}=${String(value)}`);
+    .map(([key, value]) => `${key}=${formatParameterValue(value)}`);
   return [row.kernelId, ...parameters];
 }
 
@@ -92,6 +95,7 @@ export function KernelMetricPlot({
     return {
       categories,
       series: [...seriesByRun.values()],
+      total: allCategories.length,
       truncated: allCategories.length > categories.length,
     };
   }, [rows]);
@@ -342,7 +346,10 @@ export function KernelMetricPlot({
       </div>
       {model.truncated ? (
         <p className="help-copy">
-          {t("analyze.k.metricPlotTruncated", { count: String(model.categories.length) })}
+          {t("analyze.k.metricPlotTruncated", {
+            count: String(model.categories.length),
+            total: String(model.total),
+          })}
         </p>
       ) : null}
     </section>

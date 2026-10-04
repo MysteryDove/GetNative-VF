@@ -12,6 +12,8 @@ import type { KernelAnalyzeRequest, GeometrySnapshot, MetricSpec } from "./proto
 import { metricCompatibilityKey, type PlanSample, type PlanSource } from "./runGroupPlan";
 import type { ProjectState, Run, RunGroup } from "../project/types";
 
+import { kernelParametersText } from "./displayNames";
+
 export type KernelRunGroupType = "single_kernel" | "multi_sample_kernel";
 
 export type PlannedKernelMember = {
@@ -297,7 +299,7 @@ export function buildKernelResultRows(
     if (!extracted) continue;
     const sample = run.sampleId ? state.samplesById[run.sampleId] : null;
     for (const row of extracted) {
-      const params = Object.entries(row.parameters);
+      const parametersText = kernelParametersText(row.parameters);
       rows.push({
         candidateId: row.candidateId,
         runId: run.id,
@@ -305,9 +307,7 @@ export function buildKernelResultRows(
         kernelId: row.kernelId,
         // Engine echoes the parameters we sent (string | number | boolean).
         parameters: { ...row.parameters } as KernelRef["parameters"],
-        kernelLabel: params.length
-          ? `${row.kernelId} (${params.map(([key, value]) => `${key}=${value}`).join(", ")})`
-          : row.kernelId,
+        kernelLabel: parametersText ? `${row.kernelId} (${parametersText})` : row.kernelId,
         metric: row.metric,
         sampleLabel: sample?.label ?? run.sampleId ?? "—",
       });

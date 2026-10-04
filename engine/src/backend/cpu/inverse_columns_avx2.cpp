@@ -104,7 +104,7 @@ double absolute_difference_norm1_avx2_f32(
             sign, _mm256_sub_ps(_mm256_loadu_ps(source + x),
                                 _mm256_loadu_ps(reconstruction + x)));
         difference = _mm256_and_ps(
-            difference, _mm256_cmp_ps(difference, threshold_values, _CMP_GT_OQ));
+            difference, _mm256_cmp_ps(difference, threshold_values, _CMP_NLE_UQ));
         sum = add_norm1_lanes(_mm256_castps256_ps128(difference), sum);
         sum = add_norm1_lanes(_mm256_extractf128_ps(difference, 1), sum);
     }
@@ -151,7 +151,7 @@ double vertical_reconstruction_norm1_avx2_f32(
         __m256 difference = _mm256_andnot_ps(
             sign, _mm256_sub_ps(_mm256_loadu_ps(source + x), reconstructed));
         difference = _mm256_and_ps(
-            difference, _mm256_cmp_ps(difference, threshold_values, _CMP_GT_OQ));
+            difference, _mm256_cmp_ps(difference, threshold_values, _CMP_NLE_UQ));
         sum = add_norm1_lanes(_mm256_castps256_ps128(difference), sum);
         sum = add_norm1_lanes(_mm256_extractf128_ps(difference, 1), sum);
     }

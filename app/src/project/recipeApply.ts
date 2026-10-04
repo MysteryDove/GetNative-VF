@@ -7,6 +7,7 @@ import {
   type RecipeOpResult,
   type RecipePayloadPatch,
 } from "./recipe";
+import { formatParameterValue } from "../engine/numberInput";
 
 /**
  * Apply an analysis-side payload (geometry/kernel/metric/…) to the current
@@ -106,7 +107,7 @@ export function derivedRecipeName(recipe: Recipe, labels: ApplyLabels): string |
   if (recipe.kernel?.id) {
     const params = Object.entries(recipe.kernel.parameters ?? {});
     kernel = params.length
-      ? `${recipe.kernel.id}(${params.map(([key, value]) => `${key}=${value}`).join(",")})`
+      ? `${recipe.kernel.id}(${params.map(([key, value]) => `${key}=${formatParameterValue(value)}`).join(",")})`
       : recipe.kernel.id;
   }
   return `${size}-${kernel}`;

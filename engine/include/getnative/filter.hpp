@@ -13,6 +13,10 @@ enum class KernelType : std::uint8_t {
     spline64,
 };
 
+// Largest accepted kernel blur. Support, plan size and factorization cost all
+// scale with blur, so an unbounded value turns a typo into gigabytes per plan.
+inline constexpr double maximum_filter_blur = 16.0;
+
 struct Filter {
     KernelType type = KernelType::bicubic;
     double b = 0.0;

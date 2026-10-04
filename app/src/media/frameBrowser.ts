@@ -12,7 +12,7 @@ export type FrameStepAction =
 
 /**
  * Keyboard map for the silent frame browser.
- * Arrow keys step frames; [ ] step keyframes; Home/End jump ends.
+ * Arrow keys step frames; Shift+Arrow or [ ] step keyframes; Home/End jump ends.
  * Inputs that are currently focused should not use this helper.
  */
 export function frameStepFromKeyboard(
@@ -21,10 +21,12 @@ export function frameStepFromKeyboard(
 ): FrameStepAction | null {
   switch (key) {
     case "ArrowLeft":
+      return { type: options?.shiftKey ? "previousKeyframe" : "previousFrame" };
+    case "ArrowRight":
+      return { type: options?.shiftKey ? "nextKeyframe" : "nextFrame" };
     case "j":
     case "J":
       return { type: "previousFrame" };
-    case "ArrowRight":
     case "k":
     case "K":
       return { type: "nextFrame" };

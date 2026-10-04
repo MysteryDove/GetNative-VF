@@ -189,7 +189,12 @@ describe("kernel scan list", () => {
       id: "bicubic",
       parameters: { b: 0, c: 0.5 },
     });
-    expect(bicubicRefFromDraft({ ...draft(), bicubicB: "-1" })).toBeNull();
+    expect(bicubicRefFromDraft({ ...draft(), bicubicB: "-1" })?.parameters.b).toBe(-1);
+    expect(bicubicRefFromDraft({ ...draft(), bicubicB: "1/3", bicubicC: "1/3" })).toEqual({
+      id: "bicubic",
+      parameters: { b: 1 / 3, c: 1 / 3 },
+    });
+    expect(bicubicRefFromDraft({ ...draft(), bicubicB: "1/0" })).toBeNull();
     expect(bicubicRefFromDraft({ ...draft(), bicubicC: "" })).toBeNull();
   });
 

@@ -4,6 +4,7 @@
 #include <clocale>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -89,6 +90,20 @@ void test_parse_finite_double() {
     }
 }
 
+void test_non_finite_numbers_serialize_as_null() {
+    expect(JsonValue::number(1.5).type == JsonValue::Type::number, "finite stays a number");
+    for (const double value : {std::numeric_limits<double>::infinity(),
+                               -std::numeric_limits<double>::infinity(),
+                               std::numeric_limits<double>::quiet_NaN()}) {
+        expect(JsonValue::number(value).is_null(), "non-finite number becomes null");
+    }
+    const JsonValue object = JsonValue::object({
+        {"error", JsonValue::number(std::numeric_limits<double>::infinity())},
+    });
+    expect(parse_json(object.dump()).find("error")->is_null(),
+           "non-finite member round-trips as valid JSON null");
+}
+
 void test_rejections() {
     expect_throws([] { (void)parse_json(""); }, "empty input rejected");
     expect_throws([] { (void)parse_json("{} extra"); }, "trailing rejected");
@@ -109,6 +124,7 @@ int main() {
         test_roundtrip();
         test_parse_finite_double();
         test_rejections();
+        test_non_finite_numbers_serialize_as_null();
     } catch (const std::exception& error) {
         std::cerr << "json test failed: " << error.what() << '\n';
         return EXIT_FAILURE;

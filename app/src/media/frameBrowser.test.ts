@@ -22,6 +22,14 @@ describe("GUI-2 frame browser contracts", () => {
       frameStepFromKeyboard("ArrowUp", { shiftKey: true })?.type === "previousKeyframe",
       "shift+up",
     );
+    assert(
+      frameStepFromKeyboard("ArrowLeft", { shiftKey: true })?.type === "previousKeyframe",
+      "shift+left",
+    );
+    assert(
+      frameStepFromKeyboard("ArrowRight", { shiftKey: true })?.type === "nextKeyframe",
+      "shift+right",
+    );
     assert(frameStepFromKeyboard("a") === null, "unrelated key");
   });
 

@@ -42,7 +42,9 @@ struct Sse2Operations {
 
 [[nodiscard]] double add_norm1_lanes(
     __m128 difference, __m128 threshold, double sum) noexcept {
-    difference = _mm_and_ps(difference, _mm_cmpgt_ps(difference, threshold));
+    // not-less-or-equal: same as "greater" for ordered lanes, and keeps NaN
+    // so a non-finite pixel poisons the sum instead of vanishing.
+    difference = _mm_and_ps(difference, _mm_cmpnle_ps(difference, threshold));
     sum += static_cast<double>(_mm_cvtss_f32(difference));
     difference = _mm_shuffle_ps(difference, difference, _MM_SHUFFLE(0, 3, 2, 1));
     sum += static_cast<double>(_mm_cvtss_f32(difference));

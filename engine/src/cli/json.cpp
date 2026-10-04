@@ -8,6 +8,11 @@
 namespace getnative::cli {
 
 JsonValue JsonValue::number(double value, std::string raw) {
+    if (raw.empty() && !std::isfinite(value)) {
+        // JSON has no inf/nan literal; a non-finite measurement is reported as
+        // null, the same shape consumers already treat as "no value".
+        return JsonValue{};
+    }
     JsonValue result;
     result.type = Type::number;
     result.number_value = value;

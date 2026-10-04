@@ -30,13 +30,16 @@ export function useFileDrop(onPaths: (paths: string[]) => void, enabled = true):
     let unlisten: (() => void | Promise<void>) | undefined;
     getCurrentWebview()
       .onDragDropEvent((event) => {
-        if (event.payload.type === "enter" || event.payload.type === "over") {
-          setDropActive(true);
+        // The webview reports every drag, including in-page ones (dragging
+        // the timeline, an image, selected text). Only a drag that entered
+        // carrying file paths is an import; "over" never starts one.
+        if (event.payload.type === "enter") {
+          setDropActive(event.payload.paths.length > 0);
         } else if (event.payload.type === "leave") {
           setDropActive(false);
         } else if (event.payload.type === "drop") {
           setDropActive(false);
-          onPathsRef.current(event.payload.paths);
+          if (event.payload.paths.length > 0) onPathsRef.current(event.payload.paths);
         }
       })
       .then((stop) => {

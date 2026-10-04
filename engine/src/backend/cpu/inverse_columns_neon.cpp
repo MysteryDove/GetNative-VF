@@ -454,7 +454,9 @@ void forward_rows_neon_impl(
 
 [[nodiscard]] double add_norm1_lanes(
     float32x4_t difference, float32x4_t threshold, double sum) noexcept {
-    const uint32x4_t mask = vcgtq_f32(difference, threshold);
+    // not(<=): same as "greater" for ordered lanes, and keeps NaN so a
+    // non-finite pixel poisons the sum instead of vanishing.
+    const uint32x4_t mask = vmvnq_u32(vcleq_f32(difference, threshold));
     const float32x4_t masked = vreinterpretq_f32_u32(
         vandq_u32(vreinterpretq_u32_f32(difference), mask));
     sum += static_cast<double>(vgetq_lane_f32(masked, 0));

@@ -76,9 +76,15 @@ public:
         : metric_(metric) {}
 
     void add(float difference) {
-        if (!(difference > metric_.threshold)) {
+        // Written as "skip when <= threshold" so a NaN difference is kept and
+        // poisons the sum: a non-finite pixel must surface as a non-finite
+        // error, never as a silently smaller one.
+        if (difference <= metric_.threshold) {
             return;
         }
+        // p <= 4 moments stay Float32 products by contract (bit-identical
+        // raster-order accumulation); an out-of-range pixel that overflows
+        // them yields a non-finite error, which is reported as no value.
         if (metric_.norm == 1U) {
             sum_ += static_cast<double>(difference);
         } else if (metric_.norm == 2U) {
@@ -114,6 +120,13 @@ public:
 private:
     void add_scaled(double difference) {
         const double exponent = static_cast<double>(metric_.norm);
+        if (!std::isfinite(difference)) {
+            // The scaled form compares against the running maximum, which
+            // would drop NaN; keep it visible in the result instead.
+            scaled_sum_ = std::numeric_limits<double>::quiet_NaN();
+            scale_ = 1.0;
+            return;
+        }
         if (difference > scale_) {
             if (scale_ != 0.0) {
                 scaled_sum_ *= std::pow(scale_ / difference, exponent);

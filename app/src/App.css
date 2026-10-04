@@ -5437,3 +5437,95 @@ input {
     transition: none;
   }
 }
+
+/* ---- Workflow feedback pass: pinned actions, run labels, sample toggles ---- */
+
+/* The launch block stays reachable however long the parameter form grows. */
+.analyze-params .analyze-run-block {
+  position: sticky;
+  /* Offsets cancel the pane padding so nothing scrolls into view beyond the block. */
+  bottom: -12px;
+  z-index: 2;
+  margin: 10px -12px -12px;
+  padding: 10px 12px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.analyze-run-summary {
+  color: var(--text-faint);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Apply / Set-as-Recipe actions stay visible while results scroll beneath. */
+.analyze-plot > .analyze-plot-toolbar,
+.analyze-table-toolbar.is-sticky {
+  position: sticky;
+  top: -12px;
+  z-index: 3;
+  padding: 6px 0;
+  background: var(--surface);
+}
+
+.analyze-table-toolbar.is-sticky {
+  margin: 0 -10px;
+  padding: 6px 10px;
+  background: var(--table-host-bg);
+}
+
+.next-step-button {
+  height: 28px;
+  gap: 6px;
+}
+
+.height-results-filters .button-radio button {
+  max-width: 460px;
+}
+
+.run-filter-summary {
+  margin-left: 6px;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.analyze-sample-list li.height-sample-row {
+  grid-template-columns: minmax(0, 1fr) 24px;
+  align-items: center;
+}
+
+.sample-eye {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  color: var(--control-text);
+  background: transparent;
+  cursor: pointer;
+}
+
+.sample-eye:hover {
+  background: var(--surface-hover);
+}
+
+.sample-eye.is-off {
+  color: var(--text-disabled);
+}
+
+.analyze-params .block select + input {
+  margin-top: 4px;
+}
+
+.job-error {
+  max-width: 320px;
+  overflow: hidden;
+  color: var(--danger);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

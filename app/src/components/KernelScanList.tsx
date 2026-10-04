@@ -3,7 +3,7 @@ import { Plus } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
 import type { KernelRef } from "../engine/protocol";
-import { kernelDisplayName } from "../engine/displayNames";
+import { kernelDisplayName, kernelRefLabel } from "../engine/displayNames";
 import {
   addBicubicGridToScanList,
   addKernelsToScanList,
@@ -27,10 +27,7 @@ function AddKernelsButton({ t, onClick }: { t: Translator; onClick: () => void }
 }
 
 function kernelChipLabel(t: Translator, kernel: KernelRef): string {
-  const name = kernelDisplayName(t, kernel.id);
-  const params = Object.entries(kernel.parameters);
-  if (!params.length) return name;
-  return `${name} (${params.map(([key, value]) => `${key}=${value}`).join(", ")})`;
+  return kernelRefLabel(t, kernel);
 }
 
 /**
@@ -69,6 +66,12 @@ export function KernelScanList({
       const familyOrder = (familyA < 0 ? KERNEL_FAMILY_ORDER.length : familyA) -
         (familyB < 0 ? KERNEL_FAMILY_ORDER.length : familyB);
       if (familyOrder !== 0) return familyOrder;
+      // Numeric parameter order (b, then c, …): label order would put 1 before 1/3.
+      const keys = [...new Set([...Object.keys(a.kernel.parameters), ...Object.keys(b.kernel.parameters)])];
+      for (const key of keys) {
+        const difference = Number(a.kernel.parameters[key] ?? 0) - Number(b.kernel.parameters[key] ?? 0);
+        if (Number.isFinite(difference) && difference !== 0) return difference;
+      }
       return kernelChipLabel(t, a.kernel).localeCompare(kernelChipLabel(t, b.kernel), undefined, {
         numeric: true,
         sensitivity: "base",
@@ -248,6 +251,7 @@ export function KernelScanListBuilder({
                 <input
                   value={draft.bicubicB}
                   inputMode="decimal"
+                  title={t("analyze.fractionHint")}
                   onChange={(event) => patch({ bicubicB: event.target.value })}
                 />
               </label>
@@ -256,6 +260,7 @@ export function KernelScanListBuilder({
                 <input
                   value={draft.bicubicC}
                   inputMode="decimal"
+                  title={t("analyze.fractionHint")}
                   onChange={(event) => patch({ bicubicC: event.target.value })}
                 />
               </label>
@@ -280,13 +285,16 @@ export function KernelScanListBuilder({
                       <input
                         value={draft[key]}
                         inputMode="decimal"
+                        title={t("analyze.fractionHint")}
                         onChange={(event) => patch({ [key]: event.target.value })}
                       />
                     </label>
                   ))}
                 </div>
               ))}
-              <p className="help-copy">{t("analyze.k.gridEndpoints")}</p>
+              <p className="help-copy">
+                {t("analyze.k.gridEndpoints")} {t("analyze.fractionHint")}
+              </p>
               <button
                 className="kernel-add-button"
                 type="button"

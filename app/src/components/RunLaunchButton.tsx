@@ -13,11 +13,14 @@ export function RunLaunchButton(props: {
   submitting: boolean;
   label: string;
   blockedReason?: string | null;
+  /** Size of the pending run (candidates, work), shown above the button. */
+  summary?: string | null;
   onClick: () => void;
 }): JSX.Element {
-  const { t, disabled, submitting, label, blockedReason, onClick } = props;
+  const { t, disabled, submitting, label, blockedReason, summary, onClick } = props;
   return (
     <div className="analyze-run-block">
+      {summary ? <span className="analyze-run-summary">{summary}</span> : null}
       <button className="primary-button" type="button" disabled={disabled} onClick={onClick}>
         <Play size={15} />
         {submitting ? t("diagnostics.working") : label}

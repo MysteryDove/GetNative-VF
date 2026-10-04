@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -315,10 +316,69 @@ void test_invalid_blur_is_rejected() {
                                               getnative::BorderMode::mirror});
         }, "planner rejects nonpositive or nonfinite blur");
     }
+    auto over_limit = getnative::Filter::bicubic();
+    over_limit.blur = getnative::maximum_filter_blur;
+    expect(over_limit.effective_support() == 32, "blur at the limit is accepted");
+    over_limit.blur = std::nextafter(getnative::maximum_filter_blur, 100.0);
+    expect_throws([&] { (void)over_limit.effective_support(); },
+                  "blur above the limit is rejected");
+    expect_throws([&] {
+        (void)getnative::build_axis_plan({64, 48, 48.0, 0.0, over_limit,
+                                          getnative::BorderMode::mirror});
+    }, "planner rejects blur above the limit");
     auto too_wide = getnative::Filter::lanczos(15);
     too_wide.blur = static_cast<double>(std::numeric_limits<std::int32_t>::max());
     expect_throws<std::length_error>([&] { (void)too_wide.effective_support(); },
                                      "overflowing effective support is rejected");
+}
+
+// A non-finite source pixel must surface as a non-finite error on every norm
+// (fused SIMD p=1, small-power and scaled paths), never as a smaller one. An
+// out-of-range finite pixel may overflow the Float32 moments, but then it too
+// must read as non-finite rather than as a plausible small error.
+void test_metric_never_hides_non_finite_pixels() {
+    constexpr std::int32_t width = 40;
+    constexpr std::int32_t height = 24;
+    std::vector<float> clean(static_cast<std::size_t>(width * height));
+    for (std::size_t i = 0; i < clean.size(); ++i) {
+        clean[i] = static_cast<float>((i * 37U) % 101U) / 100.0F;
+    }
+    const getnative::AxisPlan horizontal = getnative::build_axis_plan(
+        {width, 30, 30.0, 0.0, getnative::Filter::bicubic(), getnative::BorderMode::mirror});
+    const getnative::AxisPlan vertical = getnative::build_axis_plan(
+        {height, 18, 18.0, 0.0, getnative::Filter::bicubic(), getnative::BorderMode::mirror});
+    const auto errors = [&](const std::vector<float> &pixels, std::uint32_t norm) {
+        const getnative::MetricSpec metric{1, 1, 1, 1, 0.001F, norm};
+        const getnative::ConstImageView view{pixels.data(), width, height, width};
+        getnative::CpuWorkspace workspace;
+        return std::array<double, 3>{
+            getnative::analyze_candidate_f32(view, horizontal, vertical, metric, workspace),
+            getnative::analyze_axis_candidate_f32(
+                view, horizontal, getnative::AnalysisAxes::horizontal, metric, workspace),
+            getnative::analyze_axis_candidate_f32(
+                view, vertical, getnative::AnalysisAxes::vertical, metric, workspace),
+        };
+    };
+    const std::size_t middle = static_cast<std::size_t>(12 * width + 20);
+    for (const std::uint32_t norm : {1U, 2U, 3U, 4U, 8U}) {
+        for (const double error : errors(clean, norm)) {
+            expect(std::isfinite(error), "finite source yields a finite error");
+        }
+        for (const float bad : {std::numeric_limits<float>::quiet_NaN(),
+                                std::numeric_limits<float>::infinity()}) {
+            std::vector<float> poisoned = clean;
+            poisoned[middle] = bad;
+            for (const double error : errors(poisoned, norm)) {
+                expect(!std::isfinite(error), "non-finite source pixel yields a non-finite error");
+            }
+        }
+        std::vector<float> huge = clean;
+        huge[middle] = 1.0e30F;
+        for (const double error : errors(huge, norm)) {
+            expect(!std::isfinite(error) || error > 1.0,
+                   "out-of-range pixel is either a large or a non-finite error");
+        }
+    }
 }
 
 void test_planner_weights_match_border_and_shift_oracle() {
@@ -730,6 +790,7 @@ int main() {
         test_kernel_values_and_support();
         test_blur_support_weights_unity_and_cache_key();
         test_invalid_blur_is_rejected();
+        test_metric_never_hides_non_finite_pixels();
         test_planner_weights_match_border_and_shift_oracle();
         test_banded_inverse_matches_dense_reference();
         test_forward_inverse_roundtrip();
