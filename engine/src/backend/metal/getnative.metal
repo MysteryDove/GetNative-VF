@@ -46,7 +46,26 @@ struct LumaNormalizeJob {
     uint height;
     uint bit_depth;
     uint full_range;
+    uint transfer;
 };
+
+// Linear-light hypothesis (getnative/transfer.hpp). `nominal` is already on
+// nominal 0..1 with studio-range excursions kept; transfer 0 returns it as is,
+// a curve clamps negatives to zero first.
+static inline float luma_to_linear(float nominal, uint transfer) {
+    if (transfer == 0u) return nominal;
+    const float encoded = max(nominal, 0.0f);
+    if (transfer == 1u) return pow(encoded, 2.2f);
+    if (transfer == 2u) return pow(encoded, 2.4f);
+    if (transfer == 3u) {
+        return encoded <= 0.04045f
+            ? encoded / 12.92f
+            : pow((encoded + 0.055f) / 1.055f, 2.4f);
+    }
+    return encoded < 0.081f
+        ? encoded / 4.5f
+        : pow((encoded + 0.099f) / 1.099f, 1.0f / 0.45f);
+}
 
 kernel void normalize_luma_r8(
     texture2d<float, access::read> source [[texture(0)]],
@@ -55,8 +74,8 @@ kernel void normalize_luma_r8(
     uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= job.width || gid.y >= job.height) return;
     float value = source.read(gid).r;
-    if (job.full_range == 0u) value = max(0.0f, (value * 255.0f - 16.0f) / 219.0f);
-    destination[gid.y * job.width + gid.x] = clamp(value, 0.0f, 1.0f);
+    if (job.full_range == 0u) value = (value * 255.0f - 16.0f) / 219.0f;
+    destination[gid.y * job.width + gid.x] = luma_to_linear(value, job.transfer);
 }
 
 kernel void normalize_luma_r16(
@@ -71,8 +90,8 @@ kernel void normalize_luma_r16(
     float stored = source.read(gid).r * 65535.0f;
     float code10 = stored / 64.0f;
     float value = code10 / 1023.0f;
-    if (job.full_range == 0u) value = max(0.0f, (code10 - 64.0f) / 876.0f);
-    destination[gid.y * job.width + gid.x] = clamp(value, 0.0f, 1.0f);
+    if (job.full_range == 0u) value = (code10 - 64.0f) / 876.0f;
+    destination[gid.y * job.width + gid.x] = luma_to_linear(value, job.transfer);
 }
 
 kernel void transpose_source(

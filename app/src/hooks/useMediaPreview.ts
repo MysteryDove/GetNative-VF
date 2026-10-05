@@ -269,6 +269,8 @@ export function useMediaPreview({
 
   const scrubVideoFrame = useCallback((source: Source, frameIndex: number) => {
     setScrubFrame(frameIndex);
+    // The frame number field follows the drag, not just the committed frame.
+    setFrameInput(String(frameIndex));
     scrubPending.current = { source, frameIndex };
     if (scrubTimer.current !== null) return;
     const elapsed = Date.now() - scrubLastFire.current;

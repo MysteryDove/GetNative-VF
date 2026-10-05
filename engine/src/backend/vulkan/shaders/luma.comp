@@ -10,6 +10,26 @@ layout(push_constant, std430) uniform PushConstants {
     uint value[32];
 } pc;
 
+// getnative/transfer.hpp: studio range is always stretched to nominal 0..1
+// (excursions kept), then decoded with the requested curve when one is set.
+float to_linear(float normalized, uint transfer, uint limited_range) {
+    float encoded = limited_range != 0U
+        ? (normalized * (65535.0 / 256.0) - 16.0) / 219.0
+        : normalized;
+    if (transfer == 0U) return encoded;
+    encoded = max(encoded, 0.0);
+    if (transfer == 1U) return pow(encoded, 2.2);
+    if (transfer == 2U) return pow(encoded, 2.4);
+    if (transfer == 3U) {
+        return encoded <= 0.04045
+            ? encoded / 12.92
+            : pow((encoded + 0.055) / 1.055, 2.4);
+    }
+    return encoded < 0.081
+        ? encoded / 4.5
+        : pow((encoded + 0.099) / 1.099, 1.0 / 0.45);
+}
+
 void main() {
     const uint x = gl_GlobalInvocationID.x;
     const uint y = gl_GlobalInvocationID.y;
@@ -19,13 +39,16 @@ void main() {
 
     const uint bit_depth = pc.value[13];
     const uint normalized_bits = pc.value[14];
+    const uint transfer = pc.value[15];
+    const uint limited_range = pc.value[16];
     const float sampled = texelFetch(luma_image, ivec2(x, y), 0).r;
     if (normalized_bits > 8U) {
-        source_data[y * width + x] = sampled;
+        source_data[y * width + x] = to_linear(sampled, transfer, limited_range);
         return;
     }
     const float normalized_max = exp2(float(normalized_bits)) - 1.0;
     const float code = round(sampled * normalized_max);
     const float alignment = exp2(float(16U - bit_depth));
-    source_data[y * width + x] = code * alignment / 65535.0;
+    source_data[y * width + x] =
+        to_linear(code * alignment / 65535.0, transfer, limited_range);
 }

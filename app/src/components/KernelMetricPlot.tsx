@@ -52,7 +52,7 @@ function seriesPath(
   }).filter(Boolean).join(" ");
 }
 
-/** Categorical, log-scale line plot for Algorithm Test results. */
+/** Categorical, log-scale line plot for Kernel Search results. */
 export function KernelMetricPlot({
   t,
   rows,

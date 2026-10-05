@@ -180,10 +180,9 @@ describe("Results deletion state", () => {
     const withoutFirst = removeRunFromState(state, "first");
     const afterLast = removeRunFromState(withoutFirst, "second");
     expect(nextHistoryFilters(
-      { runGroupFilter: "group", sourceFilter: "all" },
+      { runGroupFilter: ["group"], sourceFilter: [] },
       afterLast,
-      { kind: "run", run: withoutFirst.runsById.second },
-    )).toEqual({ runGroupFilter: "all", sourceFilter: "all" });
+    )).toEqual({ runGroupFilter: [], sourceFilter: [] });
   });
 
   it("does not delete queued or running data", () => {

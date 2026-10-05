@@ -1528,6 +1528,65 @@ def main():
             "kernel-blur-replay", frame, ["200"], kernel=blur_rows[1]["kernel"]))
         check("kernel-blur-round-trip", replay["payload"]["candidates"][0]["error"] == blur_rows[1]["error"])
 
+        # Linear-light hypothesis: the frame is decoded with the requested
+        # transfer before analysis. "none" is the default path bit-for-bit,
+        # a real curve changes the measurement and is echoed for provenance.
+        def transfer_run(request_id, transfer, asset_range=None):
+            asset = {"path": frame, "format": "f32le", "width": 320, "height": 240}
+            if asset_range is not None:
+                asset["range"] = asset_range
+            command = {
+                "protocol_version": 1, "type": "analyze", "request_id": request_id,
+                "mode": "kernel", "backend": "cpu",
+                "frame_asset": asset,
+                "axis_mode": "h_only", "candidate": "200",
+                "kernels": [{"id": "spline16"}, {"id": "bilinear"}],
+                "metric": {"p_norm": 1, "threshold": 0}}
+            if transfer is not None:
+                command["transfer"] = transfer
+            return run_analyze(worker, command)
+        plain = transfer_run("transfer-default", None)
+        explicit_none = transfer_run("transfer-none", "none")
+        linear = transfer_run("transfer-bt1886", "bt1886")
+        srgb = transfer_run("transfer-srgb", "srgb")
+        errors = lambda event: [row["error"] for row in event["payload"]["candidates"]]
+        check("transfer-none-is-default", plain["type"] == "result"
+              and errors(plain) == errors(explicit_none)
+              and "transfer" not in plain["payload"] and "transfer" not in explicit_none["payload"])
+        check("transfer-changes-measurement", linear["type"] == "result"
+              and errors(linear) != errors(plain) and errors(srgb) != errors(linear),
+              json.dumps([errors(plain), errors(linear), errors(srgb)]))
+        check("transfer-echo", linear["payload"].get("transfer") == "bt1886"
+              and srgb["payload"].get("transfer") == "srgb")
+        again = transfer_run("transfer-default-again", None)
+        check("transfer-does-not-leak-into-cached-frame", errors(again) == errors(plain))
+        # Studio-range video must be stretched before the curve: the same
+        # asset declared limited measures differently and echoes its range.
+        limited = transfer_run("transfer-limited", "bt1886", "limited")
+        check("transfer-range-changes-measurement", limited["type"] == "result"
+              and errors(limited) != errors(linear)
+              and limited["payload"].get("transfer_range") == "limited"
+              and linear["payload"].get("transfer_range") == "full",
+              json.dumps([errors(linear), errors(limited)]))
+        # Studio range is stretched with or without a curve, so every backend
+        # measures nominal 0..1 samples.
+        limited_plain = transfer_run("transfer-limited-none", None, "limited")
+        check("limited-range-is-stretched-without-a-curve",
+              limited_plain["type"] == "result"
+              and errors(limited_plain) != errors(plain)
+              and "transfer" not in limited_plain["payload"]
+              and limited_plain["payload"].get("transfer_range") == "limited"
+              and "transfer_range" not in plain["payload"],
+              json.dumps([errors(plain), errors(limited_plain)]))
+        check("sample-scale-echo", plain["payload"].get("sample_scale") == "nominal"
+              and limited_plain["payload"].get("sample_scale") == "nominal")
+        bad_range = transfer_run("transfer-bad-range", "bt1886", "tv")
+        check("transfer-bad-range-rejected", bad_range["type"] == "error"
+              and bad_range.get("code") == "bad_request", json.dumps(bad_range)[:200])
+        unknown = transfer_run("transfer-unknown", "pq")
+        check("transfer-unknown-rejected", unknown["type"] == "error"
+              and unknown.get("code") == "bad_request", json.dumps(unknown)[:200])
+
         # Duplicate kernel specs get distinct index ids but one shared plan.
         dup_result = run_analyze(worker, {
             "protocol_version": 1, "type": "analyze", "request_id": "k3",

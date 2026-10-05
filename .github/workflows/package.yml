@@ -3,6 +3,10 @@ name: Package
 on:
   push:
     tags: ['v*']
+  # Weekly build-only run: the CUDA, Vulkan and bundling steps exist only in
+  # this workflow, so breakage would otherwise surface at release time.
+  schedule:
+    - cron: '17 3 * * 1'
   workflow_dispatch:
     inputs:
       draft_release:
@@ -30,6 +34,7 @@ jobs:
   version:
     name: Validate release version
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.versions.outputs.release_version }}
       tag: ${{ steps.tag.outputs.tag }}
@@ -55,7 +60,7 @@ jobs:
               exit 1
             fi
           fi
-          if [[ -n "$tag" && ! "$tag" =~ ^v[0-9] ]]; then
+          if [[ -n "$tag" && ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
             echo "Tag must look like v0.2.2, got: $tag" >&2
             exit 1
           fi
@@ -69,14 +74,17 @@ jobs:
           node-version: 22
       - name: Check synchronized versions
         id: versions
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          node scripts/check-release-version.mjs "${{ steps.tag.outputs.tag }}" \
+          node scripts/check-release-version.mjs "$RELEASE_TAG" \
             | tee -a "$GITHUB_OUTPUT"
 
   linux-package:
     name: Linux x64 package
     needs: version
     runs-on: ubuntu-22.04
+    timeout-minutes: 150
     env:
       SCCACHE_GHA_ENABLED: "true"
     steps:
@@ -146,7 +154,9 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: app/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable # tracks current stable Rust by design
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -562,6 +572,7 @@ jobs:
     name: Windows x64 package
     needs: version
     runs-on: windows-2022
+    timeout-minutes: 180
     env:
       SCCACHE_GHA_ENABLED: "true"
     steps:
@@ -669,8 +680,9 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: app/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable # tracks current stable Rust by design
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
+          toolchain: stable
           targets: x86_64-pc-windows-msvc
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
@@ -906,6 +918,7 @@ jobs:
     name: macOS arm64 package
     needs: version
     runs-on: macos-15
+    timeout-minutes: 120
     env:
       SCCACHE_GHA_ENABLED: "true"
       GETNATIVE_FFMPEG_ROOT: ${{ github.workspace }}/.deps/ffmpeg-macos-arm64
@@ -943,8 +956,9 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: app/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable # tracks current stable Rust by design
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
+          toolchain: stable
           targets: aarch64-apple-darwin
       - name: Verify packaged Rust toolchain
         shell: bash
@@ -1083,6 +1097,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' && inputs.draft_release)
     needs: [version, linux-package, windows-package, macos-package]
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:

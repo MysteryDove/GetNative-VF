@@ -16,11 +16,16 @@ export function kernelDisplayName(t: Translator, id: string): string {
 }
 
 /** `b=1/3, c=1/3` — parameters in stored order; a default blur of 1 is omitted. */
+const KERNEL_PARAMETER_KEYS = new Set(["b", "c", "taps", "blur"]);
+
 export function kernelParametersText(
   parameters: Record<string, unknown> | undefined,
   separator = ", ",
 ): string {
   return Object.entries(parameters ?? {})
+    // Runs recorded by earlier builds can carry capability descriptors
+    // (`kind`, `finite`, limits) next to the real kernel parameters.
+    .filter(([key]) => KERNEL_PARAMETER_KEYS.has(key))
     .filter(([key, value]) => !(key === "blur" && Number(value) === 1))
     .map(([key, value]) => `${key}=${formatParameterValue(value as string | number | boolean)}`)
     .join(separator);

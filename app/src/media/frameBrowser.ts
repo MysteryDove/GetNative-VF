@@ -2,6 +2,16 @@
 
 import type { FrameWindowTarget, MediaFrameWindow } from "./service";
 
+/**
+ * Frame number typed by the user, as a 0-based index within the stream:
+ * rounded and clamped to the last frame; null when it is not a number.
+ */
+export function resolveFrameInput(text: string, maxFrame: number): number | null {
+  const trimmed = text.trim();
+  if (!/^\d+(\.\d+)?$/.test(trimmed)) return null;
+  return Math.min(Math.max(0, maxFrame), Math.round(Number(trimmed)));
+}
+
 export type FrameStepAction =
   | { type: "previousFrame" }
   | { type: "nextFrame" }
@@ -71,12 +81,14 @@ export function dispatchFrameBrowserKey(
   const { frameWindow, previewBusy, select } = deps;
   if (!frameWindow || previewBusy) return;
   const target = event.target as HTMLElement | null;
+  // The timeline slider consumes its own plain arrow/Home/End keys before they
+  // bubble here, so anything arriving from it (Shift+arrows, J/K, [ ]) is a
+  // frame shortcut and is handled like from any other part of the browser.
   if (
     target &&
     (target.tagName === "INPUT" ||
       target.tagName === "SELECT" ||
-      target.tagName === "TEXTAREA" ||
-      target.getAttribute("role") === "slider")
+      target.tagName === "TEXTAREA")
   ) {
     return;
   }

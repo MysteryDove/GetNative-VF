@@ -13,6 +13,8 @@ export type ApplyGeometryValues = {
   baseWidthMode?: BaseMode;
   /** True when the measuring Run's kernel should become the Recipe kernel. */
   applyKernel?: boolean;
+  /** Axis mode to store; H+W when a single-axis result is combined with the other axis. */
+  axisMode?: AxisMode;
 };
 
 function parseField(text: string): number | null | "invalid" {
@@ -38,6 +40,7 @@ export function ApplyGeometryDialog({
   initialBaseWidthMode = "integer",
   kernelLabel,
   fromRun = false,
+  otherAxisPrefilled = false,
   onCancel,
   onConfirm,
 }: {
@@ -55,9 +58,20 @@ export function ApplyGeometryDialog({
   kernelLabel?: string | null;
   /** True when the selection is tied to a Run whose settings prefill the dialog. */
   fromRun?: boolean;
+  /**
+   * Single-axis scans only: true when the other axis's initial src value comes
+   * from the user's last selection on that axis, so combining both is offered
+   * pre-checked (the non-proportional / anamorphic descale workflow).
+   */
+  otherAxisPrefilled?: boolean;
   onCancel: () => void;
   onConfirm: (values: ApplyGeometryValues) => void;
 }) {
+  const singleAxis = axisMode !== "h_plus_w";
+  // A single-axis result can be applied together with the other axis as one
+  // independent-axes H+W geometry, without switching the scan back to H+W.
+  const [combine, setCombine] = useState(singleAxis && otherAxisPrefilled);
+  const effectiveAxis: AxisMode = singleAxis && combine ? "h_plus_w" : axisMode;
   const initialHeight = initialSrcHeight ?? sourceHeight;
   const initialWidth = initialSrcWidth ??
     (axisMode === "h_plus_w" ? sourceWidth * initialHeight / sourceHeight : sourceWidth);
@@ -68,12 +82,15 @@ export function ApplyGeometryDialog({
   const [applyKernel, setApplyKernel] = useState(true);
   const [error, setError] = useState("");
 
+  // Only an axis that is actually being set carries a parity base.
+  const appliedHeightMode: BaseMode = effectiveAxis === "w_only" ? "integer" : heightMode;
+  const appliedWidthMode: BaseMode = effectiveAxis === "h_only" ? "integer" : widthMode;
   const parsedHeight = parseField(heightText);
   const parsedWidth = parseField(widthText);
   const preview = useMemo<GeometrySnapshot | null>(() => {
     if (parsedHeight === "invalid" || parsedWidth === "invalid") return null;
-    const srcHeight = axisMode === "w_only" ? sourceHeight : parsedHeight ?? sourceHeight;
-    const srcWidth = axisMode === "h_only" ? sourceWidth : parsedWidth ?? sourceWidth;
+    const srcHeight = effectiveAxis === "w_only" ? sourceHeight : parsedHeight ?? sourceHeight;
+    const srcWidth = effectiveAxis === "h_only" ? sourceWidth : parsedWidth ?? sourceWidth;
     if (srcHeight == null || srcWidth == null) return null;
     try {
       return resolveGeometryValues({
@@ -81,23 +98,23 @@ export function ApplyGeometryDialog({
         sourceHeight,
         srcWidth,
         srcHeight,
-        baseHeight: baseForMode(srcHeight, heightMode),
-        baseWidth: baseForMode(srcWidth, widthMode),
+        baseHeight: baseForMode(srcHeight, appliedHeightMode),
+        baseWidth: baseForMode(srcWidth, appliedWidthMode),
       });
     } catch {
       return null;
     }
-  }, [axisMode, parsedHeight, parsedWidth, sourceWidth, sourceHeight, heightMode, widthMode]);
+  }, [effectiveAxis, parsedHeight, parsedWidth, sourceWidth, sourceHeight, appliedHeightMode, appliedWidthMode]);
 
   function handleConfirm() {
     if (parsedHeight === "invalid" || parsedWidth === "invalid") {
       setError(t("analyze.applyDialog.invalid"));
       return;
     }
-    const srcHeight = axisMode === "w_only" ? null : parsedHeight;
-    const srcWidth = axisMode === "h_only" ? null : parsedWidth;
-    const effectiveHeight = axisMode === "w_only" ? sourceHeight : parsedHeight;
-    const effectiveWidth = axisMode === "h_only" ? sourceWidth : parsedWidth;
+    const srcHeight = effectiveAxis === "w_only" ? null : parsedHeight;
+    const srcWidth = effectiveAxis === "h_only" ? null : parsedWidth;
+    const effectiveHeight = effectiveAxis === "w_only" ? sourceHeight : parsedHeight;
+    const effectiveWidth = effectiveAxis === "h_only" ? sourceWidth : parsedWidth;
     if (effectiveHeight == null && effectiveWidth == null) {
       setError(t("analyze.applyDialog.invalid"));
       return;
@@ -105,18 +122,20 @@ export function ApplyGeometryDialog({
     onConfirm({
       srcHeight,
       srcWidth,
-      baseHeight: effectiveHeight == null ? null : baseForMode(effectiveHeight, heightMode),
-      baseWidth: effectiveWidth == null ? null : baseForMode(effectiveWidth, widthMode),
-      baseHeightMode: heightMode,
-      baseWidthMode: widthMode,
+      baseHeight: effectiveHeight == null ? null : baseForMode(effectiveHeight, appliedHeightMode),
+      baseWidth: effectiveWidth == null ? null : baseForMode(effectiveWidth, appliedWidthMode),
+      baseHeightMode: appliedHeightMode,
+      baseWidthMode: appliedWidthMode,
       applyKernel: Boolean(kernelLabel) && applyKernel,
+      axisMode: effectiveAxis,
     });
   }
 
   const modes: BaseMode[] = ["integer", "even", "odd"];
   const field = (axis: "height" | "width") => {
     const isHeight = axis === "height";
-    const visible = axisMode === "h_plus_w" || (isHeight ? axisMode === "h_only" : axisMode === "w_only");
+    const visible = effectiveAxis === "h_plus_w"
+      || (isHeight ? effectiveAxis === "h_only" : effectiveAxis === "w_only");
     if (!visible) return null;
     const text = isHeight ? heightText : widthText;
     const setText = isHeight ? setHeightText : setWidthText;
@@ -163,6 +182,33 @@ export function ApplyGeometryDialog({
         {t("analyze.applyDialog.hint")}
         {fromRun ? ` ${t("analyze.applyDialog.fromRun")}` : ""}
       </p>
+      {singleAxis ? (
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={combine}
+            onChange={(event) => {
+              setCombine(event.target.checked);
+              setError("");
+            }}
+          />
+          <span>
+            {t("analyze.applyDialog.combine", {
+              axis: t(axisMode === "h_only" ? "analyze.srcWidth" : "analyze.srcHeight"),
+            })}
+          </span>
+        </label>
+      ) : null}
+      {singleAxis && combine ? (
+        <p className="help-copy">
+          {t("analyze.applyDialog.combineHint")}
+          {otherAxisPrefilled
+            ? ` ${t("analyze.applyDialog.fromOtherAxis", {
+                axis: t(axisMode === "h_only" ? "analyze.srcWidth" : "analyze.srcHeight"),
+              })}`
+            : ""}
+        </p>
+      ) : null}
       {field("height")}
       {field("width")}
       {preview ? (

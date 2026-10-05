@@ -43,7 +43,9 @@ pub(crate) fn migrate_legacy_media_cache(app: &AppHandle) -> Result<(), String> 
         for entry in entries.flatten() {
             let path = entry.path();
             let removable = path.extension().and_then(|value| value.to_str()) == Some("jsonl")
-                || path.file_name().and_then(|value| value.to_str())
+                || path
+                    .file_name()
+                    .and_then(|value| value.to_str())
                     .is_some_and(|value| value.contains(".jsonl.") || value.ends_with(".tmp"));
             if removable {
                 let _ = fs::remove_file(path);

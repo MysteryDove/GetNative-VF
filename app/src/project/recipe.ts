@@ -5,6 +5,7 @@ import type {
   MathMode,
   MetricSpec,
 } from "../engine/protocol";
+import type { TransferCurve } from "../engine/protocol";
 import { validateMetricSpec } from "../engine/shapeGuards";
 import { MUF_PROFILE_ID, profileFor } from "../engine/profiles";
 import type { ProjectState, Recipe } from "./types";
@@ -31,6 +32,7 @@ export type RecipePayloadPatch = {
   axisMode?: AxisMode;
   profileId?: string | null;
   mathMode?: MathMode | null;
+  transfer?: TransferCurve;
 };
 
 export type RecipeOpResult =
@@ -65,6 +67,7 @@ export function createRecipe(
     axisMode: input.axisMode ?? profileFor(MUF_PROFILE_ID).default_axis_mode,
     profileId: MUF_PROFILE_ID,
     mathMode: input.mathMode ?? null,
+    transfer: input.transfer ?? "none",
   };
   return {
     ok: true,
@@ -96,6 +99,7 @@ export function updateRecipe(
     ...(patch.axisMode !== undefined ? { axisMode: patch.axisMode } : {}),
     ...(patch.profileId !== undefined ? { profileId: MUF_PROFILE_ID } : {}),
     ...(patch.mathMode !== undefined ? { mathMode: patch.mathMode } : {}),
+    ...(patch.transfer !== undefined ? { transfer: patch.transfer } : {}),
     updatedAt: nowIso,
   };
   return {

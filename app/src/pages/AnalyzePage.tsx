@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Eye, EyeOff } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
@@ -24,6 +24,7 @@ import {
   buildSeriesTable,
   heightRunConfig,
   metricCompatibilityKey,
+  resolveScanBases,
 } from "../engine/runGroupPlan";
 import { kernelRefLabel } from "../engine/displayNames";
 import type { ProjectState } from "../project/types";
@@ -35,16 +36,18 @@ import {
 } from "../components/ApplyGeometryDialog";
 import { RecipeSummaryStrip } from "../components/RecipeSummaryStrip";
 import { HeightParamsPanel } from "../components/HeightParamsPanel";
-import { analyzeViewState } from "../project/analyzeView";
+import { analyzeViewState, restoreDraft, type AnalyzeViewState } from "../project/analyzeView";
 import { HeightResultsPanel, type HeightSelection } from "../components/HeightResultsPanel";
 import { toggleSetValue } from "../utils/collections";
+import { removeRunsFromState } from "../project/runHistory";
 import { srcFromScanSelection } from "../engine/geometry";
+import { scannedWidthParity } from "../engine/geometry";
 import {
   invalidKernelBlur,
   invalidKernelParameterNames,
+  isIntegerScan,
   missingFractionalBaseAxis,
 } from "../engine/heightDraft";
-import type { MetricSpec } from "../engine/protocol";
 
 export function AnalyzePage({
   t,
@@ -94,7 +97,9 @@ export function AnalyzePage({
   const [applyNotice, setApplyNotice] = useState("");
   const [applyDialogOpen, setApplyDialogOpen] = useState(false);
   const [applySelection, setApplySelection] = useState<HeightSelection | null>(null);
-  /** True once geometry was applied: offers the handoff to the Algorithm Test. */
+  /** Last pick on the axis not being scanned; offered as the second src dimension. */
+  const [applyOtherAxis, setApplyOtherAxis] = useState<HeightSelection | null>(null);
+  /** True once geometry was applied: offers the handoff to the Kernel Search. */
   const [applyDone, setApplyDone] = useState(false);
   const [showExcludedResults, setShowExcludedResults] = useState(false);
   const { submitting, notice: submitNotice, submit: submitRunGroup } = useRunGroupSubmit();
@@ -162,10 +167,11 @@ export function AnalyzePage({
     sourcesById: state.sourcesById,
     subroute,
     initialMetric: analyzeViewState(state).metric,
+    initialDraft: analyzeViewState(state).heightDraft,
   });
 
   const persistAnalyzeView = useCallback(
-    (partial: { metricSpecOpen?: boolean; metric?: MetricSpec | null }) => {
+    (partial: Partial<AnalyzeViewState>) => {
       onProjectChange((current) => ({
         ...current,
         uiStateByRoute: {
@@ -189,17 +195,48 @@ export function AnalyzePage({
   useEffect(() => {
     if (kernelDraft !== null || !capabilities) return;
     setKernelDraft(
-      defaultKernelDraft(
-        draft.metric,
-        draft.profileId,
-        draft.mathMode,
-        draft.backendPreference,
-      ),
+      restoreDraft(
+        defaultKernelDraft(
+          draft.metric,
+          draft.profileId,
+          draft.mathMode,
+          draft.backendPreference,
+        ) as unknown as Record<string, unknown>,
+        analyzeViewState(state).kernelDraft,
+        // The metric has its own stored copy; base sizes follow the Recipe.
+        ["metric", "baseHeight", "baseWidth"],
+      ) as unknown as KernelDraft,
     );
     // The kernel panel mirrors the current Recipe's geometry base into the
     // draft once mounted, so seeding stays profile/metric-only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [capabilities, kernelDraft]);
+
+  // Parameter drafts travel with the project: reopening it restores the scan
+  // range, base modes, kernels and the hand-built scan list. Writes are
+  // debounced so typing does not rewrite the project on every keystroke.
+  const storedHeightDraft = useRef("");
+  const storedKernelDraft = useRef("");
+  useEffect(() => {
+    const height = JSON.stringify(draft);
+    const kernel = kernelDraft ? JSON.stringify(kernelDraft) : "";
+    if (!storedHeightDraft.current) {
+      // First pass records the baseline without marking the project dirty.
+      storedHeightDraft.current = height;
+      storedKernelDraft.current = kernel;
+      return;
+    }
+    if (height === storedHeightDraft.current && kernel === storedKernelDraft.current) return;
+    const timer = window.setTimeout(() => {
+      storedHeightDraft.current = height;
+      storedKernelDraft.current = kernel;
+      persistAnalyzeView({
+        heightDraft: JSON.parse(height) as Record<string, unknown>,
+        ...(kernel ? { kernelDraft: JSON.parse(kernel) as Record<string, unknown> } : {}),
+      });
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [draft, kernelDraft, persistAnalyzeView]);
 
   // Stable identity: KernelAnalyzePanel effects depend on this callback.
   const handleKernelDraftChange = useCallback(
@@ -224,8 +261,9 @@ export function AnalyzePage({
       hiddenResultSampleIds,
       activeMetricKey,
       draft.axisMode,
+      draft.transfer ?? "none",
     ),
-    [heightRuns, state, hiddenResultSampleIds, activeMetricKey, draft.axisMode],
+    [heightRuns, state, hiddenResultSampleIds, activeMetricKey, draft.axisMode, draft.transfer],
   );
 
   const visibleSamples = analysisSamples;
@@ -301,6 +339,12 @@ export function AnalyzePage({
     return heightRunConfig(run, run.runGroupId ? state.runGroupsById[run.runGroupId] : null);
   }, [applySelection, state.runGroupsById, state.runsById]);
   const applyAxisMode = applyRunConfig?.axisMode ?? draft.axisMode;
+  const applyOtherRunConfig = useMemo(() => {
+    const run = applyOtherAxis?.runId ? state.runsById[applyOtherAxis.runId] : null;
+    if (!run) return null;
+    return heightRunConfig(run, run.runGroupId ? state.runGroupsById[run.runGroupId] : null);
+  }, [applyOtherAxis, state.runGroupsById, state.runsById]);
+  const applyOtherValue = applyOtherAxis ? Number(applyOtherAxis.height) : null;
 
   /** First included Sample's source dimensions; required to resolve geometry. */
   const applySourceDims = useMemo(() => {
@@ -313,6 +357,19 @@ export function AnalyzePage({
       ? { width: source.width, height: source.height }
       : null;
   }, [analysisSamples, state.sourcesById]);
+
+  /**
+   * The base values a non-integer scan will send, shown beside the parity
+   * selectors. An H+W width left on auto takes the source width's parity.
+   */
+  const resolvedBases = useMemo(() => {
+    if (isIntegerScan(draft) || !grid.ok || grid.grid.candidates.length === 0) return null;
+    const maximum = Math.max(...grid.grid.candidates.map(Number));
+    const bases = resolveScanBases(draft, maximum, applySourceDims ?? {});
+    if (!bases) return null;
+    return { height: bases.baseHeight, width: bases.baseWidth };
+  }, [applySourceDims, draft, grid]);
+
 
   /** All Recipes, newest first — the options of the current-recipe selector. */
   const recipeOptions = useMemo(
@@ -351,7 +408,12 @@ export function AnalyzePage({
     unknownSize: t("recipe.unknownSize"),
   };
 
-  function openApplyDialog(selected?: HeightSelection) {
+  function openApplyDialog(selected?: HeightSelection, otherAxis?: HeightSelection) {
+    // A remembered pick is only offered while the Run that measured it still
+    // exists; a deleted run must not silently prefill the other axis.
+    setApplyOtherAxis(
+      otherAxis?.runId && state.runsById[otherAxis.runId] ? otherAxis : null,
+    );
     setApplyNotice("");
     setApplyDone(false);
     if (!applySourceDims) {
@@ -379,11 +441,12 @@ export function AnalyzePage({
         return;
       }
       const selectedNumber = applySelection == null ? null : Number(applySelection.height);
-      const axis = applyAxisMode;
+      // A single-axis result combined with the other axis is stored as H+W.
+      const axis = values.axisMode ?? applyAxisMode;
       const profileId = applyRunConfig?.profileId ?? draft.profileId;
       const selectedGeometry = selectedNumber != null
         ? srcFromScanSelection({
-            axisMode: axis,
+            axisMode: applyAxisMode,
             selected: selectedNumber,
             sourceWidth: dims.width,
             sourceHeight: dims.height,
@@ -413,6 +476,8 @@ export function AnalyzePage({
           axisMode: axis,
           profileId,
           mathMode: draft.mathMode,
+          // The geometry was found under this curve; Check must use it too.
+          transfer: applyRunConfig?.transfer ?? draft.transfer ?? "none",
           ...(values.applyKernel && applyRunConfig?.kernel
             ? { kernel: applyRunConfig.kernel }
             : {}),
@@ -577,6 +642,10 @@ export function AnalyzePage({
                 : null
             }
             onRefineAroundSelection={refineAroundHeight}
+            onDeleteRuns={(runIds) =>
+              onProjectChange((current) => removeRunsFromState(current, runIds))
+            }
+
           />
 
           <HeightParamsPanel
@@ -595,6 +664,7 @@ export function AnalyzePage({
             onRun={startRun}
             metricSpecOpen={analyzeViewState(state).metricSpecOpen}
             onMetricSpecOpenChange={(open) => persistAnalyzeView({ metricSpecOpen: open })}
+            resolvedBases={resolvedBases}
           />
         </div>
       </div>
@@ -607,13 +677,34 @@ export function AnalyzePage({
           sourceWidth={applySourceDims.width}
           sourceHeight={applySourceDims.height}
           initialSrcHeight={
-            applySelection != null && applyAxisMode !== "w_only" ? Number(applySelection.height) : null
+            applySelection != null && applyAxisMode !== "w_only"
+              ? Number(applySelection.height)
+              : applyAxisMode === "w_only" ? applyOtherValue : null
           }
           initialSrcWidth={
-            applySelection != null && applyAxisMode === "w_only" ? Number(applySelection.height) : null
+            applySelection != null && applyAxisMode === "w_only"
+              ? Number(applySelection.height)
+              : applyAxisMode === "h_only" ? applyOtherValue : null
           }
-          initialBaseHeightMode={applyRunConfig?.baseHeightMode ?? draft.baseHeightMode}
-          initialBaseWidthMode={applyRunConfig?.baseWidthMode ?? draft.baseWidthMode}
+          initialBaseHeightMode={
+            (applyAxisMode === "w_only" ? applyOtherRunConfig : applyRunConfig)?.baseHeightMode
+              ?? draft.baseHeightMode
+          }
+          initialBaseWidthMode={
+            // An H+W scan whose width followed the base height used a real
+            // parity; carry that one so the Recipe matches what was measured.
+            (applyRunConfig && applyAxisMode === "h_plus_w"
+              ? scannedWidthParity({
+                  axisMode: applyAxisMode,
+                  source: applySourceDims,
+                  baseHeight: applyRunConfig.baseHeight,
+                  baseWidth: applyRunConfig.baseWidth,
+                })
+              : null)
+            ?? (applyAxisMode === "h_only" ? applyOtherRunConfig : applyRunConfig)?.baseWidthMode
+            ?? draft.baseWidthMode
+          }
+          otherAxisPrefilled={applyAxisMode !== "h_plus_w" && applyOtherValue != null}
           kernelLabel={applyRunConfig?.kernel ? kernelRefLabel(t, applyRunConfig.kernel) : null}
           fromRun={applyRunConfig !== null}
           onCancel={() => setApplyDialogOpen(false)}

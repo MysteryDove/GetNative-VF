@@ -15,12 +15,13 @@ permissions:
 
 concurrency:
   group: engine-macos-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   metal:
     name: macos-15 arm64 Metal
     runs-on: macos-15
+    timeout-minutes: 45
     env:
       SCCACHE_GHA_ENABLED: "true"
     steps:
@@ -66,6 +67,7 @@ jobs:
     name: macos-15 arm64 upstream conformance
     if: github.event_name != 'pull_request'
     runs-on: macos-15
+    timeout-minutes: 45
     env:
       SCCACHE_GHA_ENABLED: "true"
     steps:

@@ -18,6 +18,7 @@ on:
       - 'app/package.json'
       - 'app/pnpm-lock.yaml'
       - 'scripts/build-ffmpeg-*.sh'
+      - 'scripts/patches/ffmpeg-*.patch'
       - '.github/workflows/ci-media.yml'
   push:
     branches: [main]
@@ -25,7 +26,7 @@ on:
 
 concurrency:
   group: ci-media-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -37,6 +38,7 @@ jobs:
   linux-media:
     name: Linux x64 media integration
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -58,7 +60,7 @@ jobs:
         id: ffmpeg-cache
         with:
           path: .deps/ffmpeg-linux-x64
-          key: ffmpeg-${{ env.FFMPEG_VERSION }}-linux-x64-${{ hashFiles('scripts/build-ffmpeg-linux.sh') }}
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-linux-x64-${{ hashFiles('scripts/build-ffmpeg-linux.sh', 'scripts/patches/ffmpeg-*.patch') }}
       - name: Build pinned FFmpeg SDK
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         run: scripts/build-ffmpeg-linux.sh .deps/ffmpeg-linux-x64
@@ -105,6 +107,7 @@ jobs:
   windows-media:
     name: Windows x64 media integration
     runs-on: windows-2022
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -130,7 +133,7 @@ jobs:
         id: ffmpeg-cache
         with:
           path: .deps/ffmpeg-windows-x64
-          key: ffmpeg-${{ env.FFMPEG_VERSION }}-windows-x64-msvc-${{ hashFiles('scripts/build-ffmpeg-windows.sh') }}
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-windows-x64-msvc-${{ hashFiles('scripts/build-ffmpeg-windows.sh', 'scripts/patches/ffmpeg-*.patch') }}
       - name: Build pinned FFmpeg SDK
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         shell: msys2 {0}

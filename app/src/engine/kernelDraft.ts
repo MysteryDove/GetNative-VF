@@ -5,6 +5,7 @@ import type {
   KernelRef,
   MathMode,
   MetricSpec,
+  TransferCurve,
 } from "./protocol";
 import { buildCandidateGrid } from "./candidateGrid";
 import { invalidKernelBlur, kernelSignature } from "./heightDraft";
@@ -59,6 +60,12 @@ export type KernelDraft = {
   cStep: string;
   /** Add-form kernel blur; baked into each added candidate when valid and ≠ 1. */
   addBlur: string;
+  /**
+   * Optional blur sweep: when `blurStop` is set, every add produces one
+   * candidate per blur value from `addBlur` to `blurStop` in `blurStep`.
+   */
+  blurStop?: string;
+  blurStep?: string;
   /** Target native height used to resolve the fixed geometry per source shape. */
   baseHeight: string;
   baseWidth: string;
@@ -66,6 +73,8 @@ export type KernelDraft = {
   profileId: string;
   mathMode: MathMode;
   backendPreference: BackendPreference;
+  /** Linear-light hypothesis for the whole run; `none` analyses as encoded. */
+  transfer?: TransferCurve;
 };
 
 export function defaultKernelDraft(
@@ -97,6 +106,9 @@ export function defaultKernelDraft(
     cStop: "1",
     cStep: "0.2",
     addBlur: "1",
+    transfer: "none",
+    blurStop: "",
+    blurStep: "0.05",
     baseHeight: base?.baseHeight ?? "720",
     baseWidth: base?.baseWidth ?? "",
     metric: { ...metric },
@@ -117,6 +129,48 @@ export function addBlurParameters(
   if (invalidKernelBlur({ blur: raw })) return { ok: false };
   const blur = parseNumberInput(raw) as number;
   return { ok: true, parameters: blur === 1 ? {} : { blur } };
+}
+
+/** True when the add form sweeps a blur range instead of one value. */
+export function blurSweepEnabled(draft: Pick<KernelDraft, "blurStop">): boolean {
+  return (draft.blurStop ?? "").trim() !== "";
+}
+
+/**
+ * Blur values the add form applies: the single `addBlur`, or the inclusive
+ * `addBlur`..`blurStop` sweep. Every value must be a valid kernel blur.
+ */
+export function addBlurValues(
+  draft: Pick<KernelDraft, "addBlur" | "blurStop" | "blurStep">,
+): { ok: true; values: number[] } | { ok: false } {
+  if (!blurSweepEnabled(draft)) {
+    const single = addBlurParameters(draft);
+    return single.ok ? { ok: true, values: [single.parameters.blur ?? 1] } : { ok: false };
+  }
+  const sequence = resolveParameterSequence({
+    axis: "blur",
+    start: draft.addBlur ?? "1",
+    stop: draft.blurStop ?? "",
+    step: draft.blurStep ?? "",
+  });
+  if (!sequence.ok) return { ok: false };
+  const values = sequence.values.map(Number);
+  if (values.some((blur) => invalidKernelBlur({ blur }))) return { ok: false };
+  return { ok: true, values };
+}
+
+/** One kernel ref per blur value; a blur of 1 is omitted so identity stays stable. */
+export function withAddBlurVariants(
+  draft: Pick<KernelDraft, "addBlur" | "blurStop" | "blurStep">,
+  kernel: KernelRef,
+): KernelRef[] | null {
+  const blurs = addBlurValues(draft);
+  if (!blurs.ok) return null;
+  return blurs.values.map((blur) =>
+    blur === 1
+      ? kernel
+      : { id: kernel.id, parameters: { ...kernel.parameters, blur } },
+  );
 }
 
 /** Attach add-form blur onto a kernel ref; null when the blur field is invalid. */
@@ -275,16 +329,22 @@ export function addBicubicGridToScanList(
     return { ok: false, reason: "kernel_list_too_large" };
   }
 
-  const blur = addBlurParameters(draft);
-  if (!blur.ok) return { ok: false, reason: "invalid_blur" };
+  const blurs = addBlurValues(draft);
+  if (!blurs.ok) return { ok: false, reason: "invalid_blur" };
+  if (bGrid.values.length * cGrid.values.length * blurs.values.length
+      > MAX_KERNEL_CANDIDATES) {
+    return { ok: false, reason: "kernel_list_too_large" };
+  }
 
   const kernels: KernelRef[] = [];
   for (const b of bGrid.values) {
     for (const c of cGrid.values) {
-      kernels.push({
-        id: "bicubic",
-        parameters: { b, c, ...blur.parameters },
-      });
+      for (const blur of blurs.values) {
+        kernels.push({
+          id: "bicubic",
+          parameters: blur === 1 ? { b, c } : { b, c, blur },
+        });
+      }
     }
   }
   return addKernelsToScanList(draft, kernels);

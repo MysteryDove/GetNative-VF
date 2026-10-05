@@ -123,10 +123,13 @@ export function geometryForSource(
     srcWidth = sourceWidth;
   } else if (axisMode === "w_only") {
     srcHeight = sourceHeight;
-  } else {
-    // H+W keeps the selected height and follows each source's aspect ratio.
+  } else if (geometry.sourceWidth !== sourceWidth || geometry.sourceHeight !== sourceHeight) {
+    // A different source shape: keep the selected height and follow that
+    // source's aspect ratio.
     srcWidth = sourceWidth * srcHeight / sourceHeight;
   }
+  // Same shape the Recipe was measured on: src width and height stay exactly
+  // as applied, so a non-proportional (anamorphic) pair survives.
   return resolveGeometryValues({
     sourceWidth,
     sourceHeight,
@@ -201,4 +204,37 @@ export function migrateGeometrySnapshot(value: unknown): GeometrySnapshot | null
       (srcHeight != null && srcHeight !== canvasHeight && rawValue("baseHeight") === undefined),
   } satisfies GeometrySnapshot;
   return migrated;
+}
+
+/**
+ * H+W scans without an explicit base width follow the base height: the engine
+ * derives the width base from it by the source aspect ratio.
+ */
+export function derivedBaseWidth(sourceWidth: number, sourceHeight: number, baseHeight: number): number {
+  return roundToEven(sourceWidth / sourceHeight * baseHeight);
+}
+
+/**
+ * Canvas-width parity an H+W scan actually used, so applying a result can
+ * carry the same width geometry. Null when the width was not fractional.
+ */
+export function scannedWidthParity(input: {
+  axisMode: AxisMode;
+  source: { width?: number | null; height?: number | null } | null | undefined;
+  baseHeight?: string | number | null;
+  baseWidth?: string | number | null;
+}): "even" | "odd" | null {
+  if (input.axisMode !== "h_plus_w") return null;
+  const number = (value: string | number | null | undefined) => {
+    if (value == null || value === "") return null;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  const baseHeight = number(input.baseHeight);
+  let baseWidth = number(input.baseWidth);
+  if (baseWidth == null) {
+    if (baseHeight == null || !input.source?.width || !input.source.height) return null;
+    baseWidth = derivedBaseWidth(input.source.width, input.source.height, baseHeight);
+  }
+  return baseWidth % 2 === 0 ? "even" : "odd";
 }

@@ -832,6 +832,7 @@ extern "C" __global__ void getnative_cuda_luma_to_f32(
     std::uint32_t bit_depth,
     std::uint32_t storage_shift,
     std::uint32_t limited_range,
+    std::uint32_t transfer,
     float *__restrict__ output) {
     const std::uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
     const std::uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -845,9 +846,29 @@ extern "C" __global__ void getnative_cuda_luma_to_f32(
             reinterpret_cast<const std::uint16_t *>(row)[x]);
     sample >>= storage_shift;
 
-    (void)limited_range;
-    const float normalized = static_cast<float>(sample)
+    float normalized = static_cast<float>(sample)
         * static_cast<float>(1U << (16U - bit_depth)) / 65535.0F;
+    // getnative/transfer.hpp: studio range is always stretched to nominal
+    // 0..1 (excursions kept), then decoded with the requested curve.
+    if (limited_range != 0U) {
+        normalized = (normalized * (65535.0F / 256.0F) - 16.0F) / 219.0F;
+    }
+    if (transfer != 0U) {
+        const float encoded = fmaxf(normalized, 0.0F);
+        if (transfer == 1U) {
+            normalized = powf(encoded, 2.2F);
+        } else if (transfer == 2U) {
+            normalized = powf(encoded, 2.4F);
+        } else if (transfer == 3U) {
+            normalized = encoded <= 0.04045F
+                ? encoded / 12.92F
+                : powf((encoded + 0.055F) / 1.055F, 2.4F);
+        } else {
+            normalized = encoded < 0.081F
+                ? encoded / 4.5F
+                : powf((encoded + 0.099F) / 1.099F, 1.0F / 0.45F);
+        }
+    }
     output[static_cast<unsigned long long>(y) * source_width + x] =
         normalized;
 }

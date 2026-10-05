@@ -374,9 +374,11 @@ void test_device_luma_conversion(const getnative::CudaRuntimeProbe &probe) {
     std::vector<std::uint16_t> p010(pixels);
     std::vector<float> p010_f32(pixels);
     for (std::size_t index = 0U; index < pixels; ++index) {
-        const auto sample = static_cast<std::uint16_t>(64U + (index * 53U) % 877U);
+        const auto sample = static_cast<std::uint16_t>(16U + (index * 53U) % 991U);
         p010[index] = static_cast<std::uint16_t>(sample << 6U);
-        p010_f32[index] = static_cast<float>(sample) * 64.0F / 65535.0F;
+        // Studio range arrives stretched to nominal 0..1 (getnative/transfer.hpp).
+        p010_f32[index] = (static_cast<float>(sample) * 64.0F / 65535.0F
+                           * (65535.0F / 256.0F) - 16.0F) / 219.0F;
     }
     expect_device_luma_matches_cpu(
         engine, p010, p010_f32, width, height,

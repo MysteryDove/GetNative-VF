@@ -1,4 +1,5 @@
-import type { KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, type KeyboardEvent } from "react";
+import { resolveFrameInput } from "../media/frameBrowser";
 import {
   ChevronLeft,
   ChevronRight,
@@ -52,6 +53,45 @@ export function VideoFrameBrowser({
 }) {
   const currentFrame = frameWindow?.selected.frame_index ?? 0;
   const maxFrame = Math.max(0, (frameWindow?.total_frames ?? 1) - 1);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const filmstripRef = useRef<HTMLDivElement>(null);
+  /** True while keyboard focus sits somewhere inside the browser. */
+  const focusWithin = useRef(false);
+
+  // A jump replaces the filmstrip window, unmounting the thumbnail that had
+  // focus; the browser then drops focus to <body> and every later shortcut is
+  // lost. Hand focus back to the browser itself so shortcuts keep working.
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || !focusWithin.current) return;
+    if (!container.contains(document.activeElement)) {
+      container.focus({ preventScroll: true });
+    }
+  }, [frameWindow]);
+
+  // Keep the selected frame centred in the filmstrip after any jump.
+  useLayoutEffect(() => {
+    const strip = filmstripRef.current;
+    const active = strip?.querySelector<HTMLElement>('[aria-current="true"]');
+    if (!strip || !active) return;
+    const stripBox = strip.getBoundingClientRect();
+    const activeBox = active.getBoundingClientRect();
+    strip.scrollLeft += activeBox.left - stripBox.left
+      - (stripBox.width - activeBox.width) / 2;
+  }, [currentFrame, frameWindow]);
+
+  /** Jump to the typed frame number, clamped to the stream; junk reverts. */
+  function goToTypedFrame() {
+    const target = resolveFrameInput(frameInput, maxFrame);
+    if (target === null) {
+      onFrameInputChange(String(currentFrame));
+      return;
+    }
+    onFrameInputChange(String(target));
+    // Hand focus back so the frame shortcuts apply to the next key press.
+    containerRef.current?.focus({ preventScroll: true });
+    if (target !== currentFrame) void selectVideoFrame(source, "frame", target);
+  }
 
   function showNearbyTime() {
     const streamIndex = source.selectedStreamIndex ?? source.videoStreams[0]?.index;
@@ -65,8 +105,15 @@ export function VideoFrameBrowser({
   return (
     <div
       className="frame-browser"
+      ref={containerRef}
       tabIndex={frameWindow ? 0 : undefined}
       onKeyDown={onKeyDown}
+      onFocus={() => {
+        focusWithin.current = true;
+      }}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) focusWithin.current = false;
+      }}
     >
       {frameWindow ? (
         <>
@@ -92,12 +139,34 @@ export function VideoFrameBrowser({
             >
               <ChevronLeft size={14} />
             </button>
-            <label>
+            <label className="frame-number-field">
               <span>{t("media.frameNumber")}</span>
-              <input value={frameInput} inputMode="numeric" onChange={(event) => onFrameInputChange(event.target.value)} onKeyDown={(event) => {
-                if (event.key === "Enter") void selectVideoFrame(source, "frame", Number(frameInput));
-              }} />
+              <input
+                value={frameInput}
+                inputMode="numeric"
+                aria-label={t("media.frameNumber")}
+                onChange={(event) => onFrameInputChange(event.target.value)}
+                onFocus={(event) => event.currentTarget.select()}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") goToTypedFrame();
+                  if (event.key === "Escape") {
+                    onFrameInputChange(String(currentFrame));
+                    containerRef.current?.focus({ preventScroll: true });
+                  }
+                }}
+              />
+              <span className="frame-number-total">/ {maxFrame}</span>
             </label>
+            <button
+              className="icon-button reveal-button"
+              type="button"
+              title={t("media.goToFrame")}
+              aria-label={t("media.goToFrame")}
+              disabled={previewBusy}
+              onClick={goToTypedFrame}
+            >
+              <LocateFixed size={14} />
+            </button>
             <button
               className="icon-button"
               type="button"
@@ -136,8 +205,9 @@ export function VideoFrameBrowser({
             ariaLabel={t("media.timeline")}
             onChange={onScrubFrameChange}
             onCommit={(frame) => void selectVideoFrame(source, "frame", frame)}
+            onPointerRelease={() => containerRef.current?.focus({ preventScroll: true })}
           />
-          <div className="filmstrip" aria-label={t("media.frameWindow")}>
+          <div className="filmstrip" ref={filmstripRef} aria-label={t("media.frameWindow")}>
             {frameWindow.frames.map((frame) => {
               const sampled = sourceSamples.some(
                 (sample) =>
@@ -236,6 +306,7 @@ function RangeScrubber({
   ariaLabel,
   onChange,
   onCommit,
+  onPointerRelease,
 }: {
   min: number;
   max: number;
@@ -245,7 +316,16 @@ function RangeScrubber({
   ariaLabel: string;
   onChange: (value: number) => void;
   onCommit: (value: number) => void;
+  /**
+   * Called after a pointer drag ends. The owner moves focus off the slider so
+   * the frame shortcuts (J/K, Shift+arrows, [ ]) apply again instead of the
+   * slider's own arrow-key scrubbing.
+   */
+  onPointerRelease?: () => void;
 }) {
+  // Set only while this slider itself consumed an arrow/Home/End keydown, so a
+  // key-up from a shortcut it ignored never commits a stale position.
+  const keyScrubbing = useRef(false);
   const span = Math.max(max - min, 0);
   const current = snapToStep(value, min, max, step);
   const ratio = span === 0 ? 0 : (current - min) / span;
@@ -281,9 +361,11 @@ function RangeScrubber({
         const next = valueFromClientX(event.currentTarget, event.clientX);
         onChange(next);
         onCommit(next);
+        onPointerRelease?.();
       }}
       onKeyDown={(event) => {
-        if (disabled) return;
+        // Shift+arrow is the keyframe shortcut: leave it to the browser.
+        if (disabled || event.shiftKey) return;
         let next: number | null = null;
         if (event.key === "ArrowLeft" || event.key === "ArrowDown") {
           next = snapToStep(current - step, min, max, step);
@@ -298,10 +380,11 @@ function RangeScrubber({
         }
         event.preventDefault();
         event.stopPropagation();
+        keyScrubbing.current = true;
         onChange(next);
       }}
       onKeyUp={(event) => {
-        if (disabled) return;
+        if (disabled || !keyScrubbing.current) return;
         if (
           event.key === "ArrowLeft" ||
           event.key === "ArrowDown" ||
@@ -311,6 +394,7 @@ function RangeScrubber({
           event.key === "End"
         ) {
           event.stopPropagation();
+          keyScrubbing.current = false;
           onCommit(current);
         }
       }}

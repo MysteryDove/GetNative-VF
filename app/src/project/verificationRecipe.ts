@@ -29,6 +29,8 @@ export function verificationRecipe(run: Run, state: Pick<ProjectState, "recipesB
     axisMode: (request.axisMode as Recipe["axisMode"]) ?? current.axisMode,
     profileId: (request.profileId as Recipe["profileId"]) ?? current.profileId,
     mathMode: (request.mathMode as Recipe["mathMode"]) ?? current.mathMode,
+    // A run measured before the Recipe carried a curve ran as encoded.
+    transfer: (request.transfer as Recipe["transfer"]) ?? "none",
   };
 }
 

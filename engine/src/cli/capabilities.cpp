@@ -177,7 +177,7 @@ void write_capabilities(std::ostream &output, bool analysis_available) {
               "{\"id\":\"spline36\",\"parameters\":{\"kind\":\"none\"}},"
               "{\"id\":\"spline64\",\"parameters\":{\"kind\":\"none\"}}],"
               "\"unsupported_features\":[\"spline32\"],"
-              "\"features\":{\"verify_frame_ring\":true,\"media_frame_batch\":false,"
+              "\"features\":{\"verify_frame_ring\":true,\"analysis_transfer\":true,\"verify_transfer\":true,\"media_frame_batch\":false,"
               "\"verify_engine_decode\":";
 #if defined(GETNATIVE_HAS_MEDIA)
     output << "true,\"media_verify_concurrency\":{\"min\":1,\"max\":16,\"default\":8,\"gpu_max\":8}},\"decode_backends\":["

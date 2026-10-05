@@ -234,13 +234,26 @@ constexpr std::int32_t minimum_architecture = GETNATIVE_CUDA_MIN_ARCHITECTURE;
     return stream.str();
 }
 
+// Each engine owns one context; the id tells engines apart even when a new
+// context is allocated at the address of a destroyed one.
+[[nodiscard]] std::uint64_t next_context_generation() noexcept {
+    static std::atomic<std::uint64_t> counter{0U};
+    return counter.fetch_add(1U, std::memory_order_relaxed) + 1U;
+}
+
 // Worker/analyze threads stay on the engine context. Skip per-call
-// cuCtxGetCurrent/SetCurrent once this thread has already bound it.
-void bind_analysis_context(const DriverApi &api, CUcontext desired) {
+// cuCtxGetCurrent/SetCurrent once this thread has already bound it. The
+// cache is keyed on the engine's generation, not just the handle: a thread
+// that last bound a since-destroyed engine must rebind, or it would keep
+// using the destroyed context whenever the driver reuses the handle value.
+void bind_analysis_context(const DriverApi &api, CUcontext desired,
+                           std::uint64_t generation) {
     thread_local CUcontext bound = nullptr;
-    if (bound == desired) return;
+    thread_local std::uint64_t bound_generation = 0U;
+    if (bound == desired && bound_generation == generation) return;
     cuda_detail::cuda_check(api, api.ctx_set_current(desired), "cuCtxSetCurrent");
     bound = desired;
+    bound_generation = generation;
 }
 
 class DeviceBuffer {
@@ -1452,6 +1465,7 @@ struct CudaAnalysisEngine::Impl {
     std::shared_ptr<DriverApi> api;
     CudaDeviceInfo info;
     CUcontext context = nullptr;
+    const std::uint64_t context_generation = next_context_generation();
     CUmodule module = nullptr;
     CUfunction inverse_horizontal_function = nullptr;
     CUfunction horizontal_fused_function = nullptr;
@@ -1590,7 +1604,7 @@ std::uintptr_t CudaAnalysisEngine::native_context() const noexcept {
 
 std::optional<std::uint64_t> CudaAnalysisEngine::available_memory_bytes() const noexcept {
     try {
-        bind_analysis_context(*impl_->api, impl_->context);
+        bind_analysis_context(*impl_->api, impl_->context, impl_->context_generation);
         std::size_t available = 0, total = 0;
         if (impl_->api->mem_get_info(&available, &total) != CUDA_SUCCESS || !total) return std::nullopt;
         return available;
@@ -1733,7 +1747,7 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
         stop, source, candidates, impl_->effective_workspace_limit_elements);
     delta.execution_slot_wait_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - wait_start).count();
-    bind_analysis_context(*impl_->api, impl_->context);
+    bind_analysis_context(*impl_->api, impl_->context, impl_->context_generation);
     ExecutionSlot &slot = *impl_->slots[slot_index];
     std::shared_ptr<SharedSourceEntry> shared_source;
     const bool instrument = profile == GpuStageProfile::stages;
@@ -2209,11 +2223,12 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
         std::uint32_t storage_shift = luma_layout.storage_shift;
         std::uint32_t limited_range =
             cuda_luma->range == CudaColorRange::limited ? 1U : 0U;
+        std::uint32_t transfer = cuda_luma->transfer;
         CUdeviceptr output_pointer = slot.device_source.pointer();
         void *parameters[] = {
             &luma_pointer, &pitch, &conversion_width, &conversion_height,
             &storage_bytes, &bit_depth, &storage_shift,
-            &limited_range, &output_pointer,
+            &limited_range, &transfer, &output_pointer,
         };
         cuda_detail::cuda_check(
             *impl_->api,
@@ -2585,7 +2600,9 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
         }
         result.push_back({candidates[index].id, errors[index]});
     }
-    if (instrument) {
+    // Counters (launches, uploads, cache hits, candidates) are always
+    // reported, as on Vulkan; only the event timers above are profile-gated.
+    {
         const std::scoped_lock telemetry_lock(impl_->telemetry_mutex);
         merge_telemetry(impl_->telemetry, delta);
         impl_->telemetry.peak_workspace_elements =

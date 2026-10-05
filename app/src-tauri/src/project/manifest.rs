@@ -148,6 +148,9 @@ pub struct RecipeRecord {
     pub profile_id: Option<String>,
     #[serde(default)]
     pub math_mode: Option<String>,
+    /// Linear-light transfer curve the Recipe was found under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -429,10 +432,18 @@ pub fn validate_manifest(manifest: &ProjectManifest) -> Result<(), ManifestValid
         run_ids.insert(run.id.clone());
     }
     for fusion in &manifest.verification_fusions {
-        if fusion.id.trim().is_empty() || !ids.insert(fusion.id.clone()) || !fusion_ids.insert(fusion.id.clone()) {
+        if fusion.id.trim().is_empty()
+            || !ids.insert(fusion.id.clone())
+            || !fusion_ids.insert(fusion.id.clone())
+        {
             return Err(duplicate_id(&fusion.id));
         }
-        if fusion.id.trim().is_empty() || fusion.created_at.trim().is_empty() || fusion.source_id.trim().is_empty() || fusion.source_fingerprint.trim().is_empty() || fusion.source_path.trim().is_empty() {
+        if fusion.id.trim().is_empty()
+            || fusion.created_at.trim().is_empty()
+            || fusion.source_id.trim().is_empty()
+            || fusion.source_fingerprint.trim().is_empty()
+            || fusion.source_path.trim().is_empty()
+        {
             return Err(ManifestValidationError {
                 code: ManifestErrorCode::InvalidManifest,
                 message: format!("fusion {} has invalid source snapshot", fusion.id),
@@ -441,64 +452,127 @@ pub fn validate_manifest(manifest: &ProjectManifest) -> Result<(), ManifestValid
         let algorithm_ok = fusion.algorithm.as_object().is_some_and(|algorithm| {
             algorithm.get("name").and_then(Value::as_str) == Some("min_error_per_frame")
                 && algorithm.get("version").and_then(Value::as_u64) == Some(1)
-                && algorithm.get("tie_break").and_then(Value::as_str) == Some("recipe_created_at_asc")
+                && algorithm.get("tie_break").and_then(Value::as_str)
+                    == Some("recipe_created_at_asc")
         });
-        let compatibility_ok = fusion.compatibility_snapshot.as_object().is_some_and(|snapshot| {
-            let metric = snapshot.get("metric").and_then(Value::as_object);
-            let metric_ok = metric.is_some_and(|metric| {
-                ["crop_left", "crop_right", "crop_top", "crop_bottom"]
-                    .iter()
-                    .all(|key| metric.get(*key).and_then(Value::as_u64).is_some())
-                    && metric.get("pixel_exclusion_threshold").and_then(Value::as_f64).is_some_and(|value| value.is_finite() && value >= 0.0)
-                    && metric.get("p_norm").and_then(Value::as_u64).is_some_and(|value| value >= 1)
+        let compatibility_ok = fusion
+            .compatibility_snapshot
+            .as_object()
+            .is_some_and(|snapshot| {
+                let metric = snapshot.get("metric").and_then(Value::as_object);
+                let metric_ok = metric.is_some_and(|metric| {
+                    ["crop_left", "crop_right", "crop_top", "crop_bottom"]
+                        .iter()
+                        .all(|key| metric.get(*key).and_then(Value::as_u64).is_some())
+                        && metric
+                            .get("pixel_exclusion_threshold")
+                            .and_then(Value::as_f64)
+                            .is_some_and(|value| value.is_finite() && value >= 0.0)
+                        && metric
+                            .get("p_norm")
+                            .and_then(Value::as_u64)
+                            .is_some_and(|value| value >= 1)
+                });
+                metric_ok
+                    && snapshot
+                        .get("axis_mode")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| matches!(value, "h_plus_w" | "h_only" | "w_only"))
+                    && snapshot
+                        .get("profile_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.trim().is_empty())
+                    && snapshot
+                        .get("math_mode")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| matches!(value, "raw" | "log_display"))
             });
-            metric_ok
-                && snapshot.get("axis_mode").and_then(Value::as_str).is_some_and(|value| matches!(value, "h_plus_w" | "h_only" | "w_only"))
-                && snapshot.get("profile_id").and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty())
-                && snapshot.get("math_mode").and_then(Value::as_str).is_some_and(|value| matches!(value, "raw" | "log_display"))
-        });
-        let inputs_ok = fusion.inputs.len() >= 2 && fusion.inputs.iter().all(|input| {
-            let object = input.as_object();
-            object.and_then(|value| value.get("run_id")).and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty())
-                && object.and_then(|value| value.get("recipe_id")).and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty())
-                && object.and_then(|value| value.get("recipe_revision")).and_then(Value::as_u64).is_some()
-                && object.and_then(|value| value.get("recipe_name")).and_then(Value::as_str).is_some()
-                && object.is_some_and(|value| value.get("recipe_snapshot").is_some() && value.get("scan_scope").is_some())
-        });
-        let frames_ok = !fusion.frames.is_empty() && fusion.frames.iter().enumerate().all(|(position, frame)| {
-            let object = match frame.as_object() {
-                Some(value) => value,
-                None => return false,
-            };
-            let index = match object.get("frame_index").and_then(Value::as_u64) {
-                Some(value) => value,
-                None => return false,
-            };
-            let error = object.get("fused_error").and_then(Value::as_f64);
-            let candidates = object.get("candidates").and_then(Value::as_array);
-            let candidate_count = object.get("candidate_count").and_then(Value::as_u64);
-            let winner_run = object.get("winner_run_id").and_then(Value::as_str);
-            let winner_recipe = object.get("winner_recipe_id").and_then(Value::as_str);
-            let ordered = position == 0 || index > fusion.frames[position - 1]
-                .get("frame_index").and_then(Value::as_u64).unwrap_or(u64::MAX);
-            error.is_some_and(|value| value.is_finite() && value >= 0.0)
-                && candidates.is_some_and(|items| candidate_count == Some(items.len() as u64) && !items.is_empty())
-                && winner_run.is_some_and(|value| !value.trim().is_empty())
-                && winner_recipe.is_some_and(|value| !value.trim().is_empty())
-                && ordered
-                && candidates.is_some_and(|items| items.iter().all(|candidate| {
-                    let candidate = candidate.as_object();
-                    candidate.and_then(|value| value.get("run_id")).and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty())
-                        && candidate.and_then(|value| value.get("recipe_id")).and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty())
-                        && candidate.and_then(|value| value.get("error")).and_then(Value::as_f64).is_some_and(|value| value.is_finite() && value >= 0.0)
-                }))
-                && candidates.is_some_and(|items| items.iter().any(|candidate| {
-                    let candidate = candidate.as_object();
-                    candidate.and_then(|value| value.get("run_id")).and_then(Value::as_str) == winner_run
-                        && candidate.and_then(|value| value.get("recipe_id")).and_then(Value::as_str) == winner_recipe
-                        && candidate.and_then(|value| value.get("error")).and_then(Value::as_f64) == error
-                }))
-        });
+        let inputs_ok = fusion.inputs.len() >= 2
+            && fusion.inputs.iter().all(|input| {
+                let object = input.as_object();
+                object
+                    .and_then(|value| value.get("run_id"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+                    && object
+                        .and_then(|value| value.get("recipe_id"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.trim().is_empty())
+                    && object
+                        .and_then(|value| value.get("recipe_revision"))
+                        .and_then(Value::as_u64)
+                        .is_some()
+                    && object
+                        .and_then(|value| value.get("recipe_name"))
+                        .and_then(Value::as_str)
+                        .is_some()
+                    && object.is_some_and(|value| {
+                        value.get("recipe_snapshot").is_some() && value.get("scan_scope").is_some()
+                    })
+            });
+        let frames_ok = !fusion.frames.is_empty()
+            && fusion.frames.iter().enumerate().all(|(position, frame)| {
+                let object = match frame.as_object() {
+                    Some(value) => value,
+                    None => return false,
+                };
+                let index = match object.get("frame_index").and_then(Value::as_u64) {
+                    Some(value) => value,
+                    None => return false,
+                };
+                let error = object.get("fused_error").and_then(Value::as_f64);
+                let candidates = object.get("candidates").and_then(Value::as_array);
+                let candidate_count = object.get("candidate_count").and_then(Value::as_u64);
+                let winner_run = object.get("winner_run_id").and_then(Value::as_str);
+                let winner_recipe = object.get("winner_recipe_id").and_then(Value::as_str);
+                let ordered = position == 0
+                    || index
+                        > fusion.frames[position - 1]
+                            .get("frame_index")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(u64::MAX);
+                error.is_some_and(|value| value.is_finite() && value >= 0.0)
+                    && candidates.is_some_and(|items| {
+                        candidate_count == Some(items.len() as u64) && !items.is_empty()
+                    })
+                    && winner_run.is_some_and(|value| !value.trim().is_empty())
+                    && winner_recipe.is_some_and(|value| !value.trim().is_empty())
+                    && ordered
+                    && candidates.is_some_and(|items| {
+                        items.iter().all(|candidate| {
+                            let candidate = candidate.as_object();
+                            candidate
+                                .and_then(|value| value.get("run_id"))
+                                .and_then(Value::as_str)
+                                .is_some_and(|value| !value.trim().is_empty())
+                                && candidate
+                                    .and_then(|value| value.get("recipe_id"))
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|value| !value.trim().is_empty())
+                                && candidate
+                                    .and_then(|value| value.get("error"))
+                                    .and_then(Value::as_f64)
+                                    .is_some_and(|value| value.is_finite() && value >= 0.0)
+                        })
+                    })
+                    && candidates.is_some_and(|items| {
+                        items.iter().any(|candidate| {
+                            let candidate = candidate.as_object();
+                            candidate
+                                .and_then(|value| value.get("run_id"))
+                                .and_then(Value::as_str)
+                                == winner_run
+                                && candidate
+                                    .and_then(|value| value.get("recipe_id"))
+                                    .and_then(Value::as_str)
+                                    == winner_recipe
+                                && candidate
+                                    .and_then(|value| value.get("error"))
+                                    .and_then(Value::as_f64)
+                                    == error
+                        })
+                    })
+            });
         if !algorithm_ok || !compatibility_ok || !inputs_ok || !frames_ok {
             return Err(ManifestValidationError {
                 code: ManifestErrorCode::InvalidManifest,
@@ -755,7 +829,10 @@ mod tests {
     fn schema_one_is_migrated_in_memory_to_schema_two() {
         let mut value = serde_json::to_value(empty_manifest("Legacy", false)).unwrap();
         value["schema_version"] = json!(1);
-        value.as_object_mut().unwrap().remove("verification_fusions");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("verification_fusions");
         let manifest = parse_manifest_value(value).unwrap();
         assert_eq!(manifest.schema_version, CURRENT_SCHEMA_VERSION);
         assert!(manifest.verification_fusions.is_empty());
@@ -788,6 +865,7 @@ mod tests {
             axis_mode: None,
             profile_id: None,
             math_mode: None,
+            transfer: None,
         });
         manifest.active_recipe_id = Some("recipe_1".to_owned());
         assert!(validate_manifest(&manifest).is_ok());

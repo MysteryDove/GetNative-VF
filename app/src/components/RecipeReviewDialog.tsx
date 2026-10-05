@@ -28,7 +28,7 @@ export function missingFieldLabels(t: Translator, missing: string[]): string {
  * Recipe detail: the full semantic summary of one Recipe, including any
  * missing fields that would block whole-video Verification. Which MetricSpec
  * the Recipe owns is decided upstream by explicit apply actions (Resolution
- * Test by default, or the diverged Algorithm Test MetricSpec via its own
+ * Test by default, or the diverged Kernel Search MetricSpec via its own
  * explicit command) — this dialog shows the result.
  */
 export function RecipeReviewDialog({
@@ -107,6 +107,10 @@ export function RecipeReviewDialog({
         <div className="dense-row">
           <strong>{t("recipe.field.mathMode")}</strong>
           <span>{recipe.mathMode ?? t("recipe.fieldMissing")}</span>
+        </div>
+        <div className="dense-row">
+          <strong>{t("recipe.field.transfer")}</strong>
+          <span>{t(`analyze.transfer.${recipe.transfer ?? "none"}`)}</span>
         </div>
       </div>
 

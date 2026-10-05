@@ -17,11 +17,22 @@ import { actualBackendLabel } from "../engine/backendSelection";
 import type { ActualBackend } from "../engine/protocol";
 import { verificationRunLabel, verifyCoverageDisplay } from "../engine/verifyResults";
 import { sourceFilterLabel } from "../project/sourceLabel";
+import { MultiFilterGroup } from "../components/MultiFilterGroup";
+import { NO_FILTER, filterAccepts, pruneFilter, type FilterSelection } from "../engine/multiFilter";
 import { Modal } from "../components/Modal";
+import {
+  ACTIVE_RUN_STATUSES,
+  RUN_FAMILIES,
+  removeRunFamilyFromState,
+  removeRunsFromState,
+  runFamilyCounts,
+  type RunFamily,
+} from "../project/runHistory";
+import { runSelectionSummary } from "../engine/runSummary";
 
 export { sourceFilterLabel } from "../project/sourceLabel";
 
-const ACTIVE_STATUSES = new Set(["queued", "running"]);
+const ACTIVE_STATUSES = ACTIVE_RUN_STATUSES;
 
 export function runActualBackend(
   run: Run,
@@ -91,64 +102,36 @@ export function clearAllResultsFromState(state: ProjectState): ProjectState {
 
 export function removeRunGroupFromState(state: ProjectState, groupId: string): ProjectState {
   const group = state.runGroupsById[groupId];
+  // A group with a queued/running member is left whole.
   if (!group || runGroupActive(state, group)) return state;
-
-  const runsById = { ...state.runsById };
-  const verificationReviewsByRunId = { ...state.verificationReviewsByRunId };
-  for (const id of group.memberRunIds) {
-    delete runsById[id];
-    delete verificationReviewsByRunId[id];
-  }
-  const runGroupsById = { ...state.runGroupsById };
+  const next = removeRunsFromState(state, group.memberRunIds);
+  if (next.runGroupsById[group.id] === undefined) return next;
+  // Members already missing from runsById: still drop the emptied group.
+  const runGroupsById = { ...next.runGroupsById };
   delete runGroupsById[group.id];
-  return { ...state, runsById, runGroupsById, verificationReviewsByRunId };
+  return { ...next, runGroupsById };
 }
 
+/** Drop filter entries whose Run, RunGroup or Source no longer has results. */
 export function nextHistoryFilters(
-  filters: { runGroupFilter: string; sourceFilter: string },
+  filters: { runGroupFilter: FilterSelection; sourceFilter: FilterSelection },
   nextState: ProjectState,
-  deleted: { kind: "group"; id: string } | { kind: "run"; run: Run },
-): { runGroupFilter: string; sourceFilter: string } {
-  let runGroupFilter = filters.runGroupFilter;
-  let sourceFilter = filters.sourceFilter;
-  if (deleted.kind === "group") {
-    if (runGroupFilter === deleted.id) runGroupFilter = "all";
-  } else {
-    if (runGroupFilter === `run:${deleted.run.id}`) runGroupFilter = "all";
-    if (
-      deleted.run.runGroupId
-      && runGroupFilter === deleted.run.runGroupId
-      && nextState.runGroupsById[deleted.run.runGroupId] === undefined
-    ) {
-      runGroupFilter = "all";
-    }
-  }
-  if (sourceFilter !== "all") {
-    const sourceStillPresent = Object.values(nextState.runsById).some(
-      (run) => run.sourceId === sourceFilter,
-    );
-    if (!sourceStillPresent) sourceFilter = "all";
-  }
-  return { runGroupFilter, sourceFilter };
+): { runGroupFilter: FilterSelection; sourceFilter: FilterSelection } {
+  const runs = Object.values(nextState.runsById);
+  return {
+    runGroupFilter: filters.runGroupFilter.filter((value) =>
+      value.startsWith("run:")
+        ? nextState.runsById[value.slice(4)] !== undefined
+        : nextState.runGroupsById[value] !== undefined),
+    sourceFilter: pruneFilter(
+      filters.sourceFilter,
+      runs.map((run) => run.sourceId).filter((id): id is string => Boolean(id)),
+    ),
+  };
 }
 
 export function removeRunFromState(state: ProjectState, runId: string): ProjectState {
-  const run = state.runsById[runId];
-  if (!run || ACTIVE_STATUSES.has(run.status)) return state;
-
-  const runsById = { ...state.runsById };
-  delete runsById[run.id];
-  const verificationReviewsByRunId = { ...state.verificationReviewsByRunId };
-  delete verificationReviewsByRunId[run.id];
-  let runGroupsById = state.runGroupsById;
-  const group = run.runGroupId ? state.runGroupsById[run.runGroupId] : null;
-  if (group) {
-    const memberRunIds = group.memberRunIds.filter((id) => id !== run.id);
-    runGroupsById = { ...state.runGroupsById };
-    if (memberRunIds.length === 0) delete runGroupsById[group.id];
-    else runGroupsById[group.id] = { ...group, memberRunIds };
-  }
-  return { ...state, runsById, runGroupsById, verificationReviewsByRunId };
+  return removeRunsFromState(state, [runId]);
 }
 
 /**
@@ -166,12 +149,17 @@ export function ResultsPage({
 }) {
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [selectedRuns, setSelectedRuns] = useState<Set<string>>(new Set());
-  const [runGroupFilter, setRunGroupFilter] = useState("all");
-  const [sourceFilter, setSourceFilter] = useState("all");
+  const [runGroupFilter, setRunGroupFilter] = useState<FilterSelection>(NO_FILTER);
+  const [sourceFilter, setSourceFilter] = useState<FilterSelection>(NO_FILTER);
   const [notice, setNotice] = useState("");
   const [pendingDelete, setPendingDelete] = useState<
-    { kind: "group"; id: string } | { kind: "run"; id: string } | { kind: "all" } | null
+    | { kind: "group"; id: string }
+    | { kind: "run"; id: string }
+    | { kind: "all" }
+    | { kind: "family"; family: RunFamily }
+    | null
   >(null);
+  const familyCounts = useMemo(() => runFamilyCounts(state), [state.runsById]);
   const hasActiveRuns = Object.values(state.runsById).some((run) => ACTIVE_STATUSES.has(run.status));
   const hasResults = [state.runsById, state.runGroupsById,
     state.verificationReviewsByRunId, state.verificationFusionsById]
@@ -223,9 +211,9 @@ export function ResultsPage({
   const visibleGroups = useMemo(
     () =>
       groups.filter((group) => {
-        if (runGroupFilter !== "all" && runGroupFilter !== group.id) return false;
-        return sourceFilter === "all" || group.memberRunIds.some(
-          (runId) => state.runsById[runId]?.sourceId === sourceFilter,
+        if (!filterAccepts(runGroupFilter, group.id)) return false;
+        return sourceFilter.length === 0 || group.memberRunIds.some(
+          (runId) => sourceFilter.includes(state.runsById[runId]?.sourceId ?? ""),
         );
       }),
     [groups, runGroupFilter, sourceFilter, state.runsById],
@@ -234,8 +222,8 @@ export function ResultsPage({
   const visibleUngroupedRuns = useMemo(
     () =>
       ungroupedRuns.filter((run) => {
-        if (runGroupFilter !== "all" && runGroupFilter !== `run:${run.id}`) return false;
-        return sourceFilter === "all" || run.sourceId === sourceFilter;
+        if (!filterAccepts(runGroupFilter, `run:${run.id}`)) return false;
+        return filterAccepts(sourceFilter, run.sourceId ?? "");
       }),
     [runGroupFilter, sourceFilter, ungroupedRuns],
   );
@@ -299,13 +287,20 @@ export function ResultsPage({
 
   function confirmDelete() {
     if (!pendingDelete) return;
-    if (pendingDelete.kind === "all") {
+    if (pendingDelete.kind === "family") {
+      const family = pendingDelete.family;
+      onProjectChange((current) => removeRunFamilyFromState(current, family));
+      const remaining = removeRunFamilyFromState(state, family).runsById;
+      setSelectedRuns((current) => new Set([...current].filter((id) => remaining[id])));
+      setRunGroupFilter(NO_FILTER);
+      setSourceFilter(NO_FILTER);
+    } else if (pendingDelete.kind === "all") {
       if (hasActiveRuns) return;
       onProjectChange(clearAllResultsFromState);
       setSelectedRuns(new Set());
       setExpandedGroups(new Set());
-      setRunGroupFilter("all");
-      setSourceFilter("all");
+      setRunGroupFilter(NO_FILTER);
+      setSourceFilter(NO_FILTER);
       setNotice("");
     } else if (pendingDelete.kind === "group") {
       const group = state.runGroupsById[pendingDelete.id];
@@ -322,7 +317,6 @@ export function ResultsPage({
       const nextFilters = nextHistoryFilters(
         { runGroupFilter, sourceFilter },
         removeRunGroupFromState(state, pendingDelete.id),
-        { kind: "group", id: pendingDelete.id },
       );
       setRunGroupFilter(nextFilters.runGroupFilter);
       setSourceFilter(nextFilters.sourceFilter);
@@ -341,7 +335,6 @@ export function ResultsPage({
       const nextFilters = nextHistoryFilters(
         { runGroupFilter, sourceFilter },
         removeRunFromState(state, pendingDelete.id),
-        { kind: "run", run },
       );
       setRunGroupFilter(nextFilters.runGroupFilter);
       setSourceFilter(nextFilters.sourceFilter);
@@ -392,12 +385,39 @@ export function ResultsPage({
   }
 
   const isEmpty = groups.length === 0 && ungroupedRuns.length === 0;
+  const pendingDeleteTitle = !pendingDelete
+    ? ""
+    : pendingDelete.kind === "family"
+      ? t(`results.deleteFamily.${pendingDelete.family}`)
+      : t(pendingDelete.kind === "all"
+          ? "results.clearAll"
+          : pendingDelete.kind === "group" ? "results.deleteGroup" : "results.deleteRun");
 
   return (
     <div className="page-panel">
       <div className="page-header">
         <h2>{t("results.title")}</h2>
         <div className="top-actions">
+          <div className="results-family-delete" role="group" aria-label={t("results.deleteByTest")}>
+            <span>{t("results.deleteByTest")}</span>
+            {RUN_FAMILIES.map((family) => {
+              const count = familyCounts[family];
+              const finished = count.total - count.active;
+              return (
+                <button
+                  key={family}
+                  className="secondary-button danger-button"
+                  type="button"
+                  disabled={finished === 0}
+                  title={t(`results.deleteFamily.${family}`)}
+                  onClick={() => setPendingDelete({ kind: "family", family })}
+                >
+                  <Trash2 size={14} />
+                  {t(`results.deleteAll.short.${family}`, { count: String(count.total) })}
+                </button>
+              );
+            })}
+          </div>
           <button
             className="secondary-button danger-button"
             type="button"
@@ -432,58 +452,20 @@ export function ResultsPage({
       {notice ? <p className="help-copy">{notice}</p> : null}
 
       <div className="results-filters" aria-label={t("results.filters.title")}>
-        <div className="results-filter-group" role="radiogroup" aria-label={t("results.filters.runs")}>
-          <span className="results-filter-label">{t("results.filters.runs")}</span>
-          <div className="button-radio">
-            <button
-              type="button"
-              role="radio"
-              aria-checked={runGroupFilter === "all"}
-              className={runGroupFilter === "all" ? "active" : ""}
-              onClick={() => setRunGroupFilter("all")}
-            >
-              {t("results.filters.all")}
-            </button>
-            {runFilterOptions.map((option) => (
-              <button
-                key={option.value}
-                type="button"
-                role="radio"
-                aria-checked={runGroupFilter === option.value}
-                className={runGroupFilter === option.value ? "active" : ""}
-                onClick={() => setRunGroupFilter(option.value)}
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="results-filter-group" role="radiogroup" aria-label={t("results.filters.source")}>
-          <span className="results-filter-label">{t("results.filters.source")}</span>
-          <div className="button-radio">
-            <button
-              type="button"
-              role="radio"
-              aria-checked={sourceFilter === "all"}
-              className={sourceFilter === "all" ? "active" : ""}
-              onClick={() => setSourceFilter("all")}
-            >
-              {t("results.filters.all")}
-            </button>
-            {sourceFilterOptions.map((option) => (
-              <button
-                key={option.value}
-                type="button"
-                role="radio"
-                aria-checked={sourceFilter === option.value}
-                className={sourceFilter === option.value ? "active" : ""}
-                onClick={() => setSourceFilter(option.value)}
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
-        </div>
+        <MultiFilterGroup
+          label={t("results.filters.runs")}
+          allLabel={t("results.filters.all")}
+          options={runFilterOptions}
+          selected={runGroupFilter}
+          onChange={setRunGroupFilter}
+        />
+        <MultiFilterGroup
+          label={t("results.filters.source")}
+          allLabel={t("results.filters.all")}
+          options={sourceFilterOptions}
+          selected={sourceFilter}
+          onChange={setSourceFilter}
+        />
       </div>
 
       {isEmpty ? (
@@ -558,7 +540,7 @@ export function ResultsPage({
       {pendingDelete ? (
         <Modal
           onClose={() => setPendingDelete(null)}
-          title={t(pendingDelete.kind === "all" ? "results.clearAll" : pendingDelete.kind === "group" ? "results.deleteGroup" : "results.deleteRun")}
+          title={pendingDeleteTitle}
           closeLabel={t("common.close")}
           actions={
             <>
@@ -573,13 +555,20 @@ export function ResultsPage({
               <button className="secondary-button danger-button" type="button" onClick={confirmDelete}
                 disabled={pendingDelete.kind === "all" && hasActiveRuns}>
                 <Trash2 size={14} />
-                {t(pendingDelete.kind === "all" ? "results.clearAll" : pendingDelete.kind === "group" ? "results.deleteGroup" : "results.deleteRun")}
+                {pendingDeleteTitle}
               </button>
             </>
           }
         >
           <p className="confirm-dialog-copy">
-            {pendingDelete.kind === "all"
+            {pendingDelete.kind === "family"
+              ? t("results.deleteFamilyConfirm", {
+                  count: String(
+                    familyCounts[pendingDelete.family].total
+                    - familyCounts[pendingDelete.family].active,
+                  ),
+                })
+              : pendingDelete.kind === "all"
               ? t("results.clearAllConfirm", { count: String(Object.keys(state.runsById).length) })
               : pendingDelete.kind === "group"
               ? t("results.deleteGroupConfirm", {
@@ -623,6 +612,9 @@ function RunGroupBlock({
   const members = group.memberRunIds
     .map((id) => state.runsById[id])
     .filter((run): run is Run => Boolean(run));
+  // What this command measured (kernel, scan range/step/base, …), so trial
+  // runs can be told apart before deleting them.
+  const summary = runSelectionSummary(t, state, group.memberRunIds);
   return (
     <div className="run-group-block">
       <div className="dense-row run-group-header">
@@ -633,7 +625,8 @@ function RunGroupBlock({
           </strong>
           <span>
             {t("analyze.memberCount", { count: String(members.length) })}
-            {group.createdAt ? ` · ${group.createdAt.slice(0, 10)}` : ""}
+            {summary ? ` · ${summary}` : ""}
+            {group.createdAt ? ` · ${group.createdAt.slice(0, 16).replace("T", " ")}` : ""}
           </span>
         </button>
         <button

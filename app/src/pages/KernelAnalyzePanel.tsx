@@ -1,11 +1,13 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ArrowRight, Check, SlidersHorizontal } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { EngineEnvelope } from "../engine/types";
-import type {
-  BackendPreference,
-  KernelRef,
-  MetricSpec,
+import {
+  TRANSFER_CURVES,
+  type BackendPreference,
+  type KernelRef,
+  type MetricSpec,
+  type TransferCurve,
 } from "../engine/protocol";
 import type { KernelDraft } from "../engine/kernelDraft";
 import { profileFor } from "../engine/profiles";
@@ -27,6 +29,16 @@ import { backendOptionLabel } from "../engine/backendSelection";
 import { toggleSetValue } from "../utils/collections";
 import { groupBySourceId } from "../project/samples";
 import { fileName } from "../media/importSources";
+import { runSelectorOptions } from "../engine/runSummary";
+import {
+  buildBicubicGrid,
+  isBicubicGridRow,
+  rankKernelsAcrossSamples,
+} from "../engine/kernelHeatmap";
+import { KernelBicubicHeatmap } from "../components/KernelBicubicHeatmap";
+import { RunSelector } from "../components/RunSelector";
+import { NO_FILTER, filterAccepts, pruneFilter, type FilterSelection } from "../engine/multiFilter";
+import { removeRunsFromState, runSelectionValue } from "../project/runHistory";
 
 export function KernelAnalyzePanel({
   t,
@@ -81,10 +93,28 @@ export function KernelAnalyzePanel({
   const [sampleFilter, setSampleFilter] = useState<string | null>(null);
   /** Selected result row (run id + candidate id); its kernel can be applied. */
   const [selectedResultKey, setSelectedResultKey] = useState<string | null>(null);
+  /** Run selector: "all" or one Run command (RunGroup). */
+  const [runFilter, setRunFilter] = useState<FilterSelection>(NO_FILTER);
+  /** Table mode: one row per Sample, or kernels ranked across Samples. */
+  const [rankAcrossSamples, setRankAcrossSamples] = useState(false);
 
   function toggleSampleExcluded(sampleId: string) {
     setExcludedSampleIds((current) => toggleSetValue(current, sampleId));
   }
+
+  const transferSupported = capabilities?.payload.features?.analysis_transfer === true;
+  const transfer: TransferCurve = transferSupported ? draft.transfer ?? "none" : "none";
+
+  // The Kernel Search continues from the current Recipe, so it starts in the
+  // Recipe's light domain; the selector still allows testing another curve.
+  const recipeTransfer = state.recipesById[state.project.activeRecipeId ?? ""]?.transfer ?? "none";
+  useEffect(() => {
+    const next = transferSupported ? recipeTransfer : "none";
+    onDraftChange((current) =>
+      (current.transfer ?? "none") === next ? current : { ...current, transfer: next });
+    // Only follow the Recipe when it changes, not on every draft edit.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recipeTransfer, state.project.activeRecipeId, transferSupported]);
 
   function patch(partial: Partial<KernelDraft>) {
     onDraftChange((current) => ({ ...current, ...partial }));
@@ -120,6 +150,45 @@ export function KernelAnalyzePanel({
     onSelectResultKey: setSelectedResultKey,
   });
 
+  const runOptions = useMemo(
+    () => runSelectorOptions(t, state, resultRows.rows.map((row) => row.runId)),
+    [resultRows, state, t],
+  );
+  const runNameByValue = useMemo(
+    () => new Map(runOptions.map((option) => [option.value, option.name])),
+    [runOptions],
+  );
+  // A deleted run can leave a stale filter behind; fall back to "all".
+  const activeRunFilter = pruneFilter(runFilter, runOptions.map((option) => option.value));
+  const inRunFilter = (runId: string) =>
+    filterAccepts(activeRunFilter, runSelectionValue(state.runsById[runId], runId));
+  const plotRows = resultRows.rows.filter(
+    (row) => inRunFilter(row.runId) && (!sampleFilter || row.sampleId === sampleFilter),
+  );
+  const tableRows = visibleTableRows
+    .filter((row) => inRunFilter(row.runId))
+    .map((row) => ({
+      ...row,
+      cells: [
+        ...row.cells.slice(0, -1),
+        runNameByValue.get(runSelectionValue(state.runsById[row.runId], row.runId))
+          ?? row.cells[row.cells.length - 1],
+      ],
+    }));
+
+  // A Bicubic (b, c) sweep reads as a grid, not as hundreds of points on a
+  // line: it gets its own heatmap and the line plot keeps the other kernels.
+  const bicubicGrid = useMemo(() => buildBicubicGrid(plotRows), [plotRows]);
+  const linePlotRows = bicubicGrid ? plotRows.filter((row) => !isBicubicGridRow(row)) : plotRows;
+  const sampleCount = new Set(tableRows.map((row) => row.sampleId)).size;
+  const ranking = useMemo(
+    () => rankKernelsAcrossSamples(
+      tableRows.map((row) => ({ key: row.key, metric: row.metric, label: String(row.cells[0]) })),
+    ),
+    [tableRows],
+  );
+  const showRanking = rankAcrossSamples && sampleCount > 1;
+
   /** Apply a kernel (id + parameters) to the current Recipe (its geometry is already there). */
   function applyKernelRefToCurrentRecipe(kernel: KernelRef | null, includeDivergedMetric: boolean) {
     if (!kernel) return null;
@@ -131,6 +200,8 @@ export function KernelAnalyzePanel({
           profileFor(draft.profileId, capabilities).default_axis_mode,
         profileId: draft.profileId,
         mathMode: draft.mathMode,
+        // The kernel was measured under this curve; Check must use it too.
+        transfer,
         ...(includeDivergedMetric ? { metric: { ...draft.metric } } : {}),
       },
       {
@@ -322,6 +393,20 @@ export function KernelAnalyzePanel({
               ) : null}
             </div>
           </div>
+          {runOptions.length > 0 ? (
+            <div className="results-filters height-results-filters" aria-label={t("results.filters.title")}>
+              <RunSelector
+                t={t}
+                options={runOptions}
+                value={activeRunFilter}
+                onChange={setRunFilter}
+                onDeleteRuns={(runIds) =>
+                  onProjectChange((current) => removeRunsFromState(current, runIds))
+                }
+                deleteAllLabel={t("results.deleteAll.kernel")}
+              />
+            </div>
+          ) : null}
           {resultSamples.length > 1 ? (
             <div className="kernel-group-chips">
               <button
@@ -345,31 +430,72 @@ export function KernelAnalyzePanel({
           ) : null}
           {resultRows.rows.length ? (
             <>
+              {bicubicGrid ? (
+                <KernelBicubicHeatmap
+                  t={t}
+                  grid={bicubicGrid}
+                  selectedKey={selectedResultKey}
+                  onSelect={(key) =>
+                    setSelectedResultKey((current) => (current === key ? null : key))
+                  }
+                />
+              ) : null}
               <KernelMetricPlot
                 t={t}
                 selectedKey={selectedResultKey}
                 onSelect={(key) =>
                   setSelectedResultKey((current) => (current === key ? null : key))
                 }
-                rows={
-                  sampleFilter
-                    ? resultRows.rows.filter((row) => row.sampleId === sampleFilter)
-                    : resultRows.rows
-                }
+                rows={linePlotRows}
               />
-              <ResultMetricTable
-                t={t}
-                ariaLabel={t("analyze.resultsTable")}
-                columns={[
-                  t("analyze.col.kernel"),
-                  t("analyze.col.metric"),
-                  t("analyze.col.sample"),
-                  t("analyze.col.run"),
-                ]}
-                metricColumnIndex={1}
-                columnTemplate="minmax(140px, 1.4fr) 96px minmax(80px, 1fr) 72px"
-                rows={visibleTableRows}
-              />
+              {sampleCount > 1 ? (
+                <label className="series-visibility kernel-ranking-toggle">
+                  <input
+                    type="checkbox"
+                    checked={rankAcrossSamples}
+                    onChange={(event) => setRankAcrossSamples(event.target.checked)}
+                  />
+                  <span>{t("analyze.k.rankAcrossSamples", { count: String(sampleCount) })}</span>
+                </label>
+              ) : null}
+              {showRanking ? (
+                <ResultMetricTable
+                  t={t}
+                  ariaLabel={t("analyze.resultsTable")}
+                  columns={[
+                    t("analyze.col.kernel"),
+                    t("analyze.col.meanMetric"),
+                    t("analyze.col.worstMetric"),
+                    t("analyze.col.sampleCount"),
+                  ]}
+                  metricColumnIndex={1}
+                  columnTemplate="minmax(140px, 1.4fr) 96px 96px 72px"
+                  defaultMetricSort="asc"
+                  rows={ranking.map((item) => ({
+                    key: item.label,
+                    metric: item.mean,
+                    cells: [item.label, item.worst.toExponential(2), String(item.count)],
+                    selected: selectedResultKey != null && item.keys.includes(selectedResultKey),
+                    onSelect: () =>
+                      setSelectedResultKey((current) =>
+                        current != null && item.keys.includes(current) ? null : item.key),
+                  }))}
+                />
+              ) : (
+                <ResultMetricTable
+                  t={t}
+                  ariaLabel={t("analyze.resultsTable")}
+                  columns={[
+                    t("analyze.col.kernel"),
+                    t("analyze.col.metric"),
+                    t("analyze.col.sample"),
+                    t("analyze.col.run"),
+                  ]}
+                  metricColumnIndex={1}
+                  columnTemplate="minmax(140px, 1.4fr) 96px minmax(80px, 1fr) 72px"
+                  rows={tableRows}
+                />
+              )}
             </>
           ) : (
             <BlockedState
@@ -442,6 +568,25 @@ export function KernelAnalyzePanel({
               }
             />
           </label>
+          {transferSupported ? (
+            <>
+              <label className="block">
+                <span>{t("analyze.transfer")}</span>
+                <select
+                  aria-label={t("analyze.transfer")}
+                  value={transfer}
+                  onChange={(event) => patch({ transfer: event.target.value as TransferCurve })}
+                >
+                  {TRANSFER_CURVES.map((curve) => (
+                    <option key={curve} value={curve}>{t(`analyze.transfer.${curve}`)}</option>
+                  ))}
+                </select>
+              </label>
+              <p className={`help-copy${transfer !== "none" ? " warning-copy" : ""}`}>
+                {t(transfer === "none" ? "analyze.transferHint" : "analyze.transferActive")}
+              </p>
+            </>
+          ) : null}
         </fieldset>
 
         <MetricSpecSection

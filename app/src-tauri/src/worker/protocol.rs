@@ -22,6 +22,9 @@ pub struct FrameAssetRef {
     pub format: String,
     pub width: u32,
     pub height: u32,
+    /// "limited" for studio-range video; consulted only with a transfer curve.
+    #[serde(default)]
+    pub range: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,11 +97,16 @@ pub struct WorkerAnalyzeRequest {
     pub profile_id: String,
     #[serde(default = "default_endpoint_rule")]
     pub endpoint_rule: String,
+    /// Linear-light hypothesis; omitted analyses the frame as encoded.
+    pub transfer: Option<String>,
     pub base_height: Option<String>,
     pub base_width: Option<String>,
     pub grid: Option<CandidateGridCommand>,
     pub geometry: Option<GeometryCommand>,
 }
+
+/// Mirrors the engine's `TransferCurve` names.
+const TRANSFER_CURVES: [&str; 5] = ["none", "gamma22", "bt1886", "srgb", "bt709"];
 
 /// Mirrors the engine's `maximum_filter_blur`: plan size grows with blur.
 const MAXIMUM_KERNEL_BLUR: f64 = 16.0;
@@ -343,6 +351,16 @@ pub(crate) fn validate_analyze(request: &WorkerAnalyzeRequest) -> Result<(), Str
             ));
         }
     }
+    if let Some(transfer) = &request.transfer {
+        if !TRANSFER_CURVES.contains(&transfer.as_str()) {
+            return Err(format!("bad_request: unknown transfer {transfer:?}"));
+        }
+    }
+    if let Some(range) = &request.frame_asset.range {
+        if range != "limited" && range != "full" {
+            return Err(format!("bad_request: unknown frame asset range {range:?}"));
+        }
+    }
     if request.metric.p_norm == Some(0) {
         return Err("bad_request: p_norm must be a positive integer".to_owned());
     }
@@ -430,6 +448,12 @@ pub(crate) fn analyze_command(request: &WorkerAnalyzeRequest) -> Result<Value, S
         "metric": metric_json(&request.metric),
         "backend": request.backend,
     });
+    if let Some(transfer) = request.transfer.as_deref().filter(|name| *name != "none") {
+        command["transfer"] = json!(transfer);
+    }
+    if let Some(range) = &request.frame_asset.range {
+        command["frame_asset"]["range"] = json!(range);
+    }
     if let Some(geometry) = &request.geometry {
         command["geometry"] = json!({
             "width": geometry.width,
@@ -493,6 +517,9 @@ pub struct VerifyMediaBeginRequest {
     pub end_frame: Option<u64>,
     pub axis_mode: String,
     pub kernel: KernelCommand,
+    /// Linear-light curve of the Recipe; omitted analyses as encoded.
+    #[serde(default)]
+    pub transfer: Option<String>,
     pub candidate: String,
     pub metric: MetricCommand,
     pub backend: String,
@@ -506,6 +533,11 @@ fn default_media_verify_concurrency() -> u32 {
 }
 
 pub(crate) fn validate_verify_media_begin(request: &VerifyMediaBeginRequest) -> Result<(), String> {
+    if let Some(transfer) = &request.transfer {
+        if !TRANSFER_CURVES.contains(&transfer.as_str()) {
+            return Err(format!("bad_request: unknown transfer {transfer:?}"));
+        }
+    }
     if request.request_id.trim().is_empty() || request.path.trim().is_empty() {
         return Err("bad_request: requestId and path must not be empty".to_owned());
     }
@@ -559,7 +591,7 @@ pub(crate) fn verify_media_begin_command(
     request: &VerifyMediaBeginRequest,
     cache_directory: &Path,
 ) -> Value {
-    json!({
+    let mut command = json!({
         "protocol_version": PROTOCOL_VERSION,
         "type": "verify_media_begin",
         "request_id": request.request_id,
@@ -592,7 +624,11 @@ pub(crate) fn verify_media_begin_command(
             "base_width": geometry.base_width,
             "base_height": geometry.base_height,
         })),
-    })
+    });
+    if let Some(transfer) = request.transfer.as_deref().filter(|name| *name != "none") {
+        command["transfer"] = json!(transfer);
+    }
+    command
 }
 
 #[cfg(test)]
@@ -803,6 +839,17 @@ mod tests {
         let command = analyze_command(&request).unwrap();
         assert_eq!(command["kernel"]["blur"], json!(1.25));
 
+        assert!(command.get("transfer").is_none());
+        request.transfer = Some("bt1886".to_owned());
+        assert_eq!(
+            analyze_command(&request).unwrap()["transfer"],
+            json!("bt1886")
+        );
+        request.transfer = Some("none".to_owned());
+        assert!(analyze_command(&request).unwrap().get("transfer").is_none());
+        request.transfer = Some("pq".to_owned());
+        assert!(validate_analyze(&request).is_err());
+        request.transfer = None;
         request.kernel.as_mut().unwrap().blur = Some(16.0);
         assert!(validate_analyze(&request).is_ok());
         request.kernel.as_mut().unwrap().blur = Some(16.5);

@@ -208,6 +208,8 @@ struct VideotoolboxSession::Impl {
     int tb_den = 90000;
     int width = 0;
     int height = 0;
+    int bit_depth = 8;
+    bool full_range = false;
     std::uint32_t codec_id = 0;
     std::vector<PendingPacket> pending;
 
@@ -381,7 +383,13 @@ struct VideotoolboxSession::Impl {
         CFMutableDictionaryRef buffer_attrs = CFDictionaryCreateMutable(
             kCFAllocatorDefault, 4, &kCFTypeDictionaryKeyCallBacks,
             &kCFTypeDictionaryValueCallBacks);
-        const OSType pixfmt = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+        // Match the coded stream: a fixed 8-bit video-range surface would make
+        // VideoToolbox narrow 10-bit sources and range-convert full-range ones.
+        const OSType pixfmt = bit_depth > 8
+            ? (full_range ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+                          : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+            : (full_range ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                          : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
         CFNumberRef pix = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pixfmt);
         CFDictionarySetValue(buffer_attrs, kCVPixelBufferPixelFormatTypeKey, pix);
         CFDictionarySetValue(buffer_attrs, kCVPixelBufferIOSurfacePropertiesKey, io_surface);
@@ -439,8 +447,11 @@ struct VideotoolboxSession::Impl {
 
 VideotoolboxSession::VideotoolboxSession(std::uint32_t codec_id, int width, int height,
                                          const std::uint8_t *extradata, int extradata_size,
-                                         std::size_t max_inflight)
+                                         std::size_t max_inflight, int bit_depth,
+                                         bool full_range)
     : impl_(std::make_unique<Impl>()) {
+    impl_->bit_depth = bit_depth;
+    impl_->full_range = full_range;
     impl_->max_inflight = std::max<std::size_t>(max_inflight, 2U);
     impl_->width = width;
     impl_->height = height;

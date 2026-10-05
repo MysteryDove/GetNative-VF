@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { EngineEnvelope } from "../engine/types";
 import {
   applyPreset,
+  normalizeScanMode,
+  refineAround,
   convertScanRange,
   scanAxisKind,
   type ScanAxisKind,
@@ -23,6 +25,7 @@ import {
 } from "../engine/runGroupPlan";
 import { pNormMaximumForBackend } from "../engine/backendSelection";
 import type { ProjectState, Sample } from "../project/types";
+import { restoreDraft } from "../project/analyzeView";
 
 /**
  * Height-scan draft state plus its pure derivations (grid, work estimate,
@@ -35,6 +38,7 @@ export function useHeightDraft({
   sourcesById,
   subroute,
   initialMetric,
+  initialDraft,
 }: {
   capabilities: EngineEnvelope | null;
   includedSamples: Sample[];
@@ -42,9 +46,16 @@ export function useHeightDraft({
   /** Owned by the shell nav; only gates plan building (height subroute only). */
   subroute: "height" | "kernel";
   initialMetric?: MetricSpec | null;
+  /** Draft saved with the project; laid over the defaults once. */
+  initialDraft?: Record<string, unknown> | null;
 }) {
+  // The metric has its own stored copy; the kernel list is validated on use.
+  const restore = (base: HeightDraft) =>
+    normalizeScanMode(
+      restoreDraft(base as unknown as Record<string, unknown>, initialDraft ?? null, ["metric"]) as unknown as HeightDraft,
+    );
   const [draft, setDraft] = useState<HeightDraft>(() => {
-    const next = defaultHeightDraft(capabilities);
+    const next = restore(defaultHeightDraft(capabilities));
     if (initialMetric) next.metric = { ...initialMetric };
     return next;
   });
@@ -53,7 +64,7 @@ export function useHeightDraft({
   useEffect(() => {
     if (draftSeeded || !capabilities) return;
     setDraft((current) => {
-      const next = defaultHeightDraft(capabilities);
+      const next = restore(defaultHeightDraft(capabilities));
       next.metric = { ...current.metric };
       return next;
     });
@@ -102,6 +113,7 @@ export function useHeightDraft({
   const widthPerHeightRef = useRef(widthPerHeight);
   widthPerHeightRef.current = widthPerHeight;
 
+  const hPlusWWidthMode = useRef<HeightDraft["baseWidthMode"] | null>(null);
   const patch = useCallback((partial: Partial<HeightDraft>) => {
     setDraft((current) => {
       let next = { ...current, ...partial };
@@ -123,11 +135,17 @@ export function useHeightDraft({
             : null);
         if (restored) next = { ...next, ...restored };
       }
-      // Only the transition into a decimal scan picks the even base; later
-      // explicit integer choices stay the user's (and are flagged inline).
-      return !scansFractionalCandidates(current) && scansFractionalCandidates(next)
-        ? withFractionalBase(next)
-        : next;
+      // The H+W width parity is its own choice: W-only forces a parity on
+      // the width, so coming back restores what H+W had (auto by default).
+      if (current.axisMode !== next.axisMode && partial.baseWidthMode === undefined) {
+        if (current.axisMode === "h_plus_w") hPlusWWidthMode.current = current.baseWidthMode;
+        if (next.axisMode === "h_plus_w") {
+          next = { ...next, baseWidthMode: hPlusWWidthMode.current ?? "integer", baseWidth: "" };
+        }
+      }
+      // A non-integer scan always has a parity base on its scanned axis
+      // (switching the axis can move that requirement to the other one).
+      return scansFractionalCandidates(next) ? withFractionalBase(next) : next;
     });
   }, []);
 
@@ -137,17 +155,7 @@ export function useHeightDraft({
 
   /** Refine the grid around a height picked from the results plot/table. */
   const refineAroundHeight = useCallback((height: string) => {
-    setDraft((current) =>
-      applyPreset(
-        {
-          ...current,
-          refineSelected: height,
-          refineHalfSpan: current.refineHalfSpan || "1.0",
-          step: current.step.includes(".") ? current.step : "0.1",
-        },
-        "fractional_refine",
-      ),
-    );
+    setDraft((current) => refineAround(current, height, Number(current.refineHalfSpan) || 1));
   }, []);
 
   return {

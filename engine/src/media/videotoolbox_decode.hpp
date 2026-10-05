@@ -28,9 +28,13 @@ struct VideotoolboxFrame {
 // flight. The FFmpeg hwaccel path waits after every DecodeFrame and cannot.
 class VideotoolboxSession {
 public:
+    // `bit_depth` and `full_range` describe the coded stream. The session
+    // asks VideoToolbox for a matching output surface, so 10-bit sources are
+    // not narrowed to 8 bits and full-range sources are not range-converted.
     VideotoolboxSession(std::uint32_t codec_id, int width, int height,
                         const std::uint8_t *extradata, int extradata_size,
-                        std::size_t max_inflight);
+                        std::size_t max_inflight, int bit_depth = 8,
+                        bool full_range = false);
     VideotoolboxSession(const VideotoolboxSession &) = delete;
     VideotoolboxSession &operator=(const VideotoolboxSession &) = delete;
     ~VideotoolboxSession();

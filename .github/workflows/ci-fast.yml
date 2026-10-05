@@ -8,7 +8,7 @@ on:
 
 concurrency:
   group: ci-fast-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -17,6 +17,7 @@ jobs:
   changes:
     name: Detect changed areas
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       frontend: ${{ steps.filter.outputs.frontend }}
       rust: ${{ steps.filter.outputs.rust }}
@@ -31,7 +32,10 @@ jobs:
           filters: |
             frontend:
               - 'app/src/**'
+              - 'app/public/**'
+              - 'app/scripts/**'
               - 'app/index.html'
+              - 'app/layout-harness.html'
               - 'app/package.json'
               - 'app/pnpm-lock.yaml'
               - 'app/tsconfig*.json'
@@ -55,6 +59,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -85,6 +90,7 @@ jobs:
       needs.changes.outputs.rust == 'true' ||
       needs.changes.outputs.engine == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     env:
       SCCACHE_GHA_ENABLED: "true"
     steps:
@@ -105,8 +111,9 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: app/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable # tracks current stable Rust by design
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
@@ -126,6 +133,7 @@ jobs:
       - name: Rust checks
         working-directory: app
         run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml --check
           cargo test --manifest-path src-tauri/Cargo.toml
           cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
@@ -136,6 +144,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       needs.changes.outputs.engine == 'true'
     runs-on: windows-2022
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -160,6 +169,7 @@ jobs:
     if: always()
     needs: [changes, frontend, tauri, windows-engine]
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: Require all selected checks
         env:

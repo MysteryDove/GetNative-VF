@@ -582,6 +582,41 @@ is decoded once. Cache keys include fingerprint, stream, frame, dimensions,
 format, and index version. Product code never launches `ffmpeg` or `ffprobe`;
 those executables may be used only by test fixture generators.
 
+### 2.9 Transfer curve (linear-light hypothesis)
+
+`analyze` and `verify_media_begin` accept an optional `transfer`:
+`none` (default), `gamma22`, `bt1886` (pure 2.4 power), `srgb`, or `bt709`
+(inverse OETF). With a curve set, luma is decoded to linear light before the
+descale/rescale round trip and the error is measured in that domain; errors
+from different curves are therefore not on one scale. Unknown names are
+rejected with `bad_request`. Workers advertise support through
+`features.analysis_transfer` and `features.verify_transfer`.
+
+Analysis always runs on nominal samples: 0 is black and 1 is white. Decoded
+F32 luma and exported frame assets keep the video's code range
+(`code * 2^(16-depth) / 65535`, so 8-bit black is 16/256), and studio-range
+samples are stretched to nominal 0..1 (8-bit codes 16..235) before analysis,
+with or without a curve. Codes outside the nominal range are kept and land
+below 0 or above 1; a curve clamps negatives to zero.
+
+- `analyze`: `frame_asset.range` is `limited` or `full` (default `full`, i.e.
+  stills). `media_asset_batch` results report each asset's `range`; pass it
+  back unchanged.
+- `verify_media_begin`: the range comes from the indexed stream; unspecified
+  YUV is treated as `limited`, RGB as `full`.
+- `verify_begin` (client-pushed frames): optional `transfer_range`, default
+  `full`.
+
+The stretch and the curve are applied where the analysis frame is produced, so
+every compute backend analyses the same samples: on the host for frame assets
+and software decode, and inside the device luma conversion for the CUDA,
+Vulkan, and VideoToolbox/Metal zero-copy paths. Results echo `transfer` when a
+curve is set, `transfer_range` when a conversion happened, and always
+`sample_scale: "nominal"` (`payload` for analyze, `payload.provenance` for
+media verify). Workers before this convention analysed studio-range video on
+the code scale without a curve and did not report `sample_scale`; their errors
+are about 1.17x smaller and not comparable.
+
 ## 3. Events
 
 Every event carries `protocol_version`, `request_id` (of the triggering

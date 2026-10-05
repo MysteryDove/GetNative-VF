@@ -111,10 +111,7 @@ pub fn app_set_language(
 }
 
 #[tauri::command]
-pub fn app_set_theme(
-    app: AppHandle,
-    request: SetThemeRequest,
-) -> Result<AppPreferences, String> {
+pub fn app_set_theme(app: AppHandle, request: SetThemeRequest) -> Result<AppPreferences, String> {
     let mut prefs = load_preferences(&app)?;
     prefs.theme = request.theme;
     save_preferences(&app, &prefs)?;

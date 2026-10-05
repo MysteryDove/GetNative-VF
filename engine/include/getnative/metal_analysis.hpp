@@ -94,6 +94,9 @@ struct MetalLumaFrameView {
     std::int32_t bit_depth = 8;
     std::string surface_format;
     std::string range = "unknown";
+    // TransferCurve id (getnative/transfer.hpp); 0 applies no curve. Studio
+    // range is always stretched to nominal 0..1 first.
+    std::uint32_t transfer = 0U;
 };
 
 [[nodiscard]] bool metal_backend_available() noexcept;

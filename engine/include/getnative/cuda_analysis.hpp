@@ -180,6 +180,9 @@ struct CudaLumaFrameView {
     CudaColorRange range = CudaColorRange::limited;
     std::uintptr_t context = 0U;
     std::uintptr_t producer_stream = 0U;
+    // TransferCurve id (getnative/transfer.hpp); 0 applies no curve. A
+    // `limited` range is always stretched to nominal 0..1 first.
+    std::uint32_t transfer = 0U;
 };
 
 [[nodiscard]] CudaRuntimeProbe cuda_runtime_probe() noexcept;

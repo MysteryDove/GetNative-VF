@@ -152,6 +152,15 @@ export function planVerifyRunGroup(input: {
 }): { ok: true; plan: VerifyRunGroupPlan } | { ok: false; reason: string } {
   const readiness = recipeReadiness(input.recipe);
   if (!readiness.ok) return { ok: false, reason: "recipe_incomplete" };
+  // A worker that predates transfer support would ignore the curve and run
+  // as encoded while the Run is recorded as linear-light; refuse instead.
+  if (
+    input.recipe.transfer && input.recipe.transfer !== "none"
+    && input.capabilities
+    && input.capabilities.payload.features?.verify_transfer !== true
+  ) {
+    return { ok: false, reason: "transfer_unsupported" };
+  }
   // recipeReadiness guarantees geometry/kernel/metric are present.
   const recipeSnapshot = structuredClone(input.recipe);
   const recipeGeometry = recipeSnapshot.geometry!;
@@ -203,6 +212,9 @@ export function planVerifyRunGroup(input: {
       axisMode: input.recipe.axisMode,
       profileId: input.recipe.profileId ?? "",
       mathMode: input.recipe.mathMode ?? "raw",
+      ...(input.recipe.transfer && input.recipe.transfer !== "none"
+        ? { transfer: input.recipe.transfer }
+        : {}),
       scanScope: scope.scope,
       backendPreference: input.draft.backendPreference,
       concurrency: input.draft.concurrency,

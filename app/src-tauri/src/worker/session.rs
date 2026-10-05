@@ -375,6 +375,7 @@ mod tests {
                 format: "f32le".to_owned(),
                 width: 320,
                 height: 240,
+                range: None,
             },
             axis_mode: "h_only".to_owned(),
             kernel: Some(KernelCommand {
@@ -400,6 +401,7 @@ mod tests {
             endpoint_rule: default_endpoint_rule(),
             base_height: None,
             base_width: None,
+            transfer: None,
             grid: None,
             geometry: None,
         };
@@ -523,6 +525,7 @@ mod tests {
                 format: asset.format.clone(),
                 width: asset.width,
                 height: asset.height,
+                range: None,
             },
             axis_mode: "h_only".to_owned(),
             kernel: Some(KernelCommand {
@@ -548,6 +551,7 @@ mod tests {
             endpoint_rule: default_endpoint_rule(),
             base_height: None,
             base_width: None,
+            transfer: None,
             grid: None,
             geometry: None,
         };

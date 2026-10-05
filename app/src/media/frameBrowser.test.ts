@@ -1,7 +1,8 @@
-import { describe, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   findDuplicateSampleId,
   frameStepFromKeyboard,
+  resolveFrameInput,
 } from "./frameBrowser";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -63,5 +64,20 @@ describe("GUI-2 frame browser contracts", () => {
       }) === null,
       "new frame",
     );
+  });
+});
+
+describe("resolveFrameInput", () => {
+  it("clamps a typed frame number to the stream and rounds decimals", () => {
+    expect(resolveFrameInput("1200", 34000)).toBe(1200);
+    expect(resolveFrameInput(" 99999 ", 34000)).toBe(34000);
+    expect(resolveFrameInput("12.6", 100)).toBe(13);
+    expect(resolveFrameInput("0", 100)).toBe(0);
+  });
+
+  it("rejects anything that is not a non-negative number", () => {
+    for (const text of ["", "abc", "-5", "1e3", "12a"]) {
+      expect(resolveFrameInput(text, 100)).toBeNull();
+    }
   });
 });

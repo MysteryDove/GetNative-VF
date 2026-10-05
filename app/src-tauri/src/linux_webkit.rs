@@ -109,7 +109,10 @@ fn isolate_gtk_search_path() {
         .filter(|entry| !entry.is_empty() && entry.starts_with(&appdir))
         .collect();
     env::set_var("GTK_PATH", filtered.join(":"));
-    eprintln!("getnative: GTK_PATH={} (drop host GTK modules from AppImage)", filtered.join(":"));
+    eprintln!(
+        "getnative: GTK_PATH={} (drop host GTK modules from AppImage)",
+        filtered.join(":")
+    );
 }
 
 fn isolate_host_im_module() {
@@ -122,7 +125,9 @@ fn isolate_host_im_module() {
     // only path — XIM is. Disable both unless the user opts back in.
     env::set_var(GTK_IM_MODULE, "simple");
     env::set_var(XMODIFIERS, "@im=none");
-    eprintln!("getnative: {GTK_IM_MODULE}=simple {XMODIFIERS}=@im=none (block fcitx5/ibus on focus)");
+    eprintln!(
+        "getnative: {GTK_IM_MODULE}=simple {XMODIFIERS}=@im=none (block fcitx5/ibus on focus)"
+    );
 }
 
 fn disable_atk_bridge() {

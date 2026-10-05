@@ -95,6 +95,10 @@ export type EngineEnvelope = {
     >;
     features?: {
       verify_frame_ring?: boolean;
+      /** Analyze accepts a `transfer` curve (linear-light hypothesis). */
+      analysis_transfer?: boolean;
+      /** Check (`verify_media_begin`) applies the Recipe's `transfer`. */
+      verify_transfer?: boolean;
       media_frame_batch?: boolean;
       verify_engine_decode?: boolean;
       media_verify_concurrency?: {

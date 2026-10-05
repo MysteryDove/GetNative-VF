@@ -45,6 +45,9 @@ export function RecipeSummaryStrip({
             : ""}
           {recipe.kernel?.id ? ` · ${kernelDisplayName(t, recipe.kernel.id)}` : ""}
           {recipe.mathMode ? ` · ${recipe.mathMode}` : ""}
+          {recipe.transfer && recipe.transfer !== "none"
+            ? ` · ${t(`analyze.transfer.${recipe.transfer}`)}`
+            : ""}
           {recipe.metric
             ? ` · ${t("analyze.pixelExclusion")} ${recipe.metric.pixelExclusionThreshold}`
             : ""}

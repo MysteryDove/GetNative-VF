@@ -50,6 +50,10 @@ import type { ExecutionBridge } from "../engine/executeRunGroup";
 import type { ProjectRoute, ProjectState, Run } from "../project/types";
 import { buildVerificationFusion, fusionEligibility, prepareFusionRuns } from "../project/verificationFusion";
 import { buildVerificationFusionCsv, buildVerificationFusionJson, saveArtifact } from "../project/export";
+import { runSelectorOptions } from "../engine/runSummary";
+import { RunSelector } from "../components/RunSelector";
+import { NO_FILTER, filterAccepts, pruneFilter, type FilterSelection } from "../engine/multiFilter";
+import { removeRunsFromState, runSelectionValue } from "../project/runHistory";
 
 /**
  * Whole-video Verification: setup (sources, scope, range, backend) plus the
@@ -183,9 +187,21 @@ export function VerifyPage({
     return result.ok ? result.plan : null;
   }, [draft, recipe, scanMetric, state.sourcesById, capabilities]);
 
-  const runs = useMemo(
+  /** Run selector: the selected Check commands (RunGroups); empty shows all. */
+  const [runFilter, setRunFilter] = useState<FilterSelection>(NO_FILTER);
+  const historyRuns = useMemo(
     () => verificationRuns(state).filter((run) => !historySourceId || run.sourceId === historySourceId),
     [state, historySourceId],
+  );
+  const runOptions = useMemo(
+    () => runSelectorOptions(t, state, historyRuns.map((run) => run.id)),
+    [historyRuns, state, t],
+  );
+  // A deleted run or a changed history source can leave a stale filter behind.
+  const activeRunFilter = pruneFilter(runFilter, runOptions.map((option) => option.value));
+  const runs = useMemo(
+    () => historyRuns.filter((run) => filterAccepts(activeRunFilter, runSelectionValue(run, run.id))),
+    [historyRuns, activeRunFilter],
   );
   const historySourceIds = useMemo(() => new Set([
     ...verificationRuns(state).map((run) => run.sourceId).filter((id): id is string => Boolean(id)),
@@ -646,6 +662,20 @@ export function VerifyPage({
               </div>
             ) : null}
           </div>
+          {runOptions.length > 0 ? (
+            <div className="results-filters height-results-filters" aria-label={t("results.filters.title")}>
+              <RunSelector
+                t={t}
+                options={runOptions}
+                value={activeRunFilter}
+                onChange={setRunFilter}
+                onDeleteRuns={(runIds) =>
+                  onProjectChange((current) => removeRunsFromState(current, runIds))
+                }
+                deleteAllLabel={t("results.deleteAll.verify")}
+              />
+            </div>
+          ) : null}
           {runs.length > 0 || sourceFusions.length > 0 ? (
             <div className="verify-fusion-picker">
               <div className="verify-fusion-picker-head">

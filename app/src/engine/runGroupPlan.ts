@@ -1,5 +1,12 @@
 import type { EngineEnvelope } from "./types";
-import type { AxisMode, BaseMode, CandidateGridSpec, KernelRef, MetricSpec } from "./protocol";
+import type {
+  AxisMode,
+  BaseMode,
+  CandidateGridSpec,
+  KernelRef,
+  MetricSpec,
+  TransferCurve,
+} from "./protocol";
 import {
   fixedKernelsForDraft,
   missingFractionalBaseAxis,
@@ -9,11 +16,11 @@ import {
 } from "./heightDraft";
 import { validateHeightShape } from "./shapeGuards";
 import type { HeightAnalyzeRequest } from "./protocol";
-import type { ProjectState, Run, RunGroup } from "../project/types";
+import type { ProjectState, Run, RunGroup, Sample } from "../project/types";
 import type { Translator } from "../i18n";
 import { kernelRefLabel } from "./displayNames";
 import { decimalPlaces } from "./numberInput";
-import { baseForMode } from "./geometry";
+import { baseForMode, derivedBaseWidth, minimumBaseForParity } from "./geometry";
 
 export type HeightRunGroupType =
   | "single_height"
@@ -129,16 +136,6 @@ export function planHeightRunGroup(input: {
     return { ok: false, reason: "grid_invalid" };
   }
 
-  function resolveBase(
-    mode: HeightDraft["baseHeightMode"],
-    explicit: string | null,
-    srcMaximum: number,
-  ): string | null {
-    if (explicit) return explicit;
-    const value = baseForMode(srcMaximum, mode);
-    return value == null ? null : String(value);
-  }
-
   for (const sample of included) {
     const source = input.sourcesById[sample.sourceId];
     if (!source || source.state !== "ready") {
@@ -152,25 +149,10 @@ export function planHeightRunGroup(input: {
       return { ok: false, reason: "sample_fingerprint_stale" };
     }
 
-    const baseHeightForMember = input.draft.axisMode === "w_only"
-      ? null
-      : resolveBase(input.draft.baseHeightMode, baseHeight, candidateMaximum);
-    let widthMaximum: number | null = null;
-    if (input.draft.axisMode === "w_only") {
-      widthMaximum = candidateMaximum;
-    } else if (input.draft.axisMode === "h_plus_w") {
-      if (baseWidth && input.draft.baseWidthMode === "integer") {
-        widthMaximum = 1;
-      } else if (input.draft.baseWidthMode !== "integer") {
-        if (!(source.width && source.height)) {
-          return { ok: false, reason: "source_dimensions_required" };
-        }
-        widthMaximum = source.width * candidateMaximum / source.height;
-      }
-    }
-    const baseWidthForMember = input.draft.axisMode === "h_only" || widthMaximum == null
-      ? null
-      : resolveBase(input.draft.baseWidthMode, baseWidth, widthMaximum);
+    const bases = resolveScanBases(input.draft, candidateMaximum, source);
+    if (!bases) return { ok: false, reason: "source_dimensions_required" };
+    const baseHeightForMember = bases.baseHeight;
+    const baseWidthForMember = bases.baseWidth;
 
     for (const kernel of kernels) {
       const requestId = `${prefix}_${now}_${requestSeq++}`;
@@ -189,6 +171,9 @@ export function planHeightRunGroup(input: {
         heightGrid: grid.grid,
         baseHeight: baseHeightForMember,
         baseWidth: baseWidthForMember,
+        ...(input.draft.transfer && input.draft.transfer !== "none"
+          ? { transfer: input.draft.transfer }
+          : {}),
         metric: { ...input.draft.metric },
         profileId: input.draft.profileId,
         mathMode: input.draft.mathMode,
@@ -321,6 +306,58 @@ export function materializeHeightRunGroup(input: {
   };
 }
 
+/**
+ * The base values a scan sends to the engine for one source: an explicit
+ * base wins, otherwise the smallest base of the chosen parity that covers the
+ * largest candidate. Null when a width parity needs unknown source dimensions.
+ */
+export function resolveScanBases(
+  draft: Pick<HeightDraft, "axisMode" | "baseHeightMode" | "baseWidthMode"> & {
+    baseHeight?: string | null;
+    baseWidth?: string | null;
+  },
+  candidateMaximum: number,
+  source: { width?: number | null; height?: number | null },
+): { baseHeight: string | null; baseWidth: string | null } | null {
+  const explicitHeight = draft.baseHeight?.trim() || null;
+  const explicitWidth = draft.baseWidth?.trim() || null;
+  const resolveBase = (mode: BaseMode, explicit: string | null, srcMaximum: number) => {
+    if (explicit) return explicit;
+    const value = baseForMode(srcMaximum, mode);
+    return value == null ? null : String(value);
+  };
+  const baseHeight = draft.axisMode === "w_only"
+    ? null
+    : resolveBase(draft.baseHeightMode, explicitHeight, candidateMaximum);
+  let widthMaximum: number | null = null;
+  if (draft.axisMode === "w_only") {
+    widthMaximum = candidateMaximum;
+  } else if (draft.axisMode === "h_plus_w") {
+    if (explicitWidth && draft.baseWidthMode === "integer") {
+      widthMaximum = 1;
+    } else if (draft.baseWidthMode !== "integer") {
+      if (!(source.width && source.height)) return null;
+      widthMaximum = source.width * candidateMaximum / source.height;
+    }
+  }
+  let baseWidth = draft.axisMode === "h_only" || widthMaximum == null
+    ? null
+    : resolveBase(draft.baseWidthMode, explicitWidth, widthMaximum);
+  // H+W width on auto: a parity canvas like the height, with the parity of
+  // the source width (upstream's default base is the source size). Left to
+  // the engine it would follow the base height and flip with the scan range.
+  if (
+    draft.axisMode === "h_plus_w" && baseWidth == null && baseHeight != null
+    && source.width && source.height
+  ) {
+    baseWidth = String(minimumBaseForParity(
+      source.width * candidateMaximum / source.height,
+      source.width % 2 === 0 ? "even" : "odd",
+    ));
+  }
+  return { baseHeight, baseWidth };
+}
+
 /** MetricSpec compatibility key: incompatible metrics must not overlay. */
 export function metricCompatibilityKey(metric: MetricSpec): string {
   return [
@@ -331,6 +368,40 @@ export function metricCompatibilityKey(metric: MetricSpec): string {
     metric.pixelExclusionThreshold,
     metric.pNorm,
   ].join("|");
+}
+
+/**
+ * Engines before the nominal sample scale analysed studio-range video on the
+ * decoder's code scale whenever no curve was set, so those errors sit about
+ * 1.17x below current ones. Such results carry no `sample_scale`. Stills and
+ * curve Runs were already nominal and stay comparable.
+ */
+export function runUsesLegacySampleScale(
+  run: Pick<Run, "result">,
+  transfer: TransferCurve,
+  sample: Pick<Sample, "frameIndex"> | null | undefined,
+): boolean {
+  if (transfer !== "none" || sample?.frameIndex == null) return false;
+  if (!run.result || typeof run.result !== "object") return false;
+  return (run.result as { sample_scale?: unknown }).sample_scale !== "nominal";
+}
+
+/**
+ * Earlier builds let the engine derive an auto H+W width base from the base
+ * height, so its parity moved with the scan range. Such a Run is comparable
+ * with current ones only when that parity happens to match the source width.
+ */
+export function runUsesLegacyAutoWidth(
+  run: Pick<Run, "inputSnapshot">,
+  source: { width?: number | null; height?: number | null } | null | undefined,
+): boolean {
+  const request = (run.inputSnapshot as HeightRunSnapshot | null)?.request;
+  if (request?.axisMode !== "h_plus_w" || request.baseWidth != null || request.baseHeight == null) {
+    return false;
+  }
+  if (!source?.width || !source.height) return false;
+  const derived = derivedBaseWidth(source.width, source.height, Number(request.baseHeight));
+  return derived % 2 !== source.width % 2;
 }
 
 export type HeightSeriesPoint = {
@@ -411,6 +482,7 @@ type HeightRunSnapshot = {
     axisMode?: AxisMode;
     baseHeight?: string | null;
     baseWidth?: string | null;
+    transfer?: TransferCurve;
   };
 };
 
@@ -426,6 +498,11 @@ export type HeightRunConfig = {
   decimals: number;
   baseHeightMode: BaseMode;
   baseWidthMode: BaseMode;
+  /** Resolved base values the request carried (null = none sent). */
+  baseHeight: string | null;
+  baseWidth: string | null;
+  /** Transfer curve the scan was measured under (`none` for older records). */
+  transfer: TransferCurve;
 };
 
 function baseModeFromValue(value: string | null | undefined): BaseMode {
@@ -463,6 +540,9 @@ export function heightRunConfig(
       : 0,
     baseHeightMode: intent?.baseHeightMode ?? baseModeFromValue(snapshot?.request?.baseHeight),
     baseWidthMode: intent?.baseWidthMode ?? baseModeFromValue(snapshot?.request?.baseWidth),
+    baseHeight: snapshot?.request?.baseHeight ?? null,
+    baseWidth: snapshot?.request?.baseWidth ?? null,
+    transfer: snapshot?.request?.transfer ?? "none",
   };
 }
 
@@ -472,6 +552,11 @@ export function buildSeriesTable(
   hiddenSampleIds: Set<string>,
   activeMetricKey: string,
   activeAxisMode?: AxisMode,
+  /**
+   * Errors measured in different light domains are not on one scale, so only
+   * Runs of the selected transfer are shown; the rest count as incompatible.
+   */
+  activeTransfer?: TransferCurve,
 ): SeriesTable {
   const rows: SeriesTableRow[] = [];
   const seriesMeta: SeriesMeta[] = [];
@@ -488,9 +573,22 @@ export function buildSeriesTable(
         continue;
       }
     }
+    if (activeTransfer !== undefined && config.transfer !== activeTransfer) {
+      incompatibleCount += 1;
+      continue;
+    }
+    const sample = run.sampleId ? state.samplesById[run.sampleId] : null;
+    if (runUsesLegacySampleScale(run, config.transfer, sample)) {
+      incompatibleCount += 1;
+      continue;
+    }
+    const runSourceId = run.sourceId || sample?.sourceId;
+    if (runUsesLegacyAutoWidth(run, runSourceId ? state.sourcesById?.[runSourceId] : null)) {
+      incompatibleCount += 1;
+      continue;
+    }
     const series = extractHeightSeries(run.result);
     if (!series) continue;
-    const sample = run.sampleId ? state.samplesById[run.sampleId] : null;
     const kernelId = config.kernel?.id ?? "—";
     const kernelParameters = config.kernel?.parameters ?? {};
     const kernelKey = `${kernelId}:${JSON.stringify(kernelParameters)}`;
