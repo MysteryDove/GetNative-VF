@@ -45,11 +45,12 @@ main target.
   the project.
 - "Algorithm Test" is "Kernel Search" in English; the Chinese label is
   unchanged.
+- Studio-range video is now analysed on nominal 0..1 samples on every
+  backend. Errors from earlier builds without a transfer curve are about 1.17×
+  lower; those Runs are hidden from overlays and need re-running to compare.
 
 ## Known, deliberately not addressed
 
 - Vulkan Video decode of H.264 that is all-IDR and high bitrate can return
   corrupted frames (FFmpeg/driver level; reproduced without GetNative code).
   CUDA/NVDEC is unaffected.
-- Metal and the other backends disagree by 1.169× when no transfer curve is
-  set (see `descale-preview-draft.md`).

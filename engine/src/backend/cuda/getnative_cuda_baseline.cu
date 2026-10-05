@@ -848,14 +848,13 @@ extern "C" __global__ void getnative_cuda_luma_to_f32(
 
     float normalized = static_cast<float>(sample)
         * static_cast<float>(1U << (16U - bit_depth)) / 65535.0F;
-    // Linear-light hypothesis (getnative/transfer.hpp): stretch studio range
-    // to 0..1, then decode with the requested curve. `transfer == 0` keeps
-    // the samples exactly as encoded.
+    // getnative/transfer.hpp: studio range is always stretched to nominal
+    // 0..1 (excursions kept), then decoded with the requested curve.
+    if (limited_range != 0U) {
+        normalized = (normalized * (65535.0F / 256.0F) - 16.0F) / 219.0F;
+    }
     if (transfer != 0U) {
-        float encoded = limited_range != 0U
-            ? (normalized * (65535.0F / 256.0F) - 16.0F) / 219.0F
-            : normalized;
-        encoded = fmaxf(encoded, 0.0F);
+        const float encoded = fmaxf(normalized, 0.0F);
         if (transfer == 1U) {
             normalized = powf(encoded, 2.2F);
         } else if (transfer == 2U) {

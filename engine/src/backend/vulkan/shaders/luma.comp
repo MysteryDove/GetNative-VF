@@ -10,14 +10,13 @@ layout(push_constant, std430) uniform PushConstants {
     uint value[32];
 } pc;
 
-// Linear-light hypothesis (getnative/transfer.hpp): stretch studio range to
-// 0..1, then decode with the requested curve. Transfer 0 keeps the samples
-// exactly as encoded.
+// getnative/transfer.hpp: studio range is always stretched to nominal 0..1
+// (excursions kept), then decoded with the requested curve when one is set.
 float to_linear(float normalized, uint transfer, uint limited_range) {
-    if (transfer == 0U) return normalized;
     float encoded = limited_range != 0U
         ? (normalized * (65535.0 / 256.0) - 16.0) / 219.0
         : normalized;
+    if (transfer == 0U) return encoded;
     encoded = max(encoded, 0.0);
     if (transfer == 1U) return pow(encoded, 2.2);
     if (transfer == 2U) return pow(encoded, 2.4);

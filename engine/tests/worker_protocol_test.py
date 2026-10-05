@@ -1568,8 +1568,18 @@ def main():
               and limited["payload"].get("transfer_range") == "limited"
               and linear["payload"].get("transfer_range") == "full",
               json.dumps([errors(linear), errors(limited)]))
+        # Studio range is stretched with or without a curve, so every backend
+        # measures nominal 0..1 samples.
         limited_plain = transfer_run("transfer-limited-none", None, "limited")
-        check("range-alone-changes-nothing", errors(limited_plain) == errors(plain))
+        check("limited-range-is-stretched-without-a-curve",
+              limited_plain["type"] == "result"
+              and errors(limited_plain) != errors(plain)
+              and "transfer" not in limited_plain["payload"]
+              and limited_plain["payload"].get("transfer_range") == "limited"
+              and "transfer_range" not in plain["payload"],
+              json.dumps([errors(plain), errors(limited_plain)]))
+        check("sample-scale-echo", plain["payload"].get("sample_scale") == "nominal"
+              and limited_plain["payload"].get("sample_scale") == "nominal")
         bad_range = transfer_run("transfer-bad-range", "bt1886", "tv")
         check("transfer-bad-range-rejected", bad_range["type"] == "error"
               and bad_range.get("code") == "bad_request", json.dumps(bad_range)[:200])

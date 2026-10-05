@@ -291,8 +291,8 @@ struct VerifyJobSpec {
     BackendChoice backend = BackendChoice::cpu;
     // Linear-light hypothesis carried by the Recipe. Engine-decoded media
     // takes the range from the stream; frames pushed by the client use
-    // `transfer.range` (studio range unless the client says otherwise).
-    TransferSpec transfer{TransferCurve::none, SampleRange::limited};
+    // `transfer.range` (nominal 0..1 unless the client says otherwise).
+    TransferSpec transfer{};
     std::string selected_device;
     std::string selected_device_uuid;
 #if defined(GETNATIVE_HAS_MEDIA)
@@ -695,8 +695,8 @@ FrameAsset parse_frame_asset(const JsonValue &asset) {
     if (result.width < 2 || result.height < 2) {
         throw WorkerError("bad_request", "frame dimensions must be at least 2");
     }
-    // Only consulted when a transfer curve is requested. Absent means the
-    // samples already span 0..1 (stills); exported video assets report theirs.
+    // Absent means the samples already span 0..1 (stills); exported video
+    // assets report theirs and studio range is stretched before analysis.
     if (const auto range = optional_string(asset, "range")) {
         result.transfer.range = parse_sample_range(*range);
     }
@@ -1469,8 +1469,7 @@ private:
         return asset.path + "#" + std::to_string(asset.width) + "x"
             + std::to_string(asset.height) + "#"
             + std::string{transfer_curve_name(asset.transfer.curve)}
-            + (asset.transfer.active()
-                   ? "@" + std::string{sample_range_name(asset.transfer.range)} : "");
+            + "@" + std::string{sample_range_name(asset.transfer.range)};
     }
 
     void touch(const std::string &key) {
@@ -4339,10 +4338,13 @@ private:
             payload.emplace_back(
                 "transfer",
                 JsonValue::string(std::string{transfer_curve_name(spec.frame.transfer.curve)}));
+        }
+        if (spec.frame.transfer.converts()) {
             payload.emplace_back(
                 "transfer_range",
                 JsonValue::string(std::string{sample_range_name(spec.frame.transfer.range)}));
         }
+        payload.emplace_back("sample_scale", JsonValue::string("nominal"));
         emit(JsonValue::object({
             {"protocol_version", JsonValue::integer(kProtocolVersion)},
             {"type", JsonValue::string("result")},
@@ -4874,16 +4876,16 @@ private:
                     "media_resolution_changed",
                     "decoded media resolution changed during verification");
             }
-            // Linear-light Recipe: decode a private copy so the decoder's
-            // frame stays untouched. A fresh buffer per frame keeps the
-            // backends' pointer-keyed source caches honest.
+            // Studio range and linear-light Recipes: convert a private copy so
+            // the decoder's frame stays untouched. A fresh buffer per frame
+            // keeps the backends' pointer-keyed source caches honest.
             std::vector<float> linear;
-            if (media_transfer.active()) {
+            if (media_transfer.converts()) {
                 linear = frame.pixels;
                 transfer_to_linear(media_transfer, linear);
             }
             ConstImageView view{
-                media_transfer.active() ? linear.data() : frame.pixels.data(),
+                media_transfer.converts() ? linear.data() : frame.pixels.data(),
                 frame.width, frame.height, frame.width};
             const auto compute_start = std::chrono::steady_clock::now();
             double error = 0.0;
@@ -5395,6 +5397,7 @@ private:
                         std::string{transfer_curve_name(media_transfer.curve)})},
                     {"transfer_range", JsonValue::string(
                         std::string{sample_range_name(media_transfer.range)})},
+                    {"sample_scale", JsonValue::string("nominal")},
                     {"zero_copy", JsonValue::boolean(zero_copy)},
                     {"fallback_chain", verify_fallbacks_json(spec)},
                 })},
@@ -5611,10 +5614,10 @@ private:
                                                    std::memory_order_relaxed);
                         return frame_error;
                     };
-                    // Client-pushed frames: decode a private copy when the
-                    // Recipe carries a linear-light curve.
+                    // Client-pushed frames: convert a private copy when the
+                    // samples are studio range or the Recipe carries a curve.
                     const auto with_transfer = [&](ConstImageView view) {
-                        if (!spec.transfer.active()) return view;
+                        if (!spec.transfer.converts()) return view;
                         const std::size_t count = static_cast<std::size_t>(spec.width)
                             * static_cast<std::size_t>(spec.height);
                         linear.assign(view.data, view.data + count);

@@ -157,13 +157,13 @@ void test_iosurface_zero_copy_luma_format(
         for (std::int32_t y = 0; y < height; ++y) {
             for (std::int32_t x = 0; x < width; ++x) {
                 const std::uint16_t code10 = static_cast<std::uint16_t>(
-                    96 + ((x * 7 + y * 11 + (x * y) % 31) % 720));
+                    16 + ((x * 7 + y * 11 + (x * y) % 31) % 990));
                 luma[static_cast<std::size_t>(y) * luma_stride
                      + static_cast<std::size_t>(x)] =
                     static_cast<std::uint16_t>(code10 << 6);
                 const float value = full_range
                     ? static_cast<float>(code10) / 1023.0F
-                    : std::max(0.0F, (static_cast<float>(code10) - 64.0F) / 876.0F);
+                    : (static_cast<float>(code10) - 64.0F) / 876.0F;
                 source[static_cast<std::size_t>(y * width + x)] = value;
             }
         }
@@ -172,12 +172,12 @@ void test_iosurface_zero_copy_luma_format(
         for (std::int32_t y = 0; y < height; ++y) {
             for (std::int32_t x = 0; x < width; ++x) {
                 const std::uint8_t code = static_cast<std::uint8_t>(
-                    24 + ((x * 7 + y * 11 + (x * y) % 31) % 208));
+                    4 + ((x * 7 + y * 11 + (x * y) % 31) % 248));
                 luma[static_cast<std::size_t>(y) * luma_stride_bytes
                      + static_cast<std::size_t>(x)] = code;
                 const float value = full_range
                     ? static_cast<float>(code) / 255.0F
-                    : std::max(0.0F, (static_cast<float>(code) - 16.0F) / 219.0F);
+                    : (static_cast<float>(code) - 16.0F) / 219.0F;
                 source[static_cast<std::size_t>(y * width + x)] = value;
             }
         }

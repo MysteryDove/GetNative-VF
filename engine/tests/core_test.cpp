@@ -393,10 +393,25 @@ void test_transfer_recovers_linear_light_upscale() {
            "transfer names parse and unknown names are rejected");
     using getnative::SampleRange;
     using getnative::TransferSpec;
-    expect(getnative::transfer_to_linear(TransferSpec{}, 0.37F) == 0.37F
-               && getnative::transfer_to_linear(
-                      TransferSpec{TransferCurve::none, SampleRange::limited}, 0.37F) == 0.37F,
-           "no curve leaves samples untouched, whatever the range");
+    expect(getnative::transfer_to_linear(TransferSpec{}, 0.37F) == 0.37F,
+           "full-range samples without a curve are untouched");
+    {
+        // Studio range is stretched even without a curve, and excursions
+        // outside 16..235 survive as values below 0 and above 1.
+        const TransferSpec plain{TransferCurve::none, SampleRange::limited};
+        const auto code = [](float value) { return value * 256.0F / 65535.0F; };
+        expect(plain.converts() && !plain.active() && !TransferSpec{}.converts(),
+               "studio range needs conversion on its own");
+        expect(getnative::transfer_to_linear(plain, code(16.0F)) == 0.0F
+                   && std::abs(getnative::transfer_to_linear(plain, code(235.0F)) - 1.0F) < 1e-5F
+                   && getnative::transfer_to_linear(plain, code(4.0F)) < -0.05F
+                   && getnative::transfer_to_linear(plain, code(250.0F)) > 1.05F,
+               "limited range stretches 16..235 to 0..1 and keeps excursions");
+        std::vector<float> samples{code(16.0F), code(235.0F)};
+        getnative::transfer_to_linear(plain, samples);
+        expect(samples[0] == 0.0F && std::abs(samples[1] - 1.0F) < 1e-5F,
+               "span conversion stretches studio range without a curve");
+    }
     for (const TransferCurve curve : {TransferCurve::gamma22, TransferCurve::bt1886,
                                       TransferCurve::srgb, TransferCurve::bt709}) {
         expect(getnative::transfer_eotf(curve, 0.0F) == 0.0F

@@ -72,30 +72,20 @@ Open points:
 
 Estimate: several days; engine command and tests first, then UI.
 
-## Related decision to make first: sample range convention
+## Settled: sample range convention
 
-Found while adding transfer curves. It affects what a preview should display
-and every stored error value, so it should be settled before Stage B.
+Decided 2026-10-05: analysis always runs on nominal samples (0 = black,
+1 = white). A preview should display the same scale.
 
-- Software decode, NVDEC/CUDA and Vulkan produce F32 luma on the code scale
-  (`code * 2^(16-depth) / 65535`; 8-bit black = 16/256).
-- VideoToolbox/Metal stretches studio range to nominal 0..1 (16..235 → 0..1).
-- Consequence: with no transfer curve, the same video measures 255.996 / 219 ≈
-  1.169× higher on Metal, and the pixel-exclusion threshold means a different
-  thing. With a curve, all four paths stretch and agree exactly (measured).
-- Evidence about intent: upstream `getnative` feeds a `GRAYS` clip, which zimg
-  produces on the nominal scale; the Metal conformance test asserts the
-  stretched values; the CUDA kernel receives `limited_range` but ignores it
-  (`(void)limited_range;`). So the nominal scale looks like the intended
-  convention, implemented on Metal only.
-
-Options:
-
-1. Make software/CUDA/Vulkan stretch too (matches upstream and the Metal
-   test). Every existing result shifts by 1.169× and old runs must be marked
-   incompatible rather than overlaid; cached F32 assets need a new name.
-2. Make Metal stop stretching (smallest change; existing CUDA results stay
-   valid), accepting a constant offset from upstream's numbers.
-
-Not changed in this round because either option reverses something that was
-written deliberately.
+- Software decode, NVDEC/CUDA and Vulkan used to analyse studio-range video on
+  the code scale (`code * 2^(16-depth) / 65535`; 8-bit black = 16/256) when no
+  curve was set, while VideoToolbox/Metal stretched 16..235 to 0..1. The same
+  video measured about 1.169x higher on Metal.
+- Now every path stretches studio range, with or without a curve. Codes
+  outside 16..235 are kept (below 0 / above 1) on all four paths; Metal no
+  longer clamps them, because resampling overshoot is signal for a descale.
+- Exported F32 frame assets stay on the code scale with their `range` tag and
+  are stretched at load, so cached assets remain valid.
+- Results carry `sample_scale: "nominal"`. The app hides older curve-less
+  video Runs from overlays (counted as incompatible) since they sit about
+  1.17x lower. See `docs/worker-protocol-v1.md` §2.9.

@@ -23,9 +23,11 @@ enum class TransferCurve : std::uint32_t {
 };
 
 // How the F32 samples relate to nominal black and white.
-//  - limited: studio-range video on the engine's code * 2^(16-depth) / 65535
-//    scale, i.e. black sits at 16/256 and white at 235/256. Those must be
-//    stretched to 0..1 before a transfer curve means anything.
+//  - limited: studio-range video on the decoder's code * 2^(16-depth) / 65535
+//    scale, i.e. black sits at 16/256 and white at 235/256. Analysis always
+//    stretches those to nominal 0..1 first, with or without a curve, so every
+//    backend measures the same samples. Excursions outside 16..235 are kept
+//    (they land below 0 or above 1): resampling overshoot is signal here.
 //  - full: samples already span 0..1 (stills, full-range video).
 enum class SampleRange : std::uint32_t {
     full = 0,
@@ -38,6 +40,10 @@ struct TransferSpec {
 
     [[nodiscard]] constexpr bool active() const noexcept {
         return curve != TransferCurve::none;
+    }
+    // True when decoded samples differ from what analysis must see.
+    [[nodiscard]] constexpr bool converts() const noexcept {
+        return active() || range == SampleRange::limited;
     }
     friend constexpr bool operator==(const TransferSpec &, const TransferSpec &) = default;
 };
@@ -98,14 +104,14 @@ struct TransferSpec {
     return encoded;
 }
 
-// Decoded F32 sample -> linear light under `spec`; identity when no curve is set.
+// Decoded F32 sample -> analysis sample under `spec`: nominal 0..1, then the
+// curve when one is set. Identity for full-range samples without a curve.
 [[nodiscard]] inline float transfer_to_linear(TransferSpec spec, float sample) noexcept {
-    if (!spec.active()) return sample;
     return transfer_eotf(spec.curve, expand_sample_range(spec.range, sample));
 }
 
 inline void transfer_to_linear(TransferSpec spec, std::span<float> samples) noexcept {
-    if (!spec.active()) return;
+    if (!spec.converts()) return;
     for (float &sample : samples) sample = transfer_to_linear(spec, sample);
 }
 
