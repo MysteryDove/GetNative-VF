@@ -871,8 +871,12 @@ struct BuiltDecoder {
             extradata_size = static_cast<int>(configuration->data.size());
         }
     }
+    const AVPixFmtDescriptor *descriptor =
+        av_pix_fmt_desc_get(static_cast<AVPixelFormat>(par->format));
+    const int bit_depth = descriptor != nullptr ? descriptor->comp[0].depth : 8;
     auto session = std::make_unique<VideotoolboxSession>(
-        codec_id, width, height, extradata, extradata_size, max_inflight);
+        codec_id, width, height, extradata, extradata_size, max_inflight,
+        bit_depth, par->color_range == AVCOL_RANGE_JPEG);
     session->set_timebase(stream.time_base.num, stream.time_base.den);
     return session;
 }
