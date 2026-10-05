@@ -2,11 +2,14 @@ import { useState } from "react";
 import { Trash2 } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { RunSelectorOption } from "../engine/runSummary";
+import type { FilterSelection } from "../engine/multiFilter";
 import { Modal } from "./Modal";
+import { MultiFilterGroup } from "./MultiFilterGroup";
 
 /**
  * Runs filter shared by the test pages: "All" plus one entry per Run command,
- * each labelled with what it measured. Right-clicking an entry deletes that
+ * each labelled with what it measured. Several entries can be selected
+ * together. Right-clicking an entry deletes that
  * run, and the trailing button deletes every run listed here (the page's own
  * filters apply, so hidden runs are untouched) — both after a confirmation
  * that names what will go, and never while a run is still queued or running.
@@ -21,9 +24,9 @@ export function RunSelector({
 }: {
   t: Translator;
   options: RunSelectorOption[];
-  /** "all" or an option value. */
-  value: string;
-  onChange: (value: string) => void;
+  /** Selected option values; empty shows every run. */
+  value: FilterSelection;
+  onChange: (value: FilterSelection) => void;
   onDeleteRuns: (runIds: string[]) => void;
   /** e.g. "Delete listed Resolution Test runs". */
   deleteAllLabel: string;
@@ -35,58 +38,50 @@ export function RunSelector({
   function confirm() {
     if (pending === "all") {
       onDeleteRuns(options.flatMap((option) => option.runIds));
-      onChange("all");
+      onChange([]);
     } else if (pending) {
       onDeleteRuns(pending.runIds);
-      if (value === pending.value) onChange("all");
+      if (value.includes(pending.value)) {
+        onChange(value.filter((entry) => entry !== pending.value));
+      }
     }
     setPending(null);
   }
 
   return (
-    <div className="results-filter-group" role="radiogroup" aria-label={t("results.filters.runs")}>
-      <span className="results-filter-label">{t("results.filters.runs")}</span>
-      <div className="button-radio">
-        <button
-          type="button"
-          role="radio"
-          aria-checked={value === "all"}
-          className={value === "all" ? "active" : ""}
-          onClick={() => onChange("all")}
-        >
-          {t("results.filters.all")}
-        </button>
-        {options.map((option) => (
-          <button
-            key={option.value}
-            type="button"
-            role="radio"
-            aria-checked={value === option.value}
-            className={value === option.value ? "active" : ""}
-            title={`${option.label}\n${t(option.active ? "results.deleteActiveHint" : "results.runContextHint")}`}
-            onClick={() => onChange(option.value)}
-            onContextMenu={(event) => {
-              event.preventDefault();
-              if (!option.active) setPending(option);
-            }}
-          >
+    <MultiFilterGroup
+      label={t("results.filters.runs")}
+      allLabel={t("results.filters.all")}
+      selected={value}
+      onChange={onChange}
+      options={options.map((option) => ({
+        value: option.value,
+        title: `${option.label}\n${t(option.active ? "results.deleteActiveHint" : "results.runContextHint")}`,
+        label: (
+          <>
             {option.name}
             {option.summary ? (
               <small className="run-filter-summary">{option.summary}</small>
             ) : null}
+          </>
+        ),
+      }))}
+      onOptionContextMenu={(optionValue) => {
+        const option = options.find((entry) => entry.value === optionValue);
+        if (option && !option.active) setPending(option);
+      }}
+      trailing={
+        <>
+          <button
+            type="button"
+            className="icon-button danger run-selector-clear"
+            disabled={options.length === 0 || anyActive}
+            title={anyActive ? t("results.clearAllActiveHint") : deleteAllLabel}
+            aria-label={deleteAllLabel}
+            onClick={() => setPending("all")}
+          >
+            <Trash2 size={14} />
           </button>
-        ))}
-      </div>
-      <button
-        type="button"
-        className="icon-button danger run-selector-clear"
-        disabled={options.length === 0 || anyActive}
-        title={anyActive ? t("results.clearAllActiveHint") : deleteAllLabel}
-        aria-label={deleteAllLabel}
-        onClick={() => setPending("all")}
-      >
-        <Trash2 size={14} />
-      </button>
       {pending ? (
         <Modal
           onClose={() => setPending(null)}
@@ -111,6 +106,8 @@ export function RunSelector({
           </p>
         </Modal>
       ) : null}
-    </div>
+        </>
+      }
+    />
   );
 }

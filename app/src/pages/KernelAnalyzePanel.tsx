@@ -37,6 +37,7 @@ import {
 } from "../engine/kernelHeatmap";
 import { KernelBicubicHeatmap } from "../components/KernelBicubicHeatmap";
 import { RunSelector } from "../components/RunSelector";
+import { NO_FILTER, filterAccepts, pruneFilter, type FilterSelection } from "../engine/multiFilter";
 import { removeRunsFromState, runSelectionValue } from "../project/runHistory";
 
 export function KernelAnalyzePanel({
@@ -93,7 +94,7 @@ export function KernelAnalyzePanel({
   /** Selected result row (run id + candidate id); its kernel can be applied. */
   const [selectedResultKey, setSelectedResultKey] = useState<string | null>(null);
   /** Run selector: "all" or one Run command (RunGroup). */
-  const [runFilter, setRunFilter] = useState("all");
+  const [runFilter, setRunFilter] = useState<FilterSelection>(NO_FILTER);
   /** Table mode: one row per Sample, or kernels ranked across Samples. */
   const [rankAcrossSamples, setRankAcrossSamples] = useState(false);
 
@@ -158,11 +159,9 @@ export function KernelAnalyzePanel({
     [runOptions],
   );
   // A deleted run can leave a stale filter behind; fall back to "all".
-  const activeRunFilter = runOptions.some((option) => option.value === runFilter)
-    ? runFilter : "all";
+  const activeRunFilter = pruneFilter(runFilter, runOptions.map((option) => option.value));
   const inRunFilter = (runId: string) =>
-    activeRunFilter === "all"
-    || runSelectionValue(state.runsById[runId], runId) === activeRunFilter;
+    filterAccepts(activeRunFilter, runSelectionValue(state.runsById[runId], runId));
   const plotRows = resultRows.rows.filter(
     (row) => inRunFilter(row.runId) && (!sampleFilter || row.sampleId === sampleFilter),
   );

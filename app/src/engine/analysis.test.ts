@@ -153,8 +153,8 @@ describe("GUI-3 analysis foundation", () => {
     const fractional = resolveHeightGrid({
       ...draft,
       preset: "fractional_refine",
-      refineSelected: "720",
-      refineHalfSpan: "0.5",
+      start: "719.5",
+      stop: "720.5",
       step: "0.5",
       endpointRule: "exclusive_stop",
     });
@@ -899,8 +899,8 @@ describe("height plan base-canvas overrides (engine v1.1 contract)", () => {
     const draft = {
       ...defaultHeightDraft(null),
       preset: "fractional_refine" as const,
-      refineSelected: "837",
-      refineHalfSpan: "0.5",
+      start: "836.5",
+      stop: "837.5",
       step: "0.1",
       baseHeight: "1001",
       baseWidth: "2001",
@@ -1010,8 +1010,8 @@ describe("height plan base-canvas overrides (engine v1.1 contract)", () => {
       ...defaultHeightDraft(null),
       preset: "fractional_refine" as const,
       axisMode: "h_only" as const,
-      refineSelected: "837",
-      refineHalfSpan: "0.5",
+      start: "836.5",
+      stop: "837.5",
       step: "0.1",
       baseHeightMode: "even" as const,
     };

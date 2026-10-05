@@ -24,6 +24,7 @@ import {
   buildSeriesTable,
   heightRunConfig,
   metricCompatibilityKey,
+  resolveScanBases,
 } from "../engine/runGroupPlan";
 import { kernelRefLabel } from "../engine/displayNames";
 import type { ProjectState } from "../project/types";
@@ -40,9 +41,11 @@ import { HeightResultsPanel, type HeightSelection } from "../components/HeightRe
 import { toggleSetValue } from "../utils/collections";
 import { removeRunsFromState } from "../project/runHistory";
 import { srcFromScanSelection } from "../engine/geometry";
+import { derivedBaseWidth, scannedWidthParity } from "../engine/geometry";
 import {
   invalidKernelBlur,
   invalidKernelParameterNames,
+  isIntegerScan,
   missingFractionalBaseAxis,
 } from "../engine/heightDraft";
 
@@ -355,6 +358,26 @@ export function AnalyzePage({
       : null;
   }, [analysisSamples, state.sourcesById]);
 
+  /**
+   * The base values a non-integer scan will send, shown beside the parity
+   * selectors. An H+W width left on auto is derived from the base height.
+   */
+  const resolvedBases = useMemo(() => {
+    if (isIntegerScan(draft) || !grid.ok || grid.grid.candidates.length === 0) return null;
+    const maximum = Math.max(...grid.grid.candidates.map(Number));
+    const bases = resolveScanBases(draft, maximum, applySourceDims ?? {});
+    if (!bases) return null;
+    const widthFollows = draft.axisMode === "h_plus_w" && bases.baseWidth == null
+      && bases.baseHeight != null && applySourceDims != null;
+    return {
+      height: bases.baseHeight,
+      width: widthFollows
+        ? String(derivedBaseWidth(applySourceDims.width, applySourceDims.height, Number(bases.baseHeight)))
+        : bases.baseWidth,
+    };
+  }, [applySourceDims, draft, grid]);
+
+
   /** All Recipes, newest first — the options of the current-recipe selector. */
   const recipeOptions = useMemo(
     () =>
@@ -648,6 +671,7 @@ export function AnalyzePage({
             onRun={startRun}
             metricSpecOpen={analyzeViewState(state).metricSpecOpen}
             onMetricSpecOpenChange={(open) => persistAnalyzeView({ metricSpecOpen: open })}
+            resolvedBases={resolvedBases}
           />
         </div>
       </div>
@@ -674,8 +698,18 @@ export function AnalyzePage({
               ?? draft.baseHeightMode
           }
           initialBaseWidthMode={
-            (applyAxisMode === "h_only" ? applyOtherRunConfig : applyRunConfig)?.baseWidthMode
-              ?? draft.baseWidthMode
+            // An H+W scan whose width followed the base height used a real
+            // parity; carry that one so the Recipe matches what was measured.
+            (applyRunConfig && applyAxisMode === "h_plus_w"
+              ? scannedWidthParity({
+                  axisMode: applyAxisMode,
+                  source: applySourceDims,
+                  baseHeight: applyRunConfig.baseHeight,
+                  baseWidth: applyRunConfig.baseWidth,
+                })
+              : null)
+            ?? (applyAxisMode === "h_only" ? applyOtherRunConfig : applyRunConfig)?.baseWidthMode
+            ?? draft.baseWidthMode
           }
           otherAxisPrefilled={applyAxisMode !== "h_plus_w" && applyOtherValue != null}
           kernelLabel={applyRunConfig?.kernel ? kernelRefLabel(t, applyRunConfig.kernel) : null}

@@ -113,6 +113,7 @@ const initialState: ProjectState = {
         kernel: { id: "bicubic", parameters: { b: 0, c: 0.5 } },
       },
       result: {
+        sample_scale: "nominal",
         candidates: [
           { id: "862", error: 0.00033 },
           { id: "863", error: 0.00031 },
@@ -252,6 +253,7 @@ function fractionalHeightRun(id: string, groupId: string, b: number, c: number, 
       request: { axisMode: "h_plus_w", baseHeight: "848", baseWidth: null },
     },
     result: {
+      sample_scale: "nominal",
       candidates: Array.from({ length: 81 }, (_, index) => {
         const height = 840 + index / 10;
         const distance = Math.abs(height - 843.7);
@@ -315,6 +317,7 @@ for (const [index, sampleId] of ["sample-1", "sample-2"].entries()) {
       request: {},
     },
     result: {
+      sample_scale: "nominal",
       candidates: kernelFixture.map((kernel, candidate) => {
         const b = Number((kernel.parameters as { b?: number }).b ?? 0.3);
         const c = Number((kernel.parameters as { c?: number }).c ?? 0.3);

@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, type KeyboardEvent } from "react";
+import { resolveFrameInput } from "../media/frameBrowser";
 import {
   ChevronLeft,
   ChevronRight,
@@ -79,6 +80,19 @@ export function VideoFrameBrowser({
       - (stripBox.width - activeBox.width) / 2;
   }, [currentFrame, frameWindow]);
 
+  /** Jump to the typed frame number, clamped to the stream; junk reverts. */
+  function goToTypedFrame() {
+    const target = resolveFrameInput(frameInput, maxFrame);
+    if (target === null) {
+      onFrameInputChange(String(currentFrame));
+      return;
+    }
+    onFrameInputChange(String(target));
+    // Hand focus back so the frame shortcuts apply to the next key press.
+    containerRef.current?.focus({ preventScroll: true });
+    if (target !== currentFrame) void selectVideoFrame(source, "frame", target);
+  }
+
   function showNearbyTime() {
     const streamIndex = source.selectedStreamIndex ?? source.videoStreams[0]?.index;
     const requested = Number(timeInput);
@@ -125,12 +139,34 @@ export function VideoFrameBrowser({
             >
               <ChevronLeft size={14} />
             </button>
-            <label>
+            <label className="frame-number-field">
               <span>{t("media.frameNumber")}</span>
-              <input value={frameInput} inputMode="numeric" onChange={(event) => onFrameInputChange(event.target.value)} onKeyDown={(event) => {
-                if (event.key === "Enter") void selectVideoFrame(source, "frame", Number(frameInput));
-              }} />
+              <input
+                value={frameInput}
+                inputMode="numeric"
+                aria-label={t("media.frameNumber")}
+                onChange={(event) => onFrameInputChange(event.target.value)}
+                onFocus={(event) => event.currentTarget.select()}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") goToTypedFrame();
+                  if (event.key === "Escape") {
+                    onFrameInputChange(String(currentFrame));
+                    containerRef.current?.focus({ preventScroll: true });
+                  }
+                }}
+              />
+              <span className="frame-number-total">/ {maxFrame}</span>
             </label>
+            <button
+              className="icon-button reveal-button"
+              type="button"
+              title={t("media.goToFrame")}
+              aria-label={t("media.goToFrame")}
+              disabled={previewBusy}
+              onClick={goToTypedFrame}
+            >
+              <LocateFixed size={14} />
+            </button>
             <button
               className="icon-button"
               type="button"

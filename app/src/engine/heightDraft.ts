@@ -13,7 +13,7 @@ import type {
 } from "./protocol";
 import { buildCandidateGrid, workEstimate } from "./candidateGrid";
 import { MUF_PROFILE_ID, profileFor } from "./profiles";
-import { hasFractionalPart, parseNumberInput } from "./numberInput";
+import { decimalPlaces, hasFractionalPart, parseNumberInput } from "./numberInput";
 
 export const CUDA_MAXIMUM_P_NORM = 4;
 
@@ -96,30 +96,91 @@ export function heightDraftForProfile(
   };
 }
 
+/**
+ * The scan mode is the preset: `integer_coarse` is a plain integer descale
+ * (integer candidates, no base), `fractional_refine` a fractional one
+ * (decimal candidates centred on an even/odd canvas).
+ */
+export function isIntegerScan(draft: Pick<HeightDraft, "preset">): boolean {
+  return draft.preset !== "fractional_refine";
+}
+
+/** Round a typed number to an integer; unparsable text is left alone. */
+export function roundIntegerText(text: string, minimum?: number): string {
+  if (!text.trim()) return text;
+  const value = Number(text);
+  if (!Number.isFinite(value)) return text;
+  const rounded = Math.round(value);
+  return String(minimum == null ? rounded : Math.max(minimum, rounded));
+}
+
+/** Integer mode: every range field is an integer and no base is sent. */
+function withIntegerScan<T extends HeightDraft>(draft: T): T {
+  return {
+    ...draft,
+    start: roundIntegerText(draft.start),
+    stop: roundIntegerText(draft.stop),
+    step: roundIntegerText(draft.step, 1),
+    baseHeight: "",
+    baseWidth: "",
+    baseHeightMode: "integer",
+    baseWidthMode: "integer",
+  };
+}
+
 export function applyPreset(draft: HeightDraft, preset: SearchPreset): HeightDraft {
-  if (preset === "integer_coarse") {
-    // Broad scan keeps whatever range/step the user already entered; only an
-    // empty field falls back to the profile-independent defaults.
-    return {
-      ...draft,
-      preset,
-      start: draft.start.trim() || "500",
-      stop: draft.stop.trim() || "1000",
-      endpointRule: "inclusive",
-      step: draft.step.trim() || "1",
-    };
-  }
   if (preset === "fractional_refine") {
     return withFractionalBase({
       ...draft,
       preset,
-      step: hasFractionalPart(draft.step) ? draft.step : "0.1",
+      start: draft.start.trim() || "500",
+      stop: draft.stop.trim() || "1000",
+      step: draft.step.trim() || "0.1",
       endpointRule: "inclusive",
-      refineHalfSpan: draft.refineHalfSpan || "1.0",
-      refineSelected: draft.refineSelected || "720",
     });
   }
-  return { ...draft, preset: "custom" };
+  return withIntegerScan({
+    ...draft,
+    preset: "integer_coarse",
+    start: draft.start.trim() || "500",
+    stop: draft.stop.trim() || "1000",
+    step: draft.step.trim() || "1",
+    endpointRule: "inclusive",
+  });
+}
+
+/**
+ * Drafts saved before the integer / non-integer modes could hold decimals or
+ * a parity base under the integer preset; those are non-integer scans.
+ */
+export function normalizeScanMode(draft: HeightDraft): HeightDraft {
+  if (draft.preset === "fractional_refine") return withFractionalBase(draft);
+  const fractional = [draft.start, draft.stop, draft.step].some(hasFractionalPart)
+    || draft.baseHeightMode !== "integer" || draft.baseWidthMode !== "integer"
+    || Boolean(draft.baseHeight.trim()) || Boolean(draft.baseWidth.trim());
+  return fractional
+    ? withFractionalBase({ ...draft, preset: "fractional_refine" })
+    : { ...draft, preset: "integer_coarse" };
+}
+
+/**
+ * Non-integer range centred on a picked value (the "refine around selection"
+ * step): ±halfSpan at the current decimal step, or 0.1 coming from integers.
+ */
+export function refineAround(draft: HeightDraft, selected: string, halfSpan = 1): HeightDraft {
+  const centre = Number(selected);
+  if (!Number.isFinite(centre)) return draft;
+  const step = hasFractionalPart(draft.step) ? draft.step : "0.1";
+  const places = Math.max(decimalPlaces(step), decimalPlaces(selected));
+  return applyPreset(
+    {
+      ...draft,
+      start: (centre - halfSpan).toFixed(places),
+      stop: (centre + halfSpan).toFixed(places),
+      step,
+    },
+    "fractional_refine",
+  );
 }
 
 type FractionalBaseFields = Pick<
@@ -137,16 +198,13 @@ type FractionalBaseFields = Pick<
   | "baseWidthMode"
 >;
 
-/** True when the scan produces (or is meant to produce) non-integer candidates. */
-export function scansFractionalCandidates(
-  draft: Pick<FractionalBaseFields, "preset" | "start" | "stop" | "step" | "refineSelected" | "refineHalfSpan">,
-): boolean {
-  if (draft.preset === "fractional_refine") return true;
-  return [draft.start, draft.stop, draft.step].some(hasFractionalPart);
+/** True for a non-integer scan (decimal candidates on a parity canvas). */
+export function scansFractionalCandidates(draft: Pick<HeightDraft, "preset">): boolean {
+  return !isIntegerScan(draft);
 }
 
 /**
- * Entering a decimal scan with an integer (null) base would collapse adjacent
+ * A non-integer scan with an integer (null) base would collapse adjacent
  * candidates, so the scanned axis moves to an even base — the getnative
  * convention — unless the user already chose a parity or an explicit base.
  */
@@ -200,32 +258,16 @@ export function missingFractionalBaseAxis(
 export function resolveHeightGrid(
   draft: HeightDraft,
 ): { ok: true; grid: CandidateGridSpec } | { ok: false; reason: string } {
-  if (draft.preset === "fractional_refine") {
-    const selected = Number(draft.refineSelected);
-    const half = Number(draft.refineHalfSpan);
-    if (!Number.isFinite(selected) || !Number.isFinite(half)) {
-      return { ok: false, reason: "refine_inputs_invalid" };
-    }
-    const start = (selected - half).toFixed(draft.step.includes(".") ? draft.step.split(".")[1].length : 1);
-    const stop = (selected + half).toFixed(draft.step.includes(".") ? draft.step.split(".")[1].length : 1);
-    return buildCandidateGrid({
-      axis: draft.axisMode === "w_only" ? "width" : "height",
-      start,
-      stop,
-      step: draft.step,
-      endpointRule: "inclusive",
-      gridSemantics: profileFor(draft.profileId).grid_semantics,
-      preset: "fractional_refine",
-    });
-  }
+  // Integer mode never produces decimals, whatever was typed.
+  const integer = isIntegerScan(draft);
   return buildCandidateGrid({
     axis: draft.axisMode === "w_only" ? "width" : "height",
-    start: draft.start,
-    stop: draft.stop,
-    step: draft.step,
+    start: integer ? roundIntegerText(draft.start) : draft.start,
+    stop: integer ? roundIntegerText(draft.stop) : draft.stop,
+    step: integer ? roundIntegerText(draft.step, 1) : draft.step,
     endpointRule: "inclusive",
     gridSemantics: profileFor(draft.profileId).grid_semantics,
-    preset: draft.preset,
+    preset: integer ? "integer_coarse" : "fractional_refine",
   });
 }
 
@@ -262,7 +304,7 @@ export function resolveKernelParameters(
 
 export function fixedKernelsForDraft(
   draft: HeightDraft,
-  capabilities: EngineEnvelope | null,
+  _capabilities?: EngineEnvelope | null,
 ): KernelRef[] {
   const primary: KernelRef = {
     id: draft.kernelId,
@@ -274,10 +316,9 @@ export function fixedKernelsForDraft(
     const signature = kernelSignature(kernel);
     if (seen.has(signature)) continue;
     seen.add(signature);
-    const known = capabilities?.payload.kernels.find(
-      (candidate) => candidate.id === kernel.id,
-    );
-    const parameters = { ...(known?.parameters ?? {}), ...kernel.parameters };
+    // Capability `parameters` describe a kernel family (`kind`, limits), not
+    // values to run with, so only the compare entry's own parameters count.
+    const parameters = { ...kernel.parameters };
     if (parameters.blur === undefined && primary.parameters.blur !== undefined) {
       parameters.blur = primary.parameters.blur;
     }

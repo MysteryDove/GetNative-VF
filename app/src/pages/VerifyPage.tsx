@@ -52,6 +52,7 @@ import { buildVerificationFusion, fusionEligibility, prepareFusionRuns } from ".
 import { buildVerificationFusionCsv, buildVerificationFusionJson, saveArtifact } from "../project/export";
 import { runSelectorOptions } from "../engine/runSummary";
 import { RunSelector } from "../components/RunSelector";
+import { NO_FILTER, filterAccepts, pruneFilter, type FilterSelection } from "../engine/multiFilter";
 import { removeRunsFromState, runSelectionValue } from "../project/runHistory";
 
 /**
@@ -186,8 +187,8 @@ export function VerifyPage({
     return result.ok ? result.plan : null;
   }, [draft, recipe, scanMetric, state.sourcesById, capabilities]);
 
-  /** Run selector: "all" or one Check command (RunGroup). */
-  const [runFilter, setRunFilter] = useState("all");
+  /** Run selector: the selected Check commands (RunGroups); empty shows all. */
+  const [runFilter, setRunFilter] = useState<FilterSelection>(NO_FILTER);
   const historyRuns = useMemo(
     () => verificationRuns(state).filter((run) => !historySourceId || run.sourceId === historySourceId),
     [state, historySourceId],
@@ -197,12 +198,9 @@ export function VerifyPage({
     [historyRuns, state, t],
   );
   // A deleted run or a changed history source can leave a stale filter behind.
-  const activeRunFilter = runOptions.some((option) => option.value === runFilter)
-    ? runFilter : "all";
+  const activeRunFilter = pruneFilter(runFilter, runOptions.map((option) => option.value));
   const runs = useMemo(
-    () => activeRunFilter === "all"
-      ? historyRuns
-      : historyRuns.filter((run) => runSelectionValue(run, run.id) === activeRunFilter),
+    () => historyRuns.filter((run) => filterAccepts(activeRunFilter, runSelectionValue(run, run.id))),
     [historyRuns, activeRunFilter],
   );
   const historySourceIds = useMemo(() => new Set([

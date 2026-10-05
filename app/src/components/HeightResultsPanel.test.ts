@@ -22,22 +22,45 @@ describe("filterHeightSeriesRunIds", () => {
   ];
 
   it("filters RunGroups rather than their member run ids", () => {
-    expect([...filterHeightSeriesRunIds(series, state, "group1", "all")]).toEqual([
+    expect([...filterHeightSeriesRunIds(series, state, ["group1"], [])]).toEqual([
       "run1",
       "run2",
     ]);
   });
 
   it("intersects the RunGroup and Source selections", () => {
-    expect([...filterHeightSeriesRunIds(series, state, "group1", "sourceA")]).toEqual([
+    expect([...filterHeightSeriesRunIds(series, state, ["group1"], ["sourceA"])]).toEqual([
       "run1",
     ]);
-    expect([...filterHeightSeriesRunIds(series, state, "group2", "sourceB")]).toEqual([]);
+    expect([...filterHeightSeriesRunIds(series, state, ["group2"], ["sourceB"])]).toEqual([]);
   });
 
   it("keeps legacy ungrouped runs addressable and falls back to the sample source", () => {
-    expect([...filterHeightSeriesRunIds(series, state, "run:run4", "sourceC")]).toEqual([
+    expect([...filterHeightSeriesRunIds(series, state, ["run:run4"], ["sourceC"])]).toEqual([
       "run4",
     ]);
+  });
+
+  it("unions several selected Runs and several selected Sources", () => {
+    expect([...filterHeightSeriesRunIds(series, state, ["group2", "run:run4"], [])]).toEqual([
+      "run3",
+      "run4",
+    ]);
+    expect([...filterHeightSeriesRunIds(series, state, [], ["sourceB", "sourceC"])]).toEqual([
+      "run2",
+      "run4",
+    ]);
+    expect([...filterHeightSeriesRunIds(series, state, ["group1", "group2"], ["sourceA"])]).toEqual([
+      "run1",
+      "run3",
+    ]);
+  });
+
+  it("narrows to the selected Samples (frames)", () => {
+    expect([...filterHeightSeriesRunIds(series, state, [], [], ["sample2", "sample3"])]).toEqual([
+      "run2",
+      "run3",
+    ]);
+    expect([...filterHeightSeriesRunIds(series, state, ["group1"], [], ["sample3"])]).toEqual([]);
   });
 });

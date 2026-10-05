@@ -6,6 +6,8 @@ import type { estimateHeightWork, resolveHeightGrid } from "../engine/heightDraf
 import { kernelMetaLabel, type SeriesTable } from "../engine/runGroupPlan";
 import { runSelectorOptions } from "../engine/runSummary";
 import { RunSelector } from "./RunSelector";
+import { MultiFilterGroup } from "./MultiFilterGroup";
+import { NO_FILTER, filterAccepts, pruneFilter, type FilterSelection } from "../engine/multiFilter";
 import { padDecimals } from "../engine/numberInput";
 import { toggleSetValue } from "../utils/collections";
 import { BlockedState } from "./BlockedState";
@@ -42,16 +44,18 @@ function sameHeight(a: string | null, b: string): boolean {
 export function filterHeightSeriesRunIds(
   series: Array<{ runId: string; sampleId: string }>,
   state: Pick<ProjectState, "runsById" | "samplesById">,
-  runGroupFilter: string,
-  sourceFilter: string,
+  runGroupFilter: FilterSelection,
+  sourceFilter: FilterSelection,
+  sampleFilter: FilterSelection = NO_FILTER,
 ): Set<string> {
   const ids = new Set<string>();
   for (const item of series) {
     const run = state.runsById[item.runId];
     const groupValue = run?.runGroupId ? run.runGroupId : `run:${item.runId}`;
     const sourceId = run?.sourceId || state.samplesById[item.sampleId]?.sourceId || "";
-    if (runGroupFilter !== "all" && groupValue !== runGroupFilter) continue;
-    if (sourceFilter !== "all" && sourceId !== sourceFilter) continue;
+    if (!filterAccepts(runGroupFilter, groupValue)) continue;
+    if (!filterAccepts(sourceFilter, sourceId)) continue;
+    if (!filterAccepts(sampleFilter, item.sampleId)) continue;
     ids.add(item.runId);
   }
   return ids;
@@ -121,8 +125,9 @@ export function HeightResultsPanel({
   const [tableCollapsed, setTableCollapsed] = useState<boolean | null>(null);
   const [hiddenRunIds, setHiddenRunIds] = useState<Set<string>>(new Set());
   const [kernelFilter, setKernelFilter] = useState<string | null>(null);
-  const [runGroupFilter, setRunGroupFilter] = useState("all");
-  const [sourceFilter, setSourceFilter] = useState("all");
+  const [runGroupFilter, setRunGroupFilter] = useState<FilterSelection>(NO_FILTER);
+  const [sourceFilter, setSourceFilter] = useState<FilterSelection>(NO_FILTER);
+  const [sampleFilter, setSampleFilter] = useState<FilterSelection>(NO_FILTER);
 
   useEffect(() => {
     // A selected candidate is axis-specific. Keeping a W-only selection when
@@ -135,9 +140,9 @@ export function HeightResultsPanel({
   // Runs can be deleted from here or from Results; drop a filter that no
   // longer points at an existing run instead of showing an empty plot.
   useEffect(() => {
-    if (runGroupFilter !== "all" && !runFilterOptions.some((option) => option.value === runGroupFilter)) {
-      setRunGroupFilter("all");
-    }
+    setRunGroupFilter((current) => pruneFilter(current, runFilterOptions.map((option) => option.value)));
+    setSourceFilter((current) => pruneFilter(current, sourceFilterOptions.map((option) => option.value)));
+    setSampleFilter((current) => pruneFilter(current, sampleFilterOptions.map((option) => option.value)));
   });
 
   function selectHeight(value: string | null, runId: string | null = null) {
@@ -199,14 +204,23 @@ export function HeightResultsPanel({
       label: sourceFilterLabel(value, state),
     }));
   }, [allRunSeries, state]);
+  // One entry per frame, so results of different frames can be read apart.
+  const sampleFilterOptions = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const series of allRunSeries) {
+      if (series.sampleId && !seen.has(series.sampleId)) seen.set(series.sampleId, series.sampleLabel);
+    }
+    return [...seen.entries()].map(([value, label]) => ({ value, label }));
+  }, [allRunSeries]);
   const filteredRunIds = useMemo(() => {
     return filterHeightSeriesRunIds(
       allRunSeries,
       state,
       runGroupFilter,
       sourceFilter,
+      sampleFilter,
     );
-  }, [allRunSeries, runGroupFilter, sourceFilter, state]);
+  }, [allRunSeries, runGroupFilter, sourceFilter, sampleFilter, state]);
   const runSeries = useMemo(
     () => allRunSeries.filter((series) => filteredRunIds.has(series.runId)),
     [allRunSeries, filteredRunIds],
@@ -310,20 +324,26 @@ export function HeightResultsPanel({
   const kernelGroups = useMemo(() => {
     const seen = new Map<string, string>();
     for (const meta of seriesRows.seriesMeta) {
-      if (!filteredRunIds.has(meta.runId)) continue;
+      if (!filteredRunIds.has(meta.runId) || hiddenRunIds.has(meta.runId)) continue;
       if (!seen.has(meta.kernelKey)) seen.set(meta.kernelKey, kernelMetaLabel(t, meta));
     }
     return [...seen.entries()].map(([key, label]) => ({ key, label }));
-  }, [seriesRows, filteredRunIds, t]);
+  }, [seriesRows, filteredRunIds, hiddenRunIds, t]);
 
+  // A kernel group can drop out of view when the filters above change.
+  const activeKernelFilter = kernelGroups.some((group) => group.key === kernelFilter)
+    ? kernelFilter : null;
+  // The table lists exactly what the plot shows: the Runs/Source/Sample
+  // filters and the legend toggles apply, then the kernel group narrows it.
   const filteredRows = useMemo(
     () =>
-      kernelFilter
-        ? seriesRows.rows.filter(
-            (row) => filteredRunIds.has(row.runId) && row.kernelKey === kernelFilter,
-          )
-        : seriesRows.rows.filter((row) => filteredRunIds.has(row.runId)),
-    [seriesRows, kernelFilter, filteredRunIds],
+      seriesRows.rows.filter(
+        (row) =>
+          filteredRunIds.has(row.runId)
+          && !hiddenRunIds.has(row.runId)
+          && (!activeKernelFilter || row.kernelKey === activeKernelFilter),
+      ),
+    [seriesRows, activeKernelFilter, filteredRunIds, hiddenRunIds],
   );
 
   const tableRows = useMemo(
@@ -420,32 +440,22 @@ export function HeightResultsPanel({
             onDeleteRuns={onDeleteRuns}
             deleteAllLabel={t("results.deleteAll.height")}
           />
-          <div className="results-filter-group" role="radiogroup" aria-label={t("results.filters.source")}>
-            <span className="results-filter-label">{t("results.filters.source")}</span>
-            <div className="button-radio">
-              <button
-                type="button"
-                role="radio"
-                aria-checked={sourceFilter === "all"}
-                className={sourceFilter === "all" ? "active" : ""}
-                onClick={() => setSourceFilter("all")}
-              >
-                {t("results.filters.all")}
-              </button>
-              {sourceFilterOptions.map((option) => (
-                <button
-                  key={option.value}
-                  type="button"
-                  role="radio"
-                  aria-checked={sourceFilter === option.value}
-                  className={sourceFilter === option.value ? "active" : ""}
-                  onClick={() => setSourceFilter(option.value)}
-                >
-                  {option.label}
-                </button>
-              ))}
-            </div>
-          </div>
+          <MultiFilterGroup
+            label={t("results.filters.source")}
+            allLabel={t("results.filters.all")}
+            options={sourceFilterOptions}
+            selected={sourceFilter}
+            onChange={setSourceFilter}
+          />
+          {sampleFilterOptions.length > 1 ? (
+            <MultiFilterGroup
+              label={t("results.filters.sample")}
+              allLabel={t("results.filters.all")}
+              options={sampleFilterOptions}
+              selected={sampleFilter}
+              onChange={setSampleFilter}
+            />
+          ) : null}
         </div>
       ) : null}
 
@@ -587,7 +597,7 @@ export function HeightResultsPanel({
               <div className="kernel-group-chips">
                 <button
                   type="button"
-                  className={`candidate-chip ${kernelFilter === null ? "selected" : ""}`}
+                  className={`candidate-chip ${activeKernelFilter === null ? "selected" : ""}`}
                   onClick={() => setKernelFilter(null)}
                 >
                   {t("analyze.allKernelGroups")}
@@ -596,7 +606,7 @@ export function HeightResultsPanel({
                   <button
                     key={group.key}
                     type="button"
-                    className={`candidate-chip ${kernelFilter === group.key ? "selected" : ""}`}
+                    className={`candidate-chip ${activeKernelFilter === group.key ? "selected" : ""}`}
                     onClick={() => setKernelFilter(group.key)}
                   >
                     {group.label}

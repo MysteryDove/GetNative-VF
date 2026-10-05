@@ -2,6 +2,16 @@
 
 import type { FrameWindowTarget, MediaFrameWindow } from "./service";
 
+/**
+ * Frame number typed by the user, as a 0-based index within the stream:
+ * rounded and clamped to the last frame; null when it is not a number.
+ */
+export function resolveFrameInput(text: string, maxFrame: number): number | null {
+  const trimmed = text.trim();
+  if (!/^\d+(\.\d+)?$/.test(trimmed)) return null;
+  return Math.min(Math.max(0, maxFrame), Math.round(Number(trimmed)));
+}
+
 export type FrameStepAction =
   | { type: "previousFrame" }
   | { type: "nextFrame" }

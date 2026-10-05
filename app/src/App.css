@@ -4087,6 +4087,16 @@ input {
   font-size: 9px;
 }
 
+.frame-controls label.frame-number-field {
+  grid-template-columns: auto 68px auto;
+}
+
+.frame-number-total {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .frame-controls input,
 .frame-controls select,
 .sample-tag-field input {
@@ -5653,4 +5663,12 @@ input {
 
 .kernel-ranking-toggle {
   margin: 2px 0 6px;
+}
+
+.base-resolved {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-placeholder);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }

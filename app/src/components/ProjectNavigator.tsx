@@ -21,7 +21,7 @@ const items: Array<{
   { route: "overview", icon: Gauge, labelKey: "nav.overview" },
   { route: "media", icon: Play, labelKey: "nav.media", countKey: "sources" },
   { route: "analyze", analyzeSubroute: "height", glyph: "R", labelKey: "analyze.height" },
-  { route: "analyze", analyzeSubroute: "kernel", glyph: "A", labelKey: "analyze.kernel" },
+  { route: "analyze", analyzeSubroute: "kernel", glyph: "K", labelKey: "analyze.kernel" },
   { route: "verify", icon: Search, labelKey: "nav.verify" },
   { route: "results", icon: Cpu, labelKey: "nav.results", countKey: "runs" },
 ];

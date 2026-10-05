@@ -6,8 +6,10 @@ import { kernelDisplayName } from "../engine/displayNames";
 import {
   invalidKernelBlur,
   invalidKernelParameterNames,
+  isIntegerScan,
   kernelSignature,
   missingFractionalBaseAxis,
+  roundIntegerText,
   type HeightDraft,
   type estimateHeightWork,
 } from "../engine/heightDraft";
@@ -27,20 +29,25 @@ import { RunLaunchButton } from "./RunLaunchButton";
 const LANCZOS_COMPARE_TAPS = [3, 4] as const;
 
 /** Step sizes that cover the usual getnative scans; anything else is "custom". */
-const COMMON_STEPS = ["1", "0.5", "0.1", "0.05", "0.01"] as const;
+const FRACTIONAL_STEPS = ["1", "0.5", "0.1", "0.05", "0.01"] as const;
+const INTEGER_STEPS = ["1", "2", "4", "8"] as const;
 const CUSTOM_STEP = "custom";
 
 /** Step as a pull-down of common px values with a free-form fallback. */
 function StepField({
   t,
   value,
+  integer,
   onChange,
 }: {
   t: Translator;
   value: string;
+  /** Integer scan: whole-pixel steps only; typed decimals round on blur. */
+  integer: boolean;
   onChange: (step: string) => void;
 }) {
-  const isCommon = (COMMON_STEPS as readonly string[]).includes(value.trim());
+  const steps: readonly string[] = integer ? INTEGER_STEPS : FRACTIONAL_STEPS;
+  const isCommon = steps.includes(value.trim());
   const [custom, setCustom] = useState(!isCommon);
   const showInput = custom || !isCommon;
   return (
@@ -58,7 +65,7 @@ function StepField({
           onChange(event.target.value);
         }}
       >
-        {COMMON_STEPS.map((step) => (
+        {steps.map((step) => (
           <option key={step} value={step}>{`${step} ${t("common.px")}`}</option>
         ))}
         <option value={CUSTOM_STEP}>{t("analyze.stepCustom")}</option>
@@ -66,10 +73,13 @@ function StepField({
       {showInput ? (
         // text + inputMode: WebKitGTK number spinners freeze the Linux UI
         <input
-          inputMode="decimal"
+          inputMode={integer ? "numeric" : "decimal"}
           aria-label={t("analyze.step")}
           value={value}
           onChange={(event) => onChange(event.target.value)}
+          onBlur={() => {
+            if (integer) onChange(roundIntegerText(value, 1));
+          }}
         />
       ) : null}
     </label>
@@ -106,6 +116,7 @@ export function HeightParamsPanel({
   work,
   metricSpecOpen,
   onMetricSpecOpenChange,
+  resolvedBases,
 }: {
   t: Translator;
   draft: HeightDraft;
@@ -122,6 +133,8 @@ export function HeightParamsPanel({
   work: ReturnType<typeof estimateHeightWork>;
   metricSpecOpen: boolean;
   onMetricSpecOpenChange: (open: boolean) => void;
+  /** Base values the scan will send, per axis; null when unresolved. */
+  resolvedBases: { height: string | null; width: string | null } | null;
 }) {
   const kernelOptions = capabilities?.payload.kernels ?? [];
   const missingBaseAxis = missingFractionalBaseAxis(draft);
@@ -135,12 +148,19 @@ export function HeightParamsPanel({
     (_, index) => tapsRange.min + index,
   );
   if (!tapsOptions.includes(primaryTaps)) tapsOptions.push(primaryTaps);
+  const integerScan = isIntegerScan(draft);
   const baseModes: BaseMode[] = ["integer", "odd", "even"];
   const baseModeField = (axis: "height" | "width") => axis === "height" ? "baseHeightMode" : "baseWidthMode";
   const baseValueField = (axis: "height" | "width") => axis === "height" ? "baseHeight" : "baseWidth";
+  // H+W with a parity base height and no width parity: the engine derives the
+  // width base from the height base, so "integer" would misname it.
+  const widthFollowsHeight = draft.axisMode === "h_plus_w"
+    && (draft.baseHeightMode !== "integer" || Boolean(draft.baseHeight.trim()));
   const renderBaseMode = (axis: "height" | "width") => {
     const mode = axis === "height" ? draft.baseHeightMode : draft.baseWidthMode;
     const label = axis === "height" ? t("analyze.baseHeight") : t("analyze.baseWidth");
+    // The scanned axis needs a parity canvas; only the H+W width may follow.
+    const isScannedAxis = axis === (draft.axisMode === "w_only" ? "width" : "height");
     return (
       <label className="block" key={axis}>
         <span>{label}</span>
@@ -154,12 +174,19 @@ export function HeightParamsPanel({
             })
           }
         >
-          {baseModes.map((item) => (
+          {baseModes.filter((item) => item !== "integer" || !isScannedAxis).map((item) => (
             <option key={item} value={item}>
-              {t(`analyze.baseMode.${item}`)}
+              {item === "integer" && axis === "width" && widthFollowsHeight
+                ? t("analyze.baseMode.followHeight")
+                : t(`analyze.baseMode.${item}`)}
             </option>
           ))}
         </select>
+        {resolvedBases?.[axis] ? (
+          <small className="base-resolved" title={t("analyze.baseResolvedHint")}>
+            {t("analyze.baseResolved", { value: resolvedBases[axis] as string })}
+          </small>
+        ) : null}
       </label>
     );
   };
@@ -243,49 +270,38 @@ export function HeightParamsPanel({
       <span className="block-label">
         {t(scansWidth ? "analyze.rangeWidth" : "analyze.rangeHeight")}
       </span>
-      {draft.preset === "fractional_refine" ? (
-        <div className="range-grid">
-          <label className="block">
-            <span>{t(scansWidth ? "analyze.refineSelectedWidth" : "analyze.refineSelected")}</span>
-            <input
-              value={draft.refineSelected}
-              inputMode="decimal"
-              onChange={(event) => onPatch({ refineSelected: event.target.value })}
-            />
-          </label>
-          <label className="block">
-            <span>{t("analyze.refineHalfSpan")}</span>
-            <input
-              value={draft.refineHalfSpan}
-              inputMode="decimal"
-              onChange={(event) => onPatch({ refineHalfSpan: event.target.value })}
-            />
-          </label>
-          <StepField t={t} value={draft.step} onChange={(step) => onPatch({ step })} />
-        </div>
-      ) : (
-        <div className="range-grid">
-          <label className="block">
-            <span>{t("analyze.start")}</span>
-            <input
-              value={draft.start}
-              inputMode="decimal"
-              onChange={(event) => onPatch({ start: event.target.value })}
-            />
-          </label>
-          <label className="block">
-            <span>{t("analyze.stop")}</span>
-            <input
-              value={draft.stop}
-              inputMode="decimal"
-              onChange={(event) => onPatch({ stop: event.target.value })}
-            />
-          </label>
-          <StepField t={t} value={draft.step} onChange={(step) => onPatch({ step })} />
-        </div>
-      )}
+      <div className="range-grid">
+        <label className="block">
+          <span>{t("analyze.start")}</span>
+          <input
+            value={draft.start}
+            inputMode={integerScan ? "numeric" : "decimal"}
+            onChange={(event) => onPatch({ start: event.target.value })}
+            onBlur={() => {
+              if (integerScan) onPatch({ start: roundIntegerText(draft.start) });
+            }}
+          />
+        </label>
+        <label className="block">
+          <span>{t("analyze.stop")}</span>
+          <input
+            value={draft.stop}
+            inputMode={integerScan ? "numeric" : "decimal"}
+            onChange={(event) => onPatch({ stop: event.target.value })}
+            onBlur={() => {
+              if (integerScan) onPatch({ stop: roundIntegerText(draft.stop) });
+            }}
+          />
+        </label>
+        <StepField
+          t={t}
+          value={draft.step}
+          integer={integerScan}
+          onChange={(step) => onPatch({ step })}
+        />
+      </div>
 
-      {showBaseHeight && showBaseWidth ? (
+      {integerScan ? null : showBaseHeight && showBaseWidth ? (
         <div className="metric-grid">
           {renderBaseMode("height")}
           {renderBaseMode("width")}

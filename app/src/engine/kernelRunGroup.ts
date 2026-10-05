@@ -9,7 +9,12 @@ import {
 } from "./kernelDraft";
 import { validateKernelShape } from "./shapeGuards";
 import type { KernelAnalyzeRequest, GeometrySnapshot, MetricSpec } from "./protocol";
-import { metricCompatibilityKey, type PlanSample, type PlanSource } from "./runGroupPlan";
+import {
+  metricCompatibilityKey,
+  runUsesLegacySampleScale,
+  type PlanSample,
+  type PlanSource,
+} from "./runGroupPlan";
 import type { ProjectState, Run, RunGroup } from "../project/types";
 
 import { kernelParametersText } from "./displayNames";
@@ -313,9 +318,13 @@ export function buildKernelResultRows(
       incompatibleCount += 1;
       continue;
     }
+    const sample = run.sampleId ? state.samplesById[run.sampleId] : null;
+    if (runUsesLegacySampleScale(run, kernelRunTransfer(run), sample)) {
+      incompatibleCount += 1;
+      continue;
+    }
     const extracted = extractKernelResultRows(run.result, Array.isArray(snapshot?.kernels) ? snapshot.kernels : []);
     if (!extracted) continue;
-    const sample = run.sampleId ? state.samplesById[run.sampleId] : null;
     for (const row of extracted) {
       const parametersText = kernelParametersText(row.parameters);
       rows.push({

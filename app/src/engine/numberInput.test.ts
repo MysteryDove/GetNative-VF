@@ -1,4 +1,6 @@
+import { kernelParametersText } from "./displayNames";
 import { describe, expect, it } from "vitest";
+import { derivedBaseWidth, scannedWidthParity } from "./geometry";
 import {
   formatParameterValue,
   hasFractionalPart,
@@ -7,6 +9,11 @@ import {
 } from "./numberInput";
 import {
   applyPreset,
+  isIntegerScan,
+  normalizeScanMode,
+  refineAround,
+  resolveHeightGrid,
+  roundIntegerText,
   convertScanRange,
   defaultHeightDraft,
   fixedKernelsForDraft,
@@ -27,7 +34,12 @@ import { createRecipe } from "../project/recipe";
 import { buildBicubicGrid, heatStep, rankKernelsAcrossSamples } from "./kernelHeatmap";
 import { analyzeViewState, restoreDraft } from "../project/analyzeView";
 import { defaultVerifyDraft, planVerifyRunGroup } from "./verifyPlan";
-import { buildSeriesTable, heightRunConfig, planHeightRunGroup } from "./runGroupPlan";
+import {
+  buildSeriesTable,
+  heightRunConfig,
+  planHeightRunGroup,
+  runUsesLegacySampleScale,
+} from "./runGroupPlan";
 
 describe("number input", () => {
   it("parses decimals and fractions, rejecting malformed text", () => {
@@ -57,18 +69,61 @@ describe("number input", () => {
 });
 
 describe("decimal scans and the base", () => {
-  it("flags a broad scan with a decimal step and an integer base", () => {
-    const draft = { ...defaultHeightDraft(null), preset: "integer_coarse" as const, step: "0.1" };
-    expect(missingFractionalBaseAxis(draft)).toBe("height");
-    expect(missingFractionalBaseAxis({ ...draft, baseHeightMode: "even" })).toBeNull();
-    expect(missingFractionalBaseAxis({ ...draft, step: "1" })).toBeNull();
+  it("requires a parity base only in non-integer mode", () => {
+    const integer = { ...defaultHeightDraft(null), preset: "integer_coarse" as const, step: "0.1" };
+    expect(missingFractionalBaseAxis(integer)).toBeNull();
+    const fractional = { ...integer, preset: "fractional_refine" as const };
+    expect(missingFractionalBaseAxis(fractional)).toBe("height");
+    expect(missingFractionalBaseAxis({ ...fractional, baseHeightMode: "even" })).toBeNull();
+    // An integer step is still a non-integer scan when the mode says so.
+    expect(missingFractionalBaseAxis({ ...fractional, step: "1" })).toBe("height");
   });
 
-  it("moves to an even base when entering Refine and keeps the entered range on Broad", () => {
-    const refined = applyPreset(defaultHeightDraft(null), "fractional_refine");
+  it("integer mode rounds every decimal input and sends no base", () => {
+    const fractional = applyPreset(
+      { ...defaultHeightDraft(null), start: "843.7", stop: "847.2", step: "0.4" },
+      "fractional_refine",
+    );
+    expect(fractional.baseHeightMode).toBe("even");
+    expect([fractional.start, fractional.stop, fractional.step]).toEqual(["843.7", "847.2", "0.4"]);
+
+    const integer = applyPreset({ ...fractional, baseWidthMode: "odd" }, "integer_coarse");
+    expect([integer.start, integer.stop, integer.step]).toEqual(["844", "847", "1"]);
+    expect([integer.baseHeightMode, integer.baseWidthMode]).toEqual(["integer", "integer"]);
+    expect(isIntegerScan(integer)).toBe(true);
+
+    // Decimals typed but not yet committed never reach the grid.
+    const typed = resolveHeightGrid({ ...integer, start: "843.7", stop: "846.4", step: "1.6" });
+    expect(typed.ok && typed.grid.candidates).toEqual(["844", "846"]);
+    expect(roundIntegerText("0.2", 1)).toBe("1");
+    expect(roundIntegerText("abc")).toBe("abc");
+  });
+
+  it("non-integer mode keeps decimal candidates at an integer step", () => {
+    const draft = applyPreset(
+      { ...defaultHeightDraft(null), start: "843.7", stop: "845.7", step: "1" },
+      "fractional_refine",
+    );
+    const grid = resolveHeightGrid(draft);
+    expect(grid.ok && grid.grid.candidates).toEqual(["843.7", "844.7", "845.7"]);
+  });
+
+  it("refines around a picked value as a non-integer range", () => {
+    const refined = refineAround({ ...defaultHeightDraft(null), step: "1" }, "864");
+    expect([refined.preset, refined.start, refined.stop, refined.step])
+      .toEqual(["fractional_refine", "863.0", "865.0", "0.1"]);
     expect(refined.baseHeightMode).toBe("even");
-    const broad = applyPreset({ ...refined, start: "720", stop: "960", step: "0.1" }, "integer_coarse");
-    expect([broad.start, broad.stop, broad.step]).toEqual(["720", "960", "0.1"]);
+    const finer = refineAround({ ...refined, step: "0.05" }, "843.7", 0.5);
+    expect([finer.start, finer.stop, finer.step]).toEqual(["843.20", "844.20", "0.05"]);
+  });
+
+  it("classifies drafts saved before the two modes existed", () => {
+    const base = defaultHeightDraft(null);
+    expect(normalizeScanMode(base).preset).toBe("integer_coarse");
+    expect(normalizeScanMode({ ...base, step: "0.1" })).toMatchObject({
+      preset: "fractional_refine", baseHeightMode: "even",
+    });
+    expect(normalizeScanMode({ ...base, baseHeightMode: "odd" }).preset).toBe("fractional_refine");
   });
 
   it("converts a scan range across axes by aspect ratio", () => {
@@ -371,5 +426,100 @@ describe("Kernel Search grid and ranking", () => {
     ]);
     expect(ranking.map((item) => item.label)).toEqual(["B", "A"]);
     expect(ranking[1]).toMatchObject({ worst: 9e-6, count: 2, key: "a1" });
+  });
+});
+
+describe("nominal sample scale", () => {
+  const video = { frameIndex: 12 };
+  const still = { frameIndex: null };
+  const legacy = { result: { candidates: [] } };
+  const nominal = { result: { candidates: [], sample_scale: "nominal" } };
+
+  it("flags only curve-less video Runs from engines without the nominal scale", () => {
+    expect(runUsesLegacySampleScale(legacy, "none", video)).toBe(true);
+    expect(runUsesLegacySampleScale(nominal, "none", video)).toBe(false);
+    // Curve Runs and stills were already analysed on nominal samples.
+    expect(runUsesLegacySampleScale(legacy, "bt1886", video)).toBe(false);
+    expect(runUsesLegacySampleScale(legacy, "none", still)).toBe(false);
+    // Unknown Sample or unfinished Run: nothing to conclude.
+    expect(runUsesLegacySampleScale(legacy, "none", null)).toBe(false);
+    expect(runUsesLegacySampleScale({ result: null }, "none", video)).toBe(false);
+  });
+
+  it("keeps legacy Runs out of both result tables", () => {
+    const state = { samplesById: { s: { id: "s", label: "S", frameIndex: 12 } } } as never;
+    const base = {
+      runGroupId: null, sampleId: "s", sourceId: "src", status: "completed",
+      createdAt: "", updatedAt: "", errorCode: null, errorMessage: null, completed: 1, total: 1,
+    };
+    const height = (id: string, extra: object) => ({
+      ...base, id, runType: "height",
+      inputSnapshot: {
+        kernel: { id: "bilinear", parameters: {} },
+        heightGrid: { start: "700", stop: "800", step: "1" },
+        request: { axisMode: "h_only" },
+      },
+      result: { candidates: [{ id: "720", error: 1e-7 }], ...extra },
+    });
+    const table = buildSeriesTable(
+      [height("old", {}), height("new", { sample_scale: "nominal" })] as never[],
+      state, new Set(), "", "h_only", "none",
+    );
+    expect(table.seriesMeta.map((meta) => meta.runId)).toEqual(["new"]);
+    expect(table.incompatibleCount).toBe(1);
+
+    const kernel = (id: string, extra: object) => ({
+      ...base, id, runType: "kernel",
+      inputSnapshot: { kernels: [{ id: "bilinear", parameters: {} }], request: {} },
+      result: { candidates: [{ id: "0", error: 1e-4, kernel: { id: "bilinear" } }], ...extra },
+    });
+    const rows = buildKernelResultRows(
+      [kernel("old", {}), kernel("new", { sample_scale: "nominal" })] as never[],
+      state, "", "none",
+    );
+    expect(rows.rows.map((row) => row.runId)).toEqual(["new"]);
+    expect(rows.incompatibleCount).toBe(1);
+  });
+});
+
+describe("scannedWidthParity", () => {
+  const dims = { width: 1920, height: 1080 };
+  it("follows the base height by the source aspect ratio", () => {
+    expect(derivedBaseWidth(1920, 1080, 848)).toBe(1508);
+    expect(scannedWidthParity({ axisMode: "h_plus_w", source: dims, baseHeight: "848" })).toBe("even");
+    expect(scannedWidthParity({ axisMode: "h_plus_w", source: dims, baseHeight: "850" })).toBe("odd");
+  });
+  it("uses an explicit base width, and is null for integer or single-axis scans", () => {
+    expect(scannedWidthParity({ axisMode: "h_plus_w", source: dims, baseHeight: "848", baseWidth: "1511" })).toBe("odd");
+    expect(scannedWidthParity({ axisMode: "h_plus_w", source: dims })).toBeNull();
+    expect(scannedWidthParity({ axisMode: "h_only", source: dims, baseHeight: "848" })).toBeNull();
+  });
+});
+
+describe("kernels without parameters", () => {
+  const capabilities = {
+    payload: { kernels: [
+      { id: "bilinear", parameters: { kind: "none" } },
+      { id: "spline36", parameters: { kind: "none" } },
+    ] },
+  } as never;
+
+  it("does not copy capability descriptors into compare kernels", () => {
+    const draft = {
+      ...defaultHeightDraft(null),
+      compareKernels: [{ id: "bilinear", parameters: {} }, { id: "spline36", parameters: {} }],
+    };
+    const kernels = fixedKernelsForDraft(draft, capabilities);
+    expect(kernels.slice(1).map((kernel) => kernel.parameters)).toEqual([{}, {}]);
+  });
+
+  it("labels them by name alone, also for Runs recorded with a descriptor", () => {
+    expect(kernelParametersText({ kind: "none" })).toBe("");
+    expect(kernelParametersText({ kind: "none", blur: 1 })).toBe("");
+    expect(kernelParametersText({ kind: "bicubic_bc", finite: true, b: 0, c: 0.5 })).toBe("b=0, c=0.5");
+    expect(kernelParametersText({ kind: "integer_taps", taps: 4, blur: 1.1 })).toBe("taps=4, blur=1.1");
+    expect(kernelParametersText({
+      core_max: 15, core_min: 1, gui_max: 8, gui_min: 1, kind: "integer_taps", taps: 4,
+    })).toBe("taps=4");
   });
 });
