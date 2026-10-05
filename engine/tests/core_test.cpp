@@ -1,3 +1,4 @@
+#include "getnative/transfer.hpp"
 #include "getnative/axis_plan.hpp"
 #include "getnative/cpu_analysis.hpp"
 #include "getnative/filter.hpp"
@@ -379,6 +380,90 @@ void test_metric_never_hides_non_finite_pixels() {
                    "out-of-range pixel is either a large or a non-finite error");
         }
     }
+}
+
+// The purpose of the transfer option: a frame upscaled in linear light and
+// then gamma-encoded only descales cleanly once it is decoded with the right
+// curve. Build exactly that frame and check which hypothesis recovers it.
+void test_transfer_recovers_linear_light_upscale() {
+    using getnative::TransferCurve;
+    expect(getnative::parse_transfer_curve("bt1886") == TransferCurve::bt1886
+               && getnative::parse_transfer_curve("none") == TransferCurve::none
+               && !getnative::parse_transfer_curve("pq"),
+           "transfer names parse and unknown names are rejected");
+    using getnative::SampleRange;
+    using getnative::TransferSpec;
+    expect(getnative::transfer_to_linear(TransferSpec{}, 0.37F) == 0.37F
+               && getnative::transfer_to_linear(
+                      TransferSpec{TransferCurve::none, SampleRange::limited}, 0.37F) == 0.37F,
+           "no curve leaves samples untouched, whatever the range");
+    for (const TransferCurve curve : {TransferCurve::gamma22, TransferCurve::bt1886,
+                                      TransferCurve::srgb, TransferCurve::bt709}) {
+        expect(getnative::transfer_eotf(curve, 0.0F) == 0.0F
+                   && std::abs(getnative::transfer_eotf(curve, 1.0F) - 1.0F) < 1e-6F
+                   && getnative::transfer_eotf(curve, -0.1F) == 0.0F,
+               "curves map 0 to 0, 1 to 1, and clamp negatives");
+        float previous = 0.0F;
+        for (int step = 1; step <= 100; ++step) {
+            const float value = getnative::transfer_eotf(
+                curve, static_cast<float>(step) / 100.0F);
+            expect(value > previous, "curves are strictly increasing");
+            previous = value;
+        }
+        // Studio-range video sits at code * 256 / 65535: black 16, white 235.
+        const TransferSpec limited{curve, SampleRange::limited};
+        const auto code = [](float value) { return value * 256.0F / 65535.0F; };
+        expect(getnative::transfer_to_linear(limited, code(16.0F)) == 0.0F
+                   && std::abs(getnative::transfer_to_linear(limited, code(235.0F)) - 1.0F) < 1e-5F
+                   && getnative::transfer_to_linear(limited, code(4.0F)) == 0.0F,
+               "limited range stretches 16..235 to 0..1 before the curve");
+    }
+    expect(getnative::video_sample_range("full") == SampleRange::full
+               && getnative::video_sample_range("limited") == SampleRange::limited
+               && getnative::video_sample_range("unknown") == SampleRange::limited,
+           "unspecified video range is treated as studio range");
+
+    constexpr std::int32_t width = 48;
+    constexpr std::int32_t height = 120;
+    constexpr std::int32_t native_height = 90;
+    const getnative::AxisPlan plan = getnative::build_axis_plan(
+        {height, native_height, 90.0, 0.0, getnative::Filter::bicubic(),
+         getnative::BorderMode::mirror});
+    std::vector<float> native(static_cast<std::size_t>(width * native_height));
+    for (std::size_t i = 0; i < native.size(); ++i) {
+        native[i] = 0.05F + 0.9F * static_cast<float>((i * 53U + (i / 7U) * 29U) % 97U) / 96.0F;
+    }
+    // Upscale each column in linear light, then encode with a 2.4 gamma.
+    std::vector<float> linear(static_cast<std::size_t>(width * height));
+    for (std::int32_t x = 0; x < width; ++x) {
+        getnative::forward_axis_f32(plan, native.data() + x, width, linear.data() + x, width);
+    }
+    // ...and store it the way decoded studio-range video arrives: 0..1 mapped
+    // onto codes 16..235 on the code * 256 / 65535 scale.
+    std::vector<float> encoded(linear.size());
+    for (std::size_t i = 0; i < linear.size(); ++i) {
+        const float gamma = std::pow(std::max(linear[i], 0.0F), 1.0F / 2.4F);
+        encoded[i] = (16.0F + 219.0F * gamma) * 256.0F / 65535.0F;
+    }
+    const getnative::MetricSpec metric{2, 2, 2, 2, 0.0F, 1U};
+    const auto error_under = [&](TransferCurve curve,
+                                 SampleRange range = SampleRange::limited) {
+        std::vector<float> decoded = encoded;
+        getnative::transfer_to_linear(TransferSpec{curve, range}, decoded);
+        getnative::CpuWorkspace workspace;
+        return getnative::analyze_axis_candidate_f32(
+            {decoded.data(), width, height, width}, plan,
+            getnative::AnalysisAxes::vertical, metric, workspace);
+    };
+    const double as_encoded = error_under(TransferCurve::none);
+    const double matching = error_under(TransferCurve::bt1886);
+    const double wrong_curve = error_under(TransferCurve::gamma22);
+    const double wrong_range = error_under(TransferCurve::bt1886, SampleRange::full);
+    expect(matching < 1e-5, "matching curve recovers the linear-light upscale");
+    expect(as_encoded > matching * 100.0 && wrong_curve > matching * 10.0,
+           "as-encoded and wrong-curve hypotheses leave a clearly larger error");
+    expect(wrong_range > matching * 100.0,
+           "the curve only works once studio range has been stretched");
 }
 
 void test_planner_weights_match_border_and_shift_oracle() {
@@ -791,6 +876,7 @@ int main() {
         test_blur_support_weights_unity_and_cache_key();
         test_invalid_blur_is_rejected();
         test_metric_never_hides_non_finite_pixels();
+        test_transfer_recovers_linear_light_upscale();
         test_planner_weights_match_border_and_shift_oracle();
         test_banded_inverse_matches_dense_reference();
         test_forward_inverse_roundtrip();

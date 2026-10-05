@@ -94,6 +94,9 @@ struct MetalLumaFrameView {
     std::int32_t bit_depth = 8;
     std::string surface_format;
     std::string range = "unknown";
+    // TransferCurve id (getnative/transfer.hpp); 0 analyses as encoded. The
+    // Metal conversion already stretches studio range to 0..1.
+    std::uint32_t transfer = 0U;
 };
 
 [[nodiscard]] bool metal_backend_available() noexcept;

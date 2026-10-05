@@ -4,6 +4,7 @@
 #include "capabilities.hpp"
 #include "json.hpp"
 
+#include "getnative/transfer.hpp"
 #include "getnative/axis_plan.hpp"
 #include "getnative/cpu_analysis.hpp"
 #include "getnative/cpu_features.hpp"
@@ -221,7 +222,31 @@ struct FrameAsset {
     std::string path;
     std::int32_t width = 0;
     std::int32_t height = 0;
+    // Linear-light hypothesis: the cached frame is decoded with this curve
+    // once, on the host, so every backend analyses the same linear samples.
+    // `transfer.range` says whether the asset holds studio-range video.
+    TransferSpec transfer{};
 };
+
+// Stream-level range for the decoded F32 luma. RGB sources are converted to
+// full-range gray; unspecified YUV is studio range by convention.
+[[nodiscard]] SampleRange stream_sample_range(std::string_view range,
+                                              std::string_view pixel_format) {
+    if (range == "full") return SampleRange::full;
+    if (range == "limited") return SampleRange::limited;
+    for (const std::string_view prefix : {"rgb", "bgr", "gbr", "argb", "abgr",
+                                          "rgba", "bgra", "pal", "0rgb", "0bgr",
+                                          "x2rgb", "x2bgr"}) {
+        if (pixel_format.starts_with(prefix)) return SampleRange::full;
+    }
+    return SampleRange::limited;
+}
+
+[[nodiscard]] SampleRange parse_sample_range(const std::string &name) {
+    if (name == "limited") return SampleRange::limited;
+    if (name == "full") return SampleRange::full;
+    throw WorkerError("bad_request", "range must be limited or full, got: " + name);
+}
 
 struct AnalyzeJobSpec {
     std::string request_id;
@@ -264,6 +289,10 @@ struct VerifyJobSpec {
     std::int64_t expected_frames = -1;
     BackendChoice requested_backend = BackendChoice::cpu;
     BackendChoice backend = BackendChoice::cpu;
+    // Linear-light hypothesis carried by the Recipe. Engine-decoded media
+    // takes the range from the stream; frames pushed by the client use
+    // `transfer.range` (studio range unless the client says otherwise).
+    TransferSpec transfer{TransferCurve::none, SampleRange::limited};
     std::string selected_device;
     std::string selected_device_uuid;
 #if defined(GETNATIVE_HAS_MEDIA)
@@ -666,6 +695,11 @@ FrameAsset parse_frame_asset(const JsonValue &asset) {
     if (result.width < 2 || result.height < 2) {
         throw WorkerError("bad_request", "frame dimensions must be at least 2");
     }
+    // Only consulted when a transfer curve is requested. Absent means the
+    // samples already span 0..1 (stills); exported video assets report theirs.
+    if (const auto range = optional_string(asset, "range")) {
+        result.transfer.range = parse_sample_range(*range);
+    }
     return result;
 }
 
@@ -703,6 +737,11 @@ AnalyzeJobSpec parse_analyze(const JsonValue &command, std::string job_id) {
         spec.profile_geometry = true;
     }
     spec.endpoint_rule = parse_endpoint_rule(command);
+    if (const auto transfer = optional_string(command, "transfer")) {
+        const auto curve = parse_transfer_curve(*transfer);
+        if (!curve) throw WorkerError("bad_request", "unknown transfer: " + *transfer);
+        spec.frame.transfer.curve = *curve;
+    }
     spec.base_height = optional_decimal_integer(command, "base_height");
     spec.base_width = optional_decimal_integer(command, "base_width");
     spec.geometry = optional_geometry(command);
@@ -917,6 +956,15 @@ VerifyJobSpec parse_verify_begin(const JsonValue &command, std::string job_id,
         throw WorkerError("bad_request", "candidate must be below the source axis length");
     }
     spec.candidate = std::move(decimal);
+
+    if (const auto transfer = optional_string(command, "transfer")) {
+        const auto curve = parse_transfer_curve(*transfer);
+        if (!curve) throw WorkerError("bad_request", "unknown transfer: " + *transfer);
+        spec.transfer.curve = *curve;
+    }
+    if (const auto range = optional_string(command, "transfer_range")) {
+        spec.transfer.range = parse_sample_range(*range);
+    }
 
     if (!media_mode && command.find("worker_count")) {
         const double workers = require_number(command, "worker_count");
@@ -1396,6 +1444,7 @@ public:
         }
         Entry entry;
         entry.pixels = load_frame_asset(asset);
+        transfer_to_linear(asset.transfer, entry.pixels);
         entry.width = asset.width;
         entry.height = asset.height;
         entries_.emplace(key, std::move(entry));
@@ -1415,8 +1464,13 @@ private:
     static constexpr std::size_t kMaximumEntries = 8U;
 
     static std::string frame_key(const FrameAsset &asset) {
+        // The transfer is part of the identity: each curve owns its own
+        // stable pixel buffer (backends key source residency on the pointer).
         return asset.path + "#" + std::to_string(asset.width) + "x"
-            + std::to_string(asset.height);
+            + std::to_string(asset.height) + "#"
+            + std::string{transfer_curve_name(asset.transfer.curve)}
+            + (asset.transfer.active()
+                   ? "@" + std::string{sample_range_name(asset.transfer.range)} : "");
     }
 
     void touch(const std::string &key) {
@@ -3445,6 +3499,8 @@ private:
                 {"format", JsonValue::string(asset.format)},
                 {"width", JsonValue::integer(item.width)},
                 {"height", JsonValue::integer(item.height)},
+                {"range", JsonValue::string(std::string{sample_range_name(
+                    stream_sample_range(indexed.index.range, indexed.index.pixel_format))})},
                 {"from_cache", JsonValue::boolean(!item.needs_decode)},
             }));
         }
@@ -4279,6 +4335,14 @@ private:
             payload.emplace_back("candidate",
                                  JsonValue::string(spec.candidates.front()));
         }
+        if (spec.frame.transfer.active()) {
+            payload.emplace_back(
+                "transfer",
+                JsonValue::string(std::string{transfer_curve_name(spec.frame.transfer.curve)}));
+            payload.emplace_back(
+                "transfer_range",
+                JsonValue::string(std::string{sample_range_name(spec.frame.transfer.range)}));
+        }
         emit(JsonValue::object({
             {"protocol_version", JsonValue::integer(kProtocolVersion)},
             {"type", JsonValue::string("result")},
@@ -4801,14 +4865,26 @@ private:
             progress_completed = std::max(progress_completed, analyzed);
             if (result_batch.size() >= result_batch_size) flush_results();
         };
+        const TransferSpec media_transfer{
+            spec.transfer.curve,
+            stream_sample_range(index.range, index.pixel_format)};
         const auto analyze_host = [&](const media::HostFrame &frame) {
             if (frame.width != spec.width || frame.height != spec.height) {
                 throw WorkerError(
                     "media_resolution_changed",
                     "decoded media resolution changed during verification");
             }
+            // Linear-light Recipe: decode a private copy so the decoder's
+            // frame stays untouched. A fresh buffer per frame keeps the
+            // backends' pointer-keyed source caches honest.
+            std::vector<float> linear;
+            if (media_transfer.active()) {
+                linear = frame.pixels;
+                transfer_to_linear(media_transfer, linear);
+            }
             ConstImageView view{
-                frame.pixels.data(), frame.width, frame.height, frame.width};
+                media_transfer.active() ? linear.data() : frame.pixels.data(),
+                frame.width, frame.height, frame.width};
             const auto compute_start = std::chrono::steady_clock::now();
             double error = 0.0;
             if (spec.backend == BackendChoice::cpu) {
@@ -4895,11 +4971,13 @@ private:
                                 frame.height,
                                 format,
                                 frame.bit_depth,
-                                frame.range == "full"
+                                media_transfer.range == SampleRange::full
+                                        || frame.range == "full"
                                     ? CudaColorRange::full
                                     : CudaColorRange::limited,
                                 frame.context,
                                 frame.producer_stream,
+                                static_cast<std::uint32_t>(media_transfer.curve),
                             };
                             const auto compute_start =
                                 std::chrono::steady_clock::now();
@@ -4985,6 +5063,10 @@ private:
                             view.aspect_mask = frame.aspect_mask;
                             view.width = frame.width;
                             view.height = frame.height;
+                            view.transfer =
+                                static_cast<std::uint32_t>(media_transfer.curve);
+                            view.limited_range =
+                                media_transfer.range == SampleRange::limited;
                             view.bit_depth = frame.bit_depth;
                             view.normalized_sample_bits =
                                 frame.normalized_sample_bits;
@@ -5072,7 +5154,8 @@ private:
                             }
                             MetalLumaFrameView view{
                                 frame.pixel_buffer, frame.width, frame.height,
-                                frame.bit_depth, frame.surface_format, frame.range};
+                                frame.bit_depth, frame.surface_format, frame.range,
+                                static_cast<std::uint32_t>(media_transfer.curve)};
                             const auto start = std::chrono::steady_clock::now();
                             try {
                                 const double error = metal.analyze_axis_batch_metal_luma(
@@ -5308,6 +5391,10 @@ private:
                     {"input_pixel_format", JsonValue::string(index.pixel_format)},
                     {"bit_depth", JsonValue::integer(index.bit_depth)},
                     {"range", JsonValue::string(index.range)},
+                    {"transfer", JsonValue::string(
+                        std::string{transfer_curve_name(media_transfer.curve)})},
+                    {"transfer_range", JsonValue::string(
+                        std::string{sample_range_name(media_transfer.range)})},
                     {"zero_copy", JsonValue::boolean(zero_copy)},
                     {"fallback_chain", verify_fallbacks_json(spec)},
                 })},
@@ -5488,6 +5575,7 @@ private:
             std::vector<float> buffer(static_cast<std::size_t>(elements));
 #endif
             CpuWorkspace workspace;
+            std::vector<float> linear;
             while (true) {
                 VerifyFrameItem item;
                 {
@@ -5523,12 +5611,23 @@ private:
                                                    std::memory_order_relaxed);
                         return frame_error;
                     };
+                    // Client-pushed frames: decode a private copy when the
+                    // Recipe carries a linear-light curve.
+                    const auto with_transfer = [&](ConstImageView view) {
+                        if (!spec.transfer.active()) return view;
+                        const std::size_t count = static_cast<std::size_t>(spec.width)
+                            * static_cast<std::size_t>(spec.height);
+                        linear.assign(view.data, view.data + count);
+                        transfer_to_linear(spec.transfer, linear);
+                        return ConstImageView{
+                            linear.data(), spec.width, spec.height, spec.width};
+                    };
                     if (item.ring) {
                         ConstImageView view{
                             item.ring->slot_data(item.slot), spec.width, spec.height, spec.width};
                         frame_load_ms.fetch_add(elapsed_ms(load_start),
                                                 std::memory_order_relaxed);
-                        error = analyze_view(view);
+                        error = analyze_view(with_transfer(view));
                     } else {
 #if !defined(_WIN32)
                         MappedFrame mapped(item.asset);
@@ -5539,7 +5638,7 @@ private:
 #endif
                         frame_load_ms.fetch_add(elapsed_ms(load_start),
                                                 std::memory_order_relaxed);
-                        error = analyze_view(view);
+                        error = analyze_view(with_transfer(view));
                     }
                 } catch (const std::exception &failure) {
                     {

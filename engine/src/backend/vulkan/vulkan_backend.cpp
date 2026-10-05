@@ -2120,6 +2120,8 @@ std::vector<CandidateResult> VulkanAnalysisEngine::analyze_axis_batch_impl(
         push[13] = static_cast<std::uint32_t>(device_source->bit_depth);
         push[14] = static_cast<std::uint32_t>(
             device_source->normalized_sample_bits);
+        push[15] = device_source->transfer;
+        push[16] = device_source->limited_range ? 1U : 0U;
     }
     const auto write_push = [&] {
         vkCmdPushConstants(

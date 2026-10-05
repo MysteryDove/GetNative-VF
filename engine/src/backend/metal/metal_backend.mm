@@ -58,6 +58,7 @@ struct LumaNormalizeJob {
     std::uint32_t height;
     std::uint32_t bit_depth;
     std::uint32_t full_range;
+    std::uint32_t transfer;
 };
 
 constexpr std::array all_pipeline_stages{
@@ -2108,7 +2109,8 @@ std::vector<CandidateResult> MetalAnalysisEngine::analyze_axis_batch_metal_luma(
             static_cast<std::uint32_t>(source.height),
             static_cast<std::uint32_t>(source.bit_depth),
             static_cast<std::uint32_t>(source.surface_format == "420f"
-                                       || source.surface_format == "xf20")};
+                                       || source.surface_format == "xf20"),
+            source.transfer};
         [encoder setComputePipelineState:ten_bit ? impl_->luma_normalize_r16
                                                   : impl_->luma_normalize_r8];
         [encoder setTexture:CVMetalTextureGetTexture(cv_texture) atIndex:0];

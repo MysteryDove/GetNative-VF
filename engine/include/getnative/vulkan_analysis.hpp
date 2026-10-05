@@ -120,6 +120,11 @@ struct VulkanLumaFrameView {
     std::int32_t height = 0;
     std::int32_t bit_depth = 8;
     std::int32_t normalized_sample_bits = 8;
+    // TransferCurve id (getnative/transfer.hpp); 0 analyses as encoded.
+    // `limited_range` says whether the samples need the studio-range stretch
+    // before the curve is applied.
+    std::uint32_t transfer = 0U;
+    bool limited_range = true;
     std::uint32_t layout = 0U;
     std::uint32_t access = 0U;
     std::uint32_t queue_family = 0U;

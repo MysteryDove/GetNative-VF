@@ -180,6 +180,8 @@ struct CudaLumaFrameView {
     CudaColorRange range = CudaColorRange::limited;
     std::uintptr_t context = 0U;
     std::uintptr_t producer_stream = 0U;
+    // TransferCurve id (getnative/transfer.hpp); 0 analyses as encoded.
+    std::uint32_t transfer = 0U;
 };
 
 [[nodiscard]] CudaRuntimeProbe cuda_runtime_probe() noexcept;

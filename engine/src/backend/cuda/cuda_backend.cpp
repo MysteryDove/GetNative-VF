@@ -2223,11 +2223,12 @@ std::vector<CandidateResult> CudaAnalysisEngine::analyze_axis_batch_impl(
         std::uint32_t storage_shift = luma_layout.storage_shift;
         std::uint32_t limited_range =
             cuda_luma->range == CudaColorRange::limited ? 1U : 0U;
+        std::uint32_t transfer = cuda_luma->transfer;
         CUdeviceptr output_pointer = slot.device_source.pointer();
         void *parameters[] = {
             &luma_pointer, &pitch, &conversion_width, &conversion_height,
             &storage_bytes, &bit_depth, &storage_shift,
-            &limited_range, &output_pointer,
+            &limited_range, &transfer, &output_pointer,
         };
         cuda_detail::cuda_check(
             *impl_->api,
