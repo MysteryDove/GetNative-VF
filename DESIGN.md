@@ -758,7 +758,7 @@ Rules:
   | --- | --- | --- | --- |
   | Native resolution | 原生解析度 | Native resolution | Exact training term |
   | Height Analysis | 解析度測試 | Resolution Test | Training phrases `測試原生解析度` and `測解析度` |
-  | Kernel Analysis | 演算法測試 | Algorithm Test | Training phrases `測演算法` and `選擇解析度和演算法`; preserve literal kernel names |
+  | Kernel Analysis | 演算法測試 | Kernel Search | Training phrases `測演算法` and `選擇解析度和演算法`; preserve literal kernel names |
   | Full Verification | 全影片檢查 | Full Video Check | Training phrase `全集檢查`, generalized only from episode to any video input |
   | I-picture Preview | I 幀檢查 | I-frame Check | Training phrase `只選了i幀進行檢查` |
   | Error metric | 誤差 | Error | Exact training term |
