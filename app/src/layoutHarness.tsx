@@ -270,6 +270,73 @@ function fractionalHeightRun(id: string, groupId: string, b: number, c: number, 
 fractionalHeightRun("run-frac-a", "group-frac-a", 1 / 3, 1 / 3, 4);
 fractionalHeightRun("run-frac-b", "group-frac-b", 0, 0.5, 5);
 
+/**
+ * Kernel Search repro: a Bicubic (b, c) grid plus the common resamplers on two
+ * Samples, so the b × c heatmap, the line plot of the remaining kernels and the
+ * cross-sample ranking all have real-shaped data.
+ */
+initialState.samplesById["sample-2"] = {
+  ...initialState.samplesById["sample-1"],
+  id: "sample-2",
+  label: "fixture.m2ts #240",
+  order: 1,
+  frameIndex: 240,
+};
+const kernelFixture = [
+  { id: "bilinear", parameters: {} },
+  { id: "spline36", parameters: {} },
+  { id: "lanczos", parameters: { taps: 3 } },
+  ...Array.from({ length: 6 }, (_, bi) =>
+    Array.from({ length: 6 }, (_, ci) => ({ id: "bicubic", parameters: { b: bi / 5, c: ci / 5 } })),
+  ).flat(),
+];
+initialState.runGroupsById["group-kernel"] = {
+  id: "group-kernel",
+  memberRunIds: ["run-kernel-1", "run-kernel-2"],
+  groupType: "multi_sample_kernel",
+  label: "Multi-Sample Kernel Search",
+  createdAt: "2026-08-18T00:06:00Z",
+  intentSnapshot: null,
+};
+for (const [index, sampleId] of ["sample-1", "sample-2"].entries()) {
+  initialState.runsById[`run-kernel-${index + 1}`] = {
+    id: `run-kernel-${index + 1}`,
+    runType: "kernel",
+    status: "completed",
+    runGroupId: "group-kernel",
+    sampleId,
+    sourceId: "source-1",
+    createdAt: "2026-08-18T00:06:00Z",
+    updatedAt: "2026-08-18T00:06:30Z",
+    inputSnapshot: {
+      metric,
+      kernels: kernelFixture,
+      geometry: { canvasWidth: 1536, canvasHeight: 864 },
+      request: {},
+    },
+    result: {
+      candidates: kernelFixture.map((kernel, candidate) => {
+        const b = Number((kernel.parameters as { b?: number }).b ?? 0.3);
+        const c = Number((kernel.parameters as { c?: number }).c ?? 0.3);
+        // A valley around (b, c) = (0, 0.6) on a log scale.
+        const distance = Math.hypot(b - 0, c - 0.6);
+        return {
+          id: String(candidate),
+          // The engine echoes each measured kernel alongside its error.
+          kernel: { id: kernel.id, ...kernel.parameters },
+          error: kernel.id === "bicubic"
+            ? 2e-8 * (1 + index * 0.4) * 10 ** (distance * 4.5)
+            : (candidate + 2) * 9e-5 * (1 + index * 0.2),
+        };
+      }),
+    },
+    errorCode: null,
+    errorMessage: null,
+    completed: kernelFixture.length,
+    total: kernelFixture.length,
+  };
+}
+
 const capabilities: EngineEnvelope = {
   path: "fixture-engine",
   payload: {
@@ -280,6 +347,7 @@ const capabilities: EngineEnvelope = {
     kernels: [
       { id: "bicubic", parameters: { b: 0, c: 0.5 } },
       { id: "bilinear", parameters: {} },
+      { id: "lanczos", parameters: { taps: 3 } },
     ],
     backends: [
       {
@@ -294,6 +362,7 @@ const capabilities: EngineEnvelope = {
       },
     ],
     profiles: [],
+    features: { analysis_transfer: true },
   },
 };
 

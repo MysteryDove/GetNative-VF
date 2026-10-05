@@ -18,10 +18,19 @@ import type { ActualBackend } from "../engine/protocol";
 import { verificationRunLabel, verifyCoverageDisplay } from "../engine/verifyResults";
 import { sourceFilterLabel } from "../project/sourceLabel";
 import { Modal } from "../components/Modal";
+import {
+  ACTIVE_RUN_STATUSES,
+  RUN_FAMILIES,
+  removeRunFamilyFromState,
+  removeRunsFromState,
+  runFamilyCounts,
+  type RunFamily,
+} from "../project/runHistory";
+import { runSelectionSummary } from "../engine/runSummary";
 
 export { sourceFilterLabel } from "../project/sourceLabel";
 
-const ACTIVE_STATUSES = new Set(["queued", "running"]);
+const ACTIVE_STATUSES = ACTIVE_RUN_STATUSES;
 
 export function runActualBackend(
   run: Run,
@@ -91,17 +100,14 @@ export function clearAllResultsFromState(state: ProjectState): ProjectState {
 
 export function removeRunGroupFromState(state: ProjectState, groupId: string): ProjectState {
   const group = state.runGroupsById[groupId];
+  // A group with a queued/running member is left whole.
   if (!group || runGroupActive(state, group)) return state;
-
-  const runsById = { ...state.runsById };
-  const verificationReviewsByRunId = { ...state.verificationReviewsByRunId };
-  for (const id of group.memberRunIds) {
-    delete runsById[id];
-    delete verificationReviewsByRunId[id];
-  }
-  const runGroupsById = { ...state.runGroupsById };
+  const next = removeRunsFromState(state, group.memberRunIds);
+  if (next.runGroupsById[group.id] === undefined) return next;
+  // Members already missing from runsById: still drop the emptied group.
+  const runGroupsById = { ...next.runGroupsById };
   delete runGroupsById[group.id];
-  return { ...state, runsById, runGroupsById, verificationReviewsByRunId };
+  return { ...next, runGroupsById };
 }
 
 export function nextHistoryFilters(
@@ -133,22 +139,7 @@ export function nextHistoryFilters(
 }
 
 export function removeRunFromState(state: ProjectState, runId: string): ProjectState {
-  const run = state.runsById[runId];
-  if (!run || ACTIVE_STATUSES.has(run.status)) return state;
-
-  const runsById = { ...state.runsById };
-  delete runsById[run.id];
-  const verificationReviewsByRunId = { ...state.verificationReviewsByRunId };
-  delete verificationReviewsByRunId[run.id];
-  let runGroupsById = state.runGroupsById;
-  const group = run.runGroupId ? state.runGroupsById[run.runGroupId] : null;
-  if (group) {
-    const memberRunIds = group.memberRunIds.filter((id) => id !== run.id);
-    runGroupsById = { ...state.runGroupsById };
-    if (memberRunIds.length === 0) delete runGroupsById[group.id];
-    else runGroupsById[group.id] = { ...group, memberRunIds };
-  }
-  return { ...state, runsById, runGroupsById, verificationReviewsByRunId };
+  return removeRunsFromState(state, [runId]);
 }
 
 /**
@@ -170,8 +161,13 @@ export function ResultsPage({
   const [sourceFilter, setSourceFilter] = useState("all");
   const [notice, setNotice] = useState("");
   const [pendingDelete, setPendingDelete] = useState<
-    { kind: "group"; id: string } | { kind: "run"; id: string } | { kind: "all" } | null
+    | { kind: "group"; id: string }
+    | { kind: "run"; id: string }
+    | { kind: "all" }
+    | { kind: "family"; family: RunFamily }
+    | null
   >(null);
+  const familyCounts = useMemo(() => runFamilyCounts(state), [state.runsById]);
   const hasActiveRuns = Object.values(state.runsById).some((run) => ACTIVE_STATUSES.has(run.status));
   const hasResults = [state.runsById, state.runGroupsById,
     state.verificationReviewsByRunId, state.verificationFusionsById]
@@ -299,7 +295,14 @@ export function ResultsPage({
 
   function confirmDelete() {
     if (!pendingDelete) return;
-    if (pendingDelete.kind === "all") {
+    if (pendingDelete.kind === "family") {
+      const family = pendingDelete.family;
+      onProjectChange((current) => removeRunFamilyFromState(current, family));
+      const remaining = removeRunFamilyFromState(state, family).runsById;
+      setSelectedRuns((current) => new Set([...current].filter((id) => remaining[id])));
+      setRunGroupFilter("all");
+      setSourceFilter("all");
+    } else if (pendingDelete.kind === "all") {
       if (hasActiveRuns) return;
       onProjectChange(clearAllResultsFromState);
       setSelectedRuns(new Set());
@@ -392,12 +395,39 @@ export function ResultsPage({
   }
 
   const isEmpty = groups.length === 0 && ungroupedRuns.length === 0;
+  const pendingDeleteTitle = !pendingDelete
+    ? ""
+    : pendingDelete.kind === "family"
+      ? t(`results.deleteFamily.${pendingDelete.family}`)
+      : t(pendingDelete.kind === "all"
+          ? "results.clearAll"
+          : pendingDelete.kind === "group" ? "results.deleteGroup" : "results.deleteRun");
 
   return (
     <div className="page-panel">
       <div className="page-header">
         <h2>{t("results.title")}</h2>
         <div className="top-actions">
+          <div className="results-family-delete" role="group" aria-label={t("results.deleteByTest")}>
+            <span>{t("results.deleteByTest")}</span>
+            {RUN_FAMILIES.map((family) => {
+              const count = familyCounts[family];
+              const finished = count.total - count.active;
+              return (
+                <button
+                  key={family}
+                  className="secondary-button danger-button"
+                  type="button"
+                  disabled={finished === 0}
+                  title={t(`results.deleteFamily.${family}`)}
+                  onClick={() => setPendingDelete({ kind: "family", family })}
+                >
+                  <Trash2 size={14} />
+                  {t(`results.deleteAll.short.${family}`, { count: String(count.total) })}
+                </button>
+              );
+            })}
+          </div>
           <button
             className="secondary-button danger-button"
             type="button"
@@ -558,7 +588,7 @@ export function ResultsPage({
       {pendingDelete ? (
         <Modal
           onClose={() => setPendingDelete(null)}
-          title={t(pendingDelete.kind === "all" ? "results.clearAll" : pendingDelete.kind === "group" ? "results.deleteGroup" : "results.deleteRun")}
+          title={pendingDeleteTitle}
           closeLabel={t("common.close")}
           actions={
             <>
@@ -573,13 +603,20 @@ export function ResultsPage({
               <button className="secondary-button danger-button" type="button" onClick={confirmDelete}
                 disabled={pendingDelete.kind === "all" && hasActiveRuns}>
                 <Trash2 size={14} />
-                {t(pendingDelete.kind === "all" ? "results.clearAll" : pendingDelete.kind === "group" ? "results.deleteGroup" : "results.deleteRun")}
+                {pendingDeleteTitle}
               </button>
             </>
           }
         >
           <p className="confirm-dialog-copy">
-            {pendingDelete.kind === "all"
+            {pendingDelete.kind === "family"
+              ? t("results.deleteFamilyConfirm", {
+                  count: String(
+                    familyCounts[pendingDelete.family].total
+                    - familyCounts[pendingDelete.family].active,
+                  ),
+                })
+              : pendingDelete.kind === "all"
               ? t("results.clearAllConfirm", { count: String(Object.keys(state.runsById).length) })
               : pendingDelete.kind === "group"
               ? t("results.deleteGroupConfirm", {
@@ -623,6 +660,9 @@ function RunGroupBlock({
   const members = group.memberRunIds
     .map((id) => state.runsById[id])
     .filter((run): run is Run => Boolean(run));
+  // What this command measured (kernel, scan range/step/base, …), so trial
+  // runs can be told apart before deleting them.
+  const summary = runSelectionSummary(t, state, group.memberRunIds);
   return (
     <div className="run-group-block">
       <div className="dense-row run-group-header">
@@ -633,7 +673,8 @@ function RunGroupBlock({
           </strong>
           <span>
             {t("analyze.memberCount", { count: String(members.length) })}
-            {group.createdAt ? ` · ${group.createdAt.slice(0, 10)}` : ""}
+            {summary ? ` · ${summary}` : ""}
+            {group.createdAt ? ` · ${group.createdAt.slice(0, 16).replace("T", " ")}` : ""}
           </span>
         </button>
         <button

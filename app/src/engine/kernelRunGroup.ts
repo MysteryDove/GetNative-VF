@@ -1,5 +1,5 @@
 import type { EngineEnvelope } from "./types";
-import type { AxisMode, KernelRef } from "./protocol";
+import type { AxisMode, KernelRef, TransferCurve } from "./protocol";
 import { validateBackendPNorm } from "./heightDraft";
 import {
   geometryGroupKey,
@@ -128,6 +128,9 @@ export function planKernelRunGroup(input: {
       profileId: input.draft.profileId,
       mathMode: input.draft.mathMode,
       backendPreference: input.draft.backendPreference,
+      ...(input.draft.transfer && input.draft.transfer !== "none"
+        ? { transfer: input.draft.transfer }
+        : {}),
     };
     const shape = validateKernelShape(request);
     if (!shape.ok) return { ok: false, reason: shape.code };
@@ -148,7 +151,7 @@ export function planKernelRunGroup(input: {
     ok: true,
     plan: {
       groupType: included.length > 1 ? "multi_sample_kernel" : "single_kernel",
-      label: included.length > 1 ? "Multi-Sample Algorithm Test" : "Algorithm Test",
+      label: included.length > 1 ? "Multi-Sample Kernel Search" : "Kernel Search",
       memberCount: members.length,
       kernelCount: resolved.candidates.length,
       workEstimate: members.length * resolved.candidates.length,
@@ -279,10 +282,21 @@ export function compareKernelResultRows(a: KernelResultRow, b: KernelResultRow):
  * Flatten kernel runs into result-table rows, hiding runs whose snapshot
  * metric is incompatible with the currently drafted metric.
  */
+/** Transfer curve a kernel Run was measured under (`none` for older records). */
+export function kernelRunTransfer(run: Pick<Run, "inputSnapshot">): TransferCurve {
+  const snapshot = run.inputSnapshot as { request?: { transfer?: TransferCurve } } | null;
+  return snapshot?.request?.transfer ?? "none";
+}
+
 export function buildKernelResultRows(
   runs: Run[],
   state: ProjectState,
   activeMetricKey: string,
+  /**
+   * Errors measured in different light domains are not on one scale, so only
+   * Runs of the selected transfer are shown; the rest count as incompatible.
+   */
+  activeTransfer?: TransferCurve,
 ): { rows: KernelResultRow[]; incompatibleCount: number } {
   const rows: KernelResultRow[] = [];
   let incompatibleCount = 0;
@@ -292,6 +306,10 @@ export function buildKernelResultRows(
       kernels?: KernelRef[];
     } | null;
     if (snapshot?.metric && metricCompatibilityKey(snapshot.metric) !== activeMetricKey) {
+      incompatibleCount += 1;
+      continue;
+    }
+    if (activeTransfer !== undefined && kernelRunTransfer(run) !== activeTransfer) {
       incompatibleCount += 1;
       continue;
     }

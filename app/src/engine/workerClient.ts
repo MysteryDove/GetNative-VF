@@ -29,18 +29,23 @@ import type {
   EndpointRule,
   GeometryWire,
 } from "./protocol";
+import type { SampleRange, TransferCurve } from "./protocol";
 
 export type FrameAssetRef = {
   path: string;
   format: "f32le";
   width: number;
   height: number;
+  /** Studio-range video needs stretching before a transfer curve applies. */
+  range?: SampleRange;
 };
 
 export type HeightJobParams = {
   frameAsset: FrameAssetRef;
   axisMode: AxisMode;
   kernel: { id: string; b?: number; c?: number; taps?: number; blur?: number };
+  /** Linear-light hypothesis; omitted analyses the frame as encoded. */
+  transfer?: TransferCurve;
   candidates: string[];
   metric: {
     cropLeft?: number;
@@ -67,6 +72,8 @@ export type KernelJobParams = {
   candidate: string;
   /** Ordered kernel list; result rows key on the decimal index into this list. */
   kernels: Array<{ id: string; b?: number; c?: number; taps?: number; blur?: number }>;
+  /** Linear-light hypothesis; omitted analyses the frame as encoded. */
+  transfer?: TransferCurve;
   metric: HeightJobParams["metric"];
   backend?: "cpu" | "cuda" | "vulkan" | "metal" | "auto";
   workerCount?: number;
@@ -89,6 +96,8 @@ export type VerifyMediaJobParams = {
   endFrame?: number | null;
   axisMode: AxisMode;
   kernel: { id: string; b?: number; c?: number; taps?: number; blur?: number };
+  /** Linear-light curve of the Recipe; omitted analyses as encoded. */
+  transfer?: TransferCurve;
   candidate: string;
   metric: HeightJobParams["metric"];
   backend?: "cpu" | "cuda" | "vulkan" | "metal" | "auto";
@@ -294,6 +303,7 @@ export class EngineWorkerClient {
       baseWidth: params.baseWidth ?? null,
       grid: params.grid,
       geometry: params.geometry ?? null,
+      ...(params.transfer && params.transfer !== "none" ? { transfer: params.transfer } : {}),
     }, onPrepared);
   }
 
@@ -312,6 +322,7 @@ export class EngineWorkerClient {
       baseHeight: params.baseHeight ?? null,
       baseWidth: params.baseWidth ?? null,
       geometry: params.geometry ?? null,
+      ...(params.transfer && params.transfer !== "none" ? { transfer: params.transfer } : {}),
     }, onPrepared);
   }
 
@@ -397,6 +408,7 @@ export class EngineWorkerClient {
           endFrame: params.endFrame ?? null,
           axisMode: params.axisMode,
           kernel: params.kernel,
+          ...(params.transfer && params.transfer !== "none" ? { transfer: params.transfer } : {}),
           candidate: params.candidate,
           metric: params.metric,
           backend: params.backend ?? "auto",

@@ -107,7 +107,7 @@ export function runPureModuleChecks(): void {
   assert(tEn("hub.revealProject") === "Show in Folder", "en reveal Project term");
   assert(tEn("engine.version", { version: "1.0" }) === "Engine 1.0", "placeholder expansion");
   assert(tZh("overview.step.height") === "分辨率测试", "zh-CN Resolution Test term");
-  assert(tZh("overview.step.kernel") === "算法测试", "zh-CN Algorithm Test term");
+  assert(tZh("overview.step.kernel") === "算法测试", "zh-CN Kernel Search term");
   assert(tZh("overview.step.verify") === "全视频检查", "zh-CN Full Video Check term");
   assert(tZh("recipe.active") === "当前", "zh-CN active Recipe state");
   assert(tZh("diagnostics.axis.twoAxis") === "两个方向", "zh-CN both-directions term");
@@ -157,7 +157,7 @@ export function runPureModuleChecks(): void {
 
   const runnable = readiness(state, true);
   assert(runnable.heightReady, "included Sample with a ready source enables Resolution Test");
-  assert(runnable.kernelReady, "included Sample with a ready source enables Algorithm Test");
+  assert(runnable.kernelReady, "included Sample with a ready source enables Kernel Search");
   assert(!runnable.verifyReady, "Full Video Check requires a complete current Recipe");
 
   state.recipesById.recipe_1 = {

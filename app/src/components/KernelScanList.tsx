@@ -11,7 +11,9 @@ import {
   lanczosRefsFromDraft,
   lanczosTapsRange,
   removeKernelFromScanList,
-  withAddBlurParams,
+  addBlurValues,
+  blurSweepEnabled,
+  withAddBlurVariants,
   KERNEL_FAMILY_ORDER,
   type KernelDraft,
 } from "../engine/kernelDraft";
@@ -133,7 +135,14 @@ export function KernelScanListBuilder({
   }
 
   const addBlurValue = draft.addBlur ?? "1";
-  const addBlurInvalid = invalidKernelBlur({ blur: addBlurValue });
+  const sweeping = blurSweepEnabled(draft);
+  // Own open state: tying it to the stop field would collapse the section
+  // (and hide the focused input) the moment the field is cleared to retype.
+  const [sweepOpen, setSweepOpen] = useState(sweeping);
+  const blurValues = addBlurValues(draft);
+  const addBlurInvalid = sweeping
+    ? !blurValues.ok
+    : invalidKernelBlur({ blur: addBlurValue });
 
   function handleAddKernels(refs: KernelRef[]) {
     if (addBlurInvalid) {
@@ -142,12 +151,12 @@ export function KernelScanListBuilder({
     }
     const attached: KernelRef[] = [];
     for (const ref of refs) {
-      const withBlur = withAddBlurParams(draft, ref);
-      if (!withBlur) {
+      const variants = withAddBlurVariants(draft, ref);
+      if (!variants) {
         setAddNotice(t("analyze.blurInvalid"));
         return;
       }
-      attached.push(withBlur);
+      attached.push(...variants);
     }
     if (!attached.length) {
       setAddNotice(t("analyze.k.scanList.invalidParams"));
@@ -159,7 +168,16 @@ export function KernelScanListBuilder({
       return;
     }
     onDraftChange(() => result.draft);
-    setAddNotice(result.added ? "" : t("analyze.k.scanList.duplicate"));
+    setAddNotice(
+      !result.added
+        ? t("analyze.k.scanList.duplicate")
+        : attached.length > 1
+          ? t("analyze.k.scanList.gridAdded", {
+              added: String(result.added),
+              skipped: String(result.skipped),
+            })
+          : "",
+    );
   }
 
   function handleAddFamily() {
@@ -236,6 +254,51 @@ export function KernelScanListBuilder({
           />
         </label>
       </div>
+      <details
+        className="grid-range"
+        open={sweepOpen}
+        onToggle={(event) => setSweepOpen(event.currentTarget.open)}
+      >
+        <summary>{t("analyze.k.blurSweep")}</summary>
+        <div className="grid-range-body">
+          <div className="grid-range-row">
+            <span className="grid-range-axis" aria-hidden="true">≈</span>
+            <label>
+              <span>{t("analyze.start")}</span>
+              <input
+                inputMode="decimal"
+                aria-invalid={addBlurInvalid || undefined}
+                value={addBlurValue}
+                onChange={(event) => patch({ addBlur: event.target.value })}
+              />
+            </label>
+            <label>
+              <span>{t("analyze.stop")}</span>
+              <input
+                inputMode="decimal"
+                placeholder={t("analyze.k.blurSweepOff")}
+                aria-invalid={(sweeping && addBlurInvalid) || undefined}
+                value={draft.blurStop ?? ""}
+                onChange={(event) => patch({ blurStop: event.target.value })}
+              />
+            </label>
+            <label>
+              <span>{t("analyze.step")}</span>
+              <input
+                inputMode="decimal"
+                aria-invalid={(sweeping && addBlurInvalid) || undefined}
+                value={draft.blurStep ?? ""}
+                onChange={(event) => patch({ blurStep: event.target.value })}
+              />
+            </label>
+          </div>
+          <p className="help-copy">
+            {sweeping && blurValues.ok
+              ? t("analyze.k.blurSweepCount", { count: String(blurValues.values.length) })
+              : t("analyze.k.blurSweepHint")}
+          </p>
+        </div>
+      </details>
       {addBlurInvalid ? (
         <p className="help-copy warning-copy" role="alert">
           {t("analyze.blurInvalid")}

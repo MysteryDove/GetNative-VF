@@ -7,6 +7,8 @@ describe("analyzeViewState", () => {
     expect(analyzeViewState(emptyProjectState())).toEqual({
       metricSpecOpen: false,
       metric: null,
+      heightDraft: null,
+      kernelDraft: null,
     });
   });
 
@@ -21,7 +23,9 @@ describe("analyzeViewState", () => {
     };
     const state = emptyProjectState();
     state.uiStateByRoute.analyze = { metricSpecOpen: true, metric };
-    expect(analyzeViewState(state)).toEqual({ metricSpecOpen: true, metric });
+    expect(analyzeViewState(state)).toEqual({
+      metricSpecOpen: true, metric, heightDraft: null, kernelDraft: null,
+    });
   });
 
   it("rejects incomplete stored metrics", () => {

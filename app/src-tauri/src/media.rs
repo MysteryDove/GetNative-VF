@@ -48,6 +48,8 @@ pub struct MediaFrameAsset {
     pub format: String,
     pub width: u32,
     pub height: u32,
+    /// Stills decode to full-range samples; video assets come from the engine.
+    pub range: String,
     pub from_cache: bool,
 }
 
@@ -80,8 +82,8 @@ pub fn media_pick_files() -> Result<Vec<String>, String> {
         .add_filter(
             "Media",
             &[
-                "png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "mkv", "mp4",
-                "m4v", "mov", "avi", "webm", "ts", "m2ts",
+                "png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "mkv", "mp4", "m4v",
+                "mov", "avi", "webm", "ts", "m2ts",
             ],
         )
         .pick_files()
@@ -191,7 +193,11 @@ fn probe_path(path: &Path) -> Result<MediaProbeResult, String> {
         return Ok(MediaProbeResult {
             path: path.display().to_string(),
             file_name,
-            kind: if animated { SourceKind::Animated } else { SourceKind::Still },
+            kind: if animated {
+                SourceKind::Animated
+            } else {
+                SourceKind::Still
+            },
             state: SourceState::Ready,
             fingerprint,
             size_bytes: metadata.len(),
@@ -251,7 +257,9 @@ pub(crate) fn validated_media_path(raw: &str) -> Result<PathBuf, String> {
 }
 
 fn validate_expected_fingerprint(path: &Path, expected: Option<&str>) -> Result<(), String> {
-    let Some(expected) = expected else { return Ok(()) };
+    let Some(expected) = expected else {
+        return Ok(());
+    };
     let size = fs::metadata(path)
         .map_err(|error| format!("media_read_error: failed to read media metadata: {error}"))?
         .len();
@@ -290,11 +298,17 @@ fn image_format(path: &Path) -> Option<ImageFormat> {
         .with_guessed_format()
         .ok()?
         .format()
-        .filter(|format| matches!(
-            format,
-            ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif
-                | ImageFormat::WebP | ImageFormat::Tiff | ImageFormat::Bmp
-        ))
+        .filter(|format| {
+            matches!(
+                format,
+                ImageFormat::Png
+                    | ImageFormat::Jpeg
+                    | ImageFormat::Gif
+                    | ImageFormat::WebP
+                    | ImageFormat::Tiff
+                    | ImageFormat::Bmp
+            )
+        })
 }
 
 fn is_animated_image(path: &Path, format: ImageFormat) -> Result<bool, String> {
@@ -336,12 +350,7 @@ fn looks_like_video(path: &Path) -> bool {
     )
 }
 
-fn frame_asset_cache_path(
-    cache: &Path,
-    identity: &str,
-    width: u32,
-    height: u32,
-) -> PathBuf {
+fn frame_asset_cache_path(cache: &Path, identity: &str, width: u32, height: u32) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(identity.as_bytes());
     hasher.update(width.to_le_bytes());
@@ -355,7 +364,9 @@ pub(crate) fn frame_asset_still(
     cache: &Path,
 ) -> Result<MediaFrameAsset, String> {
     if request.stream_index.is_some() || request.frame_index.is_some() {
-        return Err("frame_asset_invalid: still images do not accept stream or frame indices".to_owned());
+        return Err(
+            "frame_asset_invalid: still images do not accept stream or frame indices".to_owned(),
+        );
     }
     let rgb = image::open(path)
         .map_err(|error| format!("image_decode_error: {error}"))?
@@ -368,7 +379,10 @@ pub(crate) fn frame_asset_still(
             ));
         }
     }
-    let identity = request.fingerprint.as_deref().unwrap_or_else(|| path.to_str().unwrap_or(""));
+    let identity = request
+        .fingerprint
+        .as_deref()
+        .unwrap_or_else(|| path.to_str().unwrap_or(""));
     let output = frame_asset_cache_path(cache, identity, width, height);
     let expected_bytes = u64::from(width) * u64::from(height) * 4_u64;
     if fs::metadata(&output).is_ok_and(|metadata| metadata.len() == expected_bytes) {
@@ -377,25 +391,25 @@ pub(crate) fn frame_asset_still(
             format: "f32le".to_owned(),
             width,
             height,
+            range: "full".to_owned(),
             from_cache: true,
         });
     }
-    fs::create_dir_all(cache)
-        .map_err(|error| format!("frame_asset_cache_error: {error}"))?;
+    fs::create_dir_all(cache).map_err(|error| format!("frame_asset_cache_error: {error}"))?;
     let temporary = output.with_extension(format!("{}.tmp", Uuid::new_v4()));
     let result = (|| -> Result<(), String> {
-        let file = File::create(&temporary)
-            .map_err(|error| format!("frame_asset_error: {error}"))?;
+        let file =
+            File::create(&temporary).map_err(|error| format!("frame_asset_error: {error}"))?;
         let mut writer = BufWriter::new(file);
         for pixel in rgb.pixels() {
-            let luma = 0.2126_f32 * pixel.0[0]
-                + 0.7152_f32 * pixel.0[1]
-                + 0.0722_f32 * pixel.0[2];
+            let luma = 0.2126_f32 * pixel.0[0] + 0.7152_f32 * pixel.0[1] + 0.0722_f32 * pixel.0[2];
             writer
                 .write_all(&luma.to_le_bytes())
                 .map_err(|error| format!("frame_asset_error: {error}"))?;
         }
-        writer.flush().map_err(|error| format!("frame_asset_error: {error}"))?;
+        writer
+            .flush()
+            .map_err(|error| format!("frame_asset_error: {error}"))?;
         writer
             .get_ref()
             .sync_all()
@@ -405,7 +419,11 @@ pub(crate) fn frame_asset_still(
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
-    if fs::metadata(&temporary).map(|metadata| metadata.len()).unwrap_or(0) != expected_bytes {
+    if fs::metadata(&temporary)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        != expected_bytes
+    {
         let _ = fs::remove_file(&temporary);
         return Err("frame_asset_error: decoded still asset is truncated".to_owned());
     }
@@ -425,6 +443,7 @@ pub(crate) fn frame_asset_still(
         format: "f32le".to_owned(),
         width,
         height,
+        range: "full".to_owned(),
         from_cache: false,
     })
 }
@@ -435,9 +454,9 @@ fn prune_frame_asset_cache(cache: &Path) -> Result<(), String> {
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let metadata = entry.metadata().ok()?;
-            metadata.is_file().then(|| (
-                entry.path(), metadata.len(), metadata.modified().ok(),
-            ))
+            metadata
+                .is_file()
+                .then(|| (entry.path(), metadata.len(), metadata.modified().ok()))
         })
         .collect::<Vec<_>>();
     files.sort_by_key(|(_, _, modified)| *modified);
@@ -489,7 +508,11 @@ mod tests {
         let first = frame_asset_still(&path, &request, &cache).unwrap();
         assert!(!first.from_cache);
         assert_eq!(fs::metadata(&first.path).unwrap().len(), 8 * 6 * 4);
-        assert!(frame_asset_still(&path, &request, &cache).unwrap().from_cache);
+        assert!(
+            frame_asset_still(&path, &request, &cache)
+                .unwrap()
+                .from_cache
+        );
         let _ = fs::remove_file(path);
         let _ = fs::remove_dir_all(cache);
     }

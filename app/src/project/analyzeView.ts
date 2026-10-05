@@ -4,7 +4,39 @@ import type { ProjectState } from "./types";
 export type AnalyzeViewState = {
   metricSpecOpen: boolean;
   metric: MetricSpec | null;
+  /** Last Resolution Test / Kernel Search parameter drafts, as stored JSON. */
+  heightDraft: Record<string, unknown> | null;
+  kernelDraft: Record<string, unknown> | null;
 };
+
+function readRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown> : null;
+}
+
+/**
+ * Lay a stored draft over fresh defaults. Only keys the current draft shape
+ * knows are taken, and only when the stored value has the same kind as the
+ * default, so a draft saved by another version can never break the form.
+ */
+export function restoreDraft<T extends Record<string, unknown>>(
+  defaults: T,
+  stored: Record<string, unknown> | null,
+  skip: ReadonlyArray<keyof T> = [],
+): T {
+  if (!stored) return defaults;
+  const restored: Record<string, unknown> = { ...defaults };
+  for (const key of Object.keys(defaults)) {
+    if (skip.includes(key as keyof T) || !(key in stored)) continue;
+    const fallback = defaults[key];
+    const value = stored[key];
+    const sameKind = Array.isArray(fallback)
+      ? Array.isArray(value)
+      : typeof value === typeof fallback && value !== null && !Array.isArray(value);
+    if (sameKind) restored[key] = value;
+  }
+  return restored as T;
+}
 
 function readNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -35,11 +67,13 @@ export function parseStoredMetric(value: unknown): MetricSpec | null {
 export function analyzeViewState(state: ProjectState): AnalyzeViewState {
   const value = state.uiStateByRoute.analyze;
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return { metricSpecOpen: false, metric: null };
+    return { metricSpecOpen: false, metric: null, heightDraft: null, kernelDraft: null };
   }
-  const record = value as { metricSpecOpen?: unknown; metric?: unknown };
+  const record = value as Record<string, unknown>;
   return {
     metricSpecOpen: record.metricSpecOpen === true,
     metric: parseStoredMetric(record.metric),
+    heightDraft: readRecord(record.heightDraft),
+    kernelDraft: readRecord(record.kernelDraft),
   };
 }

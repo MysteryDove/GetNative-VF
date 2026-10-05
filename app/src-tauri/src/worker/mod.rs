@@ -16,8 +16,8 @@
 //! cache and asset path safety. This module keeps the Tauri-facing pieces:
 //! `WorkerManager` and the command handlers.
 
-pub mod protocol;
 pub(crate) mod assets;
+pub mod protocol;
 pub(crate) mod session;
 
 pub(crate) use assets::migrate_legacy_media_cache;
@@ -28,7 +28,7 @@ use assets::axis_plan_cache_directory;
 use assets::media_cache_directory;
 use protocol::{
     analyze_command, validate_analyze, validate_verify_media_begin, verify_media_begin_command,
-    WorkerAnalyzeRequest, VerifyMediaBeginRequest,
+    VerifyMediaBeginRequest, WorkerAnalyzeRequest,
 };
 use serde_json::{json, Value};
 use session::{spawn_session, WorkerOutput, WorkerSession, WorkerSink};
@@ -77,7 +77,6 @@ impl WorkerManager {
         })?;
         action(session)
     }
-
 }
 
 #[tauri::command]
@@ -119,9 +118,13 @@ pub async fn engine_worker_start(
             "type": "hello",
         }))?;
         if hello.get("type").and_then(Value::as_str) != Some("hello_ok")
-            || hello.get("protocol_version").and_then(Value::as_u64) != Some(PROTOCOL_VERSION as u64)
+            || hello.get("protocol_version").and_then(Value::as_u64)
+                != Some(PROTOCOL_VERSION as u64)
         {
-            return Err("worker_protocol_error: the engine worker rejected the protocol handshake".to_owned());
+            return Err(
+                "worker_protocol_error: the engine worker rejected the protocol handshake"
+                    .to_owned(),
+            );
         }
         session.hello = json!({
             "path": path,
@@ -147,10 +150,9 @@ pub async fn engine_worker_capabilities(state: State<'_, WorkerManager>) -> Resu
             if response.get("type").and_then(Value::as_str) != Some("capabilities") {
                 return Err("worker_protocol_error: unexpected capabilities response".to_owned());
             }
-            let payload = response
-                .get("payload")
-                .cloned()
-                .ok_or_else(|| "worker_protocol_error: capabilities response has no payload".to_owned())?;
+            let payload = response.get("payload").cloned().ok_or_else(|| {
+                "worker_protocol_error: capabilities response has no payload".to_owned()
+            })?;
             validate_capabilities(&payload)?;
             Ok(json!({ "path": session.engine_path, "payload": payload }))
         })
@@ -188,7 +190,9 @@ pub fn engine_worker_media_begin(
             | "media_preview_begin"
             | "media_asset_batch_begin"
     ) {
-        return Err(format!("bad_request: unsupported media command {command_type}"));
+        return Err(format!(
+            "bad_request: unsupported media command {command_type}"
+        ));
     }
     let path = object
         .get("path")

@@ -183,6 +183,7 @@ async function runEngineMediaVerifyMember(
       endFrame: member.scanScope.endFrame ?? null,
       axisMode: member.request.axisMode,
       kernel: kernelParamsForWire(member.request.kernel),
+      transfer: member.request.transfer,
       candidate: String(geometryCandidate(member.request.geometry, member.request.axisMode)),
       geometry: geometryToWire(member.request.geometry),
       metric: {

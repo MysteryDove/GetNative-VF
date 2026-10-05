@@ -3,7 +3,9 @@ import { ArrowRight, ChevronDown, ChevronRight } from "lucide-react";
 import type { Translator } from "../i18n";
 import type { ProjectState } from "../project/types";
 import type { estimateHeightWork, resolveHeightGrid } from "../engine/heightDraft";
-import { heightRunConfig, kernelMetaLabel, type SeriesTable } from "../engine/runGroupPlan";
+import { kernelMetaLabel, type SeriesTable } from "../engine/runGroupPlan";
+import { runSelectorOptions } from "../engine/runSummary";
+import { RunSelector } from "./RunSelector";
 import { padDecimals } from "../engine/numberInput";
 import { toggleSetValue } from "../utils/collections";
 import { BlockedState } from "./BlockedState";
@@ -79,6 +81,7 @@ export function HeightResultsPanel({
   onOpenDiagnostics,
   onOpenApplyDialog,
   onRefineAroundSelection,
+  onDeleteRuns,
   nextStep,
 }: {
   t: Translator;
@@ -98,14 +101,19 @@ export function HeightResultsPanel({
   excludedResultsAvailable: boolean;
   onToggleExcludedResults: (value: boolean) => void;
   onOpenDiagnostics: () => void;
-  onOpenApplyDialog: (selected?: HeightSelection) => void;
+  /** `otherAxis` is the last pick made while scanning the other axis, if any. */
+  onOpenApplyDialog: (selected?: HeightSelection, otherAxis?: HeightSelection) => void;
   onRefineAroundSelection: (height: string) => void;
+  onDeleteRuns: (runIds: string[]) => void;
   /** Workflow handoff shown beside the apply notice once geometry is applied. */
   nextStep?: { label: string; onClick: () => void } | null;
 }) {
   const [selection, setSelection] = useState<HeightSelection | null>(null);
   const selectedHeight = selection?.height ?? null;
   const selectedHeightAxis = useRef<typeof axisMode>(axisMode);
+  // Last pick per scanned axis. It outlives the axis switch so an H-only and a
+  // W-only result can be applied together as one non-proportional geometry.
+  const lastPickByAxis = useRef<{ height?: HeightSelection; width?: HeightSelection }>({});
   const [logDisplay, setLogDisplay] = useState(true);
   // Zoom window reported by the plot; also scopes the valley search (scope D).
   const [zoomRange, setZoomRange] = useState<{ xMin: number; xMax: number } | null>(null);
@@ -124,8 +132,21 @@ export function HeightResultsPanel({
     setZoomRange(null);
   }, [axisMode]);
 
+  // Runs can be deleted from here or from Results; drop a filter that no
+  // longer points at an existing run instead of showing an empty plot.
+  useEffect(() => {
+    if (runGroupFilter !== "all" && !runFilterOptions.some((option) => option.value === runGroupFilter)) {
+      setRunGroupFilter("all");
+    }
+  });
+
   function selectHeight(value: string | null, runId: string | null = null) {
     selectedHeightAxis.current = axisMode;
+    // Only single-axis scans feed the combine offer: an H+W pick already
+    // implies its own width, so it is not an independent height measurement.
+    if (value != null && axisMode !== "h_plus_w") {
+      lastPickByAxis.current[axisMode === "w_only" ? "width" : "height"] = { height: value, runId };
+    }
     setSelection(value == null ? null : { height: value, runId });
   }
 
@@ -139,53 +160,10 @@ export function HeightResultsPanel({
   };
   // Each Run command gets a number plus the settings it was measured with, so
   // a curve can always be traced back to its kernel parameters/step/base.
-  const runFilterOptions = useMemo(() => {
-    const members = new Map<string, string[]>();
-    for (const meta of seriesRows.seriesMeta) {
-      const value = runGroupValue(meta.runId);
-      members.set(value, [...(members.get(value) ?? []), meta.runId]);
-    }
-    const values = new Set(members.keys());
-    const ordered = [...values].sort((a, b) => {
-      const aTime = a.startsWith("run:")
-        ? state.runsById[a.slice(4)]?.createdAt
-        : state.runGroupsById[a]?.createdAt;
-      const bTime = b.startsWith("run:")
-        ? state.runsById[b.slice(4)]?.createdAt
-        : state.runGroupsById[b]?.createdAt;
-      return (aTime ?? "").localeCompare(bTime ?? "") || a.localeCompare(b);
-    });
-    return ordered.map((value, index) => {
-      const runIds = members.get(value) ?? [];
-      const firstRun = state.runsById[runIds[0]];
-      const config = firstRun
-        ? heightRunConfig(firstRun, value.startsWith("run:") ? null : state.runGroupsById[value])
-        : null;
-      const kernels = new Set(
-        seriesRows.seriesMeta
-          .filter((meta) => runIds.includes(meta.runId))
-          .map((meta) => kernelMetaLabel(t, meta)),
-      );
-      const name = t("results.runOption", { number: String(index + 1) });
-      const summary = config?.step
-        ? [
-            kernels.size === 1
-              ? [...kernels][0]
-              : t("results.runKernelCount", { count: String(kernels.size) }),
-            t("results.runScanSummary", {
-              start: config.start ?? "",
-              stop: config.stop ?? "",
-              step: config.step,
-              base: t(
-                `analyze.baseMode.${axisMode === "w_only" ? config.baseWidthMode : config.baseHeightMode}`,
-              ),
-            }),
-          ].join(" · ")
-        : "";
-      return { value, name, summary, label: summary ? `${name} · ${summary}` : name };
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [seriesRows, state.runGroupsById, state.runsById, axisMode, t]);
+  const runFilterOptions = useMemo(
+    () => runSelectorOptions(t, state, seriesRows.seriesMeta.map((meta) => meta.runId)),
+    [seriesRows, state, t],
+  );
   const runNameByValue = useMemo(
     () => new Map(runFilterOptions.map((option) => [option.value, option.name])),
     [runFilterOptions],
@@ -397,6 +375,9 @@ export function HeightResultsPanel({
           disabled={applyBusy || !hasIncludedSamples}
           onClick={() => onOpenApplyDialog(
             selectedHeightAxis.current === axisMode ? selection ?? undefined : undefined,
+            axisMode === "h_only"
+              ? lastPickByAxis.current.width
+              : axisMode === "w_only" ? lastPickByAxis.current.height : undefined,
           )}
         >
           {t("analyze.applyToRecipe")}
@@ -431,36 +412,14 @@ export function HeightResultsPanel({
 
       {allRunSeries.length > 0 ? (
         <div className="results-filters height-results-filters" aria-label={t("results.filters.title")}>
-          <div className="results-filter-group" role="radiogroup" aria-label={t("results.filters.runs")}>
-            <span className="results-filter-label">{t("results.filters.runs")}</span>
-            <div className="button-radio">
-              <button
-                type="button"
-                role="radio"
-                aria-checked={runGroupFilter === "all"}
-                className={runGroupFilter === "all" ? "active" : ""}
-                onClick={() => setRunGroupFilter("all")}
-              >
-                {t("results.filters.all")}
-              </button>
-              {runFilterOptions.map((option) => (
-                <button
-                  key={option.value}
-                  type="button"
-                  role="radio"
-                  aria-checked={runGroupFilter === option.value}
-                  className={runGroupFilter === option.value ? "active" : ""}
-                  title={option.label}
-                  onClick={() => setRunGroupFilter(option.value)}
-                >
-                  {option.name}
-                  {option.summary ? (
-                    <small className="run-filter-summary">{option.summary}</small>
-                  ) : null}
-                </button>
-              ))}
-            </div>
-          </div>
+          <RunSelector
+            t={t}
+            options={runFilterOptions}
+            value={runGroupFilter}
+            onChange={setRunGroupFilter}
+            onDeleteRuns={onDeleteRuns}
+            deleteAllLabel={t("results.deleteAll.height")}
+          />
           <div className="results-filter-group" role="radiogroup" aria-label={t("results.filters.source")}>
             <span className="results-filter-label">{t("results.filters.source")}</span>
             <div className="button-radio">

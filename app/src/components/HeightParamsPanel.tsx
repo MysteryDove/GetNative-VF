@@ -11,8 +11,15 @@ import {
   type HeightDraft,
   type estimateHeightWork,
 } from "../engine/heightDraft";
-import type { BaseMode, KernelRef, SearchPreset } from "../engine/protocol";
+import {
+  TRANSFER_CURVES,
+  type BaseMode,
+  type KernelRef,
+  type SearchPreset,
+  type TransferCurve,
+} from "../engine/protocol";
 import { backendOptionLabel } from "../engine/backendSelection";
+import { lanczosTapsRange } from "../engine/kernelDraft";
 import { MetricEditor, MetricSpecSection, metricSpecSummary } from "./MetricEditor";
 import { MenuSelect } from "./MenuSelect";
 import { RunLaunchButton } from "./RunLaunchButton";
@@ -120,6 +127,14 @@ export function HeightParamsPanel({
   const missingBaseAxis = missingFractionalBaseAxis(draft);
   const invalidParameters = invalidKernelParameterNames(draft.kernelParameters);
   const scansWidth = draft.axisMode === "w_only";
+  const transfer: TransferCurve = draft.transfer ?? "none";
+  const primaryTaps = Number(draft.kernelParameters.taps ?? 3);
+  const tapsRange = lanczosTapsRange(capabilities);
+  const tapsOptions = Array.from(
+    { length: tapsRange.max - tapsRange.min + 1 },
+    (_, index) => tapsRange.min + index,
+  );
+  if (!tapsOptions.includes(primaryTaps)) tapsOptions.push(primaryTaps);
   const baseModes: BaseMode[] = ["integer", "odd", "even"];
   const baseModeField = (axis: "height" | "width") => axis === "height" ? "baseHeightMode" : "baseWidthMode";
   const baseValueField = (axis: "height" | "width") => axis === "height" ? "baseHeight" : "baseWidth";
@@ -356,12 +371,25 @@ export function HeightParamsPanel({
         <div className="metric-grid">
           <label className="block">
             <span>{t("analyze.lanczosTaps")}</span>
-            <input
-              inputMode="numeric"
-              value="3"
-              readOnly
-              aria-readonly="true"
-            />
+            <select
+              aria-label={t("analyze.lanczosTaps")}
+              value={String(primaryTaps)}
+              onChange={(event) => {
+                const taps = Number(event.target.value);
+                onPatch({
+                  kernelParameters: { ...draft.kernelParameters, taps },
+                  // The chosen taps becomes the fixed kernel, so it leaves the
+                  // compare set instead of running twice.
+                  compareKernels: draft.compareKernels.filter(
+                    (item) => !(item.id === "lanczos" && Number(item.parameters.taps) === taps),
+                  ),
+                });
+              }}
+            >
+              {tapsOptions.map((taps) => (
+                <option key={taps} value={taps}>{taps}</option>
+              ))}
+            </select>
           </label>
           {blurField}
         </div>
@@ -458,6 +486,26 @@ export function HeightParamsPanel({
           }
         />
       </label>
+
+      {capabilities?.payload.features?.analysis_transfer ? (
+        <>
+          <label className="block">
+            <span>{t("analyze.transfer")}</span>
+            <select
+              aria-label={t("analyze.transfer")}
+              value={transfer}
+              onChange={(event) => onPatch({ transfer: event.target.value as TransferCurve })}
+            >
+              {TRANSFER_CURVES.map((curve) => (
+                <option key={curve} value={curve}>{t(`analyze.transfer.${curve}`)}</option>
+              ))}
+            </select>
+          </label>
+          <p className={`help-copy${transfer !== "none" ? " warning-copy" : ""}`}>
+            {t(transfer === "none" ? "analyze.transferHint" : "analyze.transferActive")}
+          </p>
+        </>
+      ) : null}
 
       <MetricSpecSection
         t={t}

@@ -23,6 +23,7 @@ import {
 } from "../engine/runGroupPlan";
 import { pNormMaximumForBackend } from "../engine/backendSelection";
 import type { ProjectState, Sample } from "../project/types";
+import { restoreDraft } from "../project/analyzeView";
 
 /**
  * Height-scan draft state plus its pure derivations (grid, work estimate,
@@ -35,6 +36,7 @@ export function useHeightDraft({
   sourcesById,
   subroute,
   initialMetric,
+  initialDraft,
 }: {
   capabilities: EngineEnvelope | null;
   includedSamples: Sample[];
@@ -42,9 +44,14 @@ export function useHeightDraft({
   /** Owned by the shell nav; only gates plan building (height subroute only). */
   subroute: "height" | "kernel";
   initialMetric?: MetricSpec | null;
+  /** Draft saved with the project; laid over the defaults once. */
+  initialDraft?: Record<string, unknown> | null;
 }) {
+  // The metric has its own stored copy; the kernel list is validated on use.
+  const restore = (base: HeightDraft) =>
+    restoreDraft(base as unknown as Record<string, unknown>, initialDraft ?? null, ["metric"]) as unknown as HeightDraft;
   const [draft, setDraft] = useState<HeightDraft>(() => {
-    const next = defaultHeightDraft(capabilities);
+    const next = restore(defaultHeightDraft(capabilities));
     if (initialMetric) next.metric = { ...initialMetric };
     return next;
   });
@@ -53,7 +60,7 @@ export function useHeightDraft({
   useEffect(() => {
     if (draftSeeded || !capabilities) return;
     setDraft((current) => {
-      const next = defaultHeightDraft(capabilities);
+      const next = restore(defaultHeightDraft(capabilities));
       next.metric = { ...current.metric };
       return next;
     });

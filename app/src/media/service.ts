@@ -2,6 +2,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { DecodeBackendCapability, EngineEnvelope } from "../engine/types";
 import type { SourceKind, SourceState } from "../project/types";
+import type { SampleRange } from "../engine/protocol";
 
 export type MediaCapabilities = {
   still_formats: string[];
@@ -336,6 +337,8 @@ export type MediaFrameAsset = {
   format: "f32le";
   width: number;
   height: number;
+  /** Colour range of the samples; stills are full, video reports its own. */
+  range?: SampleRange;
   from_cache: boolean;
 };
 
@@ -372,6 +375,7 @@ export function exportFrameAsset(request: {
         format: "f32le",
         width: asset.width,
         height: asset.height,
+        range: asset.range,
         from_cache: asset.from_cache,
       };
     });
@@ -402,6 +406,7 @@ type MediaAssetBatchResult = {
     format: "f32le" | "png";
     width: number;
     height: number;
+    range?: SampleRange;
     from_cache: boolean;
   }>;
   decoded_frames: number;
@@ -482,6 +487,7 @@ export async function exportFrameAssetBatch(
       format: "f32le",
       width: asset.width,
       height: asset.height,
+      range: asset.range,
       from_cache: asset.from_cache,
       ticket: "engine-media-batch",
       itemId: asset.item_id,

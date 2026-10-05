@@ -1,5 +1,12 @@
 import type { EngineEnvelope } from "./types";
-import type { AxisMode, BaseMode, CandidateGridSpec, KernelRef, MetricSpec } from "./protocol";
+import type {
+  AxisMode,
+  BaseMode,
+  CandidateGridSpec,
+  KernelRef,
+  MetricSpec,
+  TransferCurve,
+} from "./protocol";
 import {
   fixedKernelsForDraft,
   missingFractionalBaseAxis,
@@ -189,6 +196,9 @@ export function planHeightRunGroup(input: {
         heightGrid: grid.grid,
         baseHeight: baseHeightForMember,
         baseWidth: baseWidthForMember,
+        ...(input.draft.transfer && input.draft.transfer !== "none"
+          ? { transfer: input.draft.transfer }
+          : {}),
         metric: { ...input.draft.metric },
         profileId: input.draft.profileId,
         mathMode: input.draft.mathMode,
@@ -411,6 +421,7 @@ type HeightRunSnapshot = {
     axisMode?: AxisMode;
     baseHeight?: string | null;
     baseWidth?: string | null;
+    transfer?: TransferCurve;
   };
 };
 
@@ -426,6 +437,8 @@ export type HeightRunConfig = {
   decimals: number;
   baseHeightMode: BaseMode;
   baseWidthMode: BaseMode;
+  /** Transfer curve the scan was measured under (`none` for older records). */
+  transfer: TransferCurve;
 };
 
 function baseModeFromValue(value: string | null | undefined): BaseMode {
@@ -463,6 +476,7 @@ export function heightRunConfig(
       : 0,
     baseHeightMode: intent?.baseHeightMode ?? baseModeFromValue(snapshot?.request?.baseHeight),
     baseWidthMode: intent?.baseWidthMode ?? baseModeFromValue(snapshot?.request?.baseWidth),
+    transfer: snapshot?.request?.transfer ?? "none",
   };
 }
 
@@ -472,6 +486,11 @@ export function buildSeriesTable(
   hiddenSampleIds: Set<string>,
   activeMetricKey: string,
   activeAxisMode?: AxisMode,
+  /**
+   * Errors measured in different light domains are not on one scale, so only
+   * Runs of the selected transfer are shown; the rest count as incompatible.
+   */
+  activeTransfer?: TransferCurve,
 ): SeriesTable {
   const rows: SeriesTableRow[] = [];
   const seriesMeta: SeriesMeta[] = [];
@@ -487,6 +506,10 @@ export function buildSeriesTable(
         incompatibleCount += 1;
         continue;
       }
+    }
+    if (activeTransfer !== undefined && config.transfer !== activeTransfer) {
+      incompatibleCount += 1;
+      continue;
     }
     const series = extractHeightSeries(run.result);
     if (!series) continue;

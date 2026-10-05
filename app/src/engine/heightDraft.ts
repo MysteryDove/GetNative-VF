@@ -9,6 +9,7 @@ import type {
   SearchPreset,
   EndpointRule,
   BaseMode,
+  TransferCurve,
 } from "./protocol";
 import { buildCandidateGrid, workEstimate } from "./candidateGrid";
 import { MUF_PROFILE_ID, profileFor } from "./profiles";
@@ -40,6 +41,8 @@ export type HeightDraft = {
   baseWidth: string;
   baseHeightMode: BaseMode;
   baseWidthMode: BaseMode;
+  /** Linear-light hypothesis for the whole scan; `none` analyses as encoded. */
+  transfer?: TransferCurve;
 };
 
 export function defaultHeightDraft(capabilities: EngineEnvelope | null): HeightDraft {
@@ -89,6 +92,7 @@ export function heightDraftForProfile(
     baseWidth: "",
     baseHeightMode: "integer",
     baseWidthMode: "integer",
+    transfer: "none",
   };
 }
 

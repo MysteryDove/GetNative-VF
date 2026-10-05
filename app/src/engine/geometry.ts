@@ -123,10 +123,13 @@ export function geometryForSource(
     srcWidth = sourceWidth;
   } else if (axisMode === "w_only") {
     srcHeight = sourceHeight;
-  } else {
-    // H+W keeps the selected height and follows each source's aspect ratio.
+  } else if (geometry.sourceWidth !== sourceWidth || geometry.sourceHeight !== sourceHeight) {
+    // A different source shape: keep the selected height and follow that
+    // source's aspect ratio.
     srcWidth = sourceWidth * srcHeight / sourceHeight;
   }
+  // Same shape the Recipe was measured on: src width and height stay exactly
+  // as applied, so a non-proportional (anamorphic) pair survives.
   return resolveGeometryValues({
     sourceWidth,
     sourceHeight,

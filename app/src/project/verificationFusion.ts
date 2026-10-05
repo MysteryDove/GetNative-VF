@@ -122,6 +122,7 @@ function runMetadata(run: Run, state: ProjectState): {
   axisMode: string;
   profileId: string;
   mathMode: MathMode;
+  transfer: string;
   scope: unknown;
 } | null {
   const request = requestOf(run);
@@ -138,6 +139,7 @@ function runMetadata(run: Run, state: ProjectState): {
     axisMode: String(request.axisMode ?? ""),
     profileId: String(request.profileId ?? ""),
     mathMode: (request.mathMode === "log_display" ? "log_display" : "raw"),
+    transfer: typeof request.transfer === "string" ? request.transfer : "none",
     scope: request.scanScope,
   };
 }
@@ -184,6 +186,8 @@ export function prepareFusionRuns(input: {
   if (orderedMetas.some((meta) => meta.axisMode !== first.axisMode)) return { ok: false, reason: "axis_mode_mismatch" };
   if (orderedMetas.some((meta) => meta.profileId !== first.profileId)) return { ok: false, reason: "profile_mismatch" };
   if (orderedMetas.some((meta) => meta.mathMode !== first.mathMode)) return { ok: false, reason: "math_mode_mismatch" };
+  // Errors measured in different light domains are not on one scale.
+  if (orderedMetas.some((meta) => meta.transfer !== first.transfer)) return { ok: false, reason: "transfer_mismatch" };
   return { ok: true, prepared: { source, orderedRuns, orderedMetas } };
 }
 

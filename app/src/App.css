@@ -5529,3 +5529,128 @@ input {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ---- Run management: per-test delete, run selector trash ---- */
+
+.results-family-delete {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 8px;
+  padding-right: 12px;
+  border-right: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.results-family-delete .secondary-button {
+  height: 28px;
+  padding: 0 8px;
+  gap: 5px;
+  font-size: 11px;
+}
+
+.results-filter-group .run-selector-clear {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+/* ---- Kernel Search: Bicubic b × c heatmap ---- */
+
+/* One-hue sequential ramp. The lowest error recedes toward the surface, so
+   the steps run light -> dark on the light theme and dark -> light on dark. */
+:root {
+  --heat-0: #0d366b;
+  --heat-1: #184f95;
+  --heat-2: #256abf;
+  --heat-3: #3987e5;
+  --heat-4: #6da7ec;
+  --heat-5: #9ec5f4;
+  --heat-6: #cde2fb;
+}
+
+[data-theme="light"] {
+  --heat-0: #cde2fb;
+  --heat-1: #9ec5f4;
+  --heat-2: #6da7ec;
+  --heat-3: #3987e5;
+  --heat-4: #256abf;
+  --heat-5: #184f95;
+  --heat-6: #0d366b;
+}
+
+.heat-0 { fill: var(--heat-0); background: var(--heat-0); }
+.heat-1 { fill: var(--heat-1); background: var(--heat-1); }
+.heat-2 { fill: var(--heat-2); background: var(--heat-2); }
+.heat-3 { fill: var(--heat-3); background: var(--heat-3); }
+.heat-4 { fill: var(--heat-4); background: var(--heat-4); }
+.heat-5 { fill: var(--heat-5); background: var(--heat-5); }
+.heat-6 { fill: var(--heat-6); background: var(--heat-6); }
+
+.kernel-heatmap-cell {
+  cursor: pointer;
+  outline: none;
+}
+
+.kernel-heatmap-cell:hover,
+.kernel-heatmap-cell:focus-visible {
+  stroke: var(--text-heading);
+  stroke-width: 1.5;
+}
+
+.kernel-heatmap-cell.is-best {
+  stroke: var(--text-heading);
+  stroke-width: 2;
+}
+
+.kernel-heatmap-cell.is-selected {
+  stroke: var(--accent);
+  stroke-width: 2.5;
+}
+
+.kernel-heatmap-empty {
+  fill: none;
+  stroke: var(--border);
+  stroke-dasharray: 2 2;
+}
+
+.kernel-heatmap-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 16px;
+  margin-top: 6px;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.kernel-heatmap-readout strong {
+  color: var(--text-heading);
+  font-weight: 600;
+}
+
+.kernel-heatmap-scale {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.kernel-heatmap-scale i {
+  width: 14px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+.kernel-heatmap-scale span {
+  margin: 0 4px;
+}
+
+.kernel-heatmap-scale-label {
+  color: var(--text-placeholder);
+}
+
+.kernel-ranking-toggle {
+  margin: 2px 0 6px;
+}

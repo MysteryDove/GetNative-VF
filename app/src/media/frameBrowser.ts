@@ -71,12 +71,14 @@ export function dispatchFrameBrowserKey(
   const { frameWindow, previewBusy, select } = deps;
   if (!frameWindow || previewBusy) return;
   const target = event.target as HTMLElement | null;
+  // The timeline slider consumes its own plain arrow/Home/End keys before they
+  // bubble here, so anything arriving from it (Shift+arrows, J/K, [ ]) is a
+  // frame shortcut and is handled like from any other part of the browser.
   if (
     target &&
     (target.tagName === "INPUT" ||
       target.tagName === "SELECT" ||
-      target.tagName === "TEXTAREA" ||
-      target.getAttribute("role") === "slider")
+      target.tagName === "TEXTAREA")
   ) {
     return;
   }

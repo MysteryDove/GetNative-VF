@@ -138,6 +138,7 @@ export function openedToProjectState(opened: OpenedProjectDto): ProjectState {
       axisMode: recipe.axis_mode ?? profileFor(MUF_PROFILE_ID).default_axis_mode,
       profileId: MUF_PROFILE_ID,
       mathMode: recipe.math_mode ?? null,
+      transfer: recipe.transfer ?? "none",
     };
   });
 
@@ -329,6 +330,7 @@ export function projectStateToManifest(state: ProjectState): ProjectManifestDto 
       axis_mode: recipe.axisMode,
       profile_id: recipe.profileId,
       math_mode: recipe.mathMode,
+      transfer: recipe.transfer ?? "none",
     })),
     run_groups: Object.values(state.runGroupsById).map((group) => ({
       id: group.id,

@@ -213,8 +213,8 @@ export function useKernelPlan({
   );
   const activeMetricKey = metricCompatibilityKey(draft.metric);
   const resultRows = useMemo(
-    () => buildKernelResultRows(kernelRuns, state, activeMetricKey),
-    [kernelRuns, state, activeMetricKey],
+    () => buildKernelResultRows(kernelRuns, state, activeMetricKey, draft.transfer ?? "none"),
+    [kernelRuns, state, activeMetricKey, draft.transfer],
   );
   const kernelTableRows = useMemo(
     () =>
@@ -224,6 +224,7 @@ export function useKernelPlan({
           key,
           metric: row.metric,
           sampleId: row.sampleId,
+          runId: row.runId,
           cells: [row.kernelLabel, row.sampleLabel, row.runId.slice(0, 10)],
           selected: selectedResultKey === key,
           onSelect: () =>

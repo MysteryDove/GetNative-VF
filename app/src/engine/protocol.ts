@@ -75,6 +75,19 @@ export type GeometrySnapshot = {
 
 export type BaseMode = "integer" | "even" | "odd";
 
+/**
+ * Transfer curve assumed for the encoded samples when testing a linear-light
+ * hypothesis; `none` analyses the samples exactly as encoded.
+ */
+export type TransferCurve = "none" | "gamma22" | "bt1886" | "srgb" | "bt709";
+
+/** Colour range of a decoded frame asset; only matters with a transfer curve. */
+export type SampleRange = "limited" | "full";
+
+export const TRANSFER_CURVES: readonly TransferCurve[] = [
+  "none", "bt1886", "gamma22", "srgb", "bt709",
+];
+
 /** The complete geometry object sent over the worker wire. */
 export type GeometryWire = {
   width: number;
@@ -106,6 +119,8 @@ export type HeightAnalyzeRequest = {
   /** Fractional-scan base-canvas overrides as decimal integer strings. */
   baseHeight?: string | null;
   baseWidth?: string | null;
+  /** Linear-light hypothesis; omitted or `none` analyses as encoded. */
+  transfer?: TransferCurve;
   metric: MetricSpec;
   profileId: string;
   mathMode: MathMode;
@@ -130,6 +145,8 @@ export type KernelAnalyzeRequest = {
   profileId: string;
   mathMode: MathMode;
   backendPreference: BackendPreference;
+  /** Omitted or `none`: analyse as encoded. */
+  transfer?: TransferCurve;
 };
 
 export type ScanSelectionRule = "all" | "decoded_i_picture" | "every_n";
@@ -158,6 +175,8 @@ export type VerifyRequest = {
   axisMode: AxisMode;
   profileId: string;
   mathMode: MathMode;
+  /** Linear-light curve of the Recipe; omitted or `none` = as encoded. */
+  transfer?: TransferCurve;
   scanScope: ScanScope;
   backendPreference: BackendPreference;
   concurrency: number;

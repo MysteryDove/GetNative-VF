@@ -5,6 +5,7 @@ import type {
   MathMode,
   MetricSpec,
 } from "../engine/protocol";
+import type { TransferCurve } from "../engine/protocol";
 
 export type SourceKind = "still" | "video" | "animated";
 export type SourceState =
@@ -106,6 +107,8 @@ export type Recipe = {
   axisMode: AxisMode;
   profileId: string | null;
   mathMode: MathMode | null;
+  /** Linear-light hypothesis the Recipe was found under; absent/`none` = as encoded. */
+  transfer?: TransferCurve;
 };
 
 /** UI-level group of independent engine Runs created by one user command. */
@@ -296,6 +299,7 @@ export type ProjectManifestDto = {
     axis_mode?: AxisMode;
     profile_id?: string | null;
     math_mode?: MathMode | null;
+    transfer?: TransferCurve | null;
   }>;
   run_groups: Array<{
     id: string;
