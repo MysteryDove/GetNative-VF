@@ -30,9 +30,15 @@ export function isBicubicGridRow(row: KernelResultRow): boolean {
     && (blur === undefined || Number(blur) === 1);
 }
 
+/** True when the row is drawn as a cell of `grid` (and so leaves the line plot). */
+export function isRowInBicubicGrid(grid: BicubicGrid, row: KernelResultRow): boolean {
+  return isBicubicGridRow(row)
+    && grid.cells.has(bicubicCellKey(Number(row.parameters.b), Number(row.parameters.c)));
+}
+
 /**
  * Build the b × c grid, or null when the rows do not form one (fewer than two
- * distinct values on either axis, or too few points to be worth a grid).
+ * distinct values on either axis, too few points, or a sparse scatter).
  */
 export function buildBicubicGrid(rows: KernelResultRow[], minimumCells = 6): BicubicGrid | null {
   const groups = new Map<string, KernelResultRow[]>();
@@ -52,10 +58,29 @@ export function buildBicubicGrid(rows: KernelResultRow[], minimumCells = 6): Bic
       keys: ordered.map(kernelResultKey),
     });
   }
+  // Only a lattice is a grid: drop points whose b or c no other point shares
+  // (the scattered presets of the default scan list), repeating until stable.
+  for (let changed = true; changed;) {
+    changed = false;
+    const perB = new Map<number, number>();
+    const perC = new Map<number, number>();
+    for (const cell of cells.values()) {
+      perB.set(cell.b, (perB.get(cell.b) ?? 0) + 1);
+      perC.set(cell.c, (perC.get(cell.c) ?? 0) + 1);
+    }
+    for (const [key, cell] of cells) {
+      if ((perB.get(cell.b) ?? 0) < 2 || (perC.get(cell.c) ?? 0) < 2) {
+        cells.delete(key);
+        changed = true;
+      }
+    }
+  }
   const values = [...cells.values()];
   const bs = [...new Set(values.map((cell) => cell.b))].sort((a, b) => a - b);
   const cs = [...new Set(values.map((cell) => cell.c))].sort((a, b) => a - b);
   if (bs.length < 2 || cs.length < 2 || values.length < minimumCells) return null;
+  // A mostly empty lattice reads worse than the line plot.
+  if (values.length * 2 < bs.length * cs.length) return null;
   const best = values.reduce((a, b) => (b.metric < a.metric ? b : a));
   return {
     bs,

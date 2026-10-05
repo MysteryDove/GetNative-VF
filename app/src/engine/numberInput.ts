@@ -44,14 +44,15 @@ export function isFractionInput(text: string): boolean {
   return FRACTION.test(text.trim());
 }
 
-/** Render a parameter value, showing non-integer thirds as `k/3`. */
+/** Render a parameter value: non-integer thirds as `k/3`, else at most four decimals. */
 export function formatParameterValue(value: string | number | boolean): string {
   if (typeof value !== "number" || !Number.isFinite(value) || Number.isInteger(value)) {
     return String(value);
   }
   const thirds = Math.round(value * 3);
   if (Math.abs(value * 3 - thirds) < 1e-9) return `${thirds}/3`;
-  return String(value);
+  // Four places keep labels readable for irrational presets (Robidoux).
+  return String(Number(value.toFixed(4)));
 }
 
 /** Digits after the decimal point in a decimal string ("0.05" → 2). */

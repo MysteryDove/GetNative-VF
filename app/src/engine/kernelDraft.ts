@@ -77,6 +77,31 @@ export type KernelDraft = {
   transfer?: TransferCurve;
 };
 
+const SQRT2 = Math.SQRT2;
+// Robidoux family (ImageMagick): Keys cubics defined by closed forms.
+const ROBIDOUX_B = 12 / (19 + 9 * SQRT2);
+const ROBIDOUX_SHARP_B = 6 / (13 + 7 * SQRT2);
+const ROBIDOUX_SOFT_B = (9 - 3 * SQRT2) / 7;
+
+/** The scan list a new Kernel Search starts with. */
+export const DEFAULT_SCAN_LIST: readonly KernelRef[] = [
+  { id: "bilinear", parameters: {} },
+  { id: "bicubic", parameters: { b: 0, c: 0.5 } }, // Catmull-Rom
+  { id: "bicubic", parameters: { b: 1 / 3, c: 1 / 3 } }, // Mitchell
+  { id: "bicubic", parameters: { b: 1, c: 0 } }, // B-spline
+  { id: "bicubic", parameters: { b: 0, c: 1 } }, // sharp
+  { id: "bicubic", parameters: { b: 0, c: 0.75 } },
+  { id: "bicubic", parameters: { b: ROBIDOUX_B, c: (1 - ROBIDOUX_B) / 2 } }, // Robidoux
+  { id: "bicubic", parameters: { b: ROBIDOUX_SHARP_B, c: (1 - ROBIDOUX_SHARP_B) / 2 } }, // RobidouxSharp
+  { id: "bicubic", parameters: { b: ROBIDOUX_SOFT_B, c: (1 - ROBIDOUX_SOFT_B) / 2 } }, // RobidouxSoft
+  { id: "spline16", parameters: {} },
+  { id: "spline36", parameters: {} },
+  { id: "spline64", parameters: {} },
+  { id: "lanczos", parameters: { taps: 2 } },
+  { id: "lanczos", parameters: { taps: 3 } },
+  { id: "lanczos", parameters: { taps: 4 } },
+];
+
 export function defaultKernelDraft(
   metric: MetricSpec,
   profileId: string,
@@ -85,16 +110,9 @@ export function defaultKernelDraft(
   base?: { baseHeight?: string; baseWidth?: string },
 ): KernelDraft {
   return {
-    // Seed the six preset families so the panel opens runnable; every entry
-    // is removable.
-    scanList: [
-      { id: "bilinear", parameters: {} },
-      { id: "bicubic", parameters: { b: 0, c: 0.5 } },
-      { id: "spline16", parameters: {} },
-      { id: "spline36", parameters: {} },
-      { id: "spline64", parameters: {} },
-      { id: "lanczos", parameters: { taps: 3 } },
-    ],
+    // Seed every family with its common presets so the panel opens runnable;
+    // every entry is removable.
+    scanList: DEFAULT_SCAN_LIST.map((kernel) => ({ id: kernel.id, parameters: { ...kernel.parameters } })),
     addFamily: "bilinear",
     bicubicB: "0",
     bicubicC: "0.5",

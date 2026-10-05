@@ -1,3 +1,4 @@
+import { kernelParametersText } from "./displayNames";
 import { describe, expect, it } from "vitest";
 import {
   addBicubicGridToScanList,
@@ -7,6 +8,7 @@ import {
   MAX_KERNEL_CANDIDATES,
   bicubicRefFromDraft,
   clearScanList,
+  DEFAULT_SCAN_LIST,
   defaultKernelDraft,
   lanczosRefsFromDraft,
   lanczosTapsRange,
@@ -34,7 +36,7 @@ function draft() {
 it("rejects an oversized Cartesian grid before materializing kernel entries", () => {
   const input = { ...draft(), bStep: "0.015", cStep: "0.015" };
   expect(addBicubicGridToScanList(input)).toEqual({ ok: false, reason: "kernel_list_too_large" });
-  expect(input.scanList).toHaveLength(6);
+  expect(input.scanList).toHaveLength(DEFAULT_SCAN_LIST.length);
 });
 
 it("batches deduplication and applies the cap to the final list without partial additions", () => {
@@ -53,20 +55,26 @@ it("batches deduplication and applies the cap to the final list without partial 
 it("reports a newly added blur candidate synchronously with its resulting draft", () => {
   const result = addKernelsToScanList(draft(), [{ id: "spline16", parameters: { blur: 1.1 } }]);
   expect(result).toMatchObject({ ok: true, added: 1, skipped: 0 });
-  if (result.ok) expect(result.draft.scanList).toHaveLength(7);
+  if (result.ok) expect(result.draft.scanList).toHaveLength(DEFAULT_SCAN_LIST.length + 1);
 });
 
 describe("kernel scan list", () => {
-  it("seeds the six preset families and honors the base override", () => {
+  it("seeds every family with the common Bicubic presets and honors the base override", () => {
     const seeded = draft();
-    expect(seeded.scanList.map((kernel) => kernel.id)).toEqual([
-      "bilinear",
-      "bicubic",
-      "spline16",
-      "spline36",
-      "spline64",
-      "lanczos",
+    expect(seeded.scanList).toEqual(DEFAULT_SCAN_LIST);
+    expect(new Set(seeded.scanList.map((kernel) => kernel.id)))
+      .toEqual(new Set(["bilinear", "bicubic", "spline16", "spline36", "spline64", "lanczos"]));
+    const bicubic = seeded.scanList
+      .filter((kernel) => kernel.id === "bicubic")
+      .map((kernel) => kernelParametersText(kernel.parameters));
+    expect(bicubic).toEqual([
+      "b=0, c=0.5", "b=1/3, c=1/3", "b=1, c=0", "b=0, c=1", "b=0, c=0.75",
+      "b=0.3782, c=0.3109", "b=0.262, c=0.369", "b=0.6796, c=0.1602",
     ]);
+    expect(seeded.scanList.filter((kernel) => kernel.id === "lanczos").map((kernel) => kernel.parameters))
+      .toEqual([{ taps: 2 }, { taps: 3 }, { taps: 4 }]);
+    // Each draft owns its entries.
+    expect(seeded.scanList[1]).not.toBe(DEFAULT_SCAN_LIST[1]);
     expect(seeded.baseHeight).toBe("720");
     expect(seeded.baseWidth).toBe("");
     expect(seeded.addBlur).toBe("1");
@@ -179,8 +187,8 @@ describe("kernel scan list", () => {
   it("removes entries by index and clears the list", () => {
     const d = draft();
     const removed = removeKernelFromScanList(d, 1);
-    expect(removed.scanList).toHaveLength(5);
-    expect(removed.scanList.map((kernel) => kernel.id)).not.toContain("bicubic");
+    expect(removed.scanList).toHaveLength(DEFAULT_SCAN_LIST.length - 1);
+    expect(removed.scanList.map((kernel) => kernel.parameters)).not.toContainEqual({ b: 0, c: 0.5 });
     expect(clearScanList(d).scanList).toHaveLength(0);
   });
 

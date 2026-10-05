@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_SCAN_LIST,
   addBicubicGridToScanList,
   addKernelToScanList,
   bicubicRefFromDraft,
@@ -104,16 +105,11 @@ describe("resolveKernelCandidates", () => {
     const result = resolveKernelCandidates(draft(), capabilities);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.candidates.map((kernel) => kernel.id)).toEqual([
-      "bilinear",
-      "bicubic",
-      "spline16",
-      "spline36",
-      "spline64",
-      "lanczos",
-    ]);
+    expect(result.candidates.map((kernel) => kernel.id))
+      .toEqual(DEFAULT_SCAN_LIST.map((kernel) => kernel.id));
     expect(result.candidates[1]?.parameters).toEqual({ b: 0, c: 0.5 });
-    expect(result.candidates[5]?.parameters).toEqual({ taps: 3 });
+    expect(result.candidates[2]?.parameters).toEqual({ b: 1 / 3, c: 1 / 3 });
+    expect(result.candidates.at(-1)?.parameters).toEqual({ taps: 4 });
   });
 
   it("expands the Bicubic grid b-outer, c-inner with normalized numeric parameters", () => {
@@ -165,10 +161,10 @@ describe("planKernelRunGroup", () => {
     if (!result.ok) return;
     expect(result.plan.groupType).toBe("single_kernel");
     expect(result.plan.members).toHaveLength(1);
-    expect(result.plan.members[0]?.kernels.length).toBe(6);
+    expect(result.plan.members[0]?.kernels.length).toBe(DEFAULT_SCAN_LIST.length);
     expect(result.plan.members[0]?.geometry.canvasHeight).toBe(720);
     expect(result.plan.members[0]?.request.mode).toBe("kernel");
-    expect(result.plan.workEstimate).toBe(6);
+    expect(result.plan.workEstimate).toBe(DEFAULT_SCAN_LIST.length);
 
     const materialized = materializeKernelRunGroup({
       plan: result.plan,
@@ -178,7 +174,7 @@ describe("planKernelRunGroup", () => {
     expect(materialized.runs).toHaveLength(1);
     expect(materialized.runs[0]?.runType).toBe("kernel");
     expect(materialized.runs[0]?.result).toBeNull();
-    expect(materialized.runs[0]?.total).toBe(6);
+    expect(materialized.runs[0]?.total).toBe(DEFAULT_SCAN_LIST.length);
   });
 
   it("preserves a W-only Recipe axis in algorithm-test requests", () => {

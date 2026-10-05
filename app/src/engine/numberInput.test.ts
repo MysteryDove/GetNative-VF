@@ -31,7 +31,8 @@ import {
 import { geometryForSource, resolveGeometryValues } from "./geometry";
 import { buildKernelResultRows, kernelRunTransfer } from "./kernelRunGroup";
 import { createRecipe } from "../project/recipe";
-import { buildBicubicGrid, heatStep, rankKernelsAcrossSamples } from "./kernelHeatmap";
+import { buildBicubicGrid, heatStep, isRowInBicubicGrid, rankKernelsAcrossSamples } from "./kernelHeatmap";
+import { DEFAULT_SCAN_LIST } from "./kernelDraft";
 import { analyzeViewState, restoreDraft } from "../project/analyzeView";
 import { defaultVerifyDraft, planVerifyRunGroup } from "./verifyPlan";
 import {
@@ -412,6 +413,26 @@ describe("Kernel Search grid and ranking", () => {
     expect(buildBicubicGrid([0, 0.2, 0.4, 0.6, 0.8, 1].map((c) => row(0, c, 1e-6)))).toBeNull();
     const blurred = [0, 0.5, 1].flatMap((b) => [0, 0.5].map((c) => row(b, c, 1e-6, "s1", { blur: 1.2 })));
     expect(buildBicubicGrid(blurred)).toBeNull();
+  });
+
+  it("ignores the scattered presets of the default scan list", () => {
+    const presets = DEFAULT_SCAN_LIST.filter((kernel) => kernel.id === "bicubic")
+      .map((kernel) => row(Number(kernel.parameters.b), Number(kernel.parameters.c), 1e-6));
+    expect(presets).toHaveLength(8);
+    expect(buildBicubicGrid(presets)).toBeNull();
+
+    // A real grid stays a grid with the presets around it; only lattice
+    // points become cells, the rest remain on the line plot.
+    const steps = [0, 0.2, 0.4, 0.6, 0.8, 1];
+    const lattice = steps.flatMap((b) => steps.map((c) => row(b, c, 2e-6)));
+    const grid = buildBicubicGrid([...presets, ...lattice]);
+    expect(grid?.bs).toEqual(steps);
+    expect(grid?.cs).toEqual(steps);
+    expect(grid?.cells.size).toBe(36);
+    if (!grid) return;
+    expect(isRowInBicubicGrid(grid, row(0, 1, 1e-6))).toBe(true);
+    expect(isRowInBicubicGrid(grid, row(0, 0.75, 1e-6))).toBe(false);
+    expect(isRowInBicubicGrid(grid, row(1 / 3, 1 / 3, 1e-6))).toBe(false);
   });
 
   it("spreads cells over the scale logarithmically", () => {

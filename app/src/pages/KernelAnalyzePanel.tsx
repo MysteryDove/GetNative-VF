@@ -32,7 +32,7 @@ import { fileName } from "../media/importSources";
 import { runSelectorOptions } from "../engine/runSummary";
 import {
   buildBicubicGrid,
-  isBicubicGridRow,
+  isRowInBicubicGrid,
   rankKernelsAcrossSamples,
 } from "../engine/kernelHeatmap";
 import { KernelBicubicHeatmap } from "../components/KernelBicubicHeatmap";
@@ -179,7 +179,9 @@ export function KernelAnalyzePanel({
   // A Bicubic (b, c) sweep reads as a grid, not as hundreds of points on a
   // line: it gets its own heatmap and the line plot keeps the other kernels.
   const bicubicGrid = useMemo(() => buildBicubicGrid(plotRows), [plotRows]);
-  const linePlotRows = bicubicGrid ? plotRows.filter((row) => !isBicubicGridRow(row)) : plotRows;
+  const linePlotRows = bicubicGrid
+    ? plotRows.filter((row) => !isRowInBicubicGrid(bicubicGrid, row))
+    : plotRows;
   const sampleCount = new Set(tableRows.map((row) => row.sampleId)).size;
   const ranking = useMemo(
     () => rankKernelsAcrossSamples(
