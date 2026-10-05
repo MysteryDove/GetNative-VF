@@ -41,7 +41,7 @@ import { HeightResultsPanel, type HeightSelection } from "../components/HeightRe
 import { toggleSetValue } from "../utils/collections";
 import { removeRunsFromState } from "../project/runHistory";
 import { srcFromScanSelection } from "../engine/geometry";
-import { derivedBaseWidth, scannedWidthParity } from "../engine/geometry";
+import { scannedWidthParity } from "../engine/geometry";
 import {
   invalidKernelBlur,
   invalidKernelParameterNames,
@@ -360,21 +360,14 @@ export function AnalyzePage({
 
   /**
    * The base values a non-integer scan will send, shown beside the parity
-   * selectors. An H+W width left on auto is derived from the base height.
+   * selectors. An H+W width left on auto takes the source width's parity.
    */
   const resolvedBases = useMemo(() => {
     if (isIntegerScan(draft) || !grid.ok || grid.grid.candidates.length === 0) return null;
     const maximum = Math.max(...grid.grid.candidates.map(Number));
     const bases = resolveScanBases(draft, maximum, applySourceDims ?? {});
     if (!bases) return null;
-    const widthFollows = draft.axisMode === "h_plus_w" && bases.baseWidth == null
-      && bases.baseHeight != null && applySourceDims != null;
-    return {
-      height: bases.baseHeight,
-      width: widthFollows
-        ? String(derivedBaseWidth(applySourceDims.width, applySourceDims.height, Number(bases.baseHeight)))
-        : bases.baseWidth,
-    };
+    return { height: bases.baseHeight, width: bases.baseWidth };
   }, [applySourceDims, draft, grid]);
 
 

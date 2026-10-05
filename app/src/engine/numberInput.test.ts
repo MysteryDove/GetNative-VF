@@ -38,6 +38,8 @@ import {
   buildSeriesTable,
   heightRunConfig,
   planHeightRunGroup,
+  resolveScanBases,
+  runUsesLegacyAutoWidth,
   runUsesLegacySampleScale,
 } from "./runGroupPlan";
 
@@ -521,5 +523,38 @@ describe("kernels without parameters", () => {
     expect(kernelParametersText({
       core_max: 15, core_min: 1, gui_max: 8, gui_min: 1, kind: "integer_taps", taps: 4,
     })).toBe("taps=4");
+  });
+});
+
+describe("auto H+W width base", () => {
+  const source = { width: 1920, height: 1080 };
+  const draft = {
+    axisMode: "h_plus_w" as const, baseHeightMode: "even" as const, baseWidthMode: "integer" as const,
+  };
+
+  it("takes the source width's parity whatever the scan range", () => {
+    // The engine-derived base flipped between these two: 1508 vs 1511.
+    expect(resolveScanBases(draft, 847.7, source)).toEqual({ baseHeight: "848", baseWidth: "1508" });
+    expect(resolveScanBases(draft, 849.7, source)).toEqual({ baseHeight: "850", baseWidth: "1512" });
+    expect(resolveScanBases(draft, 849.7, { width: 1921, height: 1080 })?.baseWidth).toBe("1513");
+  });
+
+  it("leaves integer scans, explicit parities and unknown sources alone", () => {
+    expect(resolveScanBases({ ...draft, baseHeightMode: "integer" }, 848, source))
+      .toEqual({ baseHeight: null, baseWidth: null });
+    expect(resolveScanBases({ ...draft, baseWidthMode: "odd" }, 849.7, source)?.baseWidth).toBe("1511");
+    expect(resolveScanBases(draft, 849.7, {})).toEqual({ baseHeight: "850", baseWidth: null });
+    expect(resolveScanBases({ ...draft, axisMode: "h_only" }, 849.7, source)?.baseWidth).toBeNull();
+  });
+
+  it("flags earlier Runs whose derived width parity differs from the source", () => {
+    const run = (baseHeight: string | null, baseWidth: string | null = null, axisMode = "h_plus_w") =>
+      ({ inputSnapshot: { request: { axisMode, baseHeight, baseWidth } } });
+    expect(runUsesLegacyAutoWidth(run("850"), source)).toBe(true);   // derived 1511, source even
+    expect(runUsesLegacyAutoWidth(run("848"), source)).toBe(false);  // derived 1508
+    expect(runUsesLegacyAutoWidth(run("850", "1512"), source)).toBe(false);
+    expect(runUsesLegacyAutoWidth(run(null), source)).toBe(false);
+    expect(runUsesLegacyAutoWidth(run("850", null, "h_only"), source)).toBe(false);
+    expect(runUsesLegacyAutoWidth(run("850"), null)).toBe(false);
   });
 });

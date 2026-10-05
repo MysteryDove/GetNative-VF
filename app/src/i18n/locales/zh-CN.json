@@ -599,7 +599,7 @@
   "analyze.baseMode.odd": "odd",
   "analyze.baseResolved": "{value}",
   "analyze.baseResolvedHint": "实际送给引擎的 base 值。只有它的奇偶会影响结果。",
-  "analyze.baseMode.followHeight": "自动（跟随 height）",
+  "analyze.baseMode.followHeight": "自动",
   "analyze.geometryPreview": "resolved geometry",
   "analyze.applyDialog.hint": "为显示的每个轴选择 src dimension 与 integer/even/odd base mode。",
   "analyze.applyDialog.hintWOnly": "当前轴为仅宽度：已将选中值预填为宽度；高度留空将按比例推导。",

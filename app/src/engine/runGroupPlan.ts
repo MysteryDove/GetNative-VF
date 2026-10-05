@@ -20,7 +20,7 @@ import type { ProjectState, Run, RunGroup, Sample } from "../project/types";
 import type { Translator } from "../i18n";
 import { kernelRefLabel } from "./displayNames";
 import { decimalPlaces } from "./numberInput";
-import { baseForMode } from "./geometry";
+import { baseForMode, derivedBaseWidth, minimumBaseForParity } from "./geometry";
 
 export type HeightRunGroupType =
   | "single_height"
@@ -340,9 +340,21 @@ export function resolveScanBases(
       widthMaximum = source.width * candidateMaximum / source.height;
     }
   }
-  const baseWidth = draft.axisMode === "h_only" || widthMaximum == null
+  let baseWidth = draft.axisMode === "h_only" || widthMaximum == null
     ? null
     : resolveBase(draft.baseWidthMode, explicitWidth, widthMaximum);
+  // H+W width on auto: a parity canvas like the height, with the parity of
+  // the source width (upstream's default base is the source size). Left to
+  // the engine it would follow the base height and flip with the scan range.
+  if (
+    draft.axisMode === "h_plus_w" && baseWidth == null && baseHeight != null
+    && source.width && source.height
+  ) {
+    baseWidth = String(minimumBaseForParity(
+      source.width * candidateMaximum / source.height,
+      source.width % 2 === 0 ? "even" : "odd",
+    ));
+  }
   return { baseHeight, baseWidth };
 }
 
@@ -372,6 +384,24 @@ export function runUsesLegacySampleScale(
   if (transfer !== "none" || sample?.frameIndex == null) return false;
   if (!run.result || typeof run.result !== "object") return false;
   return (run.result as { sample_scale?: unknown }).sample_scale !== "nominal";
+}
+
+/**
+ * Earlier builds let the engine derive an auto H+W width base from the base
+ * height, so its parity moved with the scan range. Such a Run is comparable
+ * with current ones only when that parity happens to match the source width.
+ */
+export function runUsesLegacyAutoWidth(
+  run: Pick<Run, "inputSnapshot">,
+  source: { width?: number | null; height?: number | null } | null | undefined,
+): boolean {
+  const request = (run.inputSnapshot as HeightRunSnapshot | null)?.request;
+  if (request?.axisMode !== "h_plus_w" || request.baseWidth != null || request.baseHeight == null) {
+    return false;
+  }
+  if (!source?.width || !source.height) return false;
+  const derived = derivedBaseWidth(source.width, source.height, Number(request.baseHeight));
+  return derived % 2 !== source.width % 2;
 }
 
 export type HeightSeriesPoint = {
@@ -549,6 +579,11 @@ export function buildSeriesTable(
     }
     const sample = run.sampleId ? state.samplesById[run.sampleId] : null;
     if (runUsesLegacySampleScale(run, config.transfer, sample)) {
+      incompatibleCount += 1;
+      continue;
+    }
+    const runSourceId = run.sourceId || sample?.sourceId;
+    if (runUsesLegacyAutoWidth(run, runSourceId ? state.sourcesById?.[runSourceId] : null)) {
       incompatibleCount += 1;
       continue;
     }

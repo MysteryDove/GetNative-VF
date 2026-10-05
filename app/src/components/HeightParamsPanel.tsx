@@ -152,8 +152,8 @@ export function HeightParamsPanel({
   const baseModes: BaseMode[] = ["integer", "odd", "even"];
   const baseModeField = (axis: "height" | "width") => axis === "height" ? "baseHeightMode" : "baseWidthMode";
   const baseValueField = (axis: "height" | "width") => axis === "height" ? "baseHeight" : "baseWidth";
-  // H+W with a parity base height and no width parity: the engine derives the
-  // width base from the height base, so "integer" would misname it.
+  // H+W with a parity base height and no width parity: the width canvas takes
+  // the source width's parity, so "integer" would misname it.
   const widthFollowsHeight = draft.axisMode === "h_plus_w"
     && (draft.baseHeightMode !== "integer" || Boolean(draft.baseHeight.trim()));
   const renderBaseMode = (axis: "height" | "width") => {
