@@ -1,53 +1,56 @@
-This release restricts production builds to their bundled engine and provides versioned Windows packages for direct download from Release assets.
+_There are two colours in my head_
 
-Check now uses adaptive hardware decoding by default across CUDA, Vulkan Video, and VideoToolbox. This update also adds per-candidate Blur controls and improves measured-result handoff, video navigation, and verification history.
+This release adds linear-light analysis and puts every backend on the same sample scale, so CPU, CUDA, Vulkan, and Metal now report the same error for the same video.
+
+Resolution Test gets explicit Integer / Non-integer scan modes, Algorithm Test is renamed Kernel Search and gains presets, Blur sweeps, and a Bicubic heatmap, and Runs can be filtered and deleted from one shared selector.
+
+> **Results are not comparable with 0.2.4 for studio-range video.** On CPU, CUDA, and Vulkan, errors measured without a transfer curve are about 1.17× higher than before. Re-run the tests you want to compare.
 
 ## New Features
 
-- Clear all Results in one action with confirmation, including reviews and saved Fusion results. Videos, samples, and recipes are preserved; clearing is disabled while tasks are queued or running.
-- Adaptive hardware decoding — Check starts with one decode session and can probe two or four according to workload, available memory, and safe video partitions. Short or analysis-bound jobs may stay at one; no manual session-count setting is required.
-- Blur candidate controls — build Kernel Search candidates with per-filter Blur values, including Bicubic B/C grids.
-- Check metric inheritance — use metrics from Resolution Test or a local Check override without changing the saved Recipe. Fusion uses the metrics recorded by each Run.
-- Higher Check concurrency — the frame-concurrency range is now 1–16, with a default of 8. GPU execution is capped at 8 in both the interface and engine.
+- Transfer curves — run Resolution Test, Kernel Search, and Check in linear light with `gamma22`, `bt1886`, `srgb`, or `bt709`. Results are grouped by curve, and applying a result stores the curve in the Recipe so Check runs under it.
+- Integer / Non-integer scan modes — these replace the search preset in Resolution Test. Integer rounds typed decimals and sends no base; Non-integer keeps decimals and requires an even/odd base on the scanned axis. The resolved base values are shown under the selectors.
+- H+W base width "auto" — the width base follows the height and takes the parity of the source width.
+- Non-proportional geometry — apply separate height-only and width-only results together as one Recipe.
+- Kernel Search presets — the default list grows from 6 to 15 entries: Mitchell, B-spline, sharp `(0, 1)`, `(0, 0.75)`, and the three Robidoux cubics for Bicubic, plus Lanczos taps 2 and 4.
+- Blur sweep — add kernels across a Blur start/stop/step range. Lanczos taps are also selectable for the fixed kernel.
+- Bicubic heatmap — a regular b × c sweep renders as a heatmap with the lowest cell outlined. Scattered presets stay on the line plot.
+- Rank kernels across Samples, and exclude a Sample or toggle its visibility from the test page.
+- Shared Run selector — Resolution Test, Kernel Search, and Check label each Run with what it measured. Right-click deletes one Run and the trash button deletes the listed Runs. Results gains per-test delete buttons and group summaries.
+- Multi-select Runs and Source filters on Resolution Test, Kernel Search, Check, and Results, plus a new Sample filter. The Resolution Test result table now follows the plot's filters and legend toggles.
+- Frame navigation — Shift+←/→ steps through keyframes, the frame number field follows timeline drags and clamps typed values, and there is a go-to-frame button.
+- Parameter drafts are saved with the project.
 
 ## Bug Fixes
 
-- Preserve decimal input while editing Pixel exclusion, including values such as `0.001`, and provide decimal keyboards for refinement and Bicubic scan parameters.
-- Block Check before submission when the selected GPU backend does not support the effective p-norm, including inherited metrics. Auto continues to use CPU for p-norm values above 4.
-- Keep curve visibility controls accessible when Check history grows, and allow hiding a single curve without deleting its result.
-- Preserve the measured filter, including non-default Blur, when applying a candidate. Older results recover omitted parameters from their original input snapshots.
-- Preserve historical verification Recipes when the active Recipe is edited or deleted, so completed Runs and Fusion keep their original inputs.
-- Restore live Check curves on macOS WebKit and keep running-result coverage up to date.
-- Show relative video time and seek correctly in files with non-zero timestamp origins.
-- Fix successful candidate additions reporting a duplicate, and reject oversized kernel grids before exceeding the engine's 4096-candidate limit.
-- Preserve reference phase and border behavior when planner cache replay encounters half-pixel ties.
-- Fix Vulkan frame-lock ownership, shared-device features, image/view usage, and synchronization between decoding and analysis.
-- Improve Fusion legends, visibility controls, and frame navigation; avoid plot extent failures on large result sets.
-
-## Performance
-
-- Separate Vulkan compute and decode queues where supported, release decode surfaces after conversion, and specialize small inverse bandwidths.
-- Share decode-demand sampling, memory budgeting, and session adjustment across the three hardware Check paths.
-- In a controlled Linux RTX 5080 test on a 34,072-frame H.264 video, automatic Vulkan decoding measured 1161.6 fps versus 807.2 fps with one fixed session, with exact frame-record parity. This is a configuration-specific comparison, not a general speedup over v0.2.2. See [the experiment record](https://github.com/MysteryDove/GetNative-VF/blob/v0.2.3/docs/performance/vulkan-optimization-experiments.md).
-- Avoid constructing resident GPU analysis engines just to report capabilities.
+- Analyse studio-range video on nominal 0..1 samples on every path. Software decode, CUDA, and Vulkan previously used the decoder's code scale while Metal stretched 16..235, so the same video measured about 1.169× higher on Metal.
+- Keep excursions outside 16..235 on all backends; Metal no longer clamps them.
+- Request a VideoToolbox surface that matches the stream's bit depth and range. 10-bit sources were narrowed to 8 bits before Metal saw them, which raised the Check error floor on a lossless 10-bit clip from 1.1e-4 to 1.1e-3.
+- Keep the width base parity stable in H+W non-integer scans. With the base on auto, parity moved with the scan range, so one candidate could be measured on two different width canvases.
+- Carry the width parity a scan used when applying an H+W result, so the Recipe matches the measured geometry.
+- Restore CUDA telemetry counters, which read 0 unless stage profiling was enabled.
+- Fix `CUDA_ERROR_CONTEXT_IS_DESTROYED` when a recreated engine received the same context handle as a destroyed one.
+- List only real parameters in kernel labels; compare kernels no longer copy capability descriptors such as `kind=none`.
+- Show at most four decimals in parameter labels. The engine still receives the exact values.
+- Reject Blur values above 16 and handle non-finite pixel values in metric calculations.
+- Keep Shift+arrow keyframe jumps working after dragging the timeline or clicking a filmstrip thumbnail, and keep the selected frame centred in the filmstrip.
+- Activate file drop only when file paths are dragged into the window.
 
 ## Packaging
 
-- Release builds only run the engine in the application resource directory. Environment overrides and working-directory engine discovery remain available in debug builds only.
-- Download `getnative-vf-0.2.4-windows-x64-portable.zip` directly from this release's Assets, together with `SHA256SUMS-windows-x64.txt`. The Actions artifact is also versioned, but adds an outer ZIP wrapper.
-- The Windows package job now tests engine resolution in the release profile before uploading packages.
-
-- Apply FFmpeg Vulkan bitstream-padding and image-view-usage fixes in the Linux and Windows SDK builds, with patch changes included in cache keys.
-- Verify VAAPI capability entries on Linux and D3D11VA entries on Windows alongside NVDEC and Vulkan Video.
+- Download `getnative-vf-0.2.5-windows-x64-portable.zip` from this release's Assets, together with `SHA256SUMS-windows-x64.txt`.
 - Continue shipping Windows x64 portable ZIP, Linux x64 `.deb` / AppImage, and macOS arm64 `.app.zip` packages.
-- Remove unused starter assets and refresh developer documentation.
+- Build the packages weekly so CUDA, Vulkan, and bundling breakage shows up before a release tag. Scheduled runs do not create a release.
+- Run the Linux CPU-only engine tests and a Rust formatting check on pull requests.
+- Key the FFmpeg caches on the patches the build scripts apply, pin the Rust toolchain action to a commit, give every job a timeout, and require a full version in the release tag.
 
 ## Notes
 
-- Existing project files remain on schema version 2. Worker timestamp additions preserve absolute-time behavior by default; the GUI requests relative time explicitly.
-- Vulkan Check uses Vulkan Video when available and falls back to software decoding otherwise. Software decoding and preview remain single-session.
-- Builders can disable adaptive decoding with `GETNATIVE_ENABLE_ADAPTIVE_DECODE=OFF`. Internal Vulkan plan caching remains off by default.
-- Adaptive multi-session runtime coverage is still configuration-specific; Windows runtime acceptance remains open. Clean Vulkan validation results used an isolated patched Validation Layer and do not establish an upstream fix.
+- Existing project files remain on schema version 2. Recipes now persist the transfer curve.
+- Curve-less video Runs measured before this release are hidden, because their errors are on the old sample scale. H+W Runs whose derived width parity differs from the source are hidden from overlays; applying them still carries the parity they were measured with.
+- The worker protocol adds an optional `transfer` on analyze and media verify, `frame_asset.range`, and a `sample_scale: "nominal"` echo in results. Support is advertised as `features.analysis_transfer` and `features.verify_transfer`. `verify_begin` with client-pushed frames defaults `transfer_range` to full. See `docs/worker-protocol-v1.md`.
+- Check refuses a transfer curve the worker cannot apply.
+- Algorithm Test is now called Kernel Search in the English interface.
 - The macOS app is unsigned and not notarized; see the Gatekeeper instructions below.
 - Linux AppImage needs host WebKitGTK 4.1. On Ubuntu, the `.deb` installs this dependency through apt.
 

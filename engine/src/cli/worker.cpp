@@ -1739,7 +1739,7 @@ public:
             {"type", JsonValue::string("hello_ok")},
             {"request_id", JsonValue::string(request_id)},
             {"timestamp_ms", JsonValue::integer(timestamp_ms())},
-            {"engine_version", JsonValue::string("0.2.4")},
+            {"engine_version", JsonValue::string("0.2.5")},
             {"commands", JsonValue::object({
                 {"analyze", JsonValue::boolean(true)},
                 {"cancel", JsonValue::boolean(true)},
