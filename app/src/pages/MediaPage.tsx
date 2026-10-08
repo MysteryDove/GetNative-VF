@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import {
   AlertTriangle,
   FileImage,
   Film,
   FolderPlus,
   ImagePlus,
+  ListPlus,
   LoaderCircle,
   Plus,
   RefreshCw,
@@ -45,8 +46,12 @@ import {
 } from "../project/samples";
 import { useIndexProgress, useMediaPreview } from "../hooks/useMediaPreview";
 import { VideoFrameBrowser } from "../components/VideoFrameBrowser";
+import { ImportFramesDialog } from "../components/ImportFramesDialog";
 
 type ProjectUpdater = (updater: (state: ProjectState) => ProjectState) => void;
+
+/** Real-pixel zoom levels (screen pixels per source pixel). */
+const ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8];
 
 export function MediaPage({
   t,
@@ -87,6 +92,17 @@ export function MediaPage({
         .filter((sample) => sample.sourceId === selectedSourceId)
         .sort((a, b) => a.order - b.order),
     [selectedSourceId, state.samplesById],
+  );
+
+  const selectedStreamIndex = selectedSource?.selectedStreamIndex ?? null;
+  const importedFrameSet = useMemo(
+    () =>
+      new Set(
+        sourceSamples
+          .filter((sample) => sample.streamIndex === selectedStreamIndex && sample.frameIndex != null)
+          .map((sample) => sample.frameIndex as number),
+      ),
+    [sourceSamples, selectedStreamIndex],
   );
 
   const selectSource = useCallback(
@@ -150,6 +166,57 @@ export function MediaPage({
     onSourceChanged: markSourceChanged,
     onSourceMissing: markSourceMissing,
   });
+
+  const previewScrollRef = useRef<HTMLDivElement>(null);
+  const previewImageRef = useRef<HTMLImageElement>(null);
+  const [importFramesOpen, setImportFramesOpen] = useState(false);
+  const [previewNaturalSize, setPreviewNaturalSize] = useState<{ width: number; height: number } | null>(null);
+  /** Picture point under the viewport centre, captured just before a zoom change. */
+  const zoomAnchorRef = useRef<{ x: number; y: number } | null>(null);
+  // Zooming resizes the canvas; keep whatever was at the viewport centre there.
+  useLayoutEffect(() => {
+    const anchor = zoomAnchorRef.current;
+    zoomAnchorRef.current = null;
+    const scroller = previewScrollRef.current;
+    const canvas = previewImageRef.current?.parentElement;
+    if (!anchor || !scroller || !canvas) return;
+    scroller.scrollLeft = canvas.offsetLeft + anchor.x * canvas.offsetWidth - scroller.clientWidth / 2;
+    scroller.scrollTop = canvas.offsetTop + anchor.y * canvas.offsetHeight - scroller.clientHeight / 2;
+  }, [zoom]);
+
+  /** Zoom is in device pixels per source pixel, so 100% is pixel-exact on HiDPI too. */
+  const devicePixelRatio = window.devicePixelRatio || 1;
+  function changeZoom(next: (current: number) => number | null) {
+    const scroller = previewScrollRef.current;
+    const image = previewImageRef.current;
+    const canvas = image?.parentElement;
+    if (!scroller || !image || !canvas || !image.naturalWidth || !image.naturalHeight) return;
+    const rect = image.getBoundingClientRect();
+    // In fit mode the scale is whatever the layout produced; measure it.
+    const current = zoom
+      ?? Math.min(rect.width / image.naturalWidth, rect.height / image.naturalHeight) * devicePixelRatio;
+    const target = next(current);
+    if (target === zoom) return;
+    zoomAnchorRef.current = {
+      x: (scroller.scrollLeft + scroller.clientWidth / 2 - canvas.offsetLeft) / canvas.offsetWidth,
+      y: (scroller.scrollTop + scroller.clientHeight / 2 - canvas.offsetTop) / canvas.offsetHeight,
+    };
+    setZoom(target);
+  }
+  const canvasStyle = previewNaturalSize
+    ? zoom === null
+      ? {
+          width: "100%",
+          height: "100%",
+          // Fit only ever shrinks: a small picture stays at 100%.
+          maxWidth: previewNaturalSize.width / devicePixelRatio,
+          maxHeight: previewNaturalSize.height / devicePixelRatio,
+        }
+      : {
+          width: (previewNaturalSize.width * zoom) / devicePixelRatio,
+          height: (previewNaturalSize.height * zoom) / devicePixelRatio,
+        }
+    : { width: "100%", height: "100%" };
 
   const importPaths = useCallback(
     async (paths: string[]) => {
@@ -286,6 +353,30 @@ export function MediaPage({
       timestampSeconds: selectedFrame?.timestamp_seconds ?? null,
     });
     onProjectChange((current) => withSample(current, sample));
+  }
+
+  /** Adds one sample per frame index; the dialog has already dropped repeats. */
+  function importFrames(frames: number[]) {
+    if (!selectedSource || selectedSource.kind !== "video" || selectedSource.state !== "ready") return;
+    const source = selectedSource;
+    const streamIndex = source.selectedStreamIndex ?? null;
+    onProjectChange((current) => {
+      let order = nextSampleOrder(current.samplesById);
+      // Timestamps stay unset: frames are addressed by index, as for samples
+      // promoted from a verification run.
+      return frames.reduce(
+        (next, frameIndex) =>
+          withSample(next, buildFrameSample({
+            source,
+            order: order++,
+            label: videoSampleLabel(source, frameIndex, t),
+            streamIndex,
+            frameIndex,
+          })),
+        current,
+      );
+    });
+    setImportFramesOpen(false);
   }
 
   function removeSample(sampleId: string) {
@@ -431,21 +522,39 @@ export function MediaPage({
                 aria-label={selectedSource.kind === "video" ? t("media.frameWindow") : undefined}
                 onKeyDown={(event) => handleFrameBrowserKeyDown(event, selectedSource)}
                 onMouseMove={(event) => {
-                  if (!selectedSource.width || !selectedSource.height) return;
-                  const rect = event.currentTarget.getBoundingClientRect();
-                  const x = Math.max(0, Math.min(selectedSource.width - 1, Math.floor(((event.clientX - rect.left) / rect.width) * selectedSource.width)));
-                  const y = Math.max(0, Math.min(selectedSource.height - 1, Math.floor(((event.clientY - rect.top) / rect.height) * selectedSource.height)));
+                  const image = previewImageRef.current;
+                  if (!image || !selectedSource.width || !selectedSource.height) return;
+                  // The image is letterboxed (object-fit: contain) inside its
+                  // zoomed box, so map through the drawn picture, not the box.
+                  const rect = image.getBoundingClientRect();
+                  const scale = Math.min(rect.width / selectedSource.width, rect.height / selectedSource.height);
+                  if (!(scale > 0)) return;
+                  const x = Math.floor((event.clientX - rect.left - (rect.width - selectedSource.width * scale) / 2) / scale);
+                  const y = Math.floor((event.clientY - rect.top - (rect.height - selectedSource.height * scale) / 2) / scale);
+                  if (x < 0 || y < 0 || x >= selectedSource.width || y >= selectedSource.height) {
+                    setPixelPosition(null);
+                    return;
+                  }
                   setPixelPosition(`${x}, ${y}`);
                 }}
                 onMouseLeave={() => setPixelPosition(null)}
               >
                 {previewUrl ? (
-                  <img
-                    src={previewUrl}
-                    alt={selectedSource.label ?? fileName(selectedSource.path)}
-                    draggable={false}
-                    style={{ transform: `scale(${zoom})` }}
-                  />
+                  <div className="viewport-scroll" ref={previewScrollRef}>
+                    <div className="viewport-canvas" style={canvasStyle}>
+                      <img
+                        ref={previewImageRef}
+                        src={previewUrl}
+                        alt={selectedSource.label ?? fileName(selectedSource.path)}
+                        draggable={false}
+                        style={zoom !== null && zoom > 1 ? { imageRendering: "pixelated" } : undefined}
+                        onLoad={(event) => {
+                          const { naturalWidth: width, naturalHeight: height } = event.currentTarget;
+                          setPreviewNaturalSize((size) => (size?.width === width && size.height === height ? size : { width, height }));
+                        }}
+                      />
+                    </div>
+                  </div>
                 ) : (
                   <div className="viewport-empty">
                     {previewBusy ? <LoaderCircle className="spin" size={24} /> : <Film size={24} />}
@@ -456,11 +565,18 @@ export function MediaPage({
                 {previewUrl ? (
                   <div className="viewport-readout">
                     <span>{pixelPosition ?? t("media.pixelPosition")}</span>
-                    <button type="button" onClick={() => setZoom((value) => Math.max(0.5, value - 0.25))} aria-label={t("media.zoomOut")}>
+                    <button type="button" onClick={() => changeZoom((current) => [...ZOOM_STEPS].reverse().find((step) => step < current - 1e-3) ?? zoom)} aria-label={t("media.zoomOut")}>
                       <ZoomOut size={14} />
                     </button>
-                    <span>{Math.round(zoom * 100)}%</span>
-                    <button type="button" onClick={() => setZoom((value) => Math.min(4, value + 0.25))} aria-label={t("media.zoomIn")}>
+                    <button
+                      type="button"
+                      className="viewport-zoom-level"
+                      title={t(zoom === null ? "media.zoomActual" : "media.zoomFit")}
+                      onClick={() => changeZoom(() => (zoom === null ? 1 : null))}
+                    >
+                      {zoom === null ? t("media.zoomFitLabel") : `${Math.round(zoom * 100)}%`}
+                    </button>
+                    <button type="button" onClick={() => changeZoom((current) => ZOOM_STEPS.find((step) => step > current + 1e-3) ?? zoom)} aria-label={t("media.zoomIn")}>
                       <ZoomIn size={14} />
                     </button>
                   </div>
@@ -525,6 +641,17 @@ export function MediaPage({
               {selectedSource?.kind === "video" ? <Plus size={15} /> : <ImagePlus size={15} />}
               {selectedSource?.kind === "video" ? t("media.addCurrentFrame") : t("media.addImage")}
             </button>
+            {selectedSource?.kind === "video" ? (
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={selectedSource.state !== "ready" || !frameWindow || state.project.readOnly}
+                onClick={() => setImportFramesOpen(true)}
+              >
+                <ListPlus size={15} />
+                {t("media.importFrames")}
+              </button>
+            ) : null}
             {dedupPopupId != null ? (
               <p className="dedup-popup" role="status">
                 {t("media.alreadySelected")}
@@ -578,6 +705,16 @@ export function MediaPage({
           </div>
         </aside>
       </div>
+
+      {importFramesOpen && selectedSource?.kind === "video" ? (
+        <ImportFramesDialog
+          t={t}
+          totalFrames={frameWindow?.total_frames ?? null}
+          existingFrames={importedFrameSet}
+          onImport={importFrames}
+          onClose={() => setImportFramesOpen(false)}
+        />
+      ) : null}
 
       {dropActive ? (
         <div className="drop-overlay">
