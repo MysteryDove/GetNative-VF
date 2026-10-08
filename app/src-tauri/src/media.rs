@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use tauri::{ipc::Response, AppHandle, Manager};
 use uuid::Uuid;
 
-const PREVIEW_MAX_DIMENSION: u32 = 1600;
+const PREVIEW_DEFAULT_DIMENSION: u32 = 1600;
+// Matches the engine worker's maximum_dimension ceiling, so the Media viewer
+// can ask for a pixel-exact preview of images as well as video frames.
+const PREVIEW_MAX_DIMENSION: u32 = 8192;
 const PREVIEW_MIN_DIMENSION: u32 = 64;
 const FINGERPRINT_EDGE_BYTES: usize = 64 * 1024;
 const FRAME_ASSET_CACHE_MAX_FILES: usize = 64;
@@ -109,7 +112,7 @@ pub async fn media_preview(request: MediaPreviewRequest) -> Result<Response, Str
                 "video_engine_required: video previews are decoded by the resident engine".to_owned(),
             );
         }
-        let maximum = request.max_dimension.unwrap_or(PREVIEW_MAX_DIMENSION);
+        let maximum = request.max_dimension.unwrap_or(PREVIEW_DEFAULT_DIMENSION);
         if !(PREVIEW_MIN_DIMENSION..=PREVIEW_MAX_DIMENSION).contains(&maximum) {
             return Err(format!(
                 "preview_dimension_invalid: maxDimension must be between {PREVIEW_MIN_DIMENSION} and {PREVIEW_MAX_DIMENSION}"

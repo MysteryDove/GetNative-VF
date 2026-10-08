@@ -27,6 +27,11 @@ export type SelectVideoFrame = (
 
 /** Draft-preview cadence while the progress slider is being dragged. */
 const SCRUB_INTERVAL_MS = 120;
+/**
+ * The viewer zooms in real source pixels, so its preview must not be
+ * downscaled: this is the decoders' ceiling, and they never upscale.
+ */
+const VIEWER_PREVIEW_DIMENSION = 8192;
 
 function revokeObjectUrl(url: string | null): void {
   if (url?.startsWith("blob:")) URL.revokeObjectURL(url);
@@ -83,7 +88,8 @@ export function useMediaPreview({
   const [frameInput, setFrameInput] = useState("0");
   const [timeInput, setTimeInput] = useState("0.000");
   const [scrubFrame, setScrubFrame] = useState(0);
-  const [zoom, setZoom] = useState(1);
+  /** Screen pixels per source pixel; null fits the picture to the viewport. */
+  const [zoom, setZoom] = useState<number | null>(null);
   const [pixelPosition, setPixelPosition] = useState<string | null>(null);
   const previewRequestId = useRef(0);
   const sourceSessionId = useRef(0);
@@ -180,7 +186,7 @@ export function useMediaPreview({
           frameIndex,
           timestampSeconds,
           timestampReference: "relative",
-          maxDimension: 1600,
+          maxDimension: VIEWER_PREVIEW_DIMENSION,
           windowRadius: 12,
         });
         activeMediaTask.current = mainTask;
@@ -256,7 +262,7 @@ export function useMediaPreview({
       fingerprint: source.fingerprint,
       streamIndex,
       frameIndex,
-      maxDimension: 1600,
+      maxDimension: VIEWER_PREVIEW_DIMENSION,
       windowRadius: 0,
     });
     activeMediaTask.current = task;
@@ -329,7 +335,7 @@ export function useMediaPreview({
     setFrameWindowState(null);
     setPreviewDecoder(null);
     setIndexBusy(false);
-    setZoom(1);
+    setZoom(null);
     setPixelPosition(null);
     previewRequestId.current += 1;
     void activeMediaTask.current?.cancel().catch(() => undefined);
@@ -342,7 +348,7 @@ export function useMediaPreview({
       }
     } else {
       void showPreview(
-        { path: selectedSource.path, fingerprint: selectedSource.fingerprint },
+        { path: selectedSource.path, fingerprint: selectedSource.fingerprint, maxDimension: VIEWER_PREVIEW_DIMENSION },
         selectedSource.id,
       );
     }

@@ -3994,7 +3994,7 @@ input {
   place-items: center;
   min-width: 0;
   min-height: 260px;
-  overflow: auto;
+  overflow: hidden;
   background-color: var(--viewport-bg);
   background-image:
     linear-gradient(45deg, var(--checker) 25%, transparent 25%),
@@ -4014,8 +4014,23 @@ input {
 }
 
 .media-viewport img {
-  transform-origin: center;
-  transition: transform 120ms ease-out;
+  width: 100%;
+  height: 100%;
+}
+
+/* Zoom resizes .viewport-canvas (a real layout box, not a transform) so the
+   scroll range covers the whole picture; auto margins centre it only while it
+   is smaller than the viewport, never pushing its left/top edge out of reach. */
+.viewport-scroll {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  overflow: auto;
+}
+
+.viewport-canvas {
+  flex: none;
+  margin: auto;
 }
 
 .viewport-empty {
@@ -4055,6 +4070,13 @@ input {
   border: 0;
   color: var(--text-faint);
   background: transparent;
+}
+
+.viewport-readout .viewport-zoom-level {
+  width: auto;
+  min-width: 34px;
+  padding: 0 2px;
+  font: inherit;
 }
 
 .frame-browser {
@@ -4798,6 +4820,34 @@ input {
   color: var(--text-subtle);
   font-size: 12px;
   line-height: 1.5;
+}
+
+.frame-import-input {
+  display: block;
+  width: 100%;
+  padding: 8px;
+  border: 1px solid var(--border-control-strong);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  background: var(--surface-control);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.frame-import-summary {
+  min-height: 18px;
+  margin: 0;
+  padding: 0;
+  color: var(--text-meta);
+  font-size: 11px;
+  line-height: 1.5;
+  list-style: none;
+}
+
+.frame-import-summary .warning {
+  color: var(--danger-text);
 }
 
 .danger-button {
